@@ -1,6 +1,8 @@
 # CCBOT合约监控
 
-Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易桌面程序，C++20 + Qt6，仅支持 Windows。
+Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易程序，C++20。图形界面版（Qt6）仅支持
+Windows；核心引擎另有一个不依赖 Qt 的**无图形界面(headless)版**，配置文件驱动，可以在 Linux
+服务器上完全后台运行，见 [docs/HEADLESS.md](docs/HEADLESS.md)。
 
 > ⚠️ **风险提示**：本项目直接对接 Binance 合约账户下真实订单接口，涉及杠杆合约交易，存在**本金全部亏损**的风险。代码按"原样"提供，不构成任何投资建议，作者不对使用本软件造成的任何资金损失负责。**请务必先在测试网（Testnet）验证策略行为，确认无误后再连接真实账户，并从小额资金开始。**
 
@@ -15,24 +17,29 @@ Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易桌面�
 - **关键事件提醒**：企业微信 / 飞书自定义机器人 / Telegram Bot webhook，触发硬止损、账户连接失败/网络异常时自动推送。
 - **日志落盘**：按天写入本地文件，方便事后复盘。
 - **实时权益/连接状态**：顶部常驻权益、可用余额、累计盈亏徽标、连接时长与呼吸灯状态指示。
+- **无图形界面(headless)版**（v2.2+）：配置文件驱动，不依赖Qt，可在Linux服务器上后台常驻运行，核心策略引擎跟图形界面版完全共用一份代码，行为一致，详见 [docs/HEADLESS.md](docs/HEADLESS.md)。
 
-## 构建
+## 构建（图形界面版，Windows）
 
 依赖（通过 [vcpkg](https://github.com/microsoft/vcpkg) manifest 模式自动安装，见 `vcpkg.json`）：
 
 - CMake ≥ 3.20
 - Visual Studio（含 MSVC，C++20）
 - Qt6 (Widgets)
-- ixwebsocket / simdjson / curl
+- ixwebsocket / simdjson / curl / mbedtls
 
 ```powershell
-git clone https://github.com/MrF-crypto/CCGMonitor.git
-cd CCGMonitor
+git clone https://github.com/MrF-crypto/CCBot.git
+cd CCBot
 cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=<vcpkg根目录>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
 
 生成的可执行文件在 `build/Release/CCGMonitor.exe`。
+
+## 构建（无图形界面版，Linux 服务器）
+
+见 [docs/HEADLESS.md](docs/HEADLESS.md)，含配置文件字段说明和 systemd 常驻部署示例。
 
 ## 测试
 

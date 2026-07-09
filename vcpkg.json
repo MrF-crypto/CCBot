@@ -1,15 +1,17 @@
 {
   "name": "ccg-monitor",
-  "version": "2.1.0",
-  "description": "CCG 合约监控 — 独立 DCA Martingale 策略程序",
+  "version": "2.2.0",
+  "description": "CCG 合约监控 — 独立 DCA Martingale 策略程序（含无界面 headless 版）",
   "dependencies": [
     "ixwebsocket",
     "simdjson",
     "curl",
+    "mbedtls",
     {
       "name": "qtbase",
       "default-features": true,
-      "features": ["widgets"]
+      "features": ["widgets"],
+      "platform": "windows"
     }
   ]
 }

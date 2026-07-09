@@ -1,8 +1,7 @@
 #include "net/trading_client.h"
 #include "core/indicators.h"
 #include <curl/curl.h>
-#include <windows.h>
-#include <bcrypt.h>
+#include <mbedtls/md.h>
 #include <simdjson.h>
 #include <sstream>
 #include <iomanip>
@@ -12,20 +11,16 @@
 
 namespace ccbot {
 
-// ── HMAC-SHA256 via Windows CNG ───────────────────────────────────────────────
+// ── HMAC-SHA256 via mbedtls ─────────────────────────────────────────────────────
+// 跨平台实现（Windows/Linux 通用）：项目本来就通过 ixwebsocket 的 TLS 后端间接
+// 依赖 mbedtls，这里直接复用它的 HMAC 接口，不用再额外区分 Windows CNG / Linux OpenSSL
 static std::string hmac_sha256(const std::string& key, const std::string& msg) {
-    BCRYPT_ALG_HANDLE  alg  = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    BYTE result[32] = {};
-
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
-                                nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    BCryptCreateHash(alg, &hash, nullptr, 0,
-                     (PUCHAR)key.data(), (ULONG)key.size(), 0);
-    BCryptHashData(hash, (PUCHAR)msg.data(), (ULONG)msg.size(), 0);
-    BCryptFinishHash(hash, result, 32, 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
+    unsigned char result[32] = {};
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_hmac(info,
+                     reinterpret_cast<const unsigned char*>(key.data()), key.size(),
+                     reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                     result);
 
     std::ostringstream oss;
     for (int i = 0; i < 32; ++i)
