@@ -1,4 +1,4 @@
-# CCGMonitor（CCG 合约监控）
+# CCBOT合约监控
 
 Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易桌面程序，C++20 + Qt6，仅支持 Windows。
 
