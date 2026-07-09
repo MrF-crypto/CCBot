@@ -1,0 +1,17 @@
+build/
+out/
+vcpkg_installed/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+.vs/
+CMakeUserPresets.json
+
+# 本地保存的加密凭证/配置，不应提交
+*credentials*
+*.dat
+
+# 参考截图（其它产品界面，跟本项目代码无关）
+图片/

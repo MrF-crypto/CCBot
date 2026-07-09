@@ -1,0 +1,18 @@
+#include <QApplication>
+#include <QFont>
+#include "gui/main_window.h"
+
+int main(int argc, char* argv[]) {
+    QApplication::setStyle("Fusion");  // 让深色 QSS 完全接管，避免下拉框/勾选框等控件
+                                       // 回退到系统原生浅色渲染，出现"一亮一暗"的效果
+    QApplication app(argc, argv);
+    app.setApplicationName("CCG合约监控");
+    app.setOrganizationName("CCGMonitor");
+
+    QFont f("Consolas", 10);
+    app.setFont(f);
+
+    ccg::MainWindow w;
+    w.show();
+    return app.exec();
+}
