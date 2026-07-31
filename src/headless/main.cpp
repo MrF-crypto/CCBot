@@ -153,10 +153,12 @@ int main(int argc, char** argv) {
 
         auto bots = engine->get_bots();
 
-        // 指标信号首单：等信号的 bot 每 tick 拉一次最新 BOLL/RSI（公开接口，不占签名限流）
+        // 指标拉取（公开接口，不占签名限流）：等首单信号的 bot + 动态W模式的 bot
+        // （动态模式持仓中也要持续拉取——补仓锚定下轨/止盈锚定上轨都依赖实时轨道）
         for (const auto& b : bots) {
-            if (b.state == CcgBot::State::Running && b.entries.empty() &&
-                b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) {
+            if (b.state == CcgBot::State::Running &&
+                ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
+                 b.cfg.dynamic_band_mode)) {
                 auto snap = client->fetch_indicators(b.cfg.symbol, b.cfg.kline_interval,
                                                       b.cfg.boll_period, b.cfg.boll_mult,
                                                       b.cfg.rsi_period);

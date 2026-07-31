@@ -99,7 +99,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , pool_(std::make_shared<ThreadPool>(4))
 {
-    setWindowTitle("CCG 合约监控  v2.2");
+    setWindowTitle("CCG 合约监控  v2.3");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -239,6 +239,8 @@ void MainWindow::save_bots() {
         o["rsi_threshold"]  = c.rsi_threshold;
         o["rsi_confirm_mode"] = (int)c.rsi_confirm_mode;
         o["rsi_oversold_th"]  = c.rsi_oversold_th;
+        o["dynamic_band_mode"] = c.dynamic_band_mode;
+        o["min_profit_floor"]  = c.min_profit_floor;
 
         // 持仓/状态快照 —— 没有这些字段的话，App 重启后本地均价/持仓量会从零重新累积，
         // 跟交易所实际仓位脱节（这正是均价跟交易所对不上的根因之一）
@@ -310,6 +312,8 @@ void MainWindow::load_and_restore_bots() {
         c.rsi_threshold  = o["rsi_threshold"].toDouble(30.0);
         c.rsi_confirm_mode = (CcgConfig::RsiConfirmMode)o["rsi_confirm_mode"].toInt(0);
         c.rsi_oversold_th  = o["rsi_oversold_th"].toDouble(25.0);
+        c.dynamic_band_mode = o["dynamic_band_mode"].toBool(false);
+        c.min_profit_floor  = o["min_profit_floor"].toDouble(0.3);
         if (c.symbol.empty()) continue;
 
         CcgBot bot;
@@ -1124,6 +1128,18 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         prefill && prefill->cfg.entry_mode == CcgConfig::EntryMode::Indicator ? 1 : 0);
     form->addRow("首单模式:", entryModeBox);
 
+    // ── 动态W模式（v2.3）───────────────────────────────────────────────────────
+    auto* dynBandBox = new QCheckBox("动态W模式（补仓锚定下轨/止盈锚定上轨/间距自适应带宽）");
+    dynBandBox->setChecked(prefill ? prefill->cfg.dynamic_band_mode : false);
+    dynBandBox->setToolTip(
+        "开启后间隔%/追踪%不再用上面的固定值，改为按实时布林带宽W自动推导：\n"
+        "间隔=W/3、追踪止盈=0.15W、追踪建仓=0.1W（各有上下限夹逼）。\n"
+        "补仓要求价格在带外（多:≤下轨），止盈要求触及对侧轨道且盈利≥保底利润。\n"
+        "带子随趋势移动时梯子跟着走，均价贴着下轨，带内震荡即可完成周期。");
+    form->addRow("", dynBandBox);
+    auto* floorEdit = mkEdit("保底利润%(动态模式):",
+                             prefill ? prefill->cfg.min_profit_floor : 0.3);
+
     dv->addLayout(form);
 
     // ── 指标信号配置（entryModeBox 选"指标信号"时才用得上）──────────────────────
@@ -1185,7 +1201,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto previewDipped = std::make_shared<bool>(false);
 
     auto refreshIndPreview = [=]() {
-        if (!client_ || entryModeBox->currentIndex() != 1) return;
+        // 指标模式或动态W模式任一开启都需要预览（动态模式即使首单是"立即开仓"也依赖轨道数据）
+        if (!client_ || (entryModeBox->currentIndex() != 1 && !dynBandBox->isChecked())) return;
         bool ok;
         int    bp   = bollPeriodEdit->text().toInt(&ok); if (!ok || bp <= 1) bp = 20;
         double bm   = bollMultEdit->text().toDouble(&ok); if (!ok || bm <= 0) bm = 2.0;
@@ -1233,12 +1250,13 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     connect(indPreviewTimer, &QTimer::timeout, &dlg, refreshIndPreview);
 
     auto updateIndVisible = [=]() {
-        bool show = entryModeBox->currentIndex() == 1;
+        bool show = entryModeBox->currentIndex() == 1 || dynBandBox->isChecked();
         indBox->setVisible(show);
         if (show) { indPreviewTimer->start(); refreshIndPreview(); }
         else        indPreviewTimer->stop();
     };
     connect(entryModeBox, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, updateIndVisible);
+    connect(dynBandBox,   &QCheckBox::toggled,                                 &dlg, updateIndVisible);
     connect(bollPeriodEdit, &QLineEdit::editingFinished, &dlg, refreshIndPreview);
     connect(bollMultEdit,   &QLineEdit::editingFinished, &dlg, refreshIndPreview);
     connect(rsiPeriodEdit,  &QLineEdit::editingFinished, &dlg, refreshIndPreview);
@@ -1427,6 +1445,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                           ? CcgConfig::RsiConfirmMode::CrossFromOversold
                           : CcgConfig::RsiConfirmMode::Snapshot;
     cfg.rsi_oversold_th  = to_d(rsiOversoldEdit, 25.0);
+    cfg.dynamic_band_mode = dynBandBox->isChecked();
+    cfg.min_profit_floor  = to_d(floorEdit, 0.3);
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -1496,12 +1516,14 @@ void MainWindow::onTick() {
 
     auto bots = engine_->get_bots();
 
-    // 指标信号首单：正在等待 BOLL/RSI 满足条件的 bot，每 tick 异步拉一次最新指标值
-    // （公开接口，不占用签名限流；只对"运行中+还没开首仓+指标模式"的 bot 生效）
+    // 指标拉取（公开接口，不占用签名限流）：
+    //  - 指标信号首单：等待 BOLL/RSI 信号的 bot（运行中+还没开首仓+指标模式）
+    //  - 动态W模式：持仓中也要持续拉取——补仓锚定下轨/止盈锚定上轨都依赖实时轨道
     std::vector<CcgBot> ind_wait;
     for (const auto& b : bots)
-        if (b.state == CcgBot::State::Running && b.entries.empty() &&
-            b.cfg.entry_mode == CcgConfig::EntryMode::Indicator)
+        if (b.state == CcgBot::State::Running &&
+            ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
+             b.cfg.dynamic_band_mode))
             ind_wait.push_back(b);
     if (!ind_wait.empty() && client_) {
         run_async([this, ind_wait]() {
@@ -1693,7 +1715,10 @@ void MainWindow::refreshBotTable() {
                 } else {
                     state_s = "等待首仓"; state_c = QColor("#58a6ff");
                 }
-            } else { state_s = "运行中"; state_c = QColor("#3fb950"); }
+            } else {
+                state_s = b.cfg.dynamic_band_mode ? "运行中·动态W" : "运行中";
+                state_c = QColor("#3fb950");
+            }
             ++running; break;
         case CcgBot::State::Cooldown: {
             auto secs = std::chrono::duration_cast<std::chrono::seconds>(

@@ -31,7 +31,10 @@
       "rsi_period": 14,
       "rsi_threshold": 30,
       "rsi_confirm_mode": "cross",
-      "rsi_oversold_th": 25
+      "rsi_oversold_th": 25,
+
+      "dynamic_band_mode": false,
+      "min_profit_floor": 0.3
     }
   ]
 }

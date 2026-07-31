@@ -1,4 +1,5 @@
 #include "core/ccg_engine.h"
+#include "core/dynamic_params.h"
 #include "net/trading_client.h"
 #include "core/thread_pool.h"
 #include <sstream>
@@ -7,6 +8,11 @@
 #include <algorithm>
 
 namespace ccbot {
+
+// 指标数据有效期：超过这个时长没有新的 BOLL/RSI 写入就视为过期。
+// 正常情况下 UI/headless 每 3s 拉一次，180s 的余量足够容忍短暂网络抖动，
+// 又能保证断网/K线接口故障时不会拿几小时前的旧轨道值继续开仓补仓
+static constexpr auto kIndStale = std::chrono::seconds(180);
 
 // ── 加仓比例序列（最多 10 层）──────────────────────────────────────────────────
 static std::vector<double> base_mult(CcgConfig::StratType t) {
@@ -157,6 +163,8 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& new_cfg) 
     cfg.rsi_threshold  = new_cfg.rsi_threshold;
     cfg.rsi_confirm_mode = new_cfg.rsi_confirm_mode;
     cfg.rsi_oversold_th  = new_cfg.rsi_oversold_th;
+    cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
+    cfg.min_profit_floor  = new_cfg.min_profit_floor;
     return true;
 }
 
@@ -186,6 +194,7 @@ void CcgEngine::update_indicator(const std::string& bot_id, double boll_lb, doub
     bot.ind_boll_ub = boll_ub;
     bot.ind_rsi     = rsi;
     bot.ind_ok      = true;
+    bot.ind_time    = std::chrono::steady_clock::now();
 
     if (bot.cfg.rsi_confirm_mode == CcgConfig::RsiConfirmMode::CrossFromOversold) {
         const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -243,19 +252,54 @@ std::vector<CcgBot> CcgEngine::get_bots() const {
     return out;
 }
 
+// ── 本 tick 生效的策略参数（在 tick 持锁中调用）───────────────────────────────
+CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
+    EffParams p;
+    p.interval_pct = bot.cfg.interval_pct;
+    p.trail_entry  = bot.cfg.trail_entry;
+    p.trail_tp     = bot.cfg.trail_tp;
+    p.dyn   = false;
+    p.fresh = true;
+    if (!bot.cfg.dynamic_band_mode) return p;
+
+    double W = dynparams::band_width_pct(bot.ind_boll_lb, bot.ind_boll_ub);
+    if (!bot.ind_ok || W <= 0) {
+        // 动态模式已开但还没有任何可用指标数据：参数保持配置值，标记数据过期
+        p.dyn   = true;
+        p.fresh = false;
+        return p;
+    }
+    p.dyn          = true;
+    p.fresh        = (std::chrono::steady_clock::now() - bot.ind_time) < kIndStale;
+    p.interval_pct = dynparams::interval_pct(W);
+    p.trail_entry  = dynparams::trail_entry_pct(W);
+    p.trail_tp     = dynparams::trail_tp_pct(W);
+    return p;
+}
+
 // ── 追踪变量更新（在 tick 持锁中调用）────────────────────────────────────────
 void CcgEngine::update_tracking(CcgBot& bot, double price) {
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
 
     if (bot.entries.empty()) return;  // 尚未建仓，不用追踪
 
+    const EffParams eff = eff_params(bot);
+
     // ── DCA 间隔追踪 ──────────────────────────────────────────────────────────
     double interval_th = bot.last_entry_price *
-        (is_long ? (1.0 - bot.cfg.interval_pct / 100.0)
-                 : (1.0 + bot.cfg.interval_pct / 100.0));
+        (is_long ? (1.0 - eff.interval_pct / 100.0)
+                 : (1.0 + eff.interval_pct / 100.0));
 
     if (!bot.interval_hit) {
         bool triggered = is_long ? (price <= interval_th) : (price >= interval_th);
+        if (eff.dyn) {
+            // 动态W模式：补仓锚定布林带——除了跌够动态间隔，价格还必须在带外
+            // （多：≤下轨；空：≥上轨），即"当前统计意义上的超卖/超买位"才武装补仓。
+            // 指标数据过期时冻结武装（fresh=false），宁可错过不可乱买
+            bool band_cond = eff.fresh &&
+                (is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub));
+            triggered = triggered && band_cond;
+        }
         if (triggered) {
             bot.interval_hit = true;
             bot.dca_extreme  = price;
@@ -268,11 +312,24 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
 
     // ── 止盈追踪 ──────────────────────────────────────────────────────────────
     if (bot.avg_price > 0) {
-        double tp_th = bot.avg_price *
-            (is_long ? (1.0 + bot.cfg.tp_pct / 100.0)
-                     : (1.0 - bot.cfg.tp_pct / 100.0));
-
-        bool tp_hit = is_long ? (price >= tp_th) : (price <= tp_th);
+        bool tp_hit;
+        if (eff.dyn) {
+            // 动态W模式：止盈锚定上轨（多）/下轨（空）+ 保底利润双条件。
+            // 保底条款必须有：下跌趋势里上轨可能低于均价（高位库存拖的），
+            // 只看"触上轨"会亏着平仓；保底保证每轮至少覆盖手续费+微利
+            double floor_th = bot.avg_price *
+                (is_long ? (1.0 + bot.cfg.min_profit_floor / 100.0)
+                         : (1.0 - bot.cfg.min_profit_floor / 100.0));
+            bool band_cond = eff.fresh &&
+                (is_long ? (price >= bot.ind_boll_ub) : (price <= bot.ind_boll_lb));
+            tp_hit = band_cond &&
+                (is_long ? (price >= floor_th) : (price <= floor_th));
+        } else {
+            double tp_th = bot.avg_price *
+                (is_long ? (1.0 + bot.cfg.tp_pct / 100.0)
+                         : (1.0 - bot.cfg.tp_pct / 100.0));
+            tp_hit = is_long ? (price >= tp_th) : (price <= tp_th);
+        }
         if (!bot.tp_reached && tp_hit) {
             bot.tp_reached = true;
             bot.tp_extreme = price;
@@ -290,9 +347,10 @@ bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
     if (bot.tp_reached)    return false;  // 达到止盈时不加仓
 
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
+    const double trail_entry = eff_params(bot).trail_entry;
     double bounce_th = bot.dca_extreme *
-        (is_long ? (1.0 + bot.cfg.trail_entry / 100.0)
-                 : (1.0 - bot.cfg.trail_entry / 100.0));
+        (is_long ? (1.0 + trail_entry / 100.0)
+                 : (1.0 - trail_entry / 100.0));
     return is_long ? (price >= bounce_th) : (price <= bounce_th);
 }
 
@@ -302,8 +360,8 @@ bool CcgEngine::should_close(const CcgBot& bot, double price) const {
 
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
     double trail_th = bot.tp_extreme *
-        (is_long ? (1.0 - bot.cfg.trail_tp / 100.0)
-                 : (1.0 + bot.cfg.trail_tp / 100.0));
+        (is_long ? (1.0 - eff_params(bot).trail_tp / 100.0)
+                 : (1.0 + eff_params(bot).trail_tp / 100.0));
     return is_long ? (price <= trail_th) : (price >= trail_th);
 }
 
@@ -336,21 +394,20 @@ void CcgEngine::tick(const std::string& symbol, double price) {
             bot.current_price = price;
 
             if (bot.state == CcgBot::State::Cooldown) {
-                if (now >= bot.cooldown_until) {
-                    // 冷却结束，重置状态重新开始
-                    bot.entries.clear();
-                    bot.avg_price = bot.total_qty = bot.total_cost = 0;
-                    bot.interval_hit = bot.tp_reached = false;
-                    bot.ind_dipped  = false;   // 新一轮等待信号，探底状态清零重新累积
-                    bot.last_entry_price = price;
-                    bot.dca_extreme = price;
-                    bot.tp_extreme  = price;
-                    bot.last_action = "重启中";
-                    bot.state = CcgBot::State::Running;
-                    do_entry.push_back(id);
-                    bot.pending = true;
-                }
-                continue;
+                if (now < bot.cooldown_until) continue;
+                // 冷却结束：清零本轮状态回到 Running，不再直接开首仓，而是落入下方
+                // entries.empty() 的正常首仓闸门——指标信号、账户总保证金上限都会被
+                // 正确检查（原先直接 do_entry 会绕过这两道闸，指标模式的 bot 每轮
+                // 止盈后会无视信号立刻市价重新买入）
+                bot.entries.clear();
+                bot.avg_price = bot.total_qty = bot.total_cost = 0;
+                bot.interval_hit = bot.tp_reached = false;
+                bot.ind_dipped  = false;   // 新一轮等待信号，探底状态清零重新累积
+                bot.last_entry_price = price;
+                bot.dca_extreme = price;
+                bot.tp_extreme  = price;
+                bot.last_action = "冷却结束，等待开仓条件";
+                bot.state = CcgBot::State::Running;
             }
             if (bot.state != CcgBot::State::Running) continue;
 
@@ -378,7 +435,10 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                                 ? (bot.ind_dipped && snapshotHit)   // 必须先探底跌破过，再回穿阈值
                                 : snapshotHit;                       // 瞬时快照：这一刻到阈值就行
                     }
-                    can_enter = bot.ind_ok && priceCond && rsiCond;
+                    // 指标数据必须在有效期内：冷却重启/程序重启后的头几秒里，
+                    // ind_* 还是上一轮甚至几小时前的旧值，拿旧轨道判断会误开仓
+                    bool fresh = (std::chrono::steady_clock::now() - bot.ind_time) < kIndStale;
+                    can_enter = bot.ind_ok && fresh && priceCond && rsiCond;
                 }
                 // 账户级总保证金上限：只挡"开新首仓"，已有仓位的加仓/止盈止损不受影响
                 double cap = max_total_margin_.load();

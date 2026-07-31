@@ -59,6 +59,15 @@ struct CcgConfig {
     double      rsi_threshold  = 30.0;   // 多：RSI≥此值；空：RSI≤(100-此值)
     RsiConfirmMode rsi_confirm_mode = RsiConfirmMode::Snapshot;
     double         rsi_oversold_th  = 25.0;  // CrossFromOversold 模式：先跌破这个值才算探过底
+
+    // 动态W模式（v2.3+）：把整个策略的锚点从"固定百分比"换成"布林带本身"——
+    //   补仓锚定下轨：除了跌够动态间隔，价格还必须在带外（统计超卖位）才补
+    //   止盈锚定上轨：价格触及上轨 且 盈利>=保底利润 才激活追踪止盈（不再用固定tp_pct）
+    //   间距自适应：间隔/追踪参数由实时带宽W推导（见 dynamic_params.h），不再用配置里的固定值
+    // 带子在下跌趋势中整体下移时梯子跟着走，均价贴着下轨，带内震荡就能完成多头周期。
+    // 指标数据超时（>180s无更新）时冻结新补仓/止盈激活，宁可错过不可乱做。
+    bool   dynamic_band_mode = false;
+    double min_profit_floor  = 0.3;   // 动态模式止盈激活的最低盈利%（覆盖手续费+微利）
 };
 
 // ─── 单笔加仓记录 ──────────────────────────────────────────────────────────────
@@ -103,6 +112,9 @@ struct CcgBot {
     double ind_rsi      = 50.0;
     // CrossFromOversold 模式：本轮"等待首单信号"期间，RSI 是否已经探底跌破过 rsi_oversold_th
     bool   ind_dipped   = false;
+    // 最近一次指标写入时间（steady_clock，默认epoch=从未更新过=视为过期）。
+    // 动态W模式和指标首单都用它做数据新鲜度检查，避免拿几小时前的旧轨道值做决策
+    std::chrono::steady_clock::time_point ind_time{};
 
     // 统计
     double realized_pnl = 0;
@@ -173,6 +185,17 @@ public:
     static std::string         dir_name  (CcgConfig::Direction d);
 
 private:
+    // 本 tick 实际生效的策略参数：静态模式=配置里的固定值；动态W模式=由实时带宽推导。
+    // fresh=false 表示指标数据过期（动态模式下会冻结新补仓/止盈激活）
+    struct EffParams {
+        double interval_pct;
+        double trail_entry;
+        double trail_tp;
+        bool   dyn;     // 动态W模式已启用且指标数据可用
+        bool   fresh;   // 指标数据是否在有效期内
+    };
+    EffParams eff_params(const CcgBot& bot) const;
+
     void update_tracking  (CcgBot& bot, double price);
     bool should_enter     (const CcgBot& bot, double price) const;
     bool should_close     (const CcgBot& bot, double price) const;

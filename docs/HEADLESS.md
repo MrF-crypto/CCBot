@@ -51,6 +51,8 @@ cmake --build build --config Release --target ccbot_headless
 | `kline_interval` `boll_period` `boll_mult` `use_rsi_filter` `rsi_period` `rsi_threshold` | 指标信号参数 | 同GUI |
 | `rsi_confirm_mode` | RSI确认方式 | `snapshot`（瞬时快照）/ `cross`（反转确认：先探底再回穿阈值） |
 | `rsi_oversold_th` | 探底阈值 | 仅 `cross` 模式用 |
+| `dynamic_band_mode` | 动态W模式 (v2.3+) | `true` 时补仓锚定下轨、止盈锚定上轨，间隔/追踪参数由实时布林带宽 W 自动推导（间隔=W/3、追踪止盈=0.15W、追踪建仓=0.1W，带上下限夹逼），配置里的 `interval_pct`/`tp_pct`/`trail_*` 固定值不再生效 |
+| `min_profit_floor` | 保底利润% | 仅动态W模式用：止盈激活除了触及上轨，还要求盈利≥此值（默认0.3，覆盖手续费+微利，防止上轨低于均价时亏着平仓） |
 
 程序启动后，配置文件里的 bot **立即开始监控**（没有GUI版"先停止等手动开启"那一步）；如果
 `state_path` 里有上次落盘的仓位状态（品种+方向能对上配置文件），会先恢复仓位再继续，不会

@@ -134,6 +134,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.rsi_threshold   = get_num(bo, "rsi_threshold", 30.0);
         c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "snapshot"));
         c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", 25.0);
+        c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", false);
+        c.min_profit_floor  = get_num(bo, "min_profit_floor", 0.3);
 
         out.bots.push_back(c);
     }
