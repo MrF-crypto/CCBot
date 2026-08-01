@@ -1,0 +1,64 @@
+# 云端构建 macOS 版（Apple Silicon）：手动触发 或 推送 v* 标签时自动跑。
+# 产物：ccbot-macos-arm64.zip（GUI + headless 两个可执行文件），
+# 标签构建会自动附加到对应的 GitHub Release。
+# 注意：产物未做 Apple 签名/公证，下载后需要:
+#   chmod +x CCGMonitor ccbot_headless && xattr -dr com.apple.quarantine .
+name: build-macos
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: macos-latest   # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ninja pkg-config
+
+      - name: Set up vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh"
+
+      # vcpkg 编译好的依赖包缓存（第一次跑 Qt 要 1~2 小时，之后命中缓存只要几分钟）
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-osx-arm64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-osx-arm64-
+
+      - name: Configure
+        run: |
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=arm64-osx
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run unit tests
+        run: ./build/ccg_indicator_tests
+
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cp build/CCGMonitor build/ccbot_headless pkg/
+          cd pkg && zip -r ../ccbot-macos-arm64.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccbot-macos-arm64
+          path: ccbot-macos-arm64.zip
+
+      - name: Attach to release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ccbot-macos-arm64.zip
