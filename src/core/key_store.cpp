@@ -1,4 +1,14 @@
 #include "core/key_store.h"
+
+// 平台加密后端：
+//   Windows —— DPAPI（CryptProtectData），密文绑定当前 Windows 用户
+//   macOS   —— 系统钥匙串（Keychain，Security.framework），条目归属当前 macOS 用户
+//   其他    —— 明文文件兜底（GUI 目前只发 Windows/macOS，这个分支只为编译完整性）
+// 三个后端对外接口一致：save/load 打包格式都是 "key\nsecret\ntestnet"，互不兼容属预期
+// （换电脑/换系统本来就要求重新输入密钥，见 README 迁移说明）。
+
+#if defined(_WIN32)
+// ─── Windows: DPAPI ───────────────────────────────────────────────────────────
 #include <windows.h>
 #include <wincrypt.h>   // CryptProtectData / CryptUnprotectData (crypt32.lib)
 #include <fstream>
@@ -22,8 +32,10 @@ static std::wstring utf8_to_wide(const std::string& s) {
 static std::vector<uint8_t> dpapi_enc(const std::string& data) {
     DATA_BLOB in  = { (DWORD)data.size(), (BYTE*)data.data() };
     DATA_BLOB out = {};
-    if (!CryptProtectData(&in, nullptr, nullptr, nullptr, nullptr,
-                          CRYPTPROTECT_LOCAL_MACHINE, &out))
+    // flags=0：密文绑定当前 Windows 用户（同机器其他账户解不开）。
+    // 旧版本用过 CRYPTPROTECT_LOCAL_MACHINE（本机任何账户可解），解密时 DPAPI 按
+    // 密文自带的元数据处理，所以旧密文照常能读，只是新保存的从此收紧为用户级
+    if (!CryptProtectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out))
         return {};
     std::vector<uint8_t> buf(out.pbData, out.pbData + out.cbData);
     LocalFree(out.pbData);
@@ -33,33 +45,137 @@ static std::vector<uint8_t> dpapi_enc(const std::string& data) {
 static std::string dpapi_dec(const std::vector<uint8_t>& data) {
     DATA_BLOB in  = { (DWORD)data.size(), (BYTE*)const_cast<uint8_t*>(data.data()) };
     DATA_BLOB out = {};
-    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
-                            CRYPTPROTECT_LOCAL_MACHINE, &out))
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out))
         return {};
     std::string s((char*)out.pbData, out.cbData);
     LocalFree(out.pbData);
     return s;
 }
 
-bool KeyStore::save(const Creds& c, const std::string& path) {
-    std::string plain = c.api_key + "\n" + c.api_secret + "\n" +
-                        (c.testnet ? "1" : "0");
-    auto enc = dpapi_enc(plain);
-    if (enc.empty()) return false;
+static bool write_blob(const std::string& path, const std::vector<uint8_t>& enc) {
     std::ofstream f(utf8_to_wide(path), std::ios::binary | std::ios::trunc);
     if (!f) return false;
     f.write((char*)enc.data(), (std::streamsize)enc.size());
     return true;
 }
 
-bool KeyStore::load(Creds& c, const std::string& path) {
+static bool read_blob(const std::string& path, std::vector<uint8_t>& enc) {
     std::ifstream f(utf8_to_wide(path), std::ios::binary);
     if (!f) return false;
-    std::vector<uint8_t> enc((std::istreambuf_iterator<char>(f)),
-                              std::istreambuf_iterator<char>());
+    enc.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return !enc.empty();
+}
+
+static bool backend_save(const std::string& plain, const std::string& path) {
+    auto enc = dpapi_enc(plain);
     if (enc.empty()) return false;
-    std::string plain = dpapi_dec(enc);
-    if (plain.empty()) return false;
+    return write_blob(path, enc);
+}
+
+static bool backend_load(std::string& plain, const std::string& path) {
+    std::vector<uint8_t> enc;
+    if (!read_blob(path, enc)) return false;
+    plain = dpapi_dec(enc);
+    return !plain.empty();
+}
+
+} // namespace ccbot
+
+#elif defined(__APPLE__)
+// ─── macOS: 系统钥匙串（Keychain）──────────────────────────────────────────────
+// 密文不落自定义文件，直接存进当前用户的钥匙串（kSecClassGenericPassword 条目，
+// service=com.ccbot.CCGMonitor）。path 参数在本后端里不使用。
+// 首次访问时 macOS 可能弹出钥匙串授权框，选"始终允许"即可。
+#include <Security/Security.h>
+#include <CoreFoundation/CoreFoundation.h>
+
+namespace ccbot {
+
+static const CFStringRef kService = CFSTR("com.ccbot.CCGMonitor");
+static const CFStringRef kAccount = CFSTR("binance-api");
+
+static CFMutableDictionaryRef base_query() {
+    CFMutableDictionaryRef q = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(q, kSecClass,       kSecClassGenericPassword);
+    CFDictionarySetValue(q, kSecAttrService, kService);
+    CFDictionarySetValue(q, kSecAttrAccount, kAccount);
+    return q;
+}
+
+static bool backend_save(const std::string& plain, const std::string& /*path*/) {
+    // 先删旧条目再新增（SecItemUpdate 的语义更繁琐，删+增等效且简单）
+    CFMutableDictionaryRef del = base_query();
+    SecItemDelete(del);
+    CFRelease(del);
+
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+                                  (const UInt8*)plain.data(), (CFIndex)plain.size());
+    if (!data) return false;
+
+    CFMutableDictionaryRef add = base_query();
+    CFDictionarySetValue(add, kSecValueData, data);
+    OSStatus st = SecItemAdd(add, nullptr);
+    CFRelease(add);
+    CFRelease(data);
+    return st == errSecSuccess;
+}
+
+static bool backend_load(std::string& plain, const std::string& /*path*/) {
+    CFMutableDictionaryRef q = base_query();
+    CFDictionarySetValue(q, kSecReturnData,  kCFBooleanTrue);
+    CFDictionarySetValue(q, kSecMatchLimit,  kSecMatchLimitOne);
+
+    CFTypeRef result = nullptr;
+    OSStatus st = SecItemCopyMatching(q, &result);
+    CFRelease(q);
+    if (st != errSecSuccess || !result) return false;
+
+    CFDataRef data = (CFDataRef)result;
+    plain.assign((const char*)CFDataGetBytePtr(data), (size_t)CFDataGetLength(data));
+    CFRelease(result);
+    return !plain.empty();
+}
+
+} // namespace ccbot
+
+#else
+// ─── 其他平台：明文文件兜底（仅为编译完整性，GUI 不在这些平台发布）────────────
+#include <fstream>
+
+namespace ccbot {
+
+static bool backend_save(const std::string& plain, const std::string& path) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(plain.data(), (std::streamsize)plain.size());
+    return true;
+}
+
+static bool backend_load(std::string& plain, const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    plain.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return !plain.empty();
+}
+
+} // namespace ccbot
+
+#endif
+
+// ─── 平台无关的打包/解包 ──────────────────────────────────────────────────────
+namespace ccbot {
+
+bool KeyStore::save(const Creds& c, const std::string& path) {
+    std::string plain = c.api_key + "\n" + c.api_secret + "\n" +
+                        (c.testnet ? "1" : "0");
+    return backend_save(plain, path);
+}
+
+bool KeyStore::load(Creds& c, const std::string& path) {
+    std::string plain;
+    if (!backend_load(plain, path)) return false;
 
     size_t p1 = plain.find('\n');
     if (p1 == std::string::npos) return false;

@@ -1,8 +1,8 @@
 # CCBOT合约监控
 
-Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易程序，C++20。图形界面版（Qt6）仅支持
-Windows；核心引擎另有一个不依赖 Qt 的**无图形界面(headless)版**，配置文件驱动，可以在 Linux
-服务器上完全后台运行，见 [docs/HEADLESS.md](docs/HEADLESS.md)。
+Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易程序，C++20。图形界面版（Qt6）支持
+Windows 和 macOS；核心引擎另有一个不依赖 Qt 的**无图形界面(headless)版**，配置文件驱动，
+可以在 Linux 服务器上完全后台运行，见 [docs/HEADLESS.md](docs/HEADLESS.md)。
 
 > ⚠️ **风险提示**：本项目直接对接 Binance 合约账户下真实订单接口，涉及杠杆合约交易，存在**本金全部亏损**的风险。代码按"原样"提供，不构成任何投资建议，作者不对使用本软件造成的任何资金损失负责。**请务必先在测试网（Testnet）验证策略行为，确认无误后再连接真实账户，并从小额资金开始。**
 
@@ -37,6 +37,29 @@ cmake --build build --config Release
 ```
 
 生成的可执行文件在 `build/Release/CCGMonitor.exe`。
+
+## 构建（图形界面版，macOS）
+
+GUI 同样支持 macOS（iMac / Mac mini / MacBook，Intel 和 Apple Silicon 都可以），
+API 密钥存进系统钥匙串（Keychain）。需要先装 Xcode 命令行工具和 Homebrew：
+
+```bash
+xcode-select --install
+brew install cmake ninja pkg-config
+
+git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
+~/vcpkg/bootstrap-vcpkg.sh
+
+git clone https://github.com/MrF-crypto/CCBot.git
+cd CCBot
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=~/vcpkg/scripts/buildsystems/vcpkg.cmake \
+    -DVCPKG_TARGET_TRIPLET=arm64-osx    # Apple Silicon（M系列）；Intel Mac 用 x64-osx
+cmake --build build --config Release
+./build/CCGMonitor
+```
+
+> 第一次配置时 vcpkg 会从源码编译 Qt6，耗时 1~2 小时（一次性）。首次保存 API
+> 密钥时 macOS 可能弹出钥匙串授权框，选"始终允许"。
 
 ## 构建（无图形界面版，Linux 服务器）
 

@@ -9,7 +9,11 @@ int main(int argc, char* argv[]) {
     app.setApplicationName("CCG合约监控");
     app.setOrganizationName("CCGMonitor");
 
+#ifdef Q_OS_MAC
+    QFont f("Menlo", 12);      // macOS 没有 Consolas，Menlo 是系统等宽字体
+#else
     QFont f("Consolas", 10);
+#endif
     app.setFont(f);
 
     ccg::MainWindow w;

@@ -11,7 +11,7 @@
       "name": "qtbase",
       "default-features": true,
       "features": ["widgets"],
-      "platform": "windows"
+      "platform": "windows | osx"
     }
   ]
 }
