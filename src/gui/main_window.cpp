@@ -99,7 +99,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , pool_(std::make_shared<ThreadPool>(4))
 {
-    setWindowTitle("CCG 合约监控  v2.3");
+    setWindowTitle("CCG 合约监控  v2.3.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
