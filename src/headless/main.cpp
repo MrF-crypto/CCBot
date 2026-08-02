@@ -19,6 +19,15 @@
 #include <iomanip>
 #include <ctime>
 #include <set>
+#include <filesystem>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#include <csignal>
+#endif
 
 using namespace ccbot;
 
@@ -53,6 +62,40 @@ void log_line(const std::string& msg, const std::string& level = "INFO") {
     }
 }
 
+// ── 单实例锁（PID 锁文件）────────────────────────────────────────────────────
+// 同一个状态文件 = 同一个逻辑实例：双开会各自独立决策、对同一账户重复下单。
+// 锁文件里写 PID；已存在时检查那个进程是否还活着，死进程残留的锁自动接管
+bool pid_alive(long pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return false;
+    DWORD code = 0;
+    bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+#else
+    return ::kill((pid_t)pid, 0) == 0 || errno == EPERM;
+#endif
+}
+
+bool acquire_instance_lock(const std::string& lock_path) {
+    if (std::filesystem::exists(lock_path)) {
+        long old_pid = 0;
+        { std::ifstream f(lock_path); f >> old_pid; }
+        if (old_pid > 0 && pid_alive(old_pid)) return false;   // 真的有实例在跑
+        std::error_code ec;
+        std::filesystem::remove(lock_path, ec);                 // 死进程残留，接管
+    }
+    std::ofstream f(lock_path, std::ios::trunc);
+    if (!f) return false;
+#ifdef _WIN32
+    f << _getpid();
+#else
+    f << ::getpid();
+#endif
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -68,6 +111,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     g_log_path = cfg.log_path;
+
+    const std::string lock_path = cfg.state_path + ".lock";
+    if (!acquire_instance_lock(lock_path)) {
+        std::cerr << "已有另一个 ccbot_headless 实例在运行（锁文件 " << lock_path
+                  << "）。同一账户双开会重复下单，拒绝启动。" << std::endl;
+        return 1;
+    }
 
     log_line("ccbot headless 启动，配置文件: " + config_path + "，共 " +
              std::to_string(cfg.bots.size()) + " 个 bot");
@@ -138,6 +188,22 @@ int main(int argc, char** argv) {
         if (!id.empty()) log_line(c.symbol + " 新建 bot，按配置文件立即开始监控");
     }
 
+    // 启动对账：本地落盘的仓位 vs 交易所实际持仓（外部手动平过仓/强平过的话本地状态是错的）
+    {
+        auto ex_pos = client->fetch_positions();
+        std::vector<CcgEngine::ExchangePos> ex;
+        for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty});
+        auto issues = engine->reconcile_positions(ex);
+        if (!issues.empty()) {
+            save_headless_state(cfg.state_path, engine->get_bots());   // 把收敛后的状态立刻落盘
+            if (!cfg.alert_webhook.empty()) {
+                std::string msg = "[ccbot] 启动对账发现 " + std::to_string(issues.size()) + " 处不一致:";
+                for (const auto& s : issues) msg += "\n" + s;
+                send_webhook(cfg.alert_webhook, msg);
+            }
+        }
+    }
+
     BookTickerStream ticker(cfg.testnet);
     ticker.start();
     std::set<std::string> symbols;
@@ -191,5 +257,6 @@ int main(int argc, char** argv) {
     log_line("收到退出信号，保存状态后退出");
     save_headless_state(cfg.state_path, engine->get_bots());
     ticker.stop();
+    { std::error_code ec; std::filesystem::remove(lock_path, ec); }
     return 0;
 }

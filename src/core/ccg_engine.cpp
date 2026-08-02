@@ -185,6 +185,61 @@ double CcgEngine::total_margin_used() const {
     return sum;
 }
 
+std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<ExchangePos>& exchange) {
+    std::vector<std::string> issues;
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+
+    // 统计每个品种有几个持仓中的 bot（多个则无法把交易所净持仓归属到具体 bot）
+    std::map<std::string, int> holders;
+    for (const auto& [id, b] : bots_)
+        if (b.total_qty > 0) holders[b.cfg.symbol]++;
+
+    for (auto& [id, bot] : bots_) {
+        if (bot.total_qty <= 0) continue;
+        if (holders[bot.cfg.symbol] > 1) {
+            issues.push_back(bot.cfg.symbol + " 有多个持仓bot，无法自动对账，请人工核对");
+            continue;
+        }
+
+        const int want_dir = (bot.cfg.direction == CcgConfig::Direction::Long) ? 1 : -1;
+        const ExchangePos* ex = nullptr;
+        for (const auto& p : exchange)
+            if (p.symbol == bot.cfg.symbol && p.direction == want_dir) { ex = &p; break; }
+
+        const double local = bot.total_qty;
+        const double tol   = std::max(local * 1e-4, 1e-9);
+
+        if (!ex || ex->qty <= tol) {
+            // 交易所已无此仓位：外部（手动/强平）已平仓——本地状态作废，停下来等人工确认
+            issues.push_back(bot.cfg.symbol + " 本地记录持仓 " + std::to_string(local) +
+                             " 但交易所已无仓位（外部平仓?），已清空本地状态并停止该bot");
+            bot.entries.clear();
+            bot.total_qty = bot.total_cost = bot.avg_price = 0;
+            bot.interval_hit = bot.tp_reached = false;
+            bot.last_entry_price = 0;
+            bot.state = CcgBot::State::Stopped;
+            bot.last_action = "对账:交易所无仓位，已停止";
+        } else if (ex->qty < local - tol) {
+            // 交易所比本地少：外部部分平仓——数量收敛到交易所值，均价保留
+            issues.push_back(bot.cfg.symbol + " 本地持仓 " + std::to_string(local) +
+                             " > 交易所 " + std::to_string(ex->qty) +
+                             "（外部部分平仓?），本地数量已收敛到交易所值");
+            bot.total_qty  = ex->qty;
+            bot.total_cost = bot.avg_price * ex->qty;
+            bot.last_action = "对账:数量已收敛";
+        } else if (ex->qty > local + tol) {
+            // 交易所比本地多：外部手动加过仓——不动本地（多出部分不归引擎管），仅提醒
+            issues.push_back(bot.cfg.symbol + " 交易所持仓 " + std::to_string(ex->qty) +
+                             " > 本地跟踪 " + std::to_string(local) +
+                             "（外部手动加仓?），多出部分不受本程序管理，请知悉");
+        }
+    }
+
+    for (const auto& msg : issues) log("⚠ 对账: " + msg);
+    if (issues.empty()) log("对账完成：本地仓位与交易所一致");
+    return issues;
+}
+
 void CcgEngine::update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
@@ -560,6 +615,13 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 bot.last_action = "第" + std::to_string(level+1) + "仓@" +
                                   std::to_string((int)fill_price);
                 log(ss.str());
+            } else if (r.uncertain) {
+                // 网络中断连查单都失败：订单可能已成交但本地没记录。绝不能下个tick
+                // 盲目重试（可能双倍仓位）——停掉该bot，等联网后由对账功能恢复真相
+                bot.state = CcgBot::State::Stopped;
+                bot.last_action = "⚠ 下单状态不明，已停止待人工核对";
+                log("⚠ " + cfg.symbol + " 第" + std::to_string(level+1) +
+                    "仓下单状态不明（" + r.error + "），已停止该bot。请恢复网络后重启程序触发对账，或手动核对交易所仓位");
             } else {
                 log(cfg.symbol + " 第" + std::to_string(level+1) + "仓失败: " + r.error);
             }
@@ -589,18 +651,29 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                 close_price = bot.current_price;
             }
 
-            bool closed_ok = false;
+            bool   closed_ok  = false;
+            double closed_qty = 0;   // 实际平掉的数量（可能是部分成交）
             if (total_qty > 0) {
                 const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                          ? "SELL" : "BUY";
                 double qty = client_->round_qty(cfg.symbol, total_qty);
                 auto r = client_->place_market(cfg.symbol, side, qty, true);
-                closed_ok = r.ok;
-                if (r.ok && r.avg_price > 0) close_price = r.avg_price;  // 用真实成交均价算PnL
-                if (!r.ok)
-                    log(cfg.symbol + " 平仓失败: " + r.error);
+                if (r.ok) {
+                    // 只认交易所回报的实际成交量：0 = 没成交（如市价单无流动性EXPIRED），
+                    // 视为失败留到下个tick重试，绝不能假设"下了单=平掉了"
+                    closed_qty = r.executed_qty;
+                    closed_ok  = closed_qty > 0;
+                    if (!closed_ok) log(cfg.symbol + " 平仓单已提交但零成交，下个tick重试");
+                    if (r.avg_price > 0) close_price = r.avg_price;  // 用真实成交均价算PnL
+                } else {
+                    // uncertain（网络中断查单也失败）也走这里：reduceOnly 平仓天然幂等——
+                    // 若实际已平，下个tick重试会被交易所拒绝，对账兜底；重试是安全的
+                    log(cfg.symbol + " 平仓失败: " + r.error +
+                        (r.uncertain ? "（状态不明，reduceOnly重试安全，下个tick再试）" : ""));
+                }
             } else {
-                closed_ok = true;  // 无持仓，视为已平
+                closed_ok  = true;  // 无持仓，视为已平
+                closed_qty = 0;
             }
 
             std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -608,6 +681,34 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
             if (it == bots_.end()) return;
             auto& bot = it->second;
             bot.pending = false;
+
+            // 部分成交：只平掉了一部分，扣减本地数量后保留仓位跟踪，下个tick继续平剩余
+            if (closed_ok && total_qty > 0 && closed_qty < total_qty * 0.999) {
+                const bool is_long = (cfg.direction == CcgConfig::Direction::Long);
+                double pnl = (is_long ? (close_price - avg_price)
+                                       : (avg_price - close_price)) * closed_qty;
+                bot.realized_pnl += pnl;
+                bot.total_qty  = total_qty - closed_qty;
+                bot.total_cost = bot.avg_price * bot.total_qty;
+                // tp_reached/entries 保持不变——下个tick should_close 仍成立，继续平剩余
+                bot.last_action = reason + "(部分成交," + std::to_string(closed_qty) + ")";
+                log(cfg.symbol + " " + reason + " 部分成交 " + std::to_string(closed_qty) +
+                    "/" + std::to_string(total_qty) + "，剩余 " + std::to_string(bot.total_qty) +
+                    " 下个tick继续平仓");
+                if (trade_cb_) {
+                    TradeRecord tr;
+                    tr.symbol      = cfg.symbol;
+                    tr.direction   = cfg.direction;
+                    tr.entry_price = avg_price;
+                    tr.exit_price  = close_price;
+                    tr.qty         = closed_qty;
+                    tr.pnl         = pnl;
+                    tr.reason      = reason + "(部分)";
+                    tr.close_time  = std::chrono::system_clock::now();
+                    trade_cb_(tr);
+                }
+                return;
+            }
 
             if (closed_ok) {
                 const bool is_long = (cfg.direction == CcgConfig::Direction::Long);

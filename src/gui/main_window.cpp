@@ -14,6 +14,7 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QDir>
 #include <QScrollBar>
@@ -99,7 +100,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , pool_(std::make_shared<ThreadPool>(4))
 {
-    setWindowTitle("CCG 合约监控  v2.3.1");
+    setWindowTitle("CCG 合约监控  v2.4");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -274,9 +275,13 @@ void MainWindow::save_bots() {
 
         arr.append(o);
     }
-    QFile f(QString::fromStdString(bot_cfg_path()));
-    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    // QSaveFile = 原子保存（写临时文件+commit时改名），进程崩在写文件中途也不会
+    // 损坏 ccg_bots.json——这个文件丢了等于仓位跟踪全丢
+    QSaveFile f(QString::fromStdString(bot_cfg_path()));
+    if (f.open(QIODevice::WriteOnly)) {
         f.write(QJsonDocument(arr).toJson());
+        f.commit();
+    }
 }
 
 void MainWindow::load_and_restore_bots() {
@@ -910,6 +915,25 @@ void MainWindow::onConnect() {
 
             // 恢复上次保存的 Bot
             load_and_restore_bots();
+
+            // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
+            // 本地状态是错的，带着错误均价继续跑会把止盈止损全算错
+            run_async([this]() {
+                if (!client_ || !engine_) return;
+                auto ex_pos = client_->fetch_positions();
+                QMetaObject::invokeMethod(this, [this, ex_pos]() {
+                    if (!engine_) return;
+                    std::vector<CcgEngine::ExchangePos> ex;
+                    for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty});
+                    auto issues = engine_->reconcile_positions(ex);
+                    if (!issues.empty()) {
+                        save_bots();   // 收敛后的状态立刻落盘
+                        refreshBotTable();
+                        QString msg = QString("[CCGMonitor] 启动对账发现 %1 处不一致，详见日志").arg(issues.size());
+                        sendAlert(msg);
+                    }
+                }, Qt::QueuedConnection);
+            });
         }, Qt::QueuedConnection);
     });
 }

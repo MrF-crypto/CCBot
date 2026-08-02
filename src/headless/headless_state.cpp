@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <chrono>
+#include <filesystem>
 
 namespace ccbot {
 
@@ -96,8 +97,24 @@ void save_headless_state(const std::string& path, const std::vector<CcgBot>& bot
     }
     ss << "]";
 
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (f) f << ss.str();
+    // 原子写盘：先写临时文件再改名覆盖。直接 trunc 覆盖写的话，进程崩在写文件
+    // 中途会留下半截损坏的 JSON，重启后仓位跟踪静默丢失
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        f << ss.str();
+        f.flush();
+        if (!f.good()) return;   // 写失败（磁盘满等），保留旧文件不动
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);   // 两平台都是覆盖式改名
+    if (ec) {
+        // 改名失败（极少见）退回直接写，至少不丢新状态
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (f) f << ss.str();
+        std::filesystem::remove(tmp, ec);
+    }
 }
 
 std::vector<CcgBot> load_headless_state(const std::string& path, const std::vector<CcgConfig>& cfgs) {

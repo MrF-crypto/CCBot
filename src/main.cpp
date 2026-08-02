@@ -1,5 +1,9 @@
 #include <QApplication>
 #include <QFont>
+#include <QLockFile>
+#include <QStandardPaths>
+#include <QDir>
+#include <QMessageBox>
 #include "gui/main_window.h"
 
 int main(int argc, char* argv[]) {
@@ -8,6 +12,18 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("CCG合约监控");
     app.setOrganizationName("CCGMonitor");
+
+    // 单实例锁：同一台机器双开会各自独立决策、对同一账户重复下单。
+    // QLockFile 自带陈旧锁检测（崩溃残留的锁会被自动接管），正常运行的实例则拒绝二开
+    QString lockDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(lockDir);
+    QLockFile instanceLock(lockDir + "/ccbot.lock");
+    if (!instanceLock.tryLock(100)) {
+        QMessageBox::critical(nullptr, "CCG 合约监控",
+            "程序已经在运行中（同一账户双开会重复下单）。\n"
+            "如果确认没有其他实例，删除锁文件后重试:\n" + lockDir + "/ccbot.lock");
+        return 1;
+    }
 
 #ifdef Q_OS_MAC
     QFont f("Menlo", 12);      // macOS 没有 Consolas，Menlo 是系统等宽字体

@@ -8,6 +8,9 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <cstdlib>
 
 namespace ccbot {
 
@@ -327,6 +330,43 @@ static std::string pos_side_param(bool dual, const std::string& side, bool reduc
     return "&positionSide=" + std::string(is_long_side ? "LONG" : "SHORT");
 }
 
+// 生成本程序专属的 clientOrderId（幂等性标识）：cb-<进程随机码>-<序号>。
+// 随机码每次进程启动生成一次，也顺带能在交易所订单历史里区分"是哪台设备/哪次运行下的单"
+static std::string make_client_order_id() {
+    static const std::string run_tag = [] {
+        std::srand((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+        static const char cs[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+        std::string s;
+        for (int i = 0; i < 6; ++i) s += cs[std::rand() % (sizeof(cs) - 1)];
+        return s;
+    }();
+    static std::atomic<int> seq{0};
+    return "cb-" + run_tag + "-" + std::to_string(seq++);
+}
+
+TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
+                                                       const std::string& client_order_id) {
+    OrderResult r;
+    auto resp = http_get("/fapi/v1/order",
+                         "symbol=" + sym + "&origClientOrderId=" + client_order_id +
+                         "&recvWindow=5000");
+    if (resp.empty()) { r.error = "无响应"; r.uncertain = true; return r; }
+
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; r.uncertain = true; return r; }
+    if (binance_error(doc, r.error)) return r;   // 含 -2013 订单不存在（= 确认没到交易所）
+
+    int64_t oid = 0;
+    doc["orderId"].get(oid);
+    r.order_id     = std::to_string(oid);
+    r.avg_price    = parse_dbl_str(doc, "avgPrice");
+    r.executed_qty = parse_dbl_str(doc, "executedQty");
+    r.ok = true;
+    return r;
+}
+
 TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
                                                         const std::string& side,
                                                         double qty, bool reduce_only) {
@@ -345,11 +385,32 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
         double try_qty = floor_to_step(qty, try_step);
         if (try_qty < minfo.min_qty) { r.error = "数量小于最小下单量"; return r; }
 
+        // 每次尝试用独立的 clientOrderId（-1111 重试是真正的新订单）
+        const std::string coid = make_client_order_id();
         std::string body = "symbol=" + sym + "&side=" + side
             + "&type=MARKET&quantity=" + fmt_qty(try_qty, try_step)
+            + "&newClientOrderId=" + coid
             + "&newOrderRespType=RESULT&recvWindow=5000" + extra;
 
         auto resp = http_post("/fapi/v1/order", body);
+
+        if (resp.empty()) {
+            // 传输层失败（超时/断网）：请求可能已经到达交易所并成交——必须查单确认，
+            // 直接当失败会导致上层重试造成重复下单
+            for (int q = 0; q < 3; ++q) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+                auto qr = query_order(sym, coid);
+                if (qr.ok) return qr;                      // 找到了：实际已到达交易所，按真实成交返回
+                if (!qr.uncertain) {                       // 明确回答"订单不存在"：确认没下进去
+                    r.error = "下单超时，已确认订单未到达交易所";
+                    return r;
+                }
+            }
+            r.error     = "下单超时且无法确认订单状态（网络中断?）";
+            r.uncertain = true;
+            return r;
+        }
+
         simdjson::dom::parser p;
         simdjson::dom::element doc;
         auto ps = simdjson::padded_string(resp);

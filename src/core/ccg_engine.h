@@ -176,6 +176,20 @@ public:
     // 由 UI 定时器每 tick 调用（传入最新价格）
     void tick(const std::string& symbol, double price);
 
+    // ── 与交易所对账（v2.4）────────────────────────────────────────────────────
+    // 交易所实际持仓的精简视图（由应用层从 TradingClient::fetch_positions 转换）
+    struct ExchangePos {
+        std::string symbol;
+        int         direction = 0;   // 1=多 -1=空
+        double      qty       = 0;   // 绝对值
+    };
+    // 连接成功/重启恢复后调用一次，把本地跟踪的仓位和交易所实际持仓核对：
+    //   本地有仓、交易所没有   → 外部已平仓：清空本地仓位并停止该bot（等人工确认，不自动重开）
+    //   本地qty > 交易所qty    → 外部部分平仓：本地数量收敛到交易所值（均价保留）
+    //   本地qty < 交易所qty    → 交易所多出（外部手动加仓）：仅告警不动本地状态
+    // 同一品种有多个持仓bot时无法归属，跳过并告警。返回每条不一致的可读描述（空=完全一致）
+    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange);
+
     // 写入指标信号快照（UI 异步拉取 BOLL/RSI 后回调，仅用于 entry_mode==Indicator 的首单判定）
     void update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi);
 

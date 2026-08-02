@@ -52,6 +52,10 @@ public:
         std::string error;
         double      avg_price    = 0;   // 实际成交均价（MARKET 单，newOrderRespType=RESULT 才有）
         double      executed_qty = 0;   // 实际成交数量
+        // 网络超时且事后查单也无法确认订单是否到达交易所（可能已成交也可能没有）。
+        // 调用方对 uncertain 必须区别对待：开仓不能盲目重试（可能双倍仓位），
+        // 平仓可以重试（reduceOnly 天然幂等）
+        bool        uncertain    = false;
     };
 
     explicit TradingClient(const Config& cfg);
@@ -63,6 +67,8 @@ public:
 
     OrderResult place_market(const std::string& symbol, const std::string& side,
                               double qty, bool reduce_only = false);
+    // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
+    OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
     OrderResult place_limit (const std::string& symbol, const std::string& side,
                               double qty, double price, bool reduce_only = false);
 
