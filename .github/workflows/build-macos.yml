@@ -21,12 +21,15 @@ jobs:
 
       - name: Set up vcpkg
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          git clone --depth 1 --branch 2026.07.29 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
           "$HOME/vcpkg/bootstrap-vcpkg.sh"
 
-      # vcpkg 编译好的依赖包缓存（第一次跑 Qt 要 1~2 小时，之后命中缓存只要几分钟）
+      # vcpkg 编译好的依赖包缓存（第一次跑 Qt 要 1~2 小时，之后命中缓存只要几分钟）。
+      # 用 restore+save 拆开而不是 actions/cache：失败的构建也要把已编译好的包存下来，
+      # 否则每次调试失败都要从零重编所有依赖
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/vcpkg/archives
           key: vcpkg-osx-arm64-${{ hashFiles('vcpkg.json') }}
@@ -41,6 +44,24 @@ jobs:
 
       - name: Build
         run: cmake --build build
+
+      - name: Save vcpkg binary cache (even on failure)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-osx-arm64-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+
+      # 依赖编译失败时把 vcpkg 的详细日志传出来，否则只能看到 BUILD_FAILED 一个词
+      - name: Upload vcpkg failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-failure-logs
+          path: |
+            build/vcpkg-manifest-install.log
+            /Users/runner/vcpkg/buildtrees/*/*.log
+          if-no-files-found: ignore
 
       - name: Run unit tests
         run: ./build/ccg_indicator_tests
