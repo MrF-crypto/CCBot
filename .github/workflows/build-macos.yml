@@ -17,7 +17,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: brew install ninja pkg-config
+        # autoconf 系列是 libb2（qtbase 依赖）的构建要求，runner 没预装
+        run: brew install ninja pkg-config autoconf autoconf-archive automake libtool
 
       - name: Set up vcpkg
         run: |
