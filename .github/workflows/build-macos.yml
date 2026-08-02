@@ -10,6 +10,10 @@ on:
   push:
     tags: ['v*']
 
+# 把产物挂到 Release 需要 contents 写权限（默认令牌是只读的，attach 步骤会 403）
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
