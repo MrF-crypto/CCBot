@@ -1040,20 +1040,14 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
     if (!symItem) return;
     std::string sym = symItem->text().toStdString();
 
+    // 右键菜单只留"配置策略"——原先紧挨着的"从列表中删除"太容易误点，删掉的是
+    // 整个 bot（含已配好的策略和仓位跟踪），代价太高。要删除品种：先【停止】该
+    // bot，再点顶部的【清除已停止】按钮，两步操作天然防误触
     QMenu menu(this);
     QAction* actConfig = menu.addAction("配置策略...");
-    QAction* actRemove = menu.addAction("从列表中删除");
     QAction* chosen = menu.exec(botTable_->viewport()->mapToGlobal(pos));
     if (chosen == actConfig) {
         openStrategyDialog(sym);
-    } else if (chosen == actRemove) {
-        if (!engine_) return;
-        int n = 0;
-        for (const auto& b : engine_->get_bots())
-            if (b.cfg.symbol == sym) { engine_->remove_bot(b.bot_id); ++n; }
-        if (n > 0) log(QString::fromStdString(sym) + " 已删除", "WARN");
-        refreshBotTable();
-        save_bots();
     }
 }
 
