@@ -1,5 +1,5 @@
-# 云端构建 macOS 版（Apple Silicon）：手动触发 或 推送 v* 标签时自动跑。
-# 产物：ccbot-macos-arm64.zip（GUI + headless 两个可执行文件），
+# 云端构建 macOS 版（Apple Silicon + Intel 双架构）：手动触发 或 推送 v* 标签时自动跑。
+# 产物：ccbot-macos-arm64.zip / ccbot-macos-x64.zip（各含 GUI + headless 两个可执行文件），
 # 标签构建会自动附加到对应的 GitHub Release。
 # 注意：产物未做 Apple 签名/公证，下载后需要:
 #   chmod +x CCGMonitor ccbot_headless && xattr -dr com.apple.quarantine .
@@ -12,7 +12,17 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest   # Apple Silicon (arm64)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64            # Apple Silicon（M系列）
+            runner: macos-latest
+            triplet: arm64-osx
+          - arch: x64              # Intel Mac
+            runner: macos-15-intel
+            triplet: x64-osx
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +35,7 @@ jobs:
           git clone --depth 1 --branch 2026.07.29 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
           "$HOME/vcpkg/bootstrap-vcpkg.sh"
 
-      # vcpkg 编译好的依赖包缓存（第一次跑 Qt 要 1~2 小时，之后命中缓存只要几分钟）。
+      # vcpkg 编译好的依赖包缓存（第一次跑 Qt 要几十分钟，之后命中缓存只要几分钟）。
       # 用 restore+save 拆开而不是 actions/cache：失败的构建也要把已编译好的包存下来，
       # 否则每次调试失败都要从零重编所有依赖
       - name: Restore vcpkg binary cache
@@ -33,15 +43,15 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-osx-arm64-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-osx-arm64-
+          key: vcpkg-osx-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-osx-${{ matrix.arch }}-
 
       - name: Configure
         run: |
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET=arm64-osx
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
 
       - name: Build
         run: cmake --build build
@@ -51,14 +61,14 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-osx-arm64-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          key: vcpkg-osx-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
 
       # 依赖编译失败时把 vcpkg 的详细日志传出来，否则只能看到 BUILD_FAILED 一个词
       - name: Upload vcpkg failure logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: vcpkg-failure-logs
+          name: vcpkg-failure-logs-${{ matrix.arch }}
           path: |
             build/vcpkg-manifest-install.log
             /Users/runner/vcpkg/buildtrees/*/*.log
@@ -71,16 +81,16 @@ jobs:
         run: |
           mkdir -p pkg
           cp build/CCGMonitor build/ccbot_headless pkg/
-          cd pkg && zip -r ../ccbot-macos-arm64.zip .
+          cd pkg && zip -r ../ccbot-macos-${{ matrix.arch }}.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ccbot-macos-arm64
-          path: ccbot-macos-arm64.zip
+          name: ccbot-macos-${{ matrix.arch }}
+          path: ccbot-macos-${{ matrix.arch }}.zip
 
       - name: Attach to release (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ccbot-macos-arm64.zip
+          files: ccbot-macos-${{ matrix.arch }}.zip
