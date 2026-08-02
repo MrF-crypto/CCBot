@@ -34,7 +34,11 @@
       "rsi_oversold_th": 25,
 
       "dynamic_band_mode": false,
-      "min_profit_floor": 0.3
+      "min_profit_floor": 0.3,
+
+      "use_trend_filter": false,
+      "trend_interval": "4h",
+      "trend_ema_period": 200
     }
   ]
 }

@@ -104,6 +104,20 @@ public:
     IndicatorSnapshot fetch_indicators(const std::string& symbol, const std::string& interval,
                                         int boll_period, double boll_mult, int rsi_period);
 
+    // 高周期趋势快照（趋势状态机用，公开接口不占签名限流）。
+    // bearish = 价格在 EMA 之下 且 中轨（SMA20）在最近 slope_bars 根K线里下移超过 0.2%
+    // ——两个条件都满足才判定为"空头态"，避免横盘时反复切换状态
+    struct TrendSnapshot {
+        bool   ok       = false;
+        bool   bearish  = false;
+        double price    = 0;
+        double ema_val  = 0;
+        double mb_slope_pct = 0;   // 中轨斜率（最近 slope_bars 根K线的位移%）
+    };
+    TrendSnapshot fetch_trend(const std::string& symbol,
+                              const std::string& interval = "4h",
+                              int ema_period = 200, int slope_bars = 3);
+
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);
 

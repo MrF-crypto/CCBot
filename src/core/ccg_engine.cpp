@@ -14,6 +14,18 @@ namespace ccbot {
 // 又能保证断网/K线接口故障时不会拿几小时前的旧轨道值继续开仓补仓
 static constexpr auto kIndStale = std::chrono::seconds(180);
 
+// 趋势数据有效期：外层每 ~5 分钟拉一次 4h 级别趋势，30 分钟没更新视为过期。
+// 过期时趋势过滤自动失效（fail-open）——它是增强项，不该因断数据卡死交易
+static constexpr auto kTrendStale = std::chrono::minutes(30);
+
+// 空头态时补仓间隔的放大倍数（子弹省着打）
+static constexpr double kBearIntervalMult = 1.5;
+
+static bool trend_active_bearish(const CcgBot& bot) {
+    return bot.cfg.use_trend_filter && bot.trend_bearish &&
+           (std::chrono::steady_clock::now() - bot.trend_time) < kTrendStale;
+}
+
 // ── 加仓比例序列（最多 10 层）──────────────────────────────────────────────────
 static std::vector<double> base_mult(CcgConfig::StratType t) {
     using ST = CcgConfig::StratType;
@@ -165,7 +177,22 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& new_cfg) 
     cfg.rsi_oversold_th  = new_cfg.rsi_oversold_th;
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
     cfg.min_profit_floor  = new_cfg.min_profit_floor;
+    cfg.use_trend_filter  = new_cfg.use_trend_filter;
+    cfg.trend_interval    = new_cfg.trend_interval;
+    cfg.trend_ema_period  = new_cfg.trend_ema_period;
     return true;
+}
+
+void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    bool was = it->second.trend_bearish;
+    it->second.trend_bearish = bearish;
+    it->second.trend_time    = std::chrono::steady_clock::now();
+    if (was != bearish)
+        log(it->second.cfg.symbol + " 趋势状态切换: " +
+            (bearish ? "空头态（暂停新首仓，补仓间隔×1.5）" : "多头/震荡态（恢复正常）"));
 }
 
 void CcgEngine::set_max_total_margin(double usdt) {
@@ -332,6 +359,11 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
     return p;
 }
 
+// 趋势空头态：补仓间隔放大（静态/动态模式都适用），在 eff_params 之上叠加
+static double apply_trend_interval(const CcgBot& bot, double interval_pct) {
+    return trend_active_bearish(bot) ? interval_pct * kBearIntervalMult : interval_pct;
+}
+
 // ── 追踪变量更新（在 tick 持锁中调用）────────────────────────────────────────
 void CcgEngine::update_tracking(CcgBot& bot, double price) {
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -339,11 +371,12 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
     if (bot.entries.empty()) return;  // 尚未建仓，不用追踪
 
     const EffParams eff = eff_params(bot);
+    const double eff_interval = apply_trend_interval(bot, eff.interval_pct);
 
     // ── DCA 间隔追踪 ──────────────────────────────────────────────────────────
     double interval_th = bot.last_entry_price *
-        (is_long ? (1.0 - eff.interval_pct / 100.0)
-                 : (1.0 + eff.interval_pct / 100.0));
+        (is_long ? (1.0 - eff_interval / 100.0)
+                 : (1.0 + eff_interval / 100.0));
 
     if (!bot.interval_hit) {
         bool triggered = is_long ? (price <= interval_th) : (price >= interval_th);
@@ -495,6 +528,14 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     bool fresh = (std::chrono::steady_clock::now() - bot.ind_time) < kIndStale;
                     can_enter = bot.ind_ok && fresh && priceCond && rsiCond;
                 }
+                // 趋势状态机：空头态暂停开新首仓（对 Immediate/Indicator 模式都生效）
+                if (can_enter && trend_active_bearish(bot)) {
+                    can_enter = false;
+                    if (bot.last_action != "空头趋势，暂停开首仓") {
+                        bot.last_action = "空头趋势，暂停开首仓";
+                        log(bot.cfg.symbol + " 处于高周期空头态，暂停开新首仓（趋势恢复后自动放行）");
+                    }
+                }
                 // 账户级总保证金上限：只挡"开新首仓"，已有仓位的加仓/止盈止损不受影响
                 double cap = max_total_margin_.load();
                 if (can_enter && cap > 0) {
@@ -640,6 +681,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
         try {
             CcgConfig cfg;
             double    total_qty = 0, avg_price = 0, close_price = 0;
+            int       layers = 0;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(bot_id);
@@ -649,6 +691,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                 total_qty   = bot.total_qty;
                 avg_price   = bot.avg_price;
                 close_price = bot.current_price;
+                layers      = (int)bot.entries.size();
             }
 
             bool   closed_ok  = false;
@@ -703,6 +746,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                     tr.exit_price  = close_price;
                     tr.qty         = closed_qty;
                     tr.pnl         = pnl;
+                    tr.layers      = layers;
                     tr.reason      = reason + "(部分)";
                     tr.close_time  = std::chrono::system_clock::now();
                     trade_cb_(tr);
@@ -726,6 +770,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                     tr.exit_price  = close_price;
                     tr.qty         = total_qty;
                     tr.pnl         = pnl;
+                    tr.layers      = layers;
                     tr.reason      = reason;
                     tr.close_time  = std::chrono::system_clock::now();
                     trade_cb_(tr);

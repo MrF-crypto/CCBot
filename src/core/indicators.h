@@ -39,6 +39,30 @@ inline BollResult bollinger(const std::vector<double>& closes, int period, doubl
     return r;
 }
 
+// EMA：标准指数移动平均。前 period 根做 SMA 种子，之后按乘数 2/(period+1) 滚动。
+// 数据不够（< period 根）返回 0（调用方以 0 判定"数据不足"）。
+inline double ema(const std::vector<double>& closes, int period) {
+    if (period <= 0 || (int)closes.size() < period) return 0;
+    double e = 0;
+    for (int i = 0; i < period; ++i) e += closes[i];
+    e /= period;
+    const double k = 2.0 / (period + 1);
+    for (int i = period; i < (int)closes.size(); ++i)
+        e = closes[i] * k + e * (1.0 - k);
+    return e;
+}
+
+// 以序列末尾往前偏移 offset_from_end 根为终点的 SMA。
+// 用于算"中轨斜率"：sma_at(c,20,0) 对比 sma_at(c,20,3) 就是中轨 3 根K线里的位移。
+// 数据不够返回 0。
+inline double sma_at(const std::vector<double>& closes, int period, int offset_from_end) {
+    int end = (int)closes.size() - offset_from_end;   // 不含 end
+    if (period <= 0 || offset_from_end < 0 || end < period) return 0;
+    double s = 0;
+    for (int i = end - period; i < end; ++i) s += closes[i];
+    return s / period;
+}
+
 // RSI：Wilder 平滑法。period 根差分做初始平均，之后逐根滚动平滑。
 // 数据不够（< period+1 根）时返回中性值 50。
 inline double rsi(const std::vector<double>& closes, int period) {

@@ -862,6 +862,49 @@ TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
     return out;
 }
 
+// ── 高周期趋势快照（趋势状态机）───────────────────────────────────────────────
+TradingClient::TrendSnapshot TradingClient::fetch_trend(
+        const std::string& sym, const std::string& interval,
+        int ema_period, int slope_bars) {
+    TrendSnapshot out;
+    int need = ema_period + slope_bars + 25;
+    std::string path = "/fapi/v1/klines?symbol=" + sym +
+                       "&interval=" + interval +
+                       "&limit=" + std::to_string(std::min(need, 1500));
+    auto resp = http_get_public(path);
+    if (resp.empty()) return out;
+
+    simdjson::dom::parser p;
+    simdjson::dom::array arr;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
+
+    std::vector<double> closes;
+    for (auto kline : arr) {
+        simdjson::dom::array ka;
+        if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
+        std::string_view close_s;
+        auto it = ka.begin();
+        for (int i = 0; i < 4 && it != ka.end(); ++i, ++it); // index 4 = close
+        if (it == ka.end()) continue;
+        (*it).get(close_s);
+        try { closes.push_back(std::stod(std::string(close_s))); } catch (...) {}
+    }
+    if ((int)closes.size() < ema_period + slope_bars) return out;   // 新币历史不够，不判定趋势
+
+    out.price   = closes.back();
+    out.ema_val = indicators::ema(closes, ema_period);
+    double mb_now  = indicators::sma_at(closes, 20, 0);
+    double mb_prev = indicators::sma_at(closes, 20, slope_bars);
+    if (out.ema_val <= 0 || mb_prev <= 0) return out;
+    out.mb_slope_pct = (mb_now - mb_prev) / mb_prev * 100.0;
+
+    // 空头态双条件：价格在 EMA 之下 且 中轨明显下拐（-0.2%阈值防横盘抖动）
+    out.bearish = (out.price < out.ema_val) && (out.mb_slope_pct < -0.2);
+    out.ok = true;
+    return out;
+}
+
 double TradingClient::fetch_mark_price(const std::string& sym) {
     auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + sym);
     if (resp.empty()) return 0.0;

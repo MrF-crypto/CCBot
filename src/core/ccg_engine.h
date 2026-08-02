@@ -68,6 +68,14 @@ struct CcgConfig {
     // 指标数据超时（>180s无更新）时冻结新补仓/止盈激活，宁可错过不可乱做。
     bool   dynamic_band_mode = false;
     double min_profit_floor  = 0.3;   // 动态模式止盈激活的最低盈利%（覆盖手续费+微利）
+
+    // 趋势状态机（v2.5+）：高周期（默认4h EMA200 + 中轨斜率）判定空头态时
+    //   1) 暂停开新首仓（网格最怕的单边下跌里不接飞刀）
+    //   2) 已有仓位的补仓间隔自动放大 1.5 倍（子弹省着打）
+    // 趋势数据缺失/过期时不拦（fail-open）：这是增强过滤，不该因为断数据把交易卡死
+    bool        use_trend_filter = false;
+    std::string trend_interval   = "4h";
+    int         trend_ema_period = 200;
 };
 
 // ─── 单笔加仓记录 ──────────────────────────────────────────────────────────────
@@ -116,6 +124,10 @@ struct CcgBot {
     // 动态W模式和指标首单都用它做数据新鲜度检查，避免拿几小时前的旧轨道值做决策
     std::chrono::steady_clock::time_point ind_time{};
 
+    // 趋势状态机快照（use_trend_filter 时由外层定期拉取写入）
+    bool   trend_bearish = false;
+    std::chrono::steady_clock::time_point trend_time{};
+
     // 统计
     double realized_pnl = 0;
     int    cycle_count  = 0;
@@ -133,6 +145,7 @@ struct TradeRecord {
     double                 exit_price   = 0;
     double                 qty          = 0;
     double                 pnl          = 0;
+    int                    layers       = 0;   // 本轮用了几层（周期统计：层数分布）
     std::string            reason;   // "追踪止盈" / "硬止损" / "手动平仓" ...
     std::chrono::system_clock::time_point close_time;
 };
@@ -192,6 +205,9 @@ public:
 
     // 写入指标信号快照（UI 异步拉取 BOLL/RSI 后回调，仅用于 entry_mode==Indicator 的首单判定）
     void update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi);
+
+    // 写入趋势状态机快照（use_trend_filter 的 bot 由外层每几分钟拉取一次高周期趋势后回调）
+    void update_trend(const std::string& bot_id, bool bearish);
 
     // ── 工具 ──────────────────────────────────────────────────────────────────
     static std::vector<double> entry_usdt(const CcgConfig& cfg);  // 各层 USDT 分配

@@ -153,12 +153,26 @@ int main(int argc, char** argv) {
         state_dirty.store(true);
     });
 
+    // 交易明细 CSV 落盘（周期统计数据源）：追加写，一行一笔平仓
+    const std::string trades_csv = "ccbot_trades.csv";
+    if (!std::filesystem::exists(trades_csv)) {
+        std::ofstream f(trades_csv);
+        if (f) f << "time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers\n";
+    }
+
     engine->set_trade_cb([&](const TradeRecord& tr) {
         std::ostringstream ss;
         ss << tr.symbol << " " << tr.reason
            << " 均=$" << tr.entry_price << " 收=$" << tr.exit_price
-           << " P&L=" << tr.pnl << "U";
+           << " P&L=" << tr.pnl << "U 层数=" << tr.layers;
         log_line(ss.str(), tr.pnl >= 0 ? "OK" : "WARN");
+        {
+            std::ofstream f(trades_csv, std::ios::app);
+            if (f) f << now_str() << "," << tr.symbol << ","
+                     << (tr.direction == CcgConfig::Direction::Short ? "short" : "long") << ","
+                     << tr.reason << "," << tr.entry_price << "," << tr.exit_price << ","
+                     << tr.qty << "," << tr.pnl << "," << tr.layers << "\n";
+        }
         if (tr.reason == "硬止损" && !webhook.empty()) {
             std::ostringstream alert_msg;
             alert_msg << "[ccbot] " << tr.symbol << " 触发硬止损平仓 | 均价 $" << tr.entry_price
@@ -229,6 +243,16 @@ int main(int argc, char** argv) {
                                                       b.cfg.boll_period, b.cfg.boll_mult,
                                                       b.cfg.rsi_period);
                 if (snap.ok) engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
+            }
+        }
+
+        // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次；首个tick立刻拉
+        if ((tick_n - 1) % 100 == 0) {
+            for (const auto& b : bots) {
+                if (b.state == CcgBot::State::Stopped || !b.cfg.use_trend_filter) continue;
+                auto t = client->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
+                                              b.cfg.trend_ema_period);
+                if (t.ok) engine->update_trend(b.bot_id, t.bearish);
             }
         }
 

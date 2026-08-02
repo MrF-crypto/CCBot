@@ -136,6 +136,9 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", 25.0);
         c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", false);
         c.min_profit_floor  = get_num(bo, "min_profit_floor", 0.3);
+        c.use_trend_filter  = get_bool(bo, "use_trend_filter", false);
+        c.trend_interval    = get_str(bo, "trend_interval", "4h");
+        c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", 200.0);
 
         out.bots.push_back(c);
     }

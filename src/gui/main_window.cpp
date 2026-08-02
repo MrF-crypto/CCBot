@@ -100,7 +100,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , pool_(std::make_shared<ThreadPool>(4))
 {
-    setWindowTitle("CCG 合约监控  v2.4");
+    setWindowTitle("CCG 合约监控  v2.5");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -242,6 +242,9 @@ void MainWindow::save_bots() {
         o["rsi_oversold_th"]  = c.rsi_oversold_th;
         o["dynamic_band_mode"] = c.dynamic_band_mode;
         o["min_profit_floor"]  = c.min_profit_floor;
+        o["use_trend_filter"]  = c.use_trend_filter;
+        o["trend_interval"]    = QString::fromStdString(c.trend_interval);
+        o["trend_ema_period"]  = c.trend_ema_period;
 
         // 持仓/状态快照 —— 没有这些字段的话，App 重启后本地均价/持仓量会从零重新累积，
         // 跟交易所实际仓位脱节（这正是均价跟交易所对不上的根因之一）
@@ -319,6 +322,9 @@ void MainWindow::load_and_restore_bots() {
         c.rsi_oversold_th  = o["rsi_oversold_th"].toDouble(25.0);
         c.dynamic_band_mode = o["dynamic_band_mode"].toBool(false);
         c.min_profit_floor  = o["min_profit_floor"].toDouble(0.3);
+        c.use_trend_filter  = o["use_trend_filter"].toBool(false);
+        c.trend_interval    = o["trend_interval"].toString("4h").toStdString();
+        c.trend_ema_period  = o["trend_ema_period"].toInt(200);
         if (c.symbol.empty()) continue;
 
         CcgBot bot;
@@ -374,6 +380,7 @@ void MainWindow::save_trades() {
         o["exit_price"]  = t.exit_price;
         o["qty"]         = t.qty;
         o["pnl"]         = t.pnl;
+        o["layers"]      = t.layers;
         o["reason"]      = QString::fromStdString(t.reason);
         o["close_time_ms"] = tp_to_ms(t.close_time);
         arr.append(o);
@@ -398,6 +405,7 @@ void MainWindow::load_trades() {
         t.exit_price  = o["exit_price"].toDouble();
         t.qty         = o["qty"].toDouble();
         t.pnl         = o["pnl"].toDouble();
+        t.layers      = o["layers"].toInt(0);
         t.reason      = o["reason"].toString().toStdString();
         t.close_time  = ms_to_tp((qint64)o["close_time_ms"].toDouble());
         trades_.push_back(t);
@@ -440,17 +448,9 @@ void MainWindow::refreshStats() {
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::openTradeHistoryDialog() {
     QDialog dlg(this);
-    dlg.setWindowTitle("交易明细");
-    dlg.resize(760, 480);
+    dlg.setWindowTitle("交易明细与周期统计");
+    dlg.resize(860, 620);
     auto* dv = new QVBoxLayout(&dlg);
-
-    auto* table = new QTableWidget(0, 8);
-    table->setHorizontalHeaderLabels(
-        {"时间","品种","方向","开仓价","平仓价","数量","盈亏","原因"});
-    table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    table->verticalHeader()->setVisible(false);
-    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    dv->addWidget(table);
 
     auto mkc = [](const QString& s, const QColor& c) {
         auto* it = new QTableWidgetItem(s);
@@ -458,6 +458,77 @@ void MainWindow::openTradeHistoryDialog() {
         it->setForeground(c);
         return it;
     };
+
+    // ── 周期统计（按品种汇总，验证闭环的四个核心指标一目了然）────────────────
+    auto* statsTitle = new QLabel("周期统计（按品种）");
+    statsTitle->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;");
+    dv->addWidget(statsTitle);
+
+    struct SymStat {
+        int cycles = 0; int wins = 0; double pnl = 0;
+        int layer_sum = 0; int layer_max = 0;
+        std::chrono::system_clock::time_point first_close{}, last_close{};
+    };
+    std::map<std::string, SymStat> stats;
+    for (const auto& t : trades_) {
+        auto& s = stats[t.symbol];
+        if (s.cycles == 0) s.first_close = t.close_time;
+        s.cycles++;
+        if (t.pnl > 0) s.wins++;
+        s.pnl       += t.pnl;
+        s.layer_sum += t.layers;
+        s.layer_max  = std::max(s.layer_max, t.layers);
+        s.last_close = t.close_time;
+    }
+
+    auto* statTable = new QTableWidget((int)stats.size(), 7);
+    statTable->setHorizontalHeaderLabels(
+        {"品种","周期数","周期/周","胜率","累计盈亏","平均层数","最大层数"});
+    statTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    statTable->verticalHeader()->setVisible(false);
+    statTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    statTable->setMaximumHeight(46 + (int)stats.size() * 30);
+    int row = 0;
+    for (const auto& [sym, s] : stats) {
+        double weeks = std::max(1.0 / 7.0,
+            std::chrono::duration_cast<std::chrono::hours>(s.last_close - s.first_close).count()
+                / 24.0 / 7.0);
+        double perWeek  = (s.cycles > 1) ? (s.cycles - 1) / weeks : 0;
+        double winRate  = s.cycles ? 100.0 * s.wins / s.cycles : 0;
+        double avgLayer = s.cycles ? (double)s.layer_sum / s.cycles : 0;
+        statTable->setItem(row, 0, mkc(QString::fromStdString(sym), QColor("#e6edf3")));
+        statTable->setItem(row, 1, mkc(QString::number(s.cycles), QColor("#8b949e")));
+        statTable->setItem(row, 2, mkc(s.cycles > 1 ? QString::number(perWeek, 'f', 1) : "--",
+                                        QColor("#8b949e")));
+        statTable->setItem(row, 3, mkc(QString("%1%").arg(winRate, 0, 'f', 0), QColor("#8b949e")));
+        statTable->setItem(row, 4, mkc(QString("%1$%2").arg(s.pnl >= 0 ? "+" : "")
+                                        .arg(std::abs(s.pnl), 0, 'f', 2),
+                                        s.pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
+        statTable->setItem(row, 5, mkc(QString::number(avgLayer, 'f', 1), QColor("#8b949e")));
+        statTable->setItem(row, 6, mkc(QString::number(s.layer_max), QColor("#8b949e")));
+        ++row;
+    }
+    dv->addWidget(statTable);
+
+    auto* statHint = new QLabel(
+        "调参提示：平均层数长期 <2 → 间隔偏宽（吃不进层）；最大层数经常顶满 → 间隔偏窄或趋势过滤失效；"
+        "周期/周 × 平均盈亏 = 该品种的真实产能。");
+    statHint->setWordWrap(true);
+    statHint->setStyleSheet("color:#8b949e;font-size:10px;");
+    dv->addWidget(statHint);
+
+    // ── 交易明细 ─────────────────────────────────────────────────────────────
+    auto* histTitle = new QLabel("交易明细");
+    histTitle->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding-top:6px;");
+    dv->addWidget(histTitle);
+
+    auto* table = new QTableWidget(0, 9);
+    table->setHorizontalHeaderLabels(
+        {"时间","品种","方向","开仓价","平仓价","数量","盈亏","层数","原因"});
+    table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    table->verticalHeader()->setVisible(false);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    dv->addWidget(table);
 
     table->setRowCount((int)trades_.size());
     for (int i = 0; i < (int)trades_.size(); ++i) {
@@ -474,7 +545,8 @@ void MainWindow::openTradeHistoryDialog() {
         table->setItem(i, 5, mkc(QString::number(t.qty, 'f', 4), QColor("#8b949e")));
         table->setItem(i, 6, mkc(QString("%1$%2").arg(t.pnl >= 0 ? "+" : "").arg(std::abs(t.pnl), 0, 'f', 2),
                                   t.pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
-        table->setItem(i, 7, mkc(QString::fromStdString(t.reason), QColor("#8b949e")));
+        table->setItem(i, 7, mkc(t.layers > 0 ? QString::number(t.layers) : "--", QColor("#8b949e")));
+        table->setItem(i, 8, mkc(QString::fromStdString(t.reason), QColor("#8b949e")));
     }
 
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Close);
@@ -1158,6 +1230,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* floorEdit = mkEdit("保底利润%(动态模式):",
                              prefill ? prefill->cfg.min_profit_floor : 0.3);
 
+    // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
+    auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
+    trendBox->setChecked(prefill ? prefill->cfg.use_trend_filter : false);
+    trendBox->setToolTip(
+        "高周期趋势判定：价格在 4h EMA200 之下 且 中轨明显下拐 = 空头态。\n"
+        "空头态期间不开新首仓（不接单边下跌的飞刀），已有仓位补仓间隔放大1.5倍。\n"
+        "趋势数据每5分钟刷新一次；数据缺失时过滤自动失效，不会卡死交易。");
+    form->addRow("", trendBox);
+
     dv->addLayout(form);
 
     // ── 指标信号配置（entryModeBox 选"指标信号"时才用得上）──────────────────────
@@ -1465,6 +1546,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.rsi_oversold_th  = to_d(rsiOversoldEdit, 25.0);
     cfg.dynamic_band_mode = dynBandBox->isChecked();
     cfg.min_profit_floor  = to_d(floorEdit, 0.3);
+    cfg.use_trend_filter  = trendBox->isChecked();
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -1555,6 +1637,28 @@ void MainWindow::onTick() {
                 }, Qt::QueuedConnection);
             }
         });
+    }
+
+    // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；
+    // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转
+    static int s_trend_tick = 0;
+    if (s_trend_tick++ % 100 == 0) {
+        std::vector<CcgBot> trend_bots;
+        for (const auto& b : bots)
+            if (b.state != CcgBot::State::Stopped && b.cfg.use_trend_filter)
+                trend_bots.push_back(b);
+        if (!trend_bots.empty()) {
+            run_async([this, trend_bots]() {
+                for (const auto& b : trend_bots) {
+                    auto t = client_->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
+                                                   b.cfg.trend_ema_period);
+                    if (!t.ok) continue;
+                    QMetaObject::invokeMethod(this, [this, bid = b.bot_id, bearish = t.bearish]() {
+                        if (engine_) engine_->update_trend(bid, bearish);
+                    }, Qt::QueuedConnection);
+                }
+            });
+        }
     }
 
     std::set<std::string> syms;

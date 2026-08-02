@@ -79,6 +79,31 @@ int main() {
         CHECK(near(v, 60.0), "手算样例 RSI 应为60");
     }
 
+    // ── EMA / 带偏移SMA（v2.5 趋势状态机）────────────────────────────────────
+    {
+        // 常数序列：EMA 应等于该常数
+        std::vector<double> closes(250, 7.5);
+        CHECK(near(ema(closes, 200), 7.5), "常数序列 EMA 应等于常数本身");
+        // 数据不足：返回 0
+        std::vector<double> few = {1, 2, 3};
+        CHECK(near(ema(few, 200), 0.0), "数据不足 EMA 应返回0");
+        // 单调上涨：EMA 应落后于最新价但高于起点
+        std::vector<double> up;
+        for (int i = 1; i <= 250; ++i) up.push_back((double)i);
+        double e = ema(up, 200);
+        CHECK(e > 100.0 && e < 250.0, "单调上涨 EMA 应在起点和最新价之间且滞后");
+    }
+    {
+        // sma_at 手算：1..10，period=3
+        std::vector<double> c = {1,2,3,4,5,6,7,8,9,10};
+        CHECK(near(sma_at(c, 3, 0), 9.0), "sma_at 末尾3根 (8+9+10)/3=9");
+        CHECK(near(sma_at(c, 3, 2), 7.0), "sma_at 偏移2 (6+7+8)/3=7");
+        CHECK(near(sma_at(c, 3, 8), 0.0), "sma_at 偏移出界应返回0");
+        CHECK(near(sma_at(c, 0, 0), 0.0), "sma_at period=0 应返回0");
+        // 斜率语义：上涨序列 now > prev
+        CHECK(sma_at(c, 3, 0) > sma_at(c, 3, 3), "上涨序列中轨斜率应为正");
+    }
+
     // ── 动态W参数推导（v2.3 动态W模式）───────────────────────────────────────
     {
         namespace dp = ccbot::dynparams;
