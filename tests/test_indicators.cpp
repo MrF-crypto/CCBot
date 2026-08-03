@@ -3,6 +3,7 @@
 // 有任何一条不对就打印具体是哪条断言失败并 exit 1。
 #include "core/indicators.h"
 #include "core/dynamic_params.h"
+#include "core/sr_zones.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -130,6 +131,56 @@ int main() {
         CHECK(near(dp::interval_pct(6.0),    1.5), "宽带宽间隔应被夹到上限1.5");
         CHECK(near(dp::trail_tp_pct(6.0),    0.6), "宽带宽追踪止盈应被夹到上限0.6");
         CHECK(near(dp::trail_entry_pct(6.0), 0.4), "宽带宽追踪建仓应被夹到上限0.4");
+    }
+
+    // ── 支撑/阻力区域检测（v2.6 SR雷达）─────────────────────────────────────
+    {
+        namespace sz = ccbot::srzones;
+        // ATR：恒定波幅 高105/低95/收100 → TR恒为10 → ATR=10
+        std::vector<sz::Bar> flat;
+        for (int i = 0; i < 30; ++i) flat.push_back({100, 105, 95, 100, 1000});
+        CHECK(near(sz::atr(flat, 14), 10.0), "恒定波幅 ATR 应为10");
+        CHECK(near(sz::atr({}, 14), 0.0), "空数据 ATR 应为0");
+
+        // 摆动点：平坦序列中间插一根深低点，应被识别为唯一摆动低点
+        std::vector<sz::Bar> vshape;
+        for (int i = 0; i < 21; ++i) vshape.push_back({105, 106, 104, 105, 1000});
+        vshape[10] = {104, 105, 98, 100, 2000};
+        auto plows = sz::pivot_lows(vshape, 3);
+        CHECK(plows.size() == 1 && plows[0] == 10, "V形序列应识别出唯一摆动低点@10");
+
+        // 聚类成区域：三次探底到 ~100 附近，应聚成一个含100的支撑区，touches=3
+        std::vector<sz::Bar> bounce;
+        for (int i = 0; i < 60; ++i) bounce.push_back({105, 106, 104, 105, 1000});
+        bounce[12] = {104, 105, 100.0, 101, 1500};
+        bounce[28] = {104, 105, 100.3, 101, 1500};
+        bounce[44] = {104, 105,  99.8, 101, 1500};
+        auto zones = sz::detect_zones(bounce, 3, 0.5, 12);
+        const sz::Zone* sup = sz::nearest_support(zones, 105.0);
+        CHECK(sup != nullptr, "三次探底应产生现价下方的支撑区");
+        if (sup) {
+            CHECK(sup->contains(100.0) || (sup->lo < 100.4 && sup->hi > 99.7),
+                  "支撑区应覆盖 ~100 的探底价位");
+            CHECK(sup->touches >= 3, "支撑区触碰次数应>=3");
+        }
+
+        // FVG：bar2 低点12 > bar0 高点10 → 看涨缺口 [10,12]，未回补应被保留
+        std::vector<sz::Bar> gap = {
+            {9.5, 10, 9, 9.8, 1000}, {10, 15, 9.5, 14.5, 3000}, {14, 16, 12, 15, 2000},
+            {15, 16, 13, 15.5, 1000},
+        };
+        auto fvgs = sz::detect_fvg(gap, 1.0);
+        CHECK(fvgs.size() == 1, "应检测出1个看涨FVG");
+        if (!fvgs.empty()) {
+            CHECK(near(fvgs[0].lo, 10.0) && near(fvgs[0].hi, 12.0), "FVG区间应为[10,12]");
+        }
+        // 回补后不应保留：加一根低点跌破10的K线
+        gap.push_back({13, 13.5, 9.9, 10.5, 1000});
+        CHECK(sz::detect_fvg(gap, 1.0).empty(), "被回补的FVG不应保留");
+
+        // nearest_resistance：把探底例子的现价放到99，支撑区应变成上方阻力（攻防互换）
+        const sz::Zone* res = sz::nearest_resistance(zones, 99.0);
+        CHECK(res != nullptr && res->lo > 99.0, "现价跌破后原支撑区应作为上方阻力被查到");
     }
 
     if (g_fail == 0) {

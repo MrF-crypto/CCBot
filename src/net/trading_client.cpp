@@ -905,6 +905,49 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend(
     return out;
 }
 
+// ── 完整 OHLCV K线（SR区域检测用）────────────────────────────────────────────
+std::vector<TradingClient::Bar> TradingClient::fetch_bars(
+        const std::string& sym, const std::string& interval, int limit) {
+    std::vector<Bar> out;
+    std::string path = "/fapi/v1/klines?symbol=" + sym +
+                       "&interval=" + interval +
+                       "&limit=" + std::to_string(std::min(std::max(limit, 1), 1500));
+    auto resp = http_get_public(path);
+    if (resp.empty()) return out;
+
+    simdjson::dom::parser p;
+    simdjson::dom::array arr;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
+
+    for (auto kline : arr) {
+        simdjson::dom::array ka;
+        if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
+        // klines 数组下标：1=open 2=high 3=low 4=close 5=volume（都是字符串）
+        Bar b;
+        int idx = 0;
+        bool ok = true;
+        for (auto field : ka) {
+            if (idx >= 1 && idx <= 5) {
+                std::string_view sv;
+                if (field.get(sv) != simdjson::SUCCESS) { ok = false; break; }
+                double v = 0;
+                try { v = std::stod(std::string(sv)); } catch (...) { ok = false; break; }
+                switch (idx) {
+                case 1: b.open = v; break;
+                case 2: b.high = v; break;
+                case 3: b.low  = v; break;
+                case 4: b.close = v; break;
+                case 5: b.volume = v; break;
+                }
+            }
+            if (++idx > 5) break;
+        }
+        if (ok) out.push_back(b);
+    }
+    return out;
+}
+
 double TradingClient::fetch_mark_price(const std::string& sym) {
     auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + sym);
     if (resp.empty()) return 0.0;

@@ -1,6 +1,7 @@
 // ccbot_headless：无图形界面版本，配置文件驱动，Windows/Linux 都能编译运行。
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
 #include "core/ccg_engine.h"
+#include "core/sr_zones.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
 #include "net/book_ticker_stream.h"
@@ -19,6 +20,8 @@
 #include <iomanip>
 #include <ctime>
 #include <set>
+#include <map>
+#include <cmath>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -243,6 +246,44 @@ int main(int argc, char** argv) {
                                                       b.cfg.boll_period, b.cfg.boll_mult,
                                                       b.cfg.rsi_period);
                 if (snap.ok) engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
+            }
+        }
+
+        // SR雷达（影子模式）：区域每 300 tick（约15分钟）重算；触区检查每tick本地做
+        static std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
+        static std::map<std::string, std::pair<double, int64_t>>  sr_alert_dedup; // sym→{mid,ms}
+        if ((tick_n - 1) % 300 == 0) {
+            for (const auto& b : bots) {
+                if (b.state == CcgBot::State::Stopped || !b.cfg.sr_radar) continue;
+                auto raw = client->fetch_bars(b.cfg.symbol, b.cfg.sr_interval, 400);
+                if (raw.size() < 50) continue;
+                std::vector<srzones::Bar> sbars;
+                sbars.reserve(raw.size());
+                for (const auto& r : raw) sbars.push_back({r.open, r.high, r.low, r.close, r.volume});
+                sr_zones_map[b.cfg.symbol] = srzones::detect_zones(sbars);
+            }
+        }
+        for (const auto& [sym, zones] : sr_zones_map) {
+            double price = ticker.mid_price(sym);
+            if (price <= 0) continue;
+            for (const auto& z : zones) {
+                if (!z.contains(price)) continue;
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                auto& [last_mid, last_ms] = sr_alert_dedup[sym];
+                bool same = std::fabs(z.mid() - last_mid) < 1e-9;
+                if (same && now_ms - last_ms < 2 * 3600 * 1000) break;
+                last_mid = z.mid(); last_ms = now_ms;
+                std::ostringstream ss;
+                ss << "[SR雷达] " << sym << " 价格 " << price << " 进入"
+                   << (z.is_fvg ? "FVG缺口" : (z.flipped ? "攻防转换区" : "摆动密集区"))
+                   << " [" << z.lo << " ~ " << z.hi << "]（评分" << z.score
+                   << "，触碰" << z.touches << "次）";
+                log_line(ss.str(), "WARN");
+                if (!webhook.empty()) {
+                    std::thread([w = webhook, text = ss.str()]() { send_webhook(w, text); }).detach();
+                }
+                break;
             }
         }
 

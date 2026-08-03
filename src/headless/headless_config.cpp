@@ -139,6 +139,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.use_trend_filter  = get_bool(bo, "use_trend_filter", false);
         c.trend_interval    = get_str(bo, "trend_interval", "4h");
         c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", 200.0);
+        c.sr_radar          = get_bool(bo, "sr_radar", false);
+        c.sr_interval       = get_str(bo, "sr_interval", "4h");
 
         out.bots.push_back(c);
     }

@@ -180,6 +180,8 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& new_cfg) 
     cfg.use_trend_filter  = new_cfg.use_trend_filter;
     cfg.trend_interval    = new_cfg.trend_interval;
     cfg.trend_ema_period  = new_cfg.trend_ema_period;
+    cfg.sr_radar          = new_cfg.sr_radar;
+    cfg.sr_interval       = new_cfg.sr_interval;
     return true;
 }
 

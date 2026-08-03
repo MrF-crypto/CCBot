@@ -118,6 +118,13 @@ public:
                               const std::string& interval = "4h",
                               int ema_period = 200, int slope_bars = 3);
 
+    // 完整 OHLCV K线（SR区域检测等需要高低点/成交量的场景用，公开接口）
+    struct Bar {
+        double open = 0, high = 0, low = 0, close = 0, volume = 0;
+    };
+    std::vector<Bar> fetch_bars(const std::string& symbol,
+                                const std::string& interval, int limit);
+
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);
 

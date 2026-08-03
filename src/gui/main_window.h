@@ -19,9 +19,11 @@
 #include <set>
 
 #include "core/ccg_engine.h"
+#include "core/sr_zones.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
 #include "net/book_ticker_stream.h"
+#include <map>
 
 namespace ccg {
 
@@ -54,6 +56,11 @@ private:
 
     // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）
     void openStrategyDialog(const std::string& symbol);
+
+    // ── SR雷达（v2.6 影子模式：检测+告警+展示，不参与下单）──
+    void refreshSrZones();                                // 定期重算区域（约15分钟一次）
+    void checkSrTouches();                                // 每tick检查价格是否触区
+    void openSrZonesDialog(const std::string& symbol);    // 右键查看区域列表
     void refreshStats();
     void openTradeHistoryDialog();
     // 品种精度信息缓存未命中时，去后台线程取一次，绝不在 GUI 线程同步阻塞等待
@@ -131,6 +138,16 @@ private:
 
     // 正在后台预取品种精度信息的品种集合，避免同一品种被重复发起请求（仅 GUI 线程访问）
     std::set<std::string> pendingSymbolFetch_;
+
+    // ── SR雷达状态（仅GUI线程访问）──
+    struct SrState {
+        std::vector<srzones::Zone> zones;
+        qint64 computed_ms   = 0;   // 上次重算时间
+        double last_alert_mid = 0;  // 上次告警的区域中点（去重）
+        qint64 last_alert_ms  = 0;
+    };
+    std::map<std::string, SrState> srStates_;
+    int srTickCount_ = 0;
 
     // ── 日志 ──
     QTextEdit* logBox_ = nullptr;

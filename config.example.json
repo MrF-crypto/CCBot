@@ -38,7 +38,10 @@
 
       "use_trend_filter": false,
       "trend_interval": "4h",
-      "trend_ema_period": 200
+      "trend_ema_period": 200,
+
+      "sr_radar": false,
+      "sr_interval": "4h"
     }
   ]
 }

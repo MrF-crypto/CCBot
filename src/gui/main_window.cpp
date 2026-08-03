@@ -100,7 +100,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , pool_(std::make_shared<ThreadPool>(4))
 {
-    setWindowTitle("CCG 合约监控  v2.5");
+    setWindowTitle("CCG 合约监控  v2.6");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -245,6 +245,8 @@ void MainWindow::save_bots() {
         o["use_trend_filter"]  = c.use_trend_filter;
         o["trend_interval"]    = QString::fromStdString(c.trend_interval);
         o["trend_ema_period"]  = c.trend_ema_period;
+        o["sr_radar"]          = c.sr_radar;
+        o["sr_interval"]       = QString::fromStdString(c.sr_interval);
 
         // 持仓/状态快照 —— 没有这些字段的话，App 重启后本地均价/持仓量会从零重新累积，
         // 跟交易所实际仓位脱节（这正是均价跟交易所对不上的根因之一）
@@ -325,6 +327,8 @@ void MainWindow::load_and_restore_bots() {
         c.use_trend_filter  = o["use_trend_filter"].toBool(false);
         c.trend_interval    = o["trend_interval"].toString("4h").toStdString();
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
+        c.sr_radar          = o["sr_radar"].toBool(false);
+        c.sr_interval       = o["sr_interval"].toString("4h").toStdString();
         if (c.symbol.empty()) continue;
 
         CcgBot bot;
@@ -1011,6 +1015,125 @@ void MainWindow::onConnect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SR雷达（影子模式）：自动支撑/阻力区检测 + 触区告警 + 展示，不参与下单
+// ─────────────────────────────────────────────────────────────────────────────
+void MainWindow::refreshSrZones() {
+    if (!client_ || !engine_) return;
+    // 收集开了 SR 雷达的品种（同品种多bot取任一配置的周期）
+    std::map<std::string, std::string> radar;   // symbol → interval
+    for (const auto& b : engine_->get_bots())
+        if (b.cfg.sr_radar && b.state != CcgBot::State::Stopped)
+            radar.emplace(b.cfg.symbol, b.cfg.sr_interval);
+    if (radar.empty()) return;
+
+    run_async([this, radar]() {
+        for (const auto& [sym, interval] : radar) {
+            auto raw = client_->fetch_bars(sym, interval, 400);
+            if (raw.size() < 50) continue;   // 新品种历史不够，跳过
+            std::vector<srzones::Bar> bars;
+            bars.reserve(raw.size());
+            for (const auto& r : raw) bars.push_back({r.open, r.high, r.low, r.close, r.volume});
+            auto zones = srzones::detect_zones(bars);
+            QMetaObject::invokeMethod(this, [this, sym, zones = std::move(zones)]() {
+                auto& st = srStates_[sym];
+                st.zones       = zones;
+                st.computed_ms = QDateTime::currentMSecsSinceEpoch();
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+void MainWindow::checkSrTouches() {
+    if (!ticker_) return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (auto& [sym, st] : srStates_) {
+        if (st.zones.empty()) continue;
+        double price = ticker_->mid_price(sym);
+        if (price <= 0) continue;
+
+        for (const auto& z : st.zones) {
+            if (!z.contains(price)) continue;
+            // 去重：同一区域2小时内只报一次（换了区域立刻可报）
+            bool same_zone = std::fabs(z.mid() - st.last_alert_mid) < 1e-9;
+            if (same_zone && (now - st.last_alert_ms) < 2 * 3600 * 1000) break;
+            st.last_alert_mid = z.mid();
+            st.last_alert_ms  = now;
+
+            QString kind = z.is_fvg ? "FVG缺口" : (z.flipped ? "攻防转换区" : "摆动密集区");
+            QString msg = QString("[SR雷达] %1 价格 %2 进入%3 [%4 ~ %5]（评分%6，触碰%7次）")
+                .arg(QString::fromStdString(sym)).arg(price, 0, 'f', 4).arg(kind)
+                .arg(z.lo, 0, 'f', 4).arg(z.hi, 0, 'f', 4)
+                .arg(z.score, 0, 'f', 1).arg(z.touches);
+            log(msg, "WARN");
+            sendAlert(msg);
+            break;   // 一个tick最多报一个区域
+        }
+    }
+}
+
+void MainWindow::openSrZonesDialog(const std::string& symbol) {
+    auto it = srStates_.find(symbol);
+    double price = ticker_ ? ticker_->mid_price(symbol) : 0;
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QString("支撑/阻力区 - %1").arg(QString::fromStdString(symbol)));
+    dlg.resize(620, 420);
+    auto* dv = new QVBoxLayout(&dlg);
+
+    if (it == srStates_.end() || it->second.zones.empty()) {
+        auto* lbl = new QLabel(
+            "暂无区域数据。\n\n请先在该品种的策略配置里勾选【SR雷达】，"
+            "开启后约15分钟内完成首次计算（4h K线，摆动点聚类+FVG检测）。");
+        lbl->setWordWrap(true);
+        dv->addWidget(lbl);
+    } else {
+        auto& st = it->second;
+        auto* info = new QLabel(QString("现价 %1  |  区域按价格从高到低排列，绿色=现价所在区域  |  更新于 %2")
+            .arg(price, 0, 'f', 4)
+            .arg(QDateTime::fromMSecsSinceEpoch(st.computed_ms).toString("HH:mm:ss")));
+        info->setStyleSheet("color:#8b949e;font-size:11px;");
+        dv->addWidget(info);
+
+        auto zones = st.zones;
+        std::sort(zones.begin(), zones.end(),
+                  [](const srzones::Zone& a, const srzones::Zone& b) { return a.mid() > b.mid(); });
+
+        auto* table = new QTableWidget((int)zones.size(), 6);
+        table->setHorizontalHeaderLabels({"类型","区间下沿","区间上沿","距现价%","触碰","评分"});
+        table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+        table->verticalHeader()->setVisible(false);
+        table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        for (int i = 0; i < (int)zones.size(); ++i) {
+            const auto& z = zones[i];
+            bool at_zone = price > 0 && z.contains(price);
+            QColor c = at_zone ? QColor("#3fb950")
+                     : (price > 0 && z.hi < price) ? QColor("#58a6ff")   // 下方=潜在支撑
+                                                    : QColor("#d29922"); // 上方=潜在阻力
+            auto mk = [&](const QString& s) {
+                auto* itc = new QTableWidgetItem(s);
+                itc->setTextAlignment(Qt::AlignCenter);
+                itc->setForeground(c);
+                return itc;
+            };
+            QString kind = z.is_fvg ? "FVG" : (z.flipped ? "攻防转换" : "摆动密集");
+            double dist = price > 0 ? (z.mid() - price) / price * 100.0 : 0;
+            table->setItem(i, 0, mk(kind));
+            table->setItem(i, 1, mk(QString::number(z.lo, 'f', 4)));
+            table->setItem(i, 2, mk(QString::number(z.hi, 'f', 4)));
+            table->setItem(i, 3, mk(QString("%1%2%").arg(dist >= 0 ? "+" : "").arg(dist, 0, 'f', 2)));
+            table->setItem(i, 4, mk(QString::number(z.touches)));
+            table->setItem(i, 5, mk(QString::number(z.score, 'f', 1)));
+        }
+        dv->addWidget(table);
+    }
+
+    auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Close);
+    dv->addWidget(btnBox);
+    connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    dlg.exec();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 权益/可用：随 onTick 异步刷新，不再只在连接那一刻查询一次
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshAccount() {
@@ -1141,9 +1264,12 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
     // bot，再点顶部的【清除已停止】按钮，两步操作天然防误触
     QMenu menu(this);
     QAction* actConfig = menu.addAction("配置策略...");
+    QAction* actSr     = menu.addAction("支撑/阻力区...");
     QAction* chosen = menu.exec(botTable_->viewport()->mapToGlobal(pos));
     if (chosen == actConfig) {
         openStrategyDialog(sym);
+    } else if (chosen == actSr) {
+        openSrZonesDialog(sym);
     }
 }
 
@@ -1229,6 +1355,16 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     form->addRow("", dynBandBox);
     auto* floorEdit = mkEdit("保底利润%(动态模式):",
                              prefill ? prefill->cfg.min_profit_floor : 0.3);
+
+    // ── SR雷达（v2.6 影子模式）───────────────────────────────────────────────
+    auto* srBox = new QCheckBox("SR雷达（自动检测支撑/阻力区+触区告警，不参与下单）");
+    srBox->setChecked(prefill ? prefill->cfg.sr_radar : false);
+    srBox->setToolTip(
+        "自动检测该品种 4h 级别的支撑/阻力区域（摆动点聚类+攻防转换+FVG缺口），\n"
+        "约15分钟刷新一次。价格触及区域时打日志+webhook告警（同区域2小时去重）。\n"
+        "右键品种→【支撑/阻力区...】查看当前区域列表。\n"
+        "影子模式：只观察不下单——先验证'程序的眼睛'准不准，执行接线是下一阶段。");
+    form->addRow("", srBox);
 
     // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
     auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
@@ -1547,6 +1683,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.dynamic_band_mode = dynBandBox->isChecked();
     cfg.min_profit_floor  = to_d(floorEdit, 0.3);
     cfg.use_trend_filter  = trendBox->isChecked();
+    cfg.sr_radar          = srBox->isChecked();
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -1638,6 +1775,10 @@ void MainWindow::onTick() {
             }
         });
     }
+
+    // SR雷达：区域每 300 tick（约15分钟）重算一次（首tick立刻算），触区检查每tick做（本地、零开销）
+    if (srTickCount_++ % 300 == 0) refreshSrZones();
+    checkSrTouches();
 
     // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；
     // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转

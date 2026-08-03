@@ -76,6 +76,12 @@ struct CcgConfig {
     bool        use_trend_filter = false;
     std::string trend_interval   = "4h";
     int         trend_ema_period = 200;
+
+    // SR雷达（v2.6+，影子模式）：自动检测支撑/阻力区域（摆动点聚类+FVG），
+    // 价格触区时告警+记录，【不参与下单决策】——先积累"程序的眼睛"的准确率数据，
+    // 执行接线是后续阶段的事。检测计算在应用层（GUI/headless），引擎只存配置
+    bool        sr_radar    = false;
+    std::string sr_interval = "4h";
 };
 
 // ─── 单笔加仓记录 ──────────────────────────────────────────────────────────────
