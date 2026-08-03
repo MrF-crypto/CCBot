@@ -156,13 +156,14 @@ int main() {
         bounce[28] = {104, 105, 100.3, 101, 1500};
         bounce[44] = {104, 105,  99.8, 101, 1500};
         auto zones = sz::detect_zones(bounce, 3, 0.5, 12);
-        const sz::Zone* sup = sz::nearest_support(zones, 105.0);
-        CHECK(sup != nullptr, "三次探底应产生现价下方的支撑区");
-        if (sup) {
-            CHECK(sup->contains(100.0) || (sup->lo < 100.4 && sup->hi > 99.7),
-                  "支撑区应覆盖 ~100 的探底价位");
-            CHECK(sup->touches >= 3, "支撑区触碰次数应>=3");
-        }
+        CHECK(sz::nearest_support(zones, 105.0) != nullptr, "现价下方应存在支撑区");
+        // 区域池里必须有覆盖 ~100 探底价位的摆动聚类区（v2.7起池里还有POC/斐波等
+        // 其他来源，"最近的支撑"未必是它，所以按覆盖价位查找而不是取最近）
+        const sz::Zone* cluster = nullptr;
+        for (const auto& z : zones)
+            if (z.contains(100.0) && (z.src_mask & sz::SrcSwing)) cluster = &z;
+        CHECK(cluster != nullptr, "三次探底应聚类出覆盖~100的摆动区");
+        if (cluster) CHECK(cluster->touches >= 3, "摆动区触碰次数应>=3");
 
         // FVG：bar2 低点12 > bar0 高点10 → 看涨缺口 [10,12]，未回补应被保留
         std::vector<sz::Bar> gap = {
@@ -181,6 +182,42 @@ int main() {
         // nearest_resistance：把探底例子的现价放到99，支撑区应变成上方阻力（攻防互换）
         const sz::Zone* res = sz::nearest_resistance(zones, 99.0);
         CHECK(res != nullptr && res->lo > 99.0, "现价跌破后原支撑区应作为上方阻力被查到");
+
+        // POC：成交量高度集中在 ~50 的价位，主筹码峰应覆盖 50
+        std::vector<sz::Bar> pocbars;
+        for (int i = 0; i < 20; ++i) pocbars.push_back({50, 51, 49, 50, 5000});
+        for (int i = 0; i < 10; ++i) pocbars.push_back({80, 81, 79, 80, 500});
+        auto pocs = sz::detect_poc(pocbars, 2.0);
+        CHECK(!pocs.empty() && pocs[0].contains(50.0), "主POC应覆盖成交量密集价位50");
+        CHECK(!pocs.empty() && pocs[0].src_mask == sz::SrcPOC, "POC来源掩码应为SrcPOC");
+
+        // 斐波那契：低点100(早)→高点200(晚)的上升波段，0.618回撤位=138.2 应在池中
+        std::vector<sz::Bar> fibbars;
+        for (int i = 0; i < 20; ++i) {
+            double p = 100 + i * (100.0 / 19.0);
+            fibbars.push_back({p, p + 1, p - 1, p, 1000});
+        }
+        auto fibs = sz::detect_fib(fibbars, 5.0);
+        bool found618 = false;
+        for (const auto& z : fibs) if (z.contains(138.2)) found618 = true;
+        CHECK(fibs.size() == 3, "斐波那契应产生3档回撤位");
+        CHECK(found618, "上升波段0.618回撤位138.2应在区域池中");
+
+        // 共振合并：摆动区[99,101]与斐波区[100.5,101.5]重叠 → 合并为共振2、评分加权
+        sz::Zone a; a.lo = 99;    a.hi = 101;   a.score = 2.0; a.src_mask = sz::SrcSwing; a.touches = 3;
+        sz::Zone b; b.lo = 100.5; b.hi = 101.5; b.score = 0.9; b.src_mask = sz::SrcFib;   b.touches = 1;
+        sz::Zone c; c.lo = 200;   c.hi = 201;   c.score = 1.0; c.src_mask = sz::SrcPOC;   c.touches = 1;
+        auto mg = sz::merge_zones({a, b, c});
+        CHECK(mg.size() == 2, "重叠的两区应合并，不重叠的独立保留");
+        const sz::Zone* top = nullptr;
+        for (const auto& z : mg) if (z.confluence() == 2) top = &z;
+        CHECK(top != nullptr, "合并区共振数应为2");
+        if (top) {
+            CHECK(near(top->score, (2.0 + 0.9 * 0.8) * 1.5), "共振区评分应为(2+0.72)×1.5");
+            CHECK(near(top->lo, 99.0) && near(top->hi, 101.5), "合并区间应取并集[99,101.5]");
+            CHECK((top->src_mask & sz::SrcSwing) && (top->src_mask & sz::SrcFib),
+                  "合并区来源掩码应含摆动+斐波");
+        }
     }
 
     if (g_fail == 0) {

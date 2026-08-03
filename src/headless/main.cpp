@@ -275,9 +275,11 @@ int main(int argc, char** argv) {
                 if (same && now_ms - last_ms < 2 * 3600 * 1000) break;
                 last_mid = z.mid(); last_ms = now_ms;
                 std::ostringstream ss;
-                ss << "[SR雷达] " << sym << " 价格 " << price << " 进入"
-                   << (z.is_fvg ? "FVG缺口" : (z.flipped ? "攻防转换区" : "摆动密集区"))
-                   << " [" << z.lo << " ~ " << z.hi << "]（评分" << z.score
+                int conf = z.confluence();
+                ss << "[SR雷达] " << sym << " 价格 " << price << " 进入区域["
+                   << srzones::src_label(z);
+                if (conf >= 2) ss << " ×" << conf << "共振";
+                ss << "]（" << z.lo << " ~ " << z.hi << "，评分" << z.score
                    << "，触碰" << z.touches << "次）";
                 log_line(ss.str(), "WARN");
                 if (!webhook.empty()) {

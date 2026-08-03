@@ -100,7 +100,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , pool_(std::make_shared<ThreadPool>(4))
 {
-    setWindowTitle("CCG 合约监控  v2.6");
+    setWindowTitle("CCG 合约监控  v2.7");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1059,8 +1059,10 @@ void MainWindow::checkSrTouches() {
             st.last_alert_mid = z.mid();
             st.last_alert_ms  = now;
 
-            QString kind = z.is_fvg ? "FVG缺口" : (z.flipped ? "攻防转换区" : "摆动密集区");
-            QString msg = QString("[SR雷达] %1 价格 %2 进入%3 [%4 ~ %5]（评分%6，触碰%7次）")
+            int conf = z.confluence();
+            QString kind = QString::fromStdString(srzones::src_label(z));
+            if (conf >= 2) kind += QString(" ×%1共振").arg(conf);
+            QString msg = QString("[SR雷达] %1 价格 %2 进入区域[%3]（%4 ~ %5，评分%6，触碰%7次）")
                 .arg(QString::fromStdString(sym)).arg(price, 0, 'f', 4).arg(kind)
                 .arg(z.lo, 0, 'f', 4).arg(z.hi, 0, 'f', 4)
                 .arg(z.score, 0, 'f', 1).arg(z.touches);
@@ -1098,8 +1100,8 @@ void MainWindow::openSrZonesDialog(const std::string& symbol) {
         std::sort(zones.begin(), zones.end(),
                   [](const srzones::Zone& a, const srzones::Zone& b) { return a.mid() > b.mid(); });
 
-        auto* table = new QTableWidget((int)zones.size(), 6);
-        table->setHorizontalHeaderLabels({"类型","区间下沿","区间上沿","距现价%","触碰","评分"});
+        auto* table = new QTableWidget((int)zones.size(), 7);
+        table->setHorizontalHeaderLabels({"类型","共振","区间下沿","区间上沿","距现价%","触碰","评分"});
         table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
         table->verticalHeader()->setVisible(false);
         table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -1115,14 +1117,15 @@ void MainWindow::openSrZonesDialog(const std::string& symbol) {
                 itc->setForeground(c);
                 return itc;
             };
-            QString kind = z.is_fvg ? "FVG" : (z.flipped ? "攻防转换" : "摆动密集");
             double dist = price > 0 ? (z.mid() - price) / price * 100.0 : 0;
-            table->setItem(i, 0, mk(kind));
-            table->setItem(i, 1, mk(QString::number(z.lo, 'f', 4)));
-            table->setItem(i, 2, mk(QString::number(z.hi, 'f', 4)));
-            table->setItem(i, 3, mk(QString("%1%2%").arg(dist >= 0 ? "+" : "").arg(dist, 0, 'f', 2)));
-            table->setItem(i, 4, mk(QString::number(z.touches)));
-            table->setItem(i, 5, mk(QString::number(z.score, 'f', 1)));
+            int conf = z.confluence();
+            table->setItem(i, 0, mk(QString::fromStdString(srzones::src_label(z))));
+            table->setItem(i, 1, mk(conf >= 2 ? QString("×%1").arg(conf) : "-"));
+            table->setItem(i, 2, mk(QString::number(z.lo, 'f', 4)));
+            table->setItem(i, 3, mk(QString::number(z.hi, 'f', 4)));
+            table->setItem(i, 4, mk(QString("%1%2%").arg(dist >= 0 ? "+" : "").arg(dist, 0, 'f', 2)));
+            table->setItem(i, 5, mk(QString::number(z.touches)));
+            table->setItem(i, 6, mk(QString::number(z.score, 'f', 1)));
         }
         dv->addWidget(table);
     }
