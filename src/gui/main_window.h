@@ -87,7 +87,10 @@ private:
     // 后端
     std::shared_ptr<TradingClient>     client_;
     std::shared_ptr<CcgEngine>         engine_;
+    // pool_ = 引擎专用（下单/平仓）；fetchPool_ = 数据拉取专用（账户/持仓/指标/趋势/SR雷达）。
+    // 必须分开：拉取任务动辄几百毫秒~几秒，混在一个池里会把手动平仓排到队尾等十几秒
     std::shared_ptr<ThreadPool>        pool_;
+    std::shared_ptr<ThreadPool>        fetchPool_;
     std::unique_ptr<BookTickerStream>  ticker_;
 
     QTimer* tick_timer_  = nullptr;

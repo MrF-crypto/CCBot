@@ -98,9 +98,10 @@ QToolTip{background:#1c2128;color:#e6edf3;border:1px solid #30363d;padding:4px 6
 // ─────────────────────────────────────────────────────────────────────────────
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    , pool_(std::make_shared<ThreadPool>(4))
+    , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
+    , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v2.7");
+    setWindowTitle("CCG 合约监控  v2.7.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -704,7 +705,9 @@ void MainWindow::sendAlert(const QString& text) {
 // 异步执行（线程池）
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::run_async(std::function<void()> fn) {
-    pool_->submit(std::move(fn));
+    // 数据拉取走独立池——引擎的 pool_ 只跑下单/平仓，保证手动平仓点下去立即执行，
+    // 不会排在指标/趋势/SR雷达这些几百毫秒~几秒的慢任务后面
+    fetchPool_->submit(std::move(fn));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
