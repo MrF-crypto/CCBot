@@ -2,6 +2,7 @@
 #include <simdjson.h>
 #include <fstream>
 #include <sstream>
+#include <set>
 
 namespace ccbot {
 
@@ -104,6 +105,17 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         return false;
     }
 
+    // 已知的 bot 配置键：拼错键名会静默落回默认值（比如 stop_loss_pct 拼错 = 没有止损），
+    // 所以未知键必须显式告警
+    static const std::set<std::string> known_keys = {
+        "symbol", "direction", "strat_type", "budget_usdt", "leverage", "max_entries",
+        "interval_pct", "trail_entry", "tp_pct", "trail_tp", "auto_restart",
+        "cooldown_secs", "stop_loss_pct", "entry_mode", "kline_interval",
+        "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
+        "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",
+        "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
+    };
+
     for (auto elem : bots) {
         simdjson::dom::object bo;
         if (elem.get(bo) != simdjson::SUCCESS) continue;
@@ -112,8 +124,24 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.symbol = get_str(bo, "symbol", "");
         if (c.symbol.empty()) continue;
 
+        for (auto field : bo) {
+            std::string k(field.key);
+            if (!known_keys.count(k))
+                out.warnings.push_back(c.symbol + " 配置里有无法识别的键 \"" + k +
+                                       "\"（拼写错误?），该项被忽略、对应参数使用默认值");
+        }
+
+        std::string dir_s = get_str(bo, "direction", "long");
+        if (dir_s == "both") {
+            // 引擎内部 Both 会走纯空头分支，headless 又没有 GUI 那样的拆分逻辑——
+            // 用户想要对冲、实际得到裸空单，必须拒绝启动
+            err = c.symbol + " 配置了 direction=both：headless 不支持双向，"
+                  "请拆成两个 bot 分别配置 long 和 short（注意需要币安双向持仓模式）";
+            return false;
+        }
+
         c.strat_type    = parse_strat(get_str(bo, "strat_type", "martingale"));
-        c.direction     = parse_dir(get_str(bo, "direction", "long"));
+        c.direction     = parse_dir(dir_s);
         c.budget_usdt   = get_num(bo, "budget_usdt", 3000.0);
         c.leverage      = (int)get_num(bo, "leverage", 3);
         c.max_entries   = (int)get_num(bo, "max_entries", 6);

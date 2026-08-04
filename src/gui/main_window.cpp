@@ -101,7 +101,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v2.8");
+    setWindowTitle("CCG 合约监控  v2.9");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -154,14 +154,26 @@ QString MainWindow::portable_data_dir() {
 void MainWindow::migrate_appdata_if_needed() {
     QString dst = portable_data_dir();
     QString old = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (dst == old) return;                                // 回退模式，无需迁移
-    if (QFile::exists(dst + "/ccg_bots.json")) return;     // 新目录已有数据，不动
+    if (dst == old) return;                          // 回退模式，无需迁移
+    if (QFile::exists(dst + "/.migrated")) return;   // 专用标记：全部文件迁移成功才写
 
+    // 逐文件"缺了才拷"：部分失败（文件被锁/杀软拦截）时下次启动会重试剩余文件，
+    // 不会出现"密钥拷过来了、仓位跟踪永久丢失"的半截迁移
     int n = 0;
+    bool all_ok = true;
     for (const char* f : {"ccg_creds.dat", "ccg_bots.json", "ccg_trades.json",
                           "ccg_settings.json"}) {
         QString src = old + "/" + f;
-        if (QFile::exists(src) && QFile::copy(src, dst + "/" + f)) ++n;
+        QString to  = dst + "/" + f;
+        if (!QFile::exists(src) || QFile::exists(to)) continue;
+        if (QFile::copy(src, to)) ++n;
+        else all_ok = false;
+    }
+    if (all_ok) {
+        QFile marker(dst + "/.migrated");
+        marker.open(QIODevice::WriteOnly);
+    } else {
+        log("旧数据目录部分文件迁移失败，下次启动将重试剩余文件", "WARN");
     }
     if (n > 0)
         log(QString("已从旧数据目录迁移 %1 个文件到程序目录 data/（原文件保留在 %2）")
@@ -220,9 +232,11 @@ void MainWindow::save_settings() {
     QJsonObject o;
     o["max_total_margin"] = maxTotalMargin_;
     o["alert_webhook"]    = alertWebhook_;
-    QFile f(QString::fromStdString(settings_path()));
-    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    QSaveFile f(QString::fromStdString(settings_path()));   // 原子保存
+    if (f.open(QIODevice::WriteOnly)) {
         f.write(QJsonDocument(o).toJson());
+        f.commit();
+    }
 }
 
 void MainWindow::load_settings() {
@@ -296,6 +310,7 @@ void MainWindow::save_bots() {
         o["dca_extreme"]       = b.dca_extreme;
         o["interval_hit"]      = b.interval_hit;
         o["tp_reached"]        = b.tp_reached;
+        o["ind_dipped"]        = b.ind_dipped;
         o["tp_extreme"]        = b.tp_extreme;
         o["realized_pnl"]      = b.realized_pnl;
         o["cycle_count"]       = b.cycle_count;
@@ -379,6 +394,7 @@ void MainWindow::load_and_restore_bots() {
         bot.dca_extreme       = o["dca_extreme"].toDouble();
         bot.interval_hit      = o["interval_hit"].toBool();
         bot.tp_reached        = o["tp_reached"].toBool();
+        bot.ind_dipped        = o["ind_dipped"].toBool(false);
         bot.tp_extreme        = o["tp_extreme"].toDouble();
         bot.realized_pnl      = o["realized_pnl"].toDouble();
         bot.cycle_count       = o["cycle_count"].toInt();
@@ -425,9 +441,11 @@ void MainWindow::save_trades() {
         o["close_time_ms"] = tp_to_ms(t.close_time);
         arr.append(o);
     }
-    QFile f(QString::fromStdString(trade_path()));
-    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    QSaveFile f(QString::fromStdString(trade_path()));   // 原子保存，崩溃不损坏交易明细
+    if (f.open(QIODevice::WriteOnly)) {
         f.write(QJsonDocument(arr).toJson());
+        f.commit();
+    }
 }
 
 void MainWindow::load_trades() {
@@ -945,6 +963,15 @@ void MainWindow::buildUi() {
 // 连接 Binance
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::onConnect() {
+    // 已连接/连接中时禁止重入：重连会替换 engine_/client_，而线程池里在途的
+    // 下单任务持有旧引擎的裸指针——旧引擎被析构后任务执行就是悬空访问，
+    // 且已发出的真实订单成交结果会写进"孤儿引擎"，本地跟踪与交易所永久脱节
+    if (connState_ == ConnState::Connected || connState_ == ConnState::Connecting ||
+        connState_ == ConnState::NetworkError) {
+        log("已处于连接状态，如需重连请重启程序（防止在途订单状态丢失）", "WARN");
+        return;
+    }
+
     QString key    = apiKey_.trimmed();
     QString secret = apiSecret_.trimmed();
     if (key.isEmpty() || secret.isEmpty()) {
@@ -1020,6 +1047,8 @@ void MainWindow::onConnect() {
             ticker_ = std::make_unique<BookTickerStream>(cfg.testnet);
             ticker_->start();
 
+            srTickCount_    = 0;   // 保证"首tick立即拉取SR/趋势"在（罕见的）重连后依然成立
+            trendTickCount_ = 0;
             tick_timer_->start();
 
             log(QString("连接成功 | %1 | 权益 $%2 | 可用 $%3")
@@ -1038,7 +1067,7 @@ void MainWindow::onConnect() {
                 QMetaObject::invokeMethod(this, [this, ex_pos]() {
                     if (!engine_) return;
                     std::vector<CcgEngine::ExchangePos> ex;
-                    for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty});
+                    for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
                     auto issues = engine_->reconcile_positions(ex);
                     if (!issues.empty()) {
                         save_bots();   // 收敛后的状态立刻落盘
@@ -1062,6 +1091,11 @@ void MainWindow::refreshSrZones() {
     for (const auto& b : engine_->get_bots())
         if (b.cfg.sr_radar && b.state != CcgBot::State::Stopped)
             radar.emplace(b.cfg.symbol, b.cfg.sr_interval);
+
+    // 清理已关闭雷达/已删除的品种，否则旧区域会永远用陈旧数据持续误报
+    for (auto it = srStates_.begin(); it != srStates_.end();)
+        it = radar.count(it->first) ? std::next(it) : srStates_.erase(it);
+
     if (radar.empty()) return;
 
     run_async([this, radar]() {
@@ -1732,6 +1766,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         c.direction = dir;
         QString dirName = (dir == CcgConfig::Direction::Short) ? "空" : "多";
         if (existing) {
+            // 弹窗没有这三项的输入控件，编辑保存时必须从原配置继承——
+            // 否则手改过 JSON 的值会被静默重置回默认
+            c.trend_interval   = existing->cfg.trend_interval;
+            c.trend_ema_period = existing->cfg.trend_ema_period;
+            c.sr_interval      = existing->cfg.sr_interval;
             engine_->update_bot_cfg(existing->bot_id, c);
             log(QString("%1 %2 策略已更新").arg(symQ).arg(dirName), "OK");
             if (!existing->entries.empty() && c.leverage != existing->cfg.leverage) {
@@ -1821,10 +1860,14 @@ void MainWindow::onTick() {
     if (srTickCount_++ % 300 == 0) refreshSrZones();
     checkSrTouches();
 
+    // 每小时重新对时一次：时钟漂移超过 recvWindow(5s) 会让所有签名请求集体失败
+    if (srTickCount_ % 1200 == 0) {
+        run_async([this]() { if (client_) client_->sync_server_time(); });
+    }
+
     // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；
     // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转
-    static int s_trend_tick = 0;
-    if (s_trend_tick++ % 100 == 0) {
+    if (trendTickCount_++ % 100 == 0) {
         std::vector<CcgBot> trend_bots;
         for (const auto& b : bots)
             if (b.state != CcgBot::State::Stopped && b.cfg.use_trend_filter)
@@ -2111,8 +2154,17 @@ void MainWindow::refreshBotTable() {
             : "QPushButton{background:#3d1a1a;color:#f85149;font-size:11px;padding:0 6px;}");
         connect(btnSR, &QPushButton::clicked, [this, bid, is_stopped]() {
             if (!engine_) return;
-            if (is_stopped) engine_->resume_bot(bid);
-            else             engine_->stop_bot(bid);
+            if (is_stopped) {
+                engine_->resume_bot(bid);
+                // 「全部停止」会关掉 tick 定时器——单个 bot 恢复时必须把它拉起来，
+                // 否则 bot 显示"运行中"但引擎永远不被驱动：止损/止盈/补仓全部失效
+                if (tick_timer_ && !tick_timer_->isActive()) {
+                    tick_timer_->start();
+                    log("Tick 定时器已重新启动");
+                }
+            } else {
+                engine_->stop_bot(bid);
+            }
             refreshBotTable();
             save_bots();
         });
@@ -2127,7 +2179,7 @@ void MainWindow::refreshBotTable() {
         connect(btnClose, &QPushButton::clicked, [this, bid]() {
             if (!engine_) return;
             engine_->close_bot(bid);   // 异步市价平仓，完成后由 log 回调刷新表格
-            log("已发送平仓请求", "WARN");
+            log("已发送平仓请求（若无持仓或订单正在处理中会自动忽略）", "WARN");
         });
         opL->addWidget(btnClose);
 

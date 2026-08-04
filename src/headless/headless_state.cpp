@@ -75,6 +75,7 @@ void save_headless_state(const std::string& path, const std::vector<CcgBot>& bot
            << "\"dca_extreme\":"   << b.dca_extreme << ","
            << "\"interval_hit\":"  << (b.interval_hit ? "true" : "false") << ","
            << "\"tp_reached\":"    << (b.tp_reached ? "true" : "false") << ","
+           << "\"ind_dipped\":"    << (b.ind_dipped ? "true" : "false") << ","
            << "\"tp_extreme\":"    << b.tp_extreme << ","
            << "\"realized_pnl\":"  << b.realized_pnl << ","
            << "\"cycle_count\":"   << b.cycle_count << ","
@@ -160,6 +161,7 @@ std::vector<CcgBot> load_headless_state(const std::string& path, const std::vect
         bot.dca_extreme       = get_num(o, "dca_extreme", 0.0);
         bot.interval_hit      = get_bool(o, "interval_hit", false);
         bot.tp_reached        = get_bool(o, "tp_reached", false);
+        bot.ind_dipped        = get_bool(o, "ind_dipped", false);
         bot.tp_extreme        = get_num(o, "tp_extreme", 0.0);
         bot.realized_pnl      = get_num(o, "realized_pnl", 0.0);
         bot.cycle_count       = (int)get_num(o, "cycle_count", 0.0);

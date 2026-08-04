@@ -330,14 +330,20 @@ static std::string pos_side_param(bool dual, const std::string& side, bool reduc
     return "&positionSide=" + std::string(is_long_side ? "LONG" : "SHORT");
 }
 
-// 生成本程序专属的 clientOrderId（幂等性标识）：cb-<进程随机码>-<序号>。
-// 随机码每次进程启动生成一次，也顺带能在交易所订单历史里区分"是哪台设备/哪次运行下的单"
+// 生成本程序专属的 clientOrderId（幂等性标识）：cb-<运行码>-<序号>。
+// 运行码 = 启动时刻毫秒时间戳的36进制（跨重启天然唯一）+ 2位随机（防同毫秒双进程）。
+// 若跨重启碰撞，超时查单恢复会按 origClientOrderId 查到【历史订单】的成交并错误入账，
+// 所以唯一性不是洁癖，是记账正确性的前提
 static std::string make_client_order_id() {
     static const std::string run_tag = [] {
-        std::srand((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
-        static const char cs[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+        auto ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        static const char cs[] = "0123456789abcdefghijklmnopqrstuvwxyz";
         std::string s;
-        for (int i = 0; i < 6; ++i) s += cs[std::rand() % (sizeof(cs) - 1)];
+        for (uint64_t v = ms; v > 0; v /= 36) s += cs[v % 36];
+        std::srand((unsigned)(ms ^ (ms >> 17)));
+        s += cs[std::rand() % 36];
+        s += cs[std::rand() % 36];
         return s;
     }();
     static std::atomic<int> seq{0};
@@ -356,7 +362,13 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; r.uncertain = true; return r; }
-    if (binance_error(doc, r.error)) return r;   // 含 -2013 订单不存在（= 确认没到交易所）
+    if (binance_error(doc, r.error)) {
+        // 只有 -2013（订单不存在）是"确认没到交易所"的可靠答案；其他业务错误
+        // （-1021时间戳超窗/-1003限流/-1022签名…）说明【查询本身】没成功，
+        // 订单状态依然未知——绝不能让恢复路径误判为"确认未成交"然后放行重试
+        r.uncertain = (r.error.find("[-2013]") == std::string::npos);
+        return r;
+    }
 
     int64_t oid = 0;
     doc["orderId"].get(oid);
@@ -394,27 +406,28 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
 
         auto resp = http_post("/fapi/v1/order", body);
 
-        if (resp.empty()) {
-            // 传输层失败（超时/断网）：请求可能已经到达交易所并成交——必须查单确认，
-            // 直接当失败会导致上层重试造成重复下单
+        // 可疑响应统一走查单恢复：空响应（超时/断网）和"非空但不是JSON"（网关5xx
+        // HTML页、Cloudflare拦截页、被截断的响应）都意味着【订单状态未知】——
+        // 请求可能已到达交易所并成交。当普通失败返回会让上层重试造成双倍仓位
+        simdjson::dom::parser p;
+        simdjson::dom::element doc;
+        simdjson::padded_string ps(resp);   // 必须活到 doc 使用结束（doc 内字符串指向此缓冲）
+        bool suspicious = resp.empty();
+        if (!suspicious && p.parse(ps).get(doc) != simdjson::SUCCESS) suspicious = true;
+        if (suspicious) {
             for (int q = 0; q < 3; ++q) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(600));
                 auto qr = query_order(sym, coid);
                 if (qr.ok) return qr;                      // 找到了：实际已到达交易所，按真实成交返回
-                if (!qr.uncertain) {                       // 明确回答"订单不存在"：确认没下进去
-                    r.error = "下单超时，已确认订单未到达交易所";
+                if (!qr.uncertain) {                       // 明确回答"-2013订单不存在"：确认没下进去
+                    r.error = "下单响应异常，已确认订单未到达交易所";
                     return r;
                 }
             }
-            r.error     = "下单超时且无法确认订单状态（网络中断?）";
+            r.error     = "下单响应异常且无法确认订单状态（网络中断?）";
             r.uncertain = true;
             return r;
         }
-
-        simdjson::dom::parser p;
-        simdjson::dom::element doc;
-        auto ps = simdjson::padded_string(resp);
-        if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; return r; }
 
         // -1111 = 精度超限，放宽一档重试
         int64_t code = 0;
@@ -689,6 +702,12 @@ const TradingClient::SymbolInfo& TradingClient::get_symbol_info(const std::strin
     }
 
     std::lock_guard<std::mutex> lk(sym_mtx_);
+    if (!info.valid) {
+        // 拉取失败不写缓存（负缓存会把"首次网络抖动"固化成整个进程生命周期的
+        // 错误精度）——返回临时默认值，下次调用重试拉取
+        static const SymbolInfo fallback{};
+        return fallback;
+    }
     sym_cache_[sym] = info;
     return sym_cache_[sym];
 }
@@ -729,6 +748,7 @@ TradingClient::place_tp_market(const std::string& sym, double stop_price,
     const int price_dp = step_decimals(info.tick_size);
     const int qty_dp   = step_decimals(info.effective_market_step());
     qty = round_qty(sym, qty);
+    if (qty <= 0) { r.error = "TP数量取整后为0，跳过"; return r; }
 
     std::ostringstream oss;
     oss << "symbol=" << sym
@@ -766,6 +786,7 @@ TradingClient::place_sl_market(const std::string& sym, double stop_price,
     const int price_dp = step_decimals(info.tick_size);
     const int qty_dp   = step_decimals(info.effective_market_step());
     qty = round_qty(sym, qty);
+    if (qty <= 0) { r.error = "SL数量取整后为0，跳过"; return r; }
 
     std::ostringstream oss;
     oss << "symbol=" << sym

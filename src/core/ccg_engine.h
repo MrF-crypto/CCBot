@@ -134,6 +134,10 @@ struct CcgBot {
     bool   trend_bearish = false;
     std::chrono::steady_clock::time_point trend_time{};
 
+    // 在途首仓预占的保证金：首仓已派发但还没成交入账的窗口里，总保证金上限
+    // 检查要把它计入，否则多品种在同一 tick 窗口齐过闸会集体超限
+    double inflight_margin = 0;
+
     // 统计
     double realized_pnl = 0;
     int    cycle_count  = 0;
@@ -199,8 +203,9 @@ public:
     // 交易所实际持仓的精简视图（由应用层从 TradingClient::fetch_positions 转换）
     struct ExchangePos {
         std::string symbol;
-        int         direction = 0;   // 1=多 -1=空
-        double      qty       = 0;   // 绝对值
+        int         direction   = 0;   // 1=多 -1=空
+        double      qty         = 0;   // 绝对值
+        double      entry_price = 0;   // 交易所侧开仓均价（孤儿仓认领时用）
     };
     // 连接成功/重启恢复后调用一次，把本地跟踪的仓位和交易所实际持仓核对：
     //   本地有仓、交易所没有   → 外部已平仓：清空本地仓位并停止该bot（等人工确认，不自动重开）

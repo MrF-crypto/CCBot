@@ -16,6 +16,7 @@ struct HeadlessConfig {
     std::string state_path = "ccbot_state.json";   // 仓位运行时状态落盘路径，重启续跑用
     std::string log_path;                // 空=只输出到 stdout，不落盘
     std::vector<CcgConfig> bots;
+    std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 };
 
 // 从 JSON 文件加载配置；失败返回 false 并把原因写进 err

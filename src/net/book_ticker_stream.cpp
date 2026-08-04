@@ -190,7 +190,12 @@ BookTickerStream::Tick BookTickerStream::get(const std::string& symbol) const {
 
 double BookTickerStream::mid_price(const std::string& symbol) const {
     auto t = get(symbol);
-    return (t.valid) ? (t.bid + t.ask) / 2.0 : 0.0;
+    if (!t.valid) return 0.0;
+    // 陈旧保护：WS 半开/静默断流时 cache 里是冻结价（valid 永远为 true）——
+    // 超过10秒没有新包就视为无效，调用方会走 REST 标记价兜底。
+    // 否则引擎会拿"僵尸价格"做补仓/止盈/止损判定，实际行情暴跌时完全失明
+    if (now_ms() - t.recv_ms > 10000) return 0.0;
+    return (t.bid + t.ask) / 2.0;
 }
 
 } // namespace ccbot

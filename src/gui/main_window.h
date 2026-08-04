@@ -154,7 +154,8 @@ private:
         qint64 last_alert_ms  = 0;
     };
     std::map<std::string, SrState> srStates_;
-    int srTickCount_ = 0;
+    int srTickCount_    = 0;
+    int trendTickCount_ = 0;
 
     // ── 日志 ──
     QTextEdit* logBox_ = nullptr;

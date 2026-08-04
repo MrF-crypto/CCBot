@@ -130,6 +130,8 @@ int main(int argc, char** argv) {
     tc_cfg.api_secret = cfg.api_secret;
     tc_cfg.testnet    = cfg.testnet;
 
+    for (const auto& w : cfg.warnings) log_line("⚠ 配置警告: " + w, "WARN");
+
     auto client = std::make_shared<TradingClient>(tc_cfg);
     client->sync_server_time();
     auto info = client->fetch_account();
@@ -138,6 +140,7 @@ int main(int argc, char** argv) {
         if (!cfg.alert_webhook.empty()) {
             send_webhook(cfg.alert_webhook, "[ccbot] 启动时连接失败: " + info.error);
         }
+        { std::error_code ec; std::filesystem::remove(lock_path, ec); }
         return 1;
     }
     log_line("连接成功 | " + std::string(cfg.testnet ? "测试网" : "主网") +
@@ -209,7 +212,7 @@ int main(int argc, char** argv) {
     {
         auto ex_pos = client->fetch_positions();
         std::vector<CcgEngine::ExchangePos> ex;
-        for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty});
+        for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
         auto issues = engine->reconcile_positions(ex);
         if (!issues.empty()) {
             save_headless_state(cfg.state_path, engine->get_bots());   // 把收敛后的状态立刻落盘
@@ -229,6 +232,17 @@ int main(int argc, char** argv) {
 
     log_line("主循环启动，Ctrl+C 退出");
 
+    // 数据拉取专用线程池（与引擎下单池分离）：指标/SR/趋势/心跳都是几百毫秒~几秒的
+    // 阻塞网络调用，原先在主循环里串行执行，行情剧烈+网络劣化时会把价格喂入和
+    // 止损/止盈判定饿死几十秒——现在价格喂入永远最先、拉取全部异步。
+    // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
+    // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
+    std::atomic<bool> ind_busy{false}, sr_busy{false}, trend_busy{false}, hb_busy{false};
+    std::mutex sr_mtx;   // sr_zones_map 由拉取线程写、主循环读
+    std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
+    std::map<std::string, std::pair<double, int64_t>>  sr_alert_dedup; // sym→{mid,ms}（仅主循环访问）
+    auto fetch_pool = std::make_shared<ThreadPool>(2);
+
     int tick_n = 0;
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -236,88 +250,132 @@ int main(int argc, char** argv) {
 
         auto bots = engine->get_bots();
 
-        // 指标拉取（公开接口，不占签名限流）：等首单信号的 bot + 动态W模式的 bot
-        // （动态模式持仓中也要持续拉取——补仓锚定下轨/止盈锚定上轨都依赖实时轨道）
-        for (const auto& b : bots) {
-            if (b.state == CcgBot::State::Running &&
-                ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
-                 b.cfg.dynamic_band_mode)) {
-                auto snap = client->fetch_indicators(b.cfg.symbol, b.cfg.kline_interval,
-                                                      b.cfg.boll_period, b.cfg.boll_mult,
-                                                      b.cfg.rsi_period);
-                if (snap.ok) engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
-            }
-        }
-
-        // SR雷达（影子模式）：区域每 300 tick（约15分钟）重算；触区检查每tick本地做
-        static std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
-        static std::map<std::string, std::pair<double, int64_t>>  sr_alert_dedup; // sym→{mid,ms}
-        if ((tick_n - 1) % 300 == 0) {
-            for (const auto& b : bots) {
-                if (b.state == CcgBot::State::Stopped || !b.cfg.sr_radar) continue;
-                auto raw = client->fetch_bars(b.cfg.symbol, b.cfg.sr_interval, 400);
-                if (raw.size() < 50) continue;
-                std::vector<srzones::Bar> sbars;
-                sbars.reserve(raw.size());
-                for (const auto& r : raw) sbars.push_back({r.open, r.high, r.low, r.close, r.volume});
-                sr_zones_map[b.cfg.symbol] = srzones::detect_zones(sbars);
-            }
-        }
-        for (const auto& [sym, zones] : sr_zones_map) {
-            double price = ticker.mid_price(sym);
-            if (price <= 0) continue;
-            for (const auto& z : zones) {
-                if (!z.contains(price)) continue;
-                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                auto& [last_mid, last_ms] = sr_alert_dedup[sym];
-                bool same = std::fabs(z.mid() - last_mid) < 1e-9;
-                if (same && now_ms - last_ms < 2 * 3600 * 1000) break;
-                last_mid = z.mid(); last_ms = now_ms;
-                std::ostringstream ss;
-                int conf = z.confluence();
-                ss << "[SR雷达] " << sym << " 价格 " << price << " 进入区域["
-                   << srzones::src_label(z);
-                if (conf >= 2) ss << " ×" << conf << "共振";
-                ss << "]（" << z.lo << " ~ " << z.hi << "，评分" << z.score
-                   << "，触碰" << z.touches << "次）";
-                log_line(ss.str(), "WARN");
-                if (!webhook.empty()) {
-                    std::thread([w = webhook, text = ss.str()]() { send_webhook(w, text); }).detach();
-                }
-                break;
-            }
-        }
-
-        // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次；首个tick立刻拉
-        if ((tick_n - 1) % 100 == 0) {
-            for (const auto& b : bots) {
-                if (b.state == CcgBot::State::Stopped || !b.cfg.use_trend_filter) continue;
-                auto t = client->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
-                                              b.cfg.trend_ema_period);
-                if (t.ok) engine->update_trend(b.bot_id, t.bearish);
-            }
-        }
-
+        // ── 1) 价格喂入 + 策略判定：永远最先执行，不被任何数据拉取阻塞 ────────
         for (const auto& sym : symbols) {
-            double price = ticker.mid_price(sym);
+            double price = ticker.mid_price(sym);   // 内置10秒陈旧保护，冻结价返回0
             if (price <= 0) price = client->fetch_mark_price(sym);
             if (price > 0) engine->tick(sym, price);
         }
 
+        // ── 2) 指标拉取（异步，busy标记防任务堆积）───────────────────────────
+        if (!ind_busy.load()) {
+            std::vector<CcgBot> need;
+            for (const auto& b : bots)
+                if (b.state == CcgBot::State::Running &&
+                    ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
+                     b.cfg.dynamic_band_mode))
+                    need.push_back(b);
+            if (!need.empty()) {
+                ind_busy.store(true);
+                fetch_pool->submit([client, engine, need, &ind_busy]() {
+                    for (const auto& b : need) {
+                        auto snap = client->fetch_indicators(b.cfg.symbol, b.cfg.kline_interval,
+                                                              b.cfg.boll_period, b.cfg.boll_mult,
+                                                              b.cfg.rsi_period);
+                        if (snap.ok) engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
+                    }
+                    ind_busy.store(false);
+                });
+            }
+        }
+
+        // ── 3) SR雷达重算（每约15分钟，异步）；触区检查每tick本地做（零开销）──
+        if ((tick_n - 1) % 300 == 0 && !sr_busy.load()) {
+            std::vector<std::pair<std::string, std::string>> radar;   // sym, interval
+            for (const auto& b : bots)
+                if (b.state != CcgBot::State::Stopped && b.cfg.sr_radar)
+                    radar.push_back({b.cfg.symbol, b.cfg.sr_interval});
+            if (!radar.empty()) {
+                sr_busy.store(true);
+                fetch_pool->submit([client, radar, &sr_mtx, &sr_zones_map, &sr_busy]() {
+                    for (const auto& [sym, interval] : radar) {
+                        auto raw = client->fetch_bars(sym, interval, 400);
+                        if (raw.size() < 50) continue;
+                        std::vector<srzones::Bar> sbars;
+                        sbars.reserve(raw.size());
+                        for (const auto& r : raw) sbars.push_back({r.open, r.high, r.low, r.close, r.volume});
+                        auto zones = srzones::detect_zones(sbars);
+                        std::lock_guard<std::mutex> lk(sr_mtx);
+                        sr_zones_map[sym] = std::move(zones);
+                    }
+                    sr_busy.store(false);
+                });
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(sr_mtx);
+            for (const auto& [sym, zones] : sr_zones_map) {
+                double price = ticker.mid_price(sym);
+                if (price <= 0) continue;
+                for (const auto& z : zones) {
+                    if (!z.contains(price)) continue;
+                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    auto& [last_mid, last_ms] = sr_alert_dedup[sym];
+                    bool same = std::fabs(z.mid() - last_mid) < 1e-9;
+                    if (same && now_ms - last_ms < 2 * 3600 * 1000) break;
+                    last_mid = z.mid(); last_ms = now_ms;
+                    std::ostringstream ss;
+                    int conf = z.confluence();
+                    ss << "[SR雷达] " << sym << " 价格 " << price << " 进入区域["
+                       << srzones::src_label(z);
+                    if (conf >= 2) ss << " ×" << conf << "共振";
+                    ss << "]（" << z.lo << " ~ " << z.hi << "，评分" << z.score
+                       << "，触碰" << z.touches << "次）";
+                    log_line(ss.str(), "WARN");
+                    if (!webhook.empty()) {
+                        std::thread([w = webhook, text = ss.str()]() { send_webhook(w, text); }).detach();
+                    }
+                    break;
+                }
+            }
+        }
+
+        // ── 4) 趋势状态机（每约5分钟，异步）──────────────────────────────────
+        if ((tick_n - 1) % 100 == 0 && !trend_busy.load()) {
+            std::vector<CcgBot> need;
+            for (const auto& b : bots)
+                if (b.state != CcgBot::State::Stopped && b.cfg.use_trend_filter)
+                    need.push_back(b);
+            if (!need.empty()) {
+                trend_busy.store(true);
+                fetch_pool->submit([client, engine, need, &trend_busy]() {
+                    for (const auto& b : need) {
+                        auto t = client->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
+                                                      b.cfg.trend_ema_period);
+                        if (t.ok) engine->update_trend(b.bot_id, t.bearish);
+                    }
+                    trend_busy.store(false);
+                });
+            }
+        }
+
+        // ── 5) 状态落盘：脏标记触发之外每约1分钟强制存一次——tp_extreme/interval_hit
+        //     这类追踪变量的变化不产生日志（不置脏），只靠脏标记会永远丢失 ─────
+        if (tick_n % 20 == 0) state_dirty.store(true);
         if (state_dirty.exchange(false)) {
             save_headless_state(cfg.state_path, engine->get_bots());
         }
 
-        // 每 20 个 tick（约1分钟）打一次心跳，确认程序还活着、网络还通
-        if (tick_n % 20 == 0) {
-            auto acc = client->fetch_account();
-            if (acc.ok) {
-                log_line("心跳 | 权益 $" + std::to_string(acc.total_equity) +
-                         " | 可用 $" + std::to_string(acc.available));
-            } else {
-                log_line("心跳失败（网络异常?): " + acc.error, "ERR");
-            }
+        // ── 6) 心跳（异步，约1分钟一次）─────────────────────────────────────
+        if (tick_n % 20 == 0 && !hb_busy.load()) {
+            hb_busy.store(true);
+            fetch_pool->submit([client, &hb_busy]() {
+                auto acc = client->fetch_account();
+                if (acc.ok) {
+                    log_line("心跳 | 权益 $" + std::to_string(acc.total_equity) +
+                             " | 可用 $" + std::to_string(acc.available));
+                } else {
+                    log_line("心跳失败（网络异常?): " + acc.error, "ERR");
+                }
+                hb_busy.store(false);
+            });
+        }
+
+        // ── 7) 服务器时间重对时（约1小时一次）：时钟漂移超 recvWindow 会让所有
+        //     签名请求集体失败 ────────────────────────────────────────────────
+        if (tick_n % 1200 == 0) {
+            fetch_pool->submit([client]() { client->sync_server_time(); });
         }
     }
 
