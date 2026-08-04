@@ -101,10 +101,11 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v2.7.2");
+    setWindowTitle("CCG 合约监控  v2.8");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
+    migrate_appdata_if_needed();   // 老版本AppData数据一次性搬到程序目录data/
     load_credentials();
     load_trades();
     load_settings();
@@ -123,34 +124,68 @@ MainWindow::~MainWindow() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 路径辅助
+// 路径辅助（便携模式）
 // ─────────────────────────────────────────────────────────────────────────────
+// 数据目录 = 程序所在目录下的 data 子目录：策略配置、交易明细、API凭证、日志
+// 全部集中在这里——整个程序文件夹拷走就是完整备份（API凭证仍是DPAPI加密，换机
+// 需重新输入）。程序目录不可写时（如装进 Program Files）自动回退到系统 AppData
+QString MainWindow::portable_data_dir() {
+    static QString cached;
+    if (!cached.isEmpty()) return cached;
+
+    QString portable = QCoreApplication::applicationDirPath() + "/data";
+    if (QDir().mkpath(portable)) {
+        QFile probe(portable + "/.write_test");
+        if (probe.open(QIODevice::WriteOnly)) {
+            probe.close();
+            probe.remove();
+            cached = portable;
+            return cached;
+        }
+    }
+    QString fallback = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(fallback);
+    cached = fallback;
+    return cached;
+}
+
+// 一次性迁移：老版本数据在系统 AppData 里，新数据目录还是空的话自动搬过来，
+// 升级用户的策略/明细/凭证无感继承
+void MainWindow::migrate_appdata_if_needed() {
+    QString dst = portable_data_dir();
+    QString old = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (dst == old) return;                                // 回退模式，无需迁移
+    if (QFile::exists(dst + "/ccg_bots.json")) return;     // 新目录已有数据，不动
+
+    int n = 0;
+    for (const char* f : {"ccg_creds.dat", "ccg_bots.json", "ccg_trades.json",
+                          "ccg_settings.json"}) {
+        QString src = old + "/" + f;
+        if (QFile::exists(src) && QFile::copy(src, dst + "/" + f)) ++n;
+    }
+    if (n > 0)
+        log(QString("已从旧数据目录迁移 %1 个文件到程序目录 data/（原文件保留在 %2）")
+            .arg(n).arg(old), "OK");
+}
+
 std::string MainWindow::cred_path() const {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    return (dir + "/ccg_creds.dat").toStdString();
+    return (portable_data_dir() + "/ccg_creds.dat").toStdString();
 }
 
 std::string MainWindow::bot_cfg_path() const {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    return (dir + "/ccg_bots.json").toStdString();
+    return (portable_data_dir() + "/ccg_bots.json").toStdString();
 }
 
 std::string MainWindow::trade_path() const {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    return (dir + "/ccg_trades.json").toStdString();
+    return (portable_data_dir() + "/ccg_trades.json").toStdString();
 }
 
 std::string MainWindow::settings_path() const {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    return (dir + "/ccg_settings.json").toStdString();
+    return (portable_data_dir() + "/ccg_settings.json").toStdString();
 }
 
 std::string MainWindow::log_path() const {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/logs";
+    QString dir = portable_data_dir() + "/logs";
     QDir().mkpath(dir);
     QString file = QDateTime::currentDateTime().toString("yyyyMMdd");
     return (dir + "/ccg_" + file + ".log").toStdString();

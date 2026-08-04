@@ -35,6 +35,9 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
 
+    // 数据目录（便携模式）：main.cpp 的单实例锁也用它，故公开
+    static QString portable_data_dir();
+
 private slots:
     void onConnect();
     void onStopAll();
@@ -66,7 +69,8 @@ private:
     // 品种精度信息缓存未命中时，去后台线程取一次，绝不在 GUI 线程同步阻塞等待
     void ensureSymbolInfoAsync(const std::string& symbol);
 
-    // 持久化
+    // 持久化（便携模式：数据存程序目录 data/ 下，不可写时回退 AppData）
+    void migrate_appdata_if_needed();
     std::string cred_path()     const;
     std::string bot_cfg_path()  const;
     std::string trade_path()   const;

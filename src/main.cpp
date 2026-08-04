@@ -14,9 +14,9 @@ int main(int argc, char* argv[]) {
     app.setOrganizationName("CCGMonitor");
 
     // 单实例锁：同一台机器双开会各自独立决策、对同一账户重复下单。
-    // QLockFile 自带陈旧锁检测（崩溃残留的锁会被自动接管），正常运行的实例则拒绝二开
-    QString lockDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(lockDir);
+    // QLockFile 自带陈旧锁检测（崩溃残留的锁会被自动接管），正常运行的实例则拒绝二开。
+    // 锁放数据目录（便携模式=程序目录data/）：同一份数据目录只允许一个实例
+    QString lockDir = ccg::MainWindow::portable_data_dir();
     QLockFile instanceLock(lockDir + "/ccbot.lock");
     if (!instanceLock.tryLock(100)) {
         QMessageBox::critical(nullptr, "CCG 合约监控",
