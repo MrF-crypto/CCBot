@@ -210,8 +210,10 @@ inline std::vector<Zone> detect_fib(const std::vector<Bar>& bars, double atr_val
 
 // ── 共振合并：不同来源的区域若价位重叠则合并成一个区域——
 //    来源掩码取并集、评分累加，最后按共振数加权（每多一种独立来源 +50%）。
-//    "≥2种点位叠在同一价位"共振越多的区域越硬，排序自然靠前 ───────────────────
-inline std::vector<Zone> merge_zones(std::vector<Zone> zones) {
+//    "≥2种点位叠在同一价位"共振越多的区域越硬，排序自然靠前。
+//    max_span：合并后区间的宽度上限（0=不限）。没有上限的话大簇会链式吞并
+//    邻近区域滚成横跨几个百分点的巨型区，"触区告警"就失去意义了 ────────────────
+inline std::vector<Zone> merge_zones(std::vector<Zone> zones, double max_span = 0) {
     std::sort(zones.begin(), zones.end(),
               [](const Zone& a, const Zone& b) { return a.score > b.score; });
     std::vector<Zone> merged;
@@ -219,12 +221,15 @@ inline std::vector<Zone> merge_zones(std::vector<Zone> zones) {
         bool absorbed = false;
         for (auto& m : merged) {
             if (z.lo <= m.hi && z.hi >= m.lo) {   // 区间重叠
+                double new_lo = std::min(m.lo, z.lo);
+                double new_hi = std::max(m.hi, z.hi);
+                if (max_span > 0 && new_hi - new_lo > max_span) continue;  // 并集超宽，不吞并
                 m.src_mask |= z.src_mask;
                 m.flipped   = m.flipped || z.flipped;
                 m.score    += z.score * 0.8;
                 m.touches  += z.touches;
-                m.lo = std::min(m.lo, z.lo);
-                m.hi = std::max(m.hi, z.hi);
+                m.lo = new_lo;
+                m.hi = new_hi;
                 absorbed = true;
                 break;
             }
@@ -268,10 +273,16 @@ inline std::vector<Zone> detect_zones(const std::vector<Bar>& bars,
     std::sort(pivs.begin(), pivs.end(),
               [](const Piv& x, const Piv& y) { return x.price < y.price; });
 
+    // 簇总宽度上限：相邻间距达标不代表可以无限链式合并——长期盘整区的摆动点
+    // 会像多米诺一样链成横跨半张图的巨型簇（每环都≤tol但总长失控），必须封顶
+    const double span_cap = a * 1.5;
+
     size_t start = 0;
     while (start < pivs.size()) {
         size_t end = start;
-        while (end + 1 < pivs.size() && pivs[end + 1].price - pivs[end].price <= tol) ++end;
+        while (end + 1 < pivs.size() &&
+               pivs[end + 1].price - pivs[end].price <= tol &&
+               pivs[end + 1].price - pivs[start].price <= span_cap) ++end;
 
         Zone z;
         z.lo = pivs[start].price;
@@ -309,8 +320,8 @@ inline std::vector<Zone> detect_zones(const std::vector<Bar>& bars,
     for (auto& z : detect_poc(bars, a))       zones.push_back(z);
     for (auto& z : detect_fib(bars, a))       zones.push_back(z);
 
-    // 共振合并：跨来源重叠的区域合成一个，共振数加权后重新排序
-    zones = merge_zones(std::move(zones));
+    // 共振合并：跨来源重叠的区域合成一个（并集宽度封顶 2×ATR），共振数加权后重新排序
+    zones = merge_zones(std::move(zones), a * 2.0);
     if ((int)zones.size() > max_zones) zones.resize(max_zones);
     return zones;
 }

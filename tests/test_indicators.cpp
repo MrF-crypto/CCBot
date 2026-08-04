@@ -218,6 +218,28 @@ int main() {
             CHECK((top->src_mask & sz::SrcSwing) && (top->src_mask & sz::SrcFib),
                   "合并区来源掩码应含摆动+斐波");
         }
+
+        // 合并宽度封顶：并集若超过 max_span 就不吞并，防止巨型区域
+        sz::Zone w1; w1.lo = 100;   w1.hi = 101; w1.score = 3.0; w1.src_mask = sz::SrcSwing;
+        sz::Zone w2; w2.lo = 100.8; w2.hi = 103; w2.score = 1.0; w2.src_mask = sz::SrcFVG;
+        CHECK(sz::merge_zones({w1, w2}, 0).size() == 1,   "无上限时重叠区应合并");
+        CHECK(sz::merge_zones({w1, w2}, 2.0).size() == 2, "并集超过max_span时不应吞并");
+
+        // 巨型簇不变量：密集摆动点链式聚类后，任何区域宽度都不得超过 2×ATR
+        // （实盘曾出现横跨7%价格的巨型区，触区告警失去意义——本断言是回归保护）
+        std::vector<sz::Bar> dense;
+        for (int i = 0; i < 66; ++i) dense.push_back({105, 106, 104, 105, 1000});
+        for (int k = 0; k < 10; ++k) {
+            double lowk = 90.0 + k;                    // 90,91,...,99 密集链
+            dense[6 + k * 6] = {104, 105, lowk, 101, 1500};
+        }
+        double datr = sz::atr(dense, 14);
+        auto dzones = sz::detect_zones(dense, 3, 0.5, 12);
+        bool width_ok = true;
+        for (const auto& z : dzones)
+            if (z.hi - z.lo > datr * 2.0 + 1e-9) width_ok = false;
+        CHECK(!dzones.empty(), "密集链数据应产生区域");
+        CHECK(width_ok, "任何区域宽度不得超过2×ATR（巨型簇回归保护）");
     }
 
     if (g_fail == 0) {
