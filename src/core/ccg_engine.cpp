@@ -802,13 +802,21 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                 layers      = (int)bot.entries.size();
             }
 
-            bool   closed_ok  = false;
+            bool   closed_ok      = false;
+            bool   external_gone  = false;   // 交易所确认无此仓位（外部已平仓）
             double closed_qty = 0;   // 实际平掉的数量（可能是部分成交）
             if (total_qty > 0) {
                 const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                          ? "SELL" : "BUY";
                 double qty = client_->round_qty(cfg.symbol, total_qty);
                 auto r = client_->place_market(cfg.symbol, side, qty, true);
+                if (!r.ok && r.error.find("[-2022]") != std::string::npos) {
+                    // reduceOnly被拒 = 交易所侧没有可平的仓位（用户在交易所手动平过/
+                    // 强平过）。本地留着这个幽灵仓位会陷入无限重试（追踪止盈/硬止损
+                    // 每tick再触发-2022），且用户手动平仓也平不掉——按启动对账同款
+                    // 策略：清空本地状态并停止该bot，等人工确认后手动"继续"
+                    external_gone = true;
+                }
                 if (r.ok) {
                     // 只认交易所回报的实际成交量：0 = 没成交（如市价单无流动性EXPIRED），
                     // 视为失败留到下个tick重试，绝不能假设"下了单=平掉了"
@@ -839,6 +847,20 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                 auto& bot = it->second;
                 bot.pending = false;
                 cb_copy = trade_cb_;
+
+                // 交易所确认无此仓位：清空本地跟踪并停止（同启动对账的外部平仓处理）
+                if (external_gone) {
+                    bot.entries.clear();
+                    bot.total_qty = bot.total_cost = bot.avg_price = 0;
+                    bot.interval_hit = bot.tp_reached = false;
+                    bot.ind_dipped = false;
+                    bot.last_entry_price = 0;
+                    bot.state = CcgBot::State::Stopped;
+                    bot.last_action = "交易所无此仓位，已清空并停止";
+                    log("⚠ " + cfg.symbol + " 平仓被拒[-2022]：交易所已无此仓位（外部手动"
+                        "平仓/强平?）。本地状态已清空、bot已停止——确认无误后可点【继续】重新启用");
+                    return;
+                }
 
                 // 灰尘结算：剩余量取整后低于最小下单量时永远无法平掉，若按"部分成交"
                 // 处理会陷入每 tick 重试的死循环——把灰尘视为已平清，正常结算本轮
