@@ -2,6 +2,7 @@
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
 #include "core/ccg_engine.h"
 #include "core/sr_zones.h"
+#include "core/decision.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
 #include "net/book_ticker_stream.h"
@@ -238,8 +239,9 @@ int main(int argc, char** argv) {
     // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     std::atomic<bool> ind_busy{false}, sr_busy{false}, trend_busy{false}, hb_busy{false};
-    std::mutex sr_mtx;   // sr_zones_map 由拉取线程写、主循环读
+    std::mutex sr_mtx;   // sr_zones_map/sr_atr_map 由拉取线程写、主循环读
     std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
+    std::map<std::string, double> sr_atr_map;   // 区域计算时的ATR（结构止损位推导）
     // 告警去重：sym → (区域mid×1e4 → 上次告警ms)。每区域独立冷却，防边界横跳刷屏
     std::map<std::string, std::map<long long, int64_t>> sr_alert_dedup;
     auto fetch_pool = std::make_shared<ThreadPool>(2);
@@ -256,6 +258,25 @@ int main(int argc, char** argv) {
             double price = ticker.mid_price(sym);   // 内置10秒陈旧保护，冻结价返回0
             if (price <= 0) price = client->fetch_mark_price(sym);
             if (price > 0) engine->tick(sym, price);
+        }
+
+        // ── 1b) v3.0 结构摘要喂入（纯本地计算）────────────────────────────────
+        {
+            std::lock_guard<std::mutex> lk(sr_mtx);
+            if (!sr_zones_map.empty()) {
+                for (const auto& b : bots) {
+                    auto zit = sr_zones_map.find(b.cfg.symbol);
+                    if (zit == sr_zones_map.end() || zit->second.empty()) continue;
+                    double price = ticker.mid_price(b.cfg.symbol);
+                    if (price <= 0) continue;
+                    auto dg = decision::digest_zones(zit->second, price, b.cfg.sr_min_confluence);
+                    double atr = sr_atr_map.count(b.cfg.symbol) ? sr_atr_map[b.cfg.symbol] : 0;
+                    double stop_level = (dg.deep_sup_lo > 0 && atr > 0)
+                                        ? dg.deep_sup_lo - 0.25 * atr : 0;
+                    engine->update_sr_structure(b.bot_id, dg.at_support, dg.sup_hi,
+                                                dg.res_lo, stop_level);
+                }
+            }
         }
 
         // ── 2) 指标拉取（异步，busy标记防任务堆积）───────────────────────────
@@ -288,7 +309,7 @@ int main(int argc, char** argv) {
                     radar.push_back({b.cfg.symbol, b.cfg.sr_interval});
             if (!radar.empty()) {
                 sr_busy.store(true);
-                fetch_pool->submit([client, radar, &sr_mtx, &sr_zones_map, &sr_busy]() {
+                fetch_pool->submit([client, radar, &sr_mtx, &sr_zones_map, &sr_atr_map, &sr_busy]() {
                     for (const auto& [sym, interval] : radar) {
                         auto raw = client->fetch_bars(sym, interval, 400);
                         if (raw.size() < 50) continue;
@@ -296,8 +317,10 @@ int main(int argc, char** argv) {
                         sbars.reserve(raw.size());
                         for (const auto& r : raw) sbars.push_back({r.open, r.high, r.low, r.close, r.volume});
                         auto zones = srzones::detect_zones(sbars);
+                        double atr  = srzones::atr(sbars, 14);
                         std::lock_guard<std::mutex> lk(sr_mtx);
                         sr_zones_map[sym] = std::move(zones);
+                        sr_atr_map[sym]   = atr;
                     }
                     sr_busy.store(false);
                 });
@@ -335,19 +358,29 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ── 4) 趋势状态机（每约5分钟，异步）──────────────────────────────────
+        // ── 4) 趋势状态机 + v3.0日线%B（每约5分钟，异步同班车）────────────────
         if ((tick_n - 1) % 100 == 0 && !trend_busy.load()) {
-            std::vector<CcgBot> need;
-            for (const auto& b : bots)
-                if (b.state != CcgBot::State::Stopped && b.cfg.use_trend_filter)
-                    need.push_back(b);
-            if (!need.empty()) {
+            std::vector<CcgBot> need, htf_need;
+            for (const auto& b : bots) {
+                if (b.state == CcgBot::State::Stopped) continue;
+                if (b.cfg.use_trend_filter) need.push_back(b);
+                if (b.state == CcgBot::State::Running && b.entries.empty() && b.cfg.use_htf_filter)
+                    htf_need.push_back(b);
+            }
+            if (!need.empty() || !htf_need.empty()) {
                 trend_busy.store(true);
-                fetch_pool->submit([client, engine, need, &trend_busy]() {
+                fetch_pool->submit([client, engine, need, htf_need, &trend_busy]() {
                     for (const auto& b : need) {
                         auto t = client->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
                                                       b.cfg.trend_ema_period);
                         if (t.ok) engine->update_trend(b.bot_id, t.bearish);
+                    }
+                    for (const auto& b : htf_need) {
+                        auto snap = client->fetch_indicators(b.cfg.symbol, b.cfg.htf_interval,
+                                                              20, 2.0, 14);
+                        if (!snap.ok) continue;
+                        double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
+                        engine->update_htf(b.bot_id, pb);
                     }
                     trend_busy.store(false);
                 });

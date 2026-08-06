@@ -82,6 +82,19 @@ struct CcgConfig {
     // 执行接线是后续阶段的事。检测计算在应用层（GUI/headless），引擎只存配置
     bool        sr_radar    = false;
     std::string sr_interval = "4h";
+
+    // ── v3.0 三层决策（宏观%B + 结构定位）────────────────────────────────────
+    // smart_gates=false（默认）：纯影子——首仓派发时记录三层判定快照，不拦截，
+    // 行为与 v2.9.x 完全一致；true：新增两层开始真实拦截（趋势/指标层沿用原开关）
+    bool        smart_gates        = false;
+    bool        use_htf_filter     = true;    // 宏观：日线%B过滤（smart_gates开启后参与）
+    std::string htf_interval       = "1d";
+    double      htf_pos_max        = 0.80;    // 自由参数①：%B高于此值拦新首仓（做多）
+    bool        use_sr_gate        = true;    // 结构：支撑质量+净空检查
+    int         sr_min_confluence  = 2;       // 够格区域的最低共振数
+    double      sr_headroom_ratio  = 1.5;     // 自由参数②：净空÷止盈距离下限
+    bool        use_sr_exit        = false;   // 止盈锚定阻力区（独立开关，默认关）
+    bool        use_structural_stop = false;  // 结构性止损（独立开关，默认关，仅动态W模式）
 };
 
 // ─── 单笔加仓记录 ──────────────────────────────────────────────────────────────
@@ -133,6 +146,23 @@ struct CcgBot {
     // 趋势状态机快照（use_trend_filter 时由外层定期拉取写入）
     bool   trend_bearish = false;
     std::chrono::steady_clock::time_point trend_time{};
+
+    // ── v3.0 结构快照（应用层喂入）────────────────────────────────────────────
+    // 宏观：日线%B
+    bool   htf_ok    = false;
+    double htf_pct_b = 0.5;
+    std::chrono::steady_clock::time_point htf_time{};
+    // 结构：相对现价的区域摘要（应用层用 decision::digest_zones 算好推进来）
+    bool   sr_ok       = false;
+    bool   sr_at_support = false;
+    double sr_sup_hi   = 0;     // 下方最近够格支撑区上沿（0=无；空头净空计算用）
+    double sr_res_lo   = 0;     // 上方最近够格阻力区下沿（0=无）
+    double sr_stop_level = 0;   // 结构止损参考位（最深支撑下沿-0.25×ATR，0=无）
+    std::chrono::steady_clock::time_point sr_time{};
+    // 结构止损：持续跌破计数（插针防护——连续N个tick才触发）
+    int    struct_stop_ticks = 0;
+    // 止盈锚（激活追踪那一刻锁定，防止区域重算把锚抽走）
+    double tp_anchor = 0;
 
     // 在途首仓预占的保证金：首仓已派发但还没成交入账的窗口里，总保证金上限
     // 检查要把它计入，否则多品种在同一 tick 窗口齐过闸会集体超限
@@ -219,6 +249,11 @@ public:
 
     // 写入趋势状态机快照（use_trend_filter 的 bot 由外层每几分钟拉取一次高周期趋势后回调）
     void update_trend(const std::string& bot_id, bool bearish);
+
+    // ── v3.0 结构数据写入（应用层喂入，同指标/趋势的快照模式）────────────────
+    void update_htf(const std::string& bot_id, double pct_b);
+    void update_sr_structure(const std::string& bot_id, bool at_support,
+                             double sup_hi, double res_lo, double stop_level);
 
     // ── 工具 ──────────────────────────────────────────────────────────────────
     static std::vector<double> entry_usdt(const CcgConfig& cfg);  // 各层 USDT 分配

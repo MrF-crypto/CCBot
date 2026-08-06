@@ -41,7 +41,13 @@
       "trend_ema_period": 200,
 
       "sr_radar": false,
-      "sr_interval": "4h"
+      "sr_interval": "4h",
+
+      "smart_gates": false,
+      "htf_pos_max": 0.80,
+      "sr_headroom_ratio": 1.5,
+      "use_sr_exit": false,
+      "use_structural_stop": false
     }
   ]
 }

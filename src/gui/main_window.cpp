@@ -1,6 +1,7 @@
 #include "gui/main_window.h"
 #include "core/key_store.h"
 #include "net/alert.h"
+#include "core/decision.h"
 
 #include <QApplication>
 #include <QVBoxLayout>
@@ -101,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v2.9.3");
+    setWindowTitle("CCG 合约监控  v3.0");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -297,6 +298,15 @@ void MainWindow::save_bots() {
         o["trend_ema_period"]  = c.trend_ema_period;
         o["sr_radar"]          = c.sr_radar;
         o["sr_interval"]       = QString::fromStdString(c.sr_interval);
+        o["smart_gates"]         = c.smart_gates;
+        o["use_htf_filter"]      = c.use_htf_filter;
+        o["htf_interval"]        = QString::fromStdString(c.htf_interval);
+        o["htf_pos_max"]         = c.htf_pos_max;
+        o["use_sr_gate"]         = c.use_sr_gate;
+        o["sr_min_confluence"]   = c.sr_min_confluence;
+        o["sr_headroom_ratio"]   = c.sr_headroom_ratio;
+        o["use_sr_exit"]         = c.use_sr_exit;
+        o["use_structural_stop"] = c.use_structural_stop;
 
         // 持仓/状态快照 —— 没有这些字段的话，App 重启后本地均价/持仓量会从零重新累积，
         // 跟交易所实际仓位脱节（这正是均价跟交易所对不上的根因之一）
@@ -380,6 +390,15 @@ void MainWindow::load_and_restore_bots() {
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
         c.sr_radar          = o["sr_radar"].toBool(false);
         c.sr_interval       = o["sr_interval"].toString("4h").toStdString();
+        c.smart_gates         = o["smart_gates"].toBool(false);
+        c.use_htf_filter      = o["use_htf_filter"].toBool(true);
+        c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
+        c.htf_pos_max         = o["htf_pos_max"].toDouble(0.80);
+        c.use_sr_gate         = o["use_sr_gate"].toBool(true);
+        c.sr_min_confluence   = o["sr_min_confluence"].toInt(2);
+        c.sr_headroom_ratio   = o["sr_headroom_ratio"].toDouble(1.5);
+        c.use_sr_exit         = o["use_sr_exit"].toBool(false);
+        c.use_structural_stop = o["use_structural_stop"].toBool(false);
         if (c.symbol.empty()) continue;
 
         CcgBot bot;
@@ -1106,9 +1125,11 @@ void MainWindow::refreshSrZones() {
             bars.reserve(raw.size());
             for (const auto& r : raw) bars.push_back({r.open, r.high, r.low, r.close, r.volume});
             auto zones = srzones::detect_zones(bars);
-            QMetaObject::invokeMethod(this, [this, sym, zones = std::move(zones)]() {
+            double atr = srzones::atr(bars, 14);
+            QMetaObject::invokeMethod(this, [this, sym, atr, zones = std::move(zones)]() {
                 auto& st = srStates_[sym];
                 st.zones       = zones;
+                st.atr         = atr;
                 st.computed_ms = QDateTime::currentMSecsSinceEpoch();
             }, Qt::QueuedConnection);
         }
@@ -1457,6 +1478,24 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "趋势数据每5分钟刷新一次；数据缺失时过滤自动失效，不会卡死交易。");
     form->addRow("", trendBox);
 
+    // ── v3.0 三层决策 ────────────────────────────────────────────────────────
+    auto* smartBox = new QCheckBox("三层决策拦截（不勾=影子模式：每笔首仓只记判定快照，不拦截）");
+    smartBox->setChecked(prefill ? prefill->cfg.smart_gates : false);
+    smartBox->setToolTip(
+        "宏观层：日线%B高于阈值拦新首仓（大图景太贵不买小回调）。\n"
+        "结构层：脚下须有共振≥2的支撑区 + 头顶净空÷止盈距离≥下限（无空间不开）。\n"
+        "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受此项控制。\n"
+        "建议先影子跑两周，用日志里的[决策]快照统计后再勾选启用。");
+    form->addRow("", smartBox);
+    auto* htfMaxEdit   = mkEdit("日线%B拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.80);
+    auto* headroomEdit = mkEdit("净空比下限:",     prefill ? prefill->cfg.sr_headroom_ratio : 1.5);
+    auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
+    srExitBox->setChecked(prefill ? prefill->cfg.use_sr_exit : false);
+    form->addRow("", srExitBox);
+    auto* structStopBox = new QCheckBox("结构性止损（持续跌破最深支撑区约1分钟平仓停机，仅动态W+多头）");
+    structStopBox->setChecked(prefill ? prefill->cfg.use_structural_stop : false);
+    form->addRow("", structStopBox);
+
     dv->addLayout(form);
 
     // ── 指标信号配置（entryModeBox 选"指标信号"时才用得上）──────────────────────
@@ -1766,6 +1805,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.min_profit_floor  = to_d(floorEdit, 0.3);
     cfg.use_trend_filter  = trendBox->isChecked();
     cfg.sr_radar          = srBox->isChecked();
+    cfg.smart_gates         = smartBox->isChecked();
+    cfg.htf_pos_max         = to_d(htfMaxEdit,   0.80);
+    cfg.sr_headroom_ratio   = to_d(headroomEdit, 1.5);
+    cfg.use_sr_exit         = srExitBox->isChecked();
+    cfg.use_structural_stop = structStopBox->isChecked();
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -1773,11 +1817,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         c.direction = dir;
         QString dirName = (dir == CcgConfig::Direction::Short) ? "空" : "多";
         if (existing) {
-            // 弹窗没有这三项的输入控件，编辑保存时必须从原配置继承——
+            // 弹窗没有这些项的输入控件，编辑保存时必须从原配置继承——
             // 否则手改过 JSON 的值会被静默重置回默认
-            c.trend_interval   = existing->cfg.trend_interval;
-            c.trend_ema_period = existing->cfg.trend_ema_period;
-            c.sr_interval      = existing->cfg.sr_interval;
+            c.trend_interval    = existing->cfg.trend_interval;
+            c.trend_ema_period  = existing->cfg.trend_ema_period;
+            c.sr_interval       = existing->cfg.sr_interval;
+            c.use_htf_filter    = existing->cfg.use_htf_filter;
+            c.htf_interval      = existing->cfg.htf_interval;
+            c.use_sr_gate       = existing->cfg.use_sr_gate;
+            c.sr_min_confluence = existing->cfg.sr_min_confluence;
             engine_->update_bot_cfg(existing->bot_id, c);
             log(QString("%1 %2 策略已更新").arg(symQ).arg(dirName), "OK");
             if (!existing->entries.empty() && c.leverage != existing->cfg.leverage) {
@@ -1867,26 +1915,55 @@ void MainWindow::onTick() {
     if (srTickCount_++ % 300 == 0) refreshSrZones();
     checkSrTouches();
 
+    // v3.0 结构摘要喂入引擎：每tick按当前价重算"脚下支撑/头顶阻力/结构止损位"
+    // （纯本地计算零开销；区域本体15分钟一换，摘要跟着价格实时变）
+    if (engine_ && ticker_) {
+        for (const auto& b : engine_->get_bots()) {
+            auto sit = srStates_.find(b.cfg.symbol);
+            if (sit == srStates_.end() || sit->second.zones.empty()) continue;
+            double price = ticker_->mid_price(b.cfg.symbol);
+            if (price <= 0) continue;
+            auto dg = decision::digest_zones(sit->second.zones, price, b.cfg.sr_min_confluence);
+            double stop_level = (dg.deep_sup_lo > 0 && sit->second.atr > 0)
+                                ? dg.deep_sup_lo - 0.25 * sit->second.atr : 0;
+            engine_->update_sr_structure(b.bot_id, dg.at_support, dg.sup_hi,
+                                         dg.res_lo, stop_level);
+        }
+    }
+
     // 每小时重新对时一次：时钟漂移超过 recvWindow(5s) 会让所有签名请求集体失败
     if (srTickCount_ % 1200 == 0) {
         run_async([this]() { if (client_) client_->sync_server_time(); });
     }
 
     // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；
-    // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转
+    // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转。
+    // v3.0：日线%B（宏观层）搭同一班车——等首仓的 bot 每5分钟拉一次日线布林
     if (trendTickCount_++ % 100 == 0) {
-        std::vector<CcgBot> trend_bots;
-        for (const auto& b : bots)
-            if (b.state != CcgBot::State::Stopped && b.cfg.use_trend_filter)
-                trend_bots.push_back(b);
-        if (!trend_bots.empty()) {
-            run_async([this, trend_bots]() {
+        std::vector<CcgBot> trend_bots, htf_bots;
+        for (const auto& b : bots) {
+            if (b.state == CcgBot::State::Stopped) continue;
+            if (b.cfg.use_trend_filter) trend_bots.push_back(b);
+            if (b.entries.empty() && b.cfg.use_htf_filter && b.state == CcgBot::State::Running)
+                htf_bots.push_back(b);
+        }
+        if (!trend_bots.empty() || !htf_bots.empty()) {
+            run_async([this, trend_bots, htf_bots]() {
                 for (const auto& b : trend_bots) {
                     auto t = client_->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
                                                    b.cfg.trend_ema_period);
                     if (!t.ok) continue;
                     QMetaObject::invokeMethod(this, [this, bid = b.bot_id, bearish = t.bearish]() {
                         if (engine_) engine_->update_trend(bid, bearish);
+                    }, Qt::QueuedConnection);
+                }
+                for (const auto& b : htf_bots) {
+                    auto snap = client_->fetch_indicators(b.cfg.symbol, b.cfg.htf_interval,
+                                                           20, 2.0, 14);
+                    if (!snap.ok) continue;
+                    double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
+                    QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb]() {
+                        if (engine_) engine_->update_htf(bid, pb);
                     }, Qt::QueuedConnection);
                 }
             });

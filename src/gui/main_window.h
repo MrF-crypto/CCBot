@@ -149,6 +149,7 @@ private:
     // ── SR雷达状态（仅GUI线程访问）──
     struct SrState {
         std::vector<srzones::Zone> zones;
+        double atr = 0;           // 区域计算时的ATR（结构止损位推导用）
         qint64 computed_ms = 0;   // 上次重算时间
         // 告警去重：每个区域（按中点标识）独立记冷却时间。只记"上一个区域"的话，
         // 价格在两个相邻区域边界来回横跳会 A→B→A→B 每次都触发，十分钟刷几十条

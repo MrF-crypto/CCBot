@@ -4,6 +4,7 @@
 #include "core/indicators.h"
 #include "core/dynamic_params.h"
 #include "core/sr_zones.h"
+#include "core/decision.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -240,6 +241,58 @@ int main() {
             if (z.hi - z.lo > datr * 2.0 + 1e-9) width_ok = false;
         CHECK(!dzones.empty(), "密集链数据应产生区域");
         CHECK(width_ok, "任何区域宽度不得超过2×ATR（巨型簇回归保护）");
+    }
+
+    // ── v3.0 三层决策核 ──────────────────────────────────────────────────────
+    {
+        namespace dc = ccbot::decision;
+        // %B：0=下轨 1=上轨，可越界；非法输入返回负
+        CHECK(near(dc::pct_b(100, 90, 110), 0.5),  "%B 带中点应为0.5");
+        CHECK(near(dc::pct_b(110, 90, 110), 1.0),  "%B 上轨应为1.0");
+        CHECK(near(dc::pct_b(85, 90, 110), -0.25), "%B 跌破下轨应为负");
+        CHECK(dc::pct_b(100, 0, 110) < 0,          "%B 非法下轨应返回-1");
+
+        // 净空比
+        CHECK(near(dc::headroom_ratio(100, 103, 2.0), 1.5), "净空: 3距离/2目标=1.5");
+        CHECK(dc::headroom_ratio(100, 0, 2.0) >= 1e8,       "无阻力应为无限净空");
+        CHECK(dc::headroom_ratio(100, 103, 0) < 0,          "非法止盈距离应返回-1");
+
+        // 区域摘要：支撑[95,97]共振2、弱区[98,99]共振1、阻力[105,107]共振3、深支撑[80,82]共振2
+        auto mkz = [](double lo, double hi, unsigned mask) {
+            ccbot::srzones::Zone z; z.lo = lo; z.hi = hi; z.src_mask = mask; return z;
+        };
+        std::vector<ccbot::srzones::Zone> zs = {
+            mkz(95, 97,  ccbot::srzones::SrcSwing | ccbot::srzones::SrcFib),
+            mkz(98, 99,  ccbot::srzones::SrcFVG),
+            mkz(105, 107, ccbot::srzones::SrcSwing | ccbot::srzones::SrcPOC | ccbot::srzones::SrcFib),
+            mkz(80, 82,  ccbot::srzones::SrcSwing | ccbot::srzones::SrcPOC),
+        };
+        auto d = dc::digest_zones(zs, 100.0, 2);
+        CHECK(d.ok && !d.at_support,             "价格100不在任何够格区内");
+        CHECK(near(d.sup_hi, 97.0),              "下方最近够格支撑上沿应为97（弱区98-99被排除）");
+        CHECK(near(d.res_lo, 105.0),             "上方最近够格阻力下沿应为105");
+        CHECK(near(d.deep_sup_lo, 80.0),         "最深支撑下沿应为80");
+        auto d2 = dc::digest_zones(zs, 96.0, 2);
+        CHECK(d2.at_support,                     "价格96应判定为处于支撑区内");
+
+        // 三层判定：基线全绿 → 四种拦截 → fail-open
+        dc::Inputs in;
+        in.is_long = true; in.use_htf = true; in.htf_ok = true; in.htf_pct_b = 0.5;
+        in.htf_pos_max = 0.80; in.use_sr = true; in.sr_ok = true; in.at_support = true;
+        in.headroom = 5.0; in.headroom_min = 1.5;
+        CHECK(dc::evaluate(in).pass(), "基线输入应全部通过");
+
+        auto t1 = in; t1.htf_pct_b = 0.9;
+        CHECK(dc::evaluate(t1).htf_block, "做多%B=0.9应触发高位拦截");
+        auto t2 = in; t2.at_support = false;
+        CHECK(dc::evaluate(t2).support_block, "无支撑应触发拦截");
+        auto t3 = in; t3.headroom = 1.0;
+        CHECK(dc::evaluate(t3).headroom_block, "净空1.0<1.5应触发拦截");
+        auto t4 = in; t4.htf_ok = false;
+        auto v4 = dc::evaluate(t4);
+        CHECK(v4.htf_missing && v4.pass(), "宏观数据缺失应fail-open放行并标注");
+        auto t5 = in; t5.is_long = false; t5.htf_pct_b = 0.1;
+        CHECK(dc::evaluate(t5).htf_block, "做空%B=0.1应镜像触发低位拦截");
     }
 
     if (g_fail == 0) {

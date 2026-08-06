@@ -1,4 +1,5 @@
 #include "core/ccg_engine.h"
+#include "core/decision.h"
 #include "core/dynamic_params.h"
 #include "net/trading_client.h"
 #include "core/thread_pool.h"
@@ -202,7 +203,39 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.trend_ema_period  = new_cfg.trend_ema_period;
     cfg.sr_radar          = new_cfg.sr_radar;
     cfg.sr_interval       = new_cfg.sr_interval;
+    cfg.smart_gates         = new_cfg.smart_gates;
+    cfg.use_htf_filter      = new_cfg.use_htf_filter;
+    cfg.htf_interval        = new_cfg.htf_interval;
+    cfg.htf_pos_max         = new_cfg.htf_pos_max;
+    cfg.use_sr_gate         = new_cfg.use_sr_gate;
+    cfg.sr_min_confluence   = new_cfg.sr_min_confluence;
+    cfg.sr_headroom_ratio   = new_cfg.sr_headroom_ratio;
+    cfg.use_sr_exit         = new_cfg.use_sr_exit;
+    cfg.use_structural_stop = new_cfg.use_structural_stop;
     return true;
+}
+
+void CcgEngine::update_htf(const std::string& bot_id, double pct_b) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    it->second.htf_ok    = (pct_b >= -0.5);   // decision::pct_b 非法时返回 -1
+    it->second.htf_pct_b = pct_b;
+    it->second.htf_time  = std::chrono::steady_clock::now();
+}
+
+void CcgEngine::update_sr_structure(const std::string& bot_id, bool at_support,
+                                    double sup_hi, double res_lo, double stop_level) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    auto& bot = it->second;
+    bot.sr_ok         = true;
+    bot.sr_at_support = at_support;
+    bot.sr_sup_hi     = sup_hi;
+    bot.sr_res_lo     = res_lo;
+    bot.sr_stop_level = stop_level;
+    bot.sr_time       = std::chrono::steady_clock::now();
 }
 
 void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
@@ -487,10 +520,23 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             double floor_th = bot.avg_price *
                 (is_long ? (1.0 + bot.cfg.min_profit_floor / 100.0)
                          : (1.0 - bot.cfg.min_profit_floor / 100.0));
+            // v3.0 止盈锚定：够格阻力比上轨更近且仍在保底线之上时，在阻力前落袋
+            // （不指望价格穿墙）。激活是一次性的，锚点天然锁定在激活时刻
+            double target = is_long ? bot.ind_boll_ub : bot.ind_boll_lb;
+            bool sr_fresh = bot.sr_ok &&
+                (std::chrono::steady_clock::now() - bot.sr_time) < std::chrono::minutes(30);
+            if (bot.cfg.use_sr_exit && sr_fresh) {
+                if (is_long && bot.sr_res_lo > floor_th && bot.sr_res_lo < target)
+                    target = bot.sr_res_lo;
+                if (!is_long && bot.sr_sup_hi > 0 && bot.sr_sup_hi < floor_th &&
+                    bot.sr_sup_hi > target)
+                    target = bot.sr_sup_hi;
+            }
             bool band_cond = eff.fresh &&
-                (is_long ? (price >= bot.ind_boll_ub) : (price <= bot.ind_boll_lb));
+                (is_long ? (price >= target) : (price <= target));
             tp_hit = band_cond &&
                 (is_long ? (price >= floor_th) : (price <= floor_th));
+            if (tp_hit && !bot.tp_reached) bot.tp_anchor = target;
         } else {
             double tp_th = bot.avg_price *
                 (is_long ? (1.0 + bot.cfg.tp_pct / 100.0)
@@ -500,6 +546,15 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
         if (!bot.tp_reached && tp_hit) {
             bot.tp_reached = true;
             bot.tp_extreme = price;
+            if (eff.dyn) {
+                // 影子对照：未启用阻力锚时，记录"若启用会更早在哪激活"供两周后对比
+                std::string extra;
+                if (!bot.cfg.use_sr_exit && bot.sr_ok &&
+                    bot.sr_res_lo > bot.avg_price && bot.sr_res_lo < bot.ind_boll_ub)
+                    extra = "（参考：若启用阻力锚将更早在 " +
+                            std::to_string(bot.sr_res_lo) + " 激活）";
+                log(bot.cfg.symbol + " 止盈追踪激活 @" + std::to_string(price) + extra);
+            }
         }
         if (bot.tp_reached) {
             bot.tp_extreme = is_long ? std::max(bot.tp_extreme, price)
@@ -597,6 +652,24 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
             update_tracking(bot, price);
 
+            // v3.0 结构性止损（仅多头+动态W模式）：价格持续跌破参考位（最深支撑下沿
+            // -0.25×ATR）20个tick≈1分钟才触发——插针防护。影子模式只记录一次不平仓
+            bool struct_stop_fire = false;
+            if (!bot.entries.empty() && bot.cfg.direction == CcgConfig::Direction::Long &&
+                bot.cfg.dynamic_band_mode && bot.sr_stop_level > 0 && bot.sr_ok &&
+                (std::chrono::steady_clock::now() - bot.sr_time) < std::chrono::minutes(30)) {
+                if (price < bot.sr_stop_level) {
+                    ++bot.struct_stop_ticks;
+                    if (bot.struct_stop_ticks == 20 && !bot.cfg.use_structural_stop)
+                        log("[决策] " + bot.cfg.symbol + " 已持续跌破结构止损位 " +
+                            std::to_string(bot.sr_stop_level) + "（影子：未启用结构止损，仅记录）");
+                    if (bot.struct_stop_ticks >= 20 && bot.cfg.use_structural_stop)
+                        struct_stop_fire = true;
+                } else {
+                    bot.struct_stop_ticks = 0;
+                }
+            }
+
             if (bot.entries.empty()) {
                 // 首仓：Immediate 模式一满足 Running 就立刻开；Indicator 模式要等
                 // BOLL+RSI 信号（UI 每 tick 异步拉取写入 bot.ind_*）才开
@@ -625,6 +698,56 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         log(bot.cfg.symbol + " 处于高周期空头态，暂停开新首仓（趋势恢复后自动放行）");
                     }
                 }
+
+                // v3.0 三层决策（宏观%B + 结构定位）：smart_gates=false 时纯影子——
+                // 只在首仓真正派发时把判定快照写进日志；true 时新增两层真实拦截
+                std::string decision_snap;
+                if (can_enter) {
+                    const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
+                    auto snow = std::chrono::steady_clock::now();
+
+                    decision::Inputs din;
+                    din.is_long     = is_long;
+                    din.use_htf     = bot.cfg.use_htf_filter;
+                    din.htf_ok      = bot.htf_ok && (snow - bot.htf_time) < std::chrono::minutes(30);
+                    din.htf_pct_b   = bot.htf_pct_b;
+                    din.htf_pos_max = bot.cfg.htf_pos_max;
+                    din.use_sr      = bot.cfg.use_sr_gate;
+                    din.sr_ok       = bot.sr_ok && (snow - bot.sr_time) < std::chrono::minutes(30);
+                    din.at_support  = bot.sr_at_support;
+                    // 预期止盈距离：动态模式=到上轨的距离（那就是利润目标）；静态=止盈%
+                    double tp_dist;
+                    if (bot.cfg.dynamic_band_mode && bot.ind_ok &&
+                        (is_long ? bot.ind_boll_ub > price : bot.ind_boll_lb < price) &&
+                        (is_long ? bot.ind_boll_ub - price : price - bot.ind_boll_lb) > 0) {
+                        tp_dist = is_long ? (bot.ind_boll_ub - price) : (price - bot.ind_boll_lb);
+                    } else {
+                        tp_dist = price * std::max(bot.cfg.dynamic_band_mode ? 1.0
+                                                                             : bot.cfg.tp_pct, 0.1) / 100.0;
+                    }
+                    // 净空：多头看上方阻力，空头镜像看下方支撑
+                    double barrier = is_long ? bot.sr_res_lo
+                                             : (bot.sr_sup_hi > 0 ? bot.sr_sup_hi : 0);
+                    if (is_long) {
+                        din.headroom = decision::headroom_ratio(price, barrier, tp_dist);
+                    } else {
+                        din.headroom = (barrier > 0 && barrier < price && tp_dist > 0)
+                                       ? (price - barrier) / tp_dist : 1e9;
+                    }
+                    if (din.headroom < 0) din.headroom = 1e9;   // 数据非法按无限净空处理
+                    din.headroom_min = bot.cfg.sr_headroom_ratio;
+
+                    auto verdict  = decision::evaluate(din);
+                    decision_snap = decision::summarize(din, verdict);
+
+                    if (!verdict.pass() && bot.cfg.smart_gates) {
+                        can_enter = false;
+                        if (bot.last_action != "三层决策拦截") {
+                            bot.last_action = "三层决策拦截";
+                            log(bot.cfg.symbol + " 首仓被三层决策拦截: " + decision_snap);
+                        }
+                    }
+                }
                 // 账户级总保证金上限：只挡"开新首仓"，已有仓位的加仓/止盈止损不受影响
                 auto sizes = entry_usdt(bot.cfg);
                 double first_margin = (!sizes.empty() && bot.cfg.leverage > 0)
@@ -646,10 +769,18 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     bot.inflight_margin = first_margin;
                     do_entry.push_back(id);
                     bot.pending = true;
+                    // v3.0 决策快照随首仓派发落日志（影子模式的数据积累点）
+                    if (!decision_snap.empty())
+                        log("[决策] " + bot.cfg.symbol + " 首仓派发 @" +
+                            std::to_string(price) + " | " + decision_snap +
+                            (bot.cfg.smart_gates ? "" : " (影子)"));
                 }
             } else if (should_stop_loss(bot, price)) {
                 // 硬止损优先于追踪止盈
                 do_close.push_back({id, "硬止损"});
+                bot.pending = true;
+            } else if (struct_stop_fire) {
+                do_close.push_back({id, "结构止损"});
                 bot.pending = true;
             } else if (should_close(bot, price)) {
                 do_close.push_back({id, "追踪止盈"});
