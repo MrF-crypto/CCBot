@@ -131,7 +131,10 @@ int64_t TradingClient::ts_ms() const {
     using namespace std::chrono;
     auto local = duration_cast<milliseconds>(
         system_clock::now().time_since_epoch()).count();
-    return local + time_offset_ms_;
+    // 刻意回拨1秒：币安对"时间戳超前"零容忍（>1000ms直接-1021拒绝），对"滞后"
+    // 有 recvWindow=5000ms 的宽容——把时间戳往安全的一侧靠，本机时钟快1~2秒的
+    // 常见漂移就不会再触发 -1021（时好时坏的"网络异常"多半是它）
+    return local + time_offset_ms_ - 1000;
 }
 
 std::string TradingClient::http_get_public(const std::string& path) {

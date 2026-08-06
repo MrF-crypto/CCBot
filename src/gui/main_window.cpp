@@ -101,7 +101,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v2.9");
+    setWindowTitle("CCG 合约监控  v2.9.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1227,6 +1227,10 @@ void MainWindow::refreshAccount() {
                     log("网络已恢复正常", "OK");
                 }
                 return;
+            }
+            // -1021 = 本机时钟漂移超窗，不是网络问题——立即重新对时自愈，不等每小时定时
+            if (info.error.find("-1021") != std::string::npos) {
+                run_async([this]() { if (client_) client_->sync_server_time(); });
             }
             // 单次失败不覆盖上一次的有效账户数据，但要计数——连续失败才判定为网络异常，
             // 避免偶尔一次超时就报警

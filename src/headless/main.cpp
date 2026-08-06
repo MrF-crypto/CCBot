@@ -367,6 +367,9 @@ int main(int argc, char** argv) {
                              " | 可用 $" + std::to_string(acc.available));
                 } else {
                     log_line("心跳失败（网络异常?): " + acc.error, "ERR");
+                    // -1021 = 时钟漂移超窗，立即重新对时自愈
+                    if (acc.error.find("-1021") != std::string::npos)
+                        client->sync_server_time();
                 }
                 hb_busy.store(false);
             });
