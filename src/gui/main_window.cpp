@@ -101,7 +101,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v2.9.1");
+    setWindowTitle("CCG 合约监控  v2.9.2");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1125,11 +1125,14 @@ void MainWindow::checkSrTouches() {
 
         for (const auto& z : st.zones) {
             if (!z.contains(price)) continue;
-            // 去重：同一区域2小时内只报一次（换了区域立刻可报）
-            bool same_zone = std::fabs(z.mid() - st.last_alert_mid) < 1e-9;
-            if (same_zone && (now - st.last_alert_ms) < 2 * 3600 * 1000) break;
-            st.last_alert_mid = z.mid();
-            st.last_alert_ms  = now;
+            // 去重：每个区域独立2小时冷却（相邻区域边界横跳不再刷屏）
+            long long zkey = (long long)std::llround(z.mid() * 1e4);
+            auto ait = st.alerted.find(zkey);
+            if (ait != st.alerted.end() && (now - ait->second) < 2 * 3600 * 1000) break;
+            st.alerted[zkey] = now;
+            // 清理过期条目，防止长期运行无限增长
+            for (auto it2 = st.alerted.begin(); it2 != st.alerted.end();)
+                it2 = (now - it2->second > 4 * 3600 * 1000) ? st.alerted.erase(it2) : std::next(it2);
 
             int conf = z.confluence();
             QString kind = QString::fromStdString(srzones::src_label(z));

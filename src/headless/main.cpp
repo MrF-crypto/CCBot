@@ -240,7 +240,8 @@ int main(int argc, char** argv) {
     std::atomic<bool> ind_busy{false}, sr_busy{false}, trend_busy{false}, hb_busy{false};
     std::mutex sr_mtx;   // sr_zones_map 由拉取线程写、主循环读
     std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
-    std::map<std::string, std::pair<double, int64_t>>  sr_alert_dedup; // sym→{mid,ms}（仅主循环访问）
+    // 告警去重：sym → (区域mid×1e4 → 上次告警ms)。每区域独立冷却，防边界横跳刷屏
+    std::map<std::string, std::map<long long, int64_t>> sr_alert_dedup;
     auto fetch_pool = std::make_shared<ThreadPool>(2);
 
     int tick_n = 0;
@@ -311,10 +312,13 @@ int main(int argc, char** argv) {
                     if (!z.contains(price)) continue;
                     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
-                    auto& [last_mid, last_ms] = sr_alert_dedup[sym];
-                    bool same = std::fabs(z.mid() - last_mid) < 1e-9;
-                    if (same && now_ms - last_ms < 2 * 3600 * 1000) break;
-                    last_mid = z.mid(); last_ms = now_ms;
+                    auto& seen = sr_alert_dedup[sym];
+                    long long zkey = (long long)std::llround(z.mid() * 1e4);
+                    auto ait = seen.find(zkey);
+                    if (ait != seen.end() && now_ms - ait->second < 2 * 3600 * 1000) break;
+                    seen[zkey] = now_ms;
+                    for (auto it2 = seen.begin(); it2 != seen.end();)
+                        it2 = (now_ms - it2->second > 4 * 3600 * 1000) ? seen.erase(it2) : std::next(it2);
                     std::ostringstream ss;
                     int conf = z.confluence();
                     ss << "[SR雷达] " << sym << " 价格 " << price << " 进入区域["
