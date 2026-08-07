@@ -143,8 +143,11 @@ struct CcgBot {
     // 动态W模式和指标首单都用它做数据新鲜度检查，避免拿几小时前的旧轨道值做决策
     std::chrono::steady_clock::time_point ind_time{};
 
-    // 趋势状态机快照（use_trend_filter 时由外层定期拉取写入）
+    // 趋势状态机快照（use_trend_filter 时由外层定期拉取写入）。
+    // 消抖：原始判定连续2次相同才切换状态（价格骑在EMA200边界时单次翻面不算数）
     bool   trend_bearish = false;
+    bool   trend_raw_last = false;   // 上一次原始判定
+    int    trend_raw_streak = 0;     // 原始判定连续相同次数
     std::chrono::steady_clock::time_point trend_time{};
 
     // ── v3.0 结构快照（应用层喂入）────────────────────────────────────────────

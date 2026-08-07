@@ -242,12 +242,23 @@ void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
     if (it == bots_.end()) return;
-    bool was = it->second.trend_bearish;
-    it->second.trend_bearish = bearish;
-    it->second.trend_time    = std::chrono::steady_clock::now();
-    if (was != bearish)
-        log(it->second.cfg.symbol + " 趋势状态切换: " +
-            (bearish ? "空头态（暂停新首仓，补仓间隔×1.5）" : "多头/震荡态（恢复正常）"));
+    auto& bot = it->second;
+    bot.trend_time = std::chrono::steady_clock::now();
+
+    // 消抖：价格骑在 EMA200/斜率阈值边界时，每5分钟的重判会来回翻面。
+    // 原始判定连续2次（约10分钟）相同才真正切换状态——趋势级别的信号不差这点延迟
+    if (bearish == bot.trend_raw_last) {
+        if (bot.trend_raw_streak < 1000) ++bot.trend_raw_streak;
+    } else {
+        bot.trend_raw_last   = bearish;
+        bot.trend_raw_streak = 1;
+    }
+    if (bot.trend_raw_streak < 2 || bearish == bot.trend_bearish) return;
+
+    bot.trend_bearish = bearish;
+    log(bot.cfg.symbol + " 趋势状态切换: " +
+        (bearish ? "空头态（暂停新首仓，补仓间隔×1.5）" : "多头/震荡态（恢复正常）") +
+        "（连续2次确认）");
 }
 
 void CcgEngine::set_max_total_margin(double usdt) {
