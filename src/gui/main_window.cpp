@@ -1115,7 +1115,8 @@ void MainWindow::refreshSrZones() {
     for (auto it = srStates_.begin(); it != srStates_.end();)
         it = radar.count(it->first) ? std::next(it) : srStates_.erase(it);
 
-    if (radar.empty()) return;
+    if (radar.empty() || srFetchBusy_.load()) return;
+    srFetchBusy_.store(true);
 
     run_async([this, radar]() {
         for (const auto& [sym, interval] : radar) {
@@ -1133,6 +1134,7 @@ void MainWindow::refreshSrZones() {
                 st.computed_ms = QDateTime::currentMSecsSinceEpoch();
             }, Qt::QueuedConnection);
         }
+        srFetchBusy_.store(false);
     });
 }
 
@@ -1236,9 +1238,11 @@ void MainWindow::openSrZonesDialog(const std::string& symbol) {
 // 权益/可用：随 onTick 异步刷新，不再只在连接那一刻查询一次
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshAccount() {
-    if (!client_) return;
+    if (!client_ || accFetchBusy_.load()) return;
+    accFetchBusy_.store(true);
     run_async([this]() {
         auto info = client_->fetch_account();
+        accFetchBusy_.store(false);
         QMetaObject::invokeMethod(this, [this, info]() {
             if (info.ok) {
                 account_info_ = info;
@@ -1897,7 +1901,8 @@ void MainWindow::onTick() {
             ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
              b.cfg.dynamic_band_mode))
             ind_wait.push_back(b);
-    if (!ind_wait.empty() && client_) {
+    if (!ind_wait.empty() && client_ && !indFetchBusy_.load()) {
+        indFetchBusy_.store(true);
         run_async([this, ind_wait]() {
             for (const auto& b : ind_wait) {
                 auto snap = client_->fetch_indicators(b.cfg.symbol, b.cfg.kline_interval,
@@ -1908,6 +1913,7 @@ void MainWindow::onTick() {
                     if (engine_) engine_->update_indicator(bid, snap.boll_lb, snap.boll_ub, snap.rsi);
                 }, Qt::QueuedConnection);
             }
+            indFetchBusy_.store(false);
         });
     }
 
@@ -1947,7 +1953,8 @@ void MainWindow::onTick() {
             if (b.entries.empty() && b.cfg.use_htf_filter && b.state == CcgBot::State::Running)
                 htf_bots.push_back(b);
         }
-        if (!trend_bots.empty() || !htf_bots.empty()) {
+        if ((!trend_bots.empty() || !htf_bots.empty()) && !trendFetchBusy_.load()) {
+            trendFetchBusy_.store(true);
             run_async([this, trend_bots, htf_bots]() {
                 for (const auto& b : trend_bots) {
                     auto t = client_->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
@@ -1966,6 +1973,7 @@ void MainWindow::onTick() {
                         if (engine_) engine_->update_htf(bid, pb);
                     }, Qt::QueuedConnection);
                 }
+                trendFetchBusy_.store(false);
             });
         }
     }
@@ -2064,9 +2072,11 @@ void MainWindow::ensureSymbolInfoAsync(const std::string& symbol) {
 // 拉取真实持仓（强平价来源）——每次 onTick 一次，1 个请求覆盖所有 symbol
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshPositions() {
-    if (!client_) return;
+    if (!client_ || posFetchBusy_.load()) return;
+    posFetchBusy_.store(true);
     run_async([this]() {
         auto positions = client_->fetch_positions();
+        posFetchBusy_.store(false);
         QMetaObject::invokeMethod(this, [this, positions = std::move(positions)]() {
             pos_cache_.clear();
             for (const auto& p : positions) {

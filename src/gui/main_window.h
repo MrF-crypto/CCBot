@@ -159,6 +159,15 @@ private:
     int srTickCount_    = 0;
     int trendTickCount_ = 0;
 
+    // 周期性拉取的防堆积守卫：上一批任务没跑完就跳过本批。没有守卫的话，
+    // bot 数量多时（31个×每个~0.3s）批量任务的生产速度会超过消化速度，
+    // 拉取队列无限增长——弹窗预览等一次性任务被排到队尾永远轮不到
+    std::atomic<bool> indFetchBusy_{false};
+    std::atomic<bool> trendFetchBusy_{false};
+    std::atomic<bool> srFetchBusy_{false};
+    std::atomic<bool> accFetchBusy_{false};
+    std::atomic<bool> posFetchBusy_{false};
+
     // ── 日志 ──
     QTextEdit* logBox_ = nullptr;
 };
