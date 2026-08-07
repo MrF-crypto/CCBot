@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.0.1");
+    setWindowTitle("CCG 合约监控  v3.0.2");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1865,6 +1865,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     refreshBotTable();
     save_bots();
+
+    // 配置保存即预热：立即触发一次SR区域重算和趋势/%B拉取，消除"新勾选雷达要等
+    // 15分钟、%B要等5分钟"的预热期——否则立即开仓模式的首仓永远在数据到达前发出
+    refreshSrZones();
+    trendTickCount_ = 0;   // 下一tick立即触发趋势+%B批次
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
