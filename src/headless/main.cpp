@@ -364,8 +364,8 @@ int main(int argc, char** argv) {
             for (const auto& b : bots) {
                 if (b.state == CcgBot::State::Stopped) continue;
                 if (b.cfg.use_trend_filter) need.push_back(b);
-                if (b.state == CcgBot::State::Running && b.entries.empty() && b.cfg.use_htf_filter)
-                    htf_need.push_back(b);
+                // %B 对所有非停止 bot 持续保鲜（立即开仓/冷却重进的首仓才赶得上数据）
+                if (b.cfg.use_htf_filter) htf_need.push_back(b);
             }
             if (!need.empty() || !htf_need.empty()) {
                 trend_busy.store(true);

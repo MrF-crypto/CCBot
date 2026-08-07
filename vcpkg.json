@@ -1,6 +1,6 @@
 {
   "name": "ccg-monitor",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "CCG 合约监控 — 独立 DCA Martingale 策略程序（含无界面 headless 版）",
   "dependencies": [
     "ixwebsocket",

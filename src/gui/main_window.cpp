@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.0");
+    setWindowTitle("CCG 合约监控  v3.0.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1814,6 +1814,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.sr_headroom_ratio   = to_d(headroomEdit, 1.5);
     cfg.use_sr_exit         = srExitBox->isChecked();
     cfg.use_structural_stop = structStopBox->isChecked();
+    // 防呆：三层拦截/止盈锚/结构止损都依赖SR雷达数据——开了它们却没开雷达，
+    // 结构层会静默地永久fail-open（形同虚设）。自动带上并提示
+    if ((cfg.smart_gates || cfg.use_sr_exit || cfg.use_structural_stop) && !cfg.sr_radar) {
+        cfg.sr_radar = true;
+        log("已自动开启SR雷达：三层决策/止盈锚/结构止损依赖它的区域数据", "WARN");
+    }
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -1950,8 +1956,10 @@ void MainWindow::onTick() {
         for (const auto& b : bots) {
             if (b.state == CcgBot::State::Stopped) continue;
             if (b.cfg.use_trend_filter) trend_bots.push_back(b);
-            if (b.entries.empty() && b.cfg.use_htf_filter && b.state == CcgBot::State::Running)
-                htf_bots.push_back(b);
+            // %B 对所有非停止 bot 持续保鲜（不限"等首仓中"）：立即开仓模式点继续
+            // 3秒内就下单、冷却结束当tick就重进——只给等待中的bot拉的话，这些
+            // 首仓永远赶不上数据，%B恒为"缺失(放行)"
+            if (b.cfg.use_htf_filter) htf_bots.push_back(b);
         }
         if ((!trend_bots.empty() || !htf_bots.empty()) && !trendFetchBusy_.load()) {
             trendFetchBusy_.store(true);
