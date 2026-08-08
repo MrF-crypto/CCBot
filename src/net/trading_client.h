@@ -1,4 +1,5 @@
 #pragma once
+#include "core/itrading_client.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -6,8 +7,8 @@
 
 namespace ccbot {
 
-// Binance USDT-M Futures REST API 客户端（同步 CURL + Windows CNG HMAC）
-class TradingClient {
+// Binance USDT-M Futures REST API 客户端（同步 CURL + mbedtls HMAC）
+class TradingClient : public ITradingClient {
 public:
     struct Config {
         std::string api_key;
@@ -77,7 +78,7 @@ public:
     bool close_position(const std::string& symbol);
     bool close_all_positions();
 
-    bool set_leverage(const std::string& symbol, int lev);
+    // set_leverage / round_qty 见下方 ITradingClient 实现区（override 声明）
 
     // TP/SL 条件市价平仓单（reduceOnly=true + 显式数量，兼容所有账户模式）
     // entry_side: "BUY"=做多仓位, "SELL"=做空仓位; qty=持仓数量
@@ -147,7 +148,6 @@ public:
     const SymbolInfo& get_symbol_info(const std::string& symbol);
     // 只读缓存，不发网络请求；未命中返回 false —— 给 GUI 线程用，绝不能阻塞界面
     bool try_get_symbol_info(const std::string& symbol, SymbolInfo& out) const;
-    double round_qty  (const std::string& symbol, double qty);
     double round_price(const std::string& symbol, double price);
 
     // ── UserData Stream ─────────────────────────────────────────────────────
@@ -159,7 +159,16 @@ public:
     void sync_server_time();
 
     bool is_testnet()   const { return cfg_.testnet; }
-    bool is_dual_mode() const { return dual_mode_; }
+    bool is_dual_mode() const override { return dual_mode_; }
+
+    // ── ITradingClient 实现（引擎通过接口调用，实盘走真实下单）──────────────
+    OrderOutcome place_market_order(const std::string& symbol, const std::string& side,
+                                    double qty, bool reduce_only) override {
+        auto r = place_market(symbol, side, qty, reduce_only);
+        return { r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain };
+    }
+    double round_qty(const std::string& symbol, double qty) override;
+    bool   set_leverage(const std::string& symbol, int lev) override;
 
 private:
     Config      cfg_;

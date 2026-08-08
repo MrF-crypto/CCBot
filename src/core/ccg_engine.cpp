@@ -1,7 +1,8 @@
 #include "core/ccg_engine.h"
 #include "core/decision.h"
 #include "core/dynamic_params.h"
-#include "net/trading_client.h"
+// 引擎只依赖 ITradingClient 接口（在 ccg_engine.h 里），不再直接依赖具体的
+// TradingClient/curl——这样回测目标可以只编译引擎+模拟客户端，无需网络库
 #include "core/thread_pool.h"
 #include <sstream>
 #include <iomanip>
@@ -22,9 +23,10 @@ static constexpr auto kTrendStale = std::chrono::minutes(30);
 // 空头态时补仓间隔的放大倍数（子弹省着打）
 static constexpr double kBearIntervalMult = 1.5;
 
-static bool trend_active_bearish(const CcgBot& bot) {
+// now 由调用方从 host_ 取（回测注入虚拟时钟，实盘=真实时钟）
+static bool trend_active_bearish(const CcgBot& bot, std::chrono::steady_clock::time_point now) {
     return bot.cfg.use_trend_filter && bot.trend_bearish &&
-           (std::chrono::steady_clock::now() - bot.trend_time) < kTrendStale;
+           (now - bot.trend_time) < kTrendStale;
 }
 
 // ── 加仓比例序列（最多 10 层）──────────────────────────────────────────────────
@@ -78,9 +80,18 @@ std::string CcgEngine::dir_name(CcgConfig::Direction d) {
 }
 
 // ── 构造 ───────────────────────────────────────────────────────────────────────
-CcgEngine::CcgEngine(std::shared_ptr<TradingClient> client,
-                     std::shared_ptr<ThreadPool>    pool)
-    : client_(std::move(client)), pool_(std::move(pool)) {}
+CcgEngine::CcgEngine(std::shared_ptr<ITradingClient> client,
+                     std::shared_ptr<ThreadPool>     pool)
+    : client_(std::move(client)), pool_(std::move(pool)) {
+    auto p = pool_;
+    host_.submit = [p](std::function<void()> fn) { p->submit(std::move(fn)); };
+}
+
+// 回测构造：注入虚拟时钟与内联执行器（默认 submit=同步执行，保证确定性）
+CcgEngine::CcgEngine(std::shared_ptr<ITradingClient> client, EngineHost host)
+    : client_(std::move(client)), host_(std::move(host)) {
+    if (!host_.submit) host_.submit = [](std::function<void()> fn) { fn(); };
+}
 
 void CcgEngine::set_log_cb(LogCb cb) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -142,7 +153,7 @@ std::string CcgEngine::add_bot(const CcgConfig& raw_cfg) {
     bot.bot_id     = id;
     bot.cfg        = cfg;
     bot.state      = CcgBot::State::Running;
-    bot.start_time = std::chrono::system_clock::now();
+    bot.start_time = host_.now_wall();
     bots_[id]      = std::move(bot);
     return id;
 }
@@ -161,7 +172,7 @@ std::string CcgEngine::restore_bot(CcgBot snapshot) {
     if (snapshot.bot_id.empty())
         snapshot.bot_id = snapshot.cfg.symbol + "_restored_" + std::to_string(id_seq_++);
     snapshot.pending    = false;
-    snapshot.start_time = std::chrono::system_clock::now();
+    snapshot.start_time = host_.now_wall();
 
     std::string id = snapshot.bot_id;
     bots_[id] = std::move(snapshot);
@@ -221,7 +232,7 @@ void CcgEngine::update_htf(const std::string& bot_id, double pct_b) {
     if (it == bots_.end()) return;
     it->second.htf_ok    = (pct_b >= -0.5);   // decision::pct_b 非法时返回 -1
     it->second.htf_pct_b = pct_b;
-    it->second.htf_time  = std::chrono::steady_clock::now();
+    it->second.htf_time  = host_.now_steady();
 }
 
 void CcgEngine::update_sr_structure(const std::string& bot_id, bool at_support,
@@ -235,7 +246,7 @@ void CcgEngine::update_sr_structure(const std::string& bot_id, bool at_support,
     bot.sr_sup_hi     = sup_hi;
     bot.sr_res_lo     = res_lo;
     bot.sr_stop_level = stop_level;
-    bot.sr_time       = std::chrono::steady_clock::now();
+    bot.sr_time       = host_.now_steady();
 }
 
 void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
@@ -243,7 +254,7 @@ void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
     auto it = bots_.find(bot_id);
     if (it == bots_.end()) return;
     auto& bot = it->second;
-    bot.trend_time = std::chrono::steady_clock::now();
+    bot.trend_time = host_.now_steady();
 
     // 消抖：价格骑在 EMA200/斜率阈值边界时，每5分钟的重判会来回翻面。
     // 原始判定连续2次（约10分钟）相同才真正切换状态——趋势级别的信号不差这点延迟
@@ -358,7 +369,7 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
             e.qty       = ex.qty;
             e.cost_usdt = ex.qty * ex.entry_price;
             e.order_id  = "adopted";
-            e.time      = std::chrono::system_clock::now();
+            e.time      = host_.now_wall();
             adopter->entries.push_back(e);
             adopter->total_qty  = ex.qty;
             adopter->avg_price  = ex.entry_price;
@@ -392,7 +403,7 @@ void CcgEngine::update_indicator(const std::string& bot_id, double boll_lb, doub
     bot.ind_boll_ub = boll_ub;
     bot.ind_rsi     = rsi;
     bot.ind_ok      = true;
-    bot.ind_time    = std::chrono::steady_clock::now();
+    bot.ind_time    = host_.now_steady();
 
     if (bot.cfg.rsi_confirm_mode == CcgConfig::RsiConfirmMode::CrossFromOversold) {
         const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -475,7 +486,7 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
         return p;
     }
     p.dyn          = true;
-    p.fresh        = (std::chrono::steady_clock::now() - bot.ind_time) < kIndStale;
+    p.fresh        = (host_.now_steady() - bot.ind_time) < kIndStale;
     p.interval_pct = dynparams::interval_pct(W);
     p.trail_entry  = dynparams::trail_entry_pct(W);
     p.trail_tp     = dynparams::trail_tp_pct(W);
@@ -483,8 +494,9 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
 }
 
 // 趋势空头态：补仓间隔放大（静态/动态模式都适用），在 eff_params 之上叠加
-static double apply_trend_interval(const CcgBot& bot, double interval_pct) {
-    return trend_active_bearish(bot) ? interval_pct * kBearIntervalMult : interval_pct;
+static double apply_trend_interval(const CcgBot& bot, double interval_pct,
+                                   std::chrono::steady_clock::time_point now) {
+    return trend_active_bearish(bot, now) ? interval_pct * kBearIntervalMult : interval_pct;
 }
 
 // ── 追踪变量更新（在 tick 持锁中调用）────────────────────────────────────────
@@ -494,7 +506,7 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
     if (bot.entries.empty()) return;  // 尚未建仓，不用追踪
 
     const EffParams eff = eff_params(bot);
-    const double eff_interval = apply_trend_interval(bot, eff.interval_pct);
+    const double eff_interval = apply_trend_interval(bot, eff.interval_pct, host_.now_steady());
 
     // ── DCA 间隔追踪 ──────────────────────────────────────────────────────────
     double interval_th = bot.last_entry_price *
@@ -535,7 +547,7 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             // （不指望价格穿墙）。激活是一次性的，锚点天然锁定在激活时刻
             double target = is_long ? bot.ind_boll_ub : bot.ind_boll_lb;
             bool sr_fresh = bot.sr_ok &&
-                (std::chrono::steady_clock::now() - bot.sr_time) < std::chrono::minutes(30);
+                (host_.now_steady() - bot.sr_time) < std::chrono::minutes(30);
             if (bot.cfg.use_sr_exit && sr_fresh) {
                 if (is_long && bot.sr_res_lo > floor_th && bot.sr_res_lo < target)
                     target = bot.sr_res_lo;
@@ -628,7 +640,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
     std::vector<std::pair<std::string,std::string>> do_close;  // {id, reason}
     {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
-        auto now = std::chrono::system_clock::now();
+        auto now = host_.now_wall();
 
         for (auto& [id, bot] : bots_) {
             if (bot.cfg.symbol != symbol) continue;
@@ -668,7 +680,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
             bool struct_stop_fire = false;
             if (!bot.entries.empty() && bot.cfg.direction == CcgConfig::Direction::Long &&
                 bot.cfg.dynamic_band_mode && bot.sr_stop_level > 0 && bot.sr_ok &&
-                (std::chrono::steady_clock::now() - bot.sr_time) < std::chrono::minutes(30)) {
+                (host_.now_steady() - bot.sr_time) < std::chrono::minutes(30)) {
                 if (price < bot.sr_stop_level) {
                     ++bot.struct_stop_ticks;
                     if (bot.struct_stop_ticks == 20 && !bot.cfg.use_structural_stop)
@@ -698,11 +710,11 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     }
                     // 指标数据必须在有效期内：冷却重启/程序重启后的头几秒里，
                     // ind_* 还是上一轮甚至几小时前的旧值，拿旧轨道判断会误开仓
-                    bool fresh = (std::chrono::steady_clock::now() - bot.ind_time) < kIndStale;
+                    bool fresh = (host_.now_steady() - bot.ind_time) < kIndStale;
                     can_enter = bot.ind_ok && fresh && priceCond && rsiCond;
                 }
                 // 趋势状态机：空头态暂停开新首仓（对 Immediate/Indicator 模式都生效）
-                if (can_enter && trend_active_bearish(bot)) {
+                if (can_enter && trend_active_bearish(bot, host_.now_steady())) {
                     can_enter = false;
                     if (bot.last_action != "空头趋势，暂停开首仓") {
                         bot.last_action = "空头趋势，暂停开首仓";
@@ -715,7 +727,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 std::string decision_snap;
                 if (can_enter) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-                    auto snow = std::chrono::steady_clock::now();
+                    auto snow = host_.now_steady();
 
                     decision::Inputs din;
                     din.is_long     = is_long;
@@ -809,7 +821,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
 // ── 异步入场（在线程池中执行 HTTP 下单）──────────────────────────────────────
 void CcgEngine::submit_entry(const std::string& bot_id) {
-    pool_->submit([this, bot_id]() {
+    host_.submit([this, bot_id]() {
         try {
             // 读取状态（短暂持锁）
             CcgConfig     cfg;
@@ -851,7 +863,7 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 return;
             }
 
-            auto r = client_->place_market(cfg.symbol, side, qty, false);
+            auto r = client_->place_market_order(cfg.symbol, side, qty, false);
 
             // 更新状态
             std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -883,7 +895,7 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 e.qty       = fill_qty;
                 e.cost_usdt = fill_qty * fill_price;
                 e.order_id  = r.order_id;
-                e.time      = std::chrono::system_clock::now();
+                e.time      = host_.now_wall();
                 bot.entries.push_back(e);
 
                 bot.total_qty  += fill_qty;
@@ -927,7 +939,7 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
 
 // ── 异步平仓 ──────────────────────────────────────────────────────────────────
 void CcgEngine::submit_close(const std::string& bot_id, const std::string& reason) {
-    pool_->submit([this, bot_id, reason]() {
+    host_.submit([this, bot_id, reason]() {
         try {
             CcgConfig cfg;
             double    total_qty = 0, avg_price = 0, close_price = 0;
@@ -951,7 +963,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                 const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                          ? "SELL" : "BUY";
                 double qty = client_->round_qty(cfg.symbol, total_qty);
-                auto r = client_->place_market(cfg.symbol, side, qty, true);
+                auto r = client_->place_market_order(cfg.symbol, side, qty, true);
                 if (!r.ok && r.error.find("[-2022]") != std::string::npos) {
                     // reduceOnly被拒 = 交易所侧没有可平的仓位（用户在交易所手动平过/
                     // 强平过）。本地留着这个幽灵仓位会陷入无限重试（追踪止盈/硬止损
@@ -1033,7 +1045,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                     rec.pnl         = pnl;
                     rec.layers      = layers;
                     rec.reason      = reason + "(部分)";
-                    rec.close_time  = std::chrono::system_clock::now();
+                    rec.close_time  = host_.now_wall();
                     has_rec = true;
                 } else if (closed_ok) {
                     const bool is_long = (cfg.direction == CcgConfig::Direction::Long);
@@ -1054,7 +1066,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                         rec.pnl         = pnl;
                         rec.layers      = layers;
                         rec.reason      = reason;
-                        rec.close_time  = std::chrono::system_clock::now();
+                        rec.close_time  = host_.now_wall();
                         has_rec = true;
                     }
 
@@ -1078,7 +1090,7 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                     // 不能被自动重启逻辑无声覆盖成 Cooldown（bot 违背意愿自动复活）
                     if (bot.state != CcgBot::State::Stopped) {
                         if (cfg.auto_restart) {
-                            bot.cooldown_until = std::chrono::system_clock::now() +
+                            bot.cooldown_until = host_.now_wall() +
                                                  std::chrono::seconds(cfg.cooldown_secs);
                             bot.state = CcgBot::State::Cooldown;
                             log(cfg.symbol + " 冷却 " + std::to_string(cfg.cooldown_secs) + "s 后重启");

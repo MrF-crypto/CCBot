@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.0.3");
+    setWindowTitle("CCG 合约监控  v3.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -393,10 +393,10 @@ void MainWindow::load_and_restore_bots() {
         c.smart_gates         = o["smart_gates"].toBool(false);
         c.use_htf_filter      = o["use_htf_filter"].toBool(true);
         c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
-        c.htf_pos_max         = o["htf_pos_max"].toDouble(0.80);
+        c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
         c.use_sr_gate         = o["use_sr_gate"].toBool(true);
         c.sr_min_confluence   = o["sr_min_confluence"].toInt(2);
-        c.sr_headroom_ratio   = o["sr_headroom_ratio"].toDouble(1.5);
+        c.sr_headroom_ratio   = o["sr_headroom_ratio"].toDouble(3.0);
         c.use_sr_exit         = o["use_sr_exit"].toBool(false);
         c.use_structural_stop = o["use_structural_stop"].toBool(false);
         if (c.symbol.empty()) continue;
@@ -1491,8 +1491,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受此项控制。\n"
         "建议先影子跑两周，用日志里的[决策]快照统计后再勾选启用。");
     form->addRow("", smartBox);
-    auto* htfMaxEdit   = mkEdit("日线%B拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.80);
-    auto* headroomEdit = mkEdit("净空比下限:",     prefill ? prefill->cfg.sr_headroom_ratio : 1.5);
+    auto* htfMaxEdit   = mkEdit("日线%B拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
+    auto* headroomEdit = mkEdit("净空比下限:",     prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
     auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
     srExitBox->setChecked(prefill ? prefill->cfg.use_sr_exit : false);
     form->addRow("", srExitBox);
@@ -1810,8 +1810,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.use_trend_filter  = trendBox->isChecked();
     cfg.sr_radar          = srBox->isChecked();
     cfg.smart_gates         = smartBox->isChecked();
-    cfg.htf_pos_max         = to_d(htfMaxEdit,   0.80);
-    cfg.sr_headroom_ratio   = to_d(headroomEdit, 1.5);
+    cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
+    cfg.sr_headroom_ratio   = to_d(headroomEdit, 3.0);
     cfg.use_sr_exit         = srExitBox->isChecked();
     cfg.use_structural_stop = structStopBox->isChecked();
     // 防呆：三层拦截/止盈锚/结构止损都依赖SR雷达数据——开了它们却没开雷达，

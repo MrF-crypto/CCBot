@@ -69,6 +69,12 @@ cmake --build build --config Release
 
 见 [docs/HEADLESS.md](docs/HEADLESS.md)，含配置文件字段说明和 systemd 常驻部署示例。
 
+## 回测框架（v3.1+）
+
+`ccbot_backtest` 独立工具：**跑实盘引擎本尊**（注入模拟客户端+虚拟时钟），1m K线四子tick走价、
+真实买卖价差建模滑点、资金费入账；支持参数网格并行寻优与 Walk-Forward 分段验证。
+三层决策的两个自由参数（净空比3.0 / 日线%B 0.60）即由此实证确定，详见 [docs/BACKTEST.md](docs/BACKTEST.md)。
+
 ## 测试
 
 指标（布林带/RSI）数学逻辑有独立单元测试，不依赖网络：

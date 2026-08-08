@@ -44,8 +44,8 @@
       "sr_interval": "4h",
 
       "smart_gates": false,
-      "htf_pos_max": 0.80,
-      "sr_headroom_ratio": 1.5,
+      "htf_pos_max": 0.60,
+      "sr_headroom_ratio": 3.0,
       "use_sr_exit": false,
       "use_structural_stop": false
     }

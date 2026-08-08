@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.0.3 LANGUAGES CXX)
+project(CCGMonitor VERSION 3.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -86,6 +86,19 @@ endif()
 if(MSVC)
     # 不链接 Qt6，拿不到 Qt 自带的 /utf-8 编译选项，源文件里的中文注释要自己声明编码
     target_compile_options(ccbot_headless PRIVATE /utf-8)
+endif()
+
+# ── 回测工具（P0 数据层）：不依赖 Qt/网络，Windows/Linux 都能跑 ────────────────
+add_executable(ccbot_backtest
+    src/backtest/bt_main.cpp
+    src/backtest/bt_data.cpp
+    src/backtest/bt_replay.cpp
+    src/core/ccg_engine.cpp     # 回测跑引擎本尊，不是仿制品
+)
+target_include_directories(ccbot_backtest PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccbot_backtest PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccbot_backtest PRIVATE /utf-8)
 endif()
 
 # ── 指标数学逻辑单元测试——纯 C++ 头文件，不依赖 Qt/curl/网络，独立小可执行文件 ──

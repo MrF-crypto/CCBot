@@ -174,10 +174,10 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.smart_gates         = get_bool(bo, "smart_gates", false);
         c.use_htf_filter      = get_bool(bo, "use_htf_filter", true);
         c.htf_interval        = get_str(bo, "htf_interval", "1d");
-        c.htf_pos_max         = get_num(bo, "htf_pos_max", 0.80);
+        c.htf_pos_max         = get_num(bo, "htf_pos_max", 0.60);
         c.use_sr_gate         = get_bool(bo, "use_sr_gate", true);
         c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", 2.0);
-        c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", 1.5);
+        c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", 3.0);
         c.use_sr_exit         = get_bool(bo, "use_sr_exit", false);
         c.use_structural_stop = get_bool(bo, "use_structural_stop", false);
 

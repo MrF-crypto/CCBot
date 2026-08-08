@@ -1,4 +1,5 @@
 #pragma once
+#include "core/itrading_client.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -10,8 +11,21 @@
 
 namespace ccbot {
 
-class TradingClient;
 class ThreadPool;
+
+// 引擎的外部时间源与执行器（回测注入虚拟实现，实盘用默认真实实现）。
+// 时钟必须可注入：回放一年数据只需几秒，用真实时钟的话冷却永远走不完、
+// 指标新鲜度检查永远通过，回测结果完全失真
+struct EngineHost {
+    // 墙钟（冷却计时、成交时间戳）
+    std::function<std::chrono::system_clock::time_point()> now_wall =
+        []{ return std::chrono::system_clock::now(); };
+    // 单调时钟（指标/趋势/结构数据的新鲜度检查）
+    std::function<std::chrono::steady_clock::time_point()> now_steady =
+        []{ return std::chrono::steady_clock::now(); };
+    // 异步执行器（实盘=线程池；回测=内联同步，保证确定性可复现）
+    std::function<void(std::function<void()>)> submit;
+};
 
 // ─── CCG 策略配置 ──────────────────────────────────────────────────────────────
 struct CcgConfig {
@@ -86,13 +100,18 @@ struct CcgConfig {
     // ── v3.0 三层决策（宏观%B + 结构定位）────────────────────────────────────
     // smart_gates=false（默认）：纯影子——首仓派发时记录三层判定快照，不拦截，
     // 行为与 v2.9.x 完全一致；true：新增两层开始真实拦截（趋势/指标层沿用原开关）
+    // ⚠ 下面两个自由参数的默认值由【回测实证】确定，不是推理值：
+    //   数据：BTC/ETH/SOL/BNB 2025-01~2026-08 的 1m 全量，walk-forward 切4段验证
+    //   净空比 2.5/3.0/4.0 均 4/4 段正收益（参数高原），而 1.5/2.0 在大跌段(S3)
+    //     严重亏损（-0.37）→ 门槛的分水岭在 2.0 与 2.5 之间，取高原中心 3.0
+    //   %B 阈值 0.60 为 4/4 段，0.80 仅 2/4 段（拦得太松≈没拦，且偶发误拦有害）
     bool        smart_gates        = false;
     bool        use_htf_filter     = true;    // 宏观：日线%B过滤（smart_gates开启后参与）
     std::string htf_interval       = "1d";
-    double      htf_pos_max        = 0.80;    // 自由参数①：%B高于此值拦新首仓（做多）
+    double      htf_pos_max        = 0.60;    // 自由参数①：%B高于此值拦新首仓（做多）
     bool        use_sr_gate        = true;    // 结构：支撑质量+净空检查
     int         sr_min_confluence  = 2;       // 够格区域的最低共振数
-    double      sr_headroom_ratio  = 1.5;     // 自由参数②：净空÷止盈距离下限
+    double      sr_headroom_ratio  = 3.0;     // 自由参数②：净空÷止盈距离下限
     bool        use_sr_exit        = false;   // 止盈锚定阻力区（独立开关，默认关）
     bool        use_structural_stop = false;  // 结构性止损（独立开关，默认关，仅动态W模式）
 };
@@ -199,8 +218,11 @@ public:
     using LogCb   = std::function<void(const std::string&)>;
     using TradeCb = std::function<void(const TradeRecord&)>;
 
-    CcgEngine(std::shared_ptr<TradingClient> client,
-              std::shared_ptr<ThreadPool>    pool);
+    // 实盘构造：客户端 + 线程池（内部包成 EngineHost）
+    CcgEngine(std::shared_ptr<ITradingClient> client,
+              std::shared_ptr<ThreadPool>     pool);
+    // 回测构造：注入虚拟时钟与内联执行器
+    CcgEngine(std::shared_ptr<ITradingClient> client, EngineHost host);
 
     // Bot 管理
     // 返回 bot_id；若已存在同品种同方向的非停止 bot 则返回空串
@@ -283,8 +305,9 @@ private:
     void submit_close   (const std::string& bot_id, const std::string& reason);
     void log            (const std::string& msg);
 
-    std::shared_ptr<TradingClient> client_;
-    std::shared_ptr<ThreadPool>    pool_;
+    std::shared_ptr<ITradingClient> client_;
+    std::shared_ptr<ThreadPool>     pool_;
+    EngineHost                      host_;
     mutable std::recursive_mutex   mtx_;
     std::map<std::string, CcgBot>  bots_;
     LogCb                          log_cb_;
