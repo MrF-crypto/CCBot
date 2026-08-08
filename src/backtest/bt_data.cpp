@@ -9,8 +9,6 @@
 
 namespace ccbot::bt {
 
-namespace {
-
 // "2026-01-01 00:00:00" → UTC毫秒。容忍非补零（"2021/6/1 0:00"）与两种分隔符
 int64_t parse_ts(const std::string& s) {
     int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
@@ -48,6 +46,7 @@ void split_csv(const std::string& line, std::vector<std::string>& out) {
     }
 }
 
+namespace {
 constexpr int64_t kMinuteMs = 60000;
 constexpr uint32_t kCacheMagic = 0x43424B31;  // "CBK1"
 
@@ -246,6 +245,93 @@ bool load_csv_multi(const std::vector<std::string>& paths, Series& out,
     rep.first_ts   = out.bars.front().ts_ms;
     rep.last_ts    = out.bars.back().ts_ms;
     return true;
+}
+
+// ── 流式读取器 ───────────────────────────────────────────────────────────────
+bool BarStream::open(const std::string& sym, std::vector<std::string> paths) {
+    symbol_ = sym;
+    paths_ = std::move(paths);
+    std::sort(paths_.begin(), paths_.end());
+    file_idx_ = 0; pos_ = 0; last_ts_ = 0; header_done_ = false;
+    buf_.clear();
+    fh_.reset();
+    return !paths_.empty() && refill();
+}
+
+int64_t BarStream::peek_ts() {
+    if (pos_ >= buf_.size() && !refill()) return 0;
+    return buf_[pos_].ts_ms;
+}
+
+bool BarStream::next(Bar& out) {
+    if (pos_ >= buf_.size() && !refill()) return false;
+    out = buf_[pos_++];
+    return true;
+}
+
+bool BarStream::refill() {
+    buf_.clear(); pos_ = 0;
+    constexpr size_t kChunk = 8192;
+
+    while (buf_.size() < kChunk) {
+        if (!fh_) {
+            if (file_idx_ >= paths_.size()) break;
+            auto f = std::make_shared<std::ifstream>(paths_[file_idx_++], std::ios::binary);
+            if (!*f) { fh_.reset(); continue; }
+            fh_ = f;
+            header_done_ = false;
+        }
+        auto& f = *std::static_pointer_cast<std::ifstream>(fh_);
+        std::string line;
+
+        if (!header_done_) {
+            // 跳版权行 + 解析表头
+            if (!std::getline(f, line)) { fh_.reset(); continue; }
+            if (line.find("candle_begin_time") == std::string::npos &&
+                !std::getline(f, line)) { fh_.reset(); continue; }
+            std::vector<std::string> cols;
+            split_csv(line, cols);
+            auto idx = [&](const char* n)->int{
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    std::string c = cols[i];
+                    c.erase(std::remove_if(c.begin(), c.end(),
+                            [](unsigned char ch){ return ch=='\r'||ch=='\n'||ch==' '; }), c.end());
+                    if (c == n) return (int)i;
+                }
+                return -1;
+            };
+            i_ts_=idx("candle_begin_time"); i_o_=idx("open"); i_h_=idx("high");
+            i_l_=idx("low"); i_c_=idx("close"); i_v_=idx("volume");
+            i_qv_=idx("quote_volume"); i_sp_=idx("Spread"); i_fr_=idx("fundingRate");
+            header_done_ = true;
+            if (i_ts_ < 0 || i_c_ < 0) { fh_.reset(); continue; }
+        }
+
+        std::vector<std::string> fs;
+        bool got = false;
+        while (buf_.size() < kChunk && std::getline(f, line)) {
+            if (line.empty()) continue;
+            split_csv(line, fs);
+            if ((int)fs.size() <= i_c_) continue;
+            Bar b;
+            b.ts_ms = parse_ts(fs[i_ts_]);
+            if (b.ts_ms <= 0 || b.ts_ms <= last_ts_) continue;   // 去重/倒序
+            b.open = to_d(fs[i_o_]); b.high = to_d(fs[i_h_]);
+            b.low = to_d(fs[i_l_]);  b.close = to_d(fs[i_c_]);
+            if (i_v_  >= 0 && (int)fs.size() > i_v_)  b.volume    = to_d(fs[i_v_]);
+            if (i_qv_ >= 0 && (int)fs.size() > i_qv_) b.quote_vol = to_d(fs[i_qv_]);
+            if (i_sp_ >= 0 && (int)fs.size() > i_sp_) b.spread    = std::fabs(to_d(fs[i_sp_]));
+            if (i_fr_ >= 0 && (int)fs.size() > i_fr_) b.funding   = to_d(fs[i_fr_]);
+            if (b.open <= 0 || b.high <= 0 || b.low <= 0 || b.close <= 0 ||
+                b.high < b.low) continue;
+            last_ts_ = b.ts_ms;
+            buf_.push_back(b);
+            got = true;
+        }
+        if (!got && f.eof()) fh_.reset();   // 本文件读完，换下一个
+        else if (buf_.size() >= kChunk) break;
+    }
+    return !buf_.empty();
 }
 
 bool save_cache(const std::string& path, const Series& s) {

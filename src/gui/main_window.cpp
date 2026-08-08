@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.1");
+    setWindowTitle("CCG 合约监控  v3.2");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -361,36 +361,36 @@ void MainWindow::load_and_restore_bots() {
         auto o = v.toObject();
         CcgConfig c;
         c.symbol       = o["symbol"].toString().toStdString();
-        c.strat_type   = (CcgConfig::StratType)o["strat_type"].toInt(1);
+        c.strat_type   = (CcgConfig::StratType)o["strat_type"].toInt(7);
         c.direction    = (CcgConfig::Direction)o["direction"].toInt(0);
         c.budget_usdt  = o["budget_usdt"].toDouble(3000.0);
         c.leverage     = o["leverage"].toInt(3);
-        c.max_entries  = o["max_entries"].toInt(6);
+        c.max_entries  = o["max_entries"].toInt(7);
         c.interval_pct = o["interval_pct"].toDouble(8.0);
         c.trail_entry  = o["trail_entry"].toDouble(1.0);
         c.tp_pct       = o["tp_pct"].toDouble(5.0);
         c.trail_tp     = o["trail_tp"].toDouble(2.0);
         c.auto_restart = o["auto_restart"].toBool(true);
-        c.cooldown_secs= o["cooldown_secs"].toInt(60);
+        c.cooldown_secs= o["cooldown_secs"].toInt(300);
         c.stop_loss_pct= o["stop_loss_pct"].toDouble(0.0);
 
-        c.entry_mode     = (CcgConfig::EntryMode)o["entry_mode"].toInt(0);
+        c.entry_mode     = (CcgConfig::EntryMode)o["entry_mode"].toInt(1);
         c.kline_interval = o["kline_interval"].toString("1h").toStdString();
         c.boll_period    = o["boll_period"].toInt(20);
         c.boll_mult      = o["boll_mult"].toDouble(2.0);
         c.use_rsi_filter = o["use_rsi_filter"].toBool(true);
         c.rsi_period     = o["rsi_period"].toInt(14);
         c.rsi_threshold  = o["rsi_threshold"].toDouble(30.0);
-        c.rsi_confirm_mode = (CcgConfig::RsiConfirmMode)o["rsi_confirm_mode"].toInt(0);
+        c.rsi_confirm_mode = (CcgConfig::RsiConfirmMode)o["rsi_confirm_mode"].toInt(1);
         c.rsi_oversold_th  = o["rsi_oversold_th"].toDouble(25.0);
-        c.dynamic_band_mode = o["dynamic_band_mode"].toBool(false);
-        c.min_profit_floor  = o["min_profit_floor"].toDouble(0.3);
-        c.use_trend_filter  = o["use_trend_filter"].toBool(false);
+        c.dynamic_band_mode = o["dynamic_band_mode"].toBool(true);
+        c.min_profit_floor  = o["min_profit_floor"].toDouble(3.5);
+        c.use_trend_filter  = o["use_trend_filter"].toBool(true);
         c.trend_interval    = o["trend_interval"].toString("4h").toStdString();
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
-        c.sr_radar          = o["sr_radar"].toBool(false);
+        c.sr_radar          = o["sr_radar"].toBool(true);
         c.sr_interval       = o["sr_interval"].toString("4h").toStdString();
-        c.smart_gates         = o["smart_gates"].toBool(false);
+        c.smart_gates         = o["smart_gates"].toBool(true);
         c.use_htf_filter      = o["use_htf_filter"].toBool(true);
         c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
@@ -1416,7 +1416,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     for (const char* s : {"平推(Flat)","倍投(Mart)","倍投Plus","三倍(Triple)",
                            "平方(Sq)","斐波那契","卢卡斯","递增(Lin)"})
         stratBox->addItem(s);
-    stratBox->setCurrentIndex(prefill ? (int)prefill->cfg.strat_type : 1);
+    stratBox->setCurrentIndex(prefill ? (int)prefill->cfg.strat_type : 7);   // 默认递增（实证最优）
     form->addRow("策略:", stratBox);
 
     auto mkEdit = [&](const QString& label, double val) {
@@ -1432,12 +1432,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     auto* budgetEdit   = mkEdit ("预算USDT:",      prefill ? prefill->cfg.budget_usdt  : 3000.0);
     auto* levEdit      = mkEditI("杠杆:",          prefill ? prefill->cfg.leverage     : 3);
-    auto* maxEntEdit   = mkEditI("最大层:",        prefill ? prefill->cfg.max_entries  : 6);
+    auto* maxEntEdit   = mkEditI("最大层:",        prefill ? prefill->cfg.max_entries  : 7);
     auto* intervalEdit = mkEdit ("间隔%:",         prefill ? prefill->cfg.interval_pct : 8.0);
     auto* trailEntEdit = mkEdit ("追踪建仓%:",     prefill ? prefill->cfg.trail_entry  : 1.0);
     auto* tpEdit       = mkEdit ("止盈%:",         prefill ? prefill->cfg.tp_pct       : 5.0);
     auto* trailTpEdit  = mkEdit ("止盈追踪%:",     prefill ? prefill->cfg.trail_tp     : 2.0);
-    auto* cooldownEdit = mkEditI("冷却(s):",       prefill ? prefill->cfg.cooldown_secs: 60);
+    auto* cooldownEdit = mkEditI("冷却(s):",       prefill ? prefill->cfg.cooldown_secs: 300);
     auto* stopLossEdit = mkEdit ("止损%(0=禁用):", prefill ? prefill->cfg.stop_loss_pct : 0.0);
 
     auto* autoRestartBox = new QCheckBox("自动重启");
@@ -1448,12 +1448,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     entryModeBox->addItem("立即开仓（一开监控就开首仓）");
     entryModeBox->addItem("指标信号（BOLL+RSI 满足才开首仓）");
     entryModeBox->setCurrentIndex(
-        prefill && prefill->cfg.entry_mode == CcgConfig::EntryMode::Indicator ? 1 : 0);
+        prefill ? (prefill->cfg.entry_mode == CcgConfig::EntryMode::Indicator ? 1 : 0) : 1);
     form->addRow("首单模式:", entryModeBox);
 
     // ── 动态W模式（v2.3）───────────────────────────────────────────────────────
     auto* dynBandBox = new QCheckBox("动态W模式（补仓锚定下轨/止盈锚定上轨/间距自适应带宽）");
-    dynBandBox->setChecked(prefill ? prefill->cfg.dynamic_band_mode : false);
+    dynBandBox->setChecked(prefill ? prefill->cfg.dynamic_band_mode : true);
     dynBandBox->setToolTip(
         "开启后间隔%/追踪%不再用上面的固定值，改为按实时布林带宽W自动推导：\n"
         "间隔=W/3、追踪止盈=0.15W、追踪建仓=0.1W（各有上下限夹逼）。\n"
@@ -1461,11 +1461,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "带子随趋势移动时梯子跟着走，均价贴着下轨，带内震荡即可完成周期。");
     form->addRow("", dynBandBox);
     auto* floorEdit = mkEdit("保底利润%(动态模式):",
-                             prefill ? prefill->cfg.min_profit_floor : 0.3);
+                             prefill ? prefill->cfg.min_profit_floor : 3.5);
 
     // ── SR雷达（v2.6 影子模式）───────────────────────────────────────────────
     auto* srBox = new QCheckBox("SR雷达（自动检测支撑/阻力区+触区告警，不参与下单）");
-    srBox->setChecked(prefill ? prefill->cfg.sr_radar : false);
+    srBox->setChecked(prefill ? prefill->cfg.sr_radar : true);
     srBox->setToolTip(
         "自动检测该品种 4h 级别的支撑/阻力区域（摆动点聚类+攻防转换+FVG缺口），\n"
         "约15分钟刷新一次。价格触及区域时打日志+webhook告警（同区域2小时去重）。\n"
@@ -1475,7 +1475,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
     auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
-    trendBox->setChecked(prefill ? prefill->cfg.use_trend_filter : false);
+    trendBox->setChecked(prefill ? prefill->cfg.use_trend_filter : true);
     trendBox->setToolTip(
         "高周期趋势判定：价格在 4h EMA200 之下 且 中轨明显下拐 = 空头态。\n"
         "空头态期间不开新首仓（不接单边下跌的飞刀），已有仓位补仓间隔放大1.5倍。\n"
@@ -1484,7 +1484,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     // ── v3.0 三层决策 ────────────────────────────────────────────────────────
     auto* smartBox = new QCheckBox("三层决策拦截（不勾=影子模式：每笔首仓只记判定快照，不拦截）");
-    smartBox->setChecked(prefill ? prefill->cfg.smart_gates : false);
+    smartBox->setChecked(prefill ? prefill->cfg.smart_gates : true);
     smartBox->setToolTip(
         "宏观层：日线%B高于阈值拦新首仓（大图景太贵不买小回调）。\n"
         "结构层：脚下须有共振≥2的支撑区 + 头顶净空÷止盈距离≥下限（无空间不开）。\n"
@@ -1529,8 +1529,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* rsiModeBox = new QComboBox();
     rsiModeBox->addItem("瞬时快照（这一刻RSI到阈值就行）");
     rsiModeBox->addItem("反转确认（先探底跌破，再回穿阈值）");
-    rsiModeBox->setCurrentIndex(
-        (prefill && prefill->cfg.rsi_confirm_mode == CcgConfig::RsiConfirmMode::CrossFromOversold) ? 1 : 0);
+    rsiModeBox->setCurrentIndex(prefill
+        ? (prefill->cfg.rsi_confirm_mode == CcgConfig::RsiConfirmMode::CrossFromOversold ? 1 : 0)
+        : 1);   // 默认反转确认（实证：快照模式在大跌段重亏）
     indForm->addRow("RSI确认方式:", rsiModeBox);
 
     auto* rsiOversoldEdit = new QLineEdit(
@@ -1784,13 +1785,13 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.direction     = static_cast<CcgConfig::Direction>(dirBox->currentIndex());
     cfg.budget_usdt   = to_d(budgetEdit,   3000.0);
     cfg.leverage      = to_i(levEdit,       3);
-    cfg.max_entries   = to_i(maxEntEdit,    6);
+    cfg.max_entries   = to_i(maxEntEdit,    7);
     cfg.interval_pct  = to_d(intervalEdit,  8.0);
     cfg.trail_entry   = to_d(trailEntEdit,  1.0);
     cfg.tp_pct        = to_d(tpEdit,        5.0);
     cfg.trail_tp      = to_d(trailTpEdit,   2.0);
     cfg.auto_restart  = autoRestartBox->isChecked();
-    cfg.cooldown_secs = to_i(cooldownEdit,  60);
+    cfg.cooldown_secs = to_i(cooldownEdit,  300);
     cfg.stop_loss_pct = to_d(stopLossEdit,  0.0);
 
     cfg.entry_mode     = (entryModeBox->currentIndex() == 1)
@@ -1806,7 +1807,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                           : CcgConfig::RsiConfirmMode::Snapshot;
     cfg.rsi_oversold_th  = to_d(rsiOversoldEdit, 25.0);
     cfg.dynamic_band_mode = dynBandBox->isChecked();
-    cfg.min_profit_floor  = to_d(floorEdit, 0.3);
+    cfg.min_profit_floor  = to_d(floorEdit, 3.5);
     cfg.use_trend_filter  = trendBox->isChecked();
     cfg.sr_radar          = srBox->isChecked();
     cfg.smart_gates         = smartBox->isChecked();

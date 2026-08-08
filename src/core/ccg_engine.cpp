@@ -731,6 +731,8 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
                     decision::Inputs din;
                     din.is_long     = is_long;
+                    // 启用拦截时数据缺失同样不放行：宁可错过不可乱开
+                    din.strict      = bot.cfg.smart_gates;
                     din.use_htf     = bot.cfg.use_htf_filter;
                     din.htf_ok      = bot.htf_ok && (snow - bot.htf_time) < std::chrono::minutes(30);
                     din.htf_pct_b   = bot.htf_pct_b;
@@ -765,9 +767,16 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
                     if (!verdict.pass() && bot.cfg.smart_gates) {
                         can_enter = false;
-                        if (bot.last_action != "三层决策拦截") {
-                            bot.last_action = "三层决策拦截";
-                            log(bot.cfg.symbol + " 首仓被三层决策拦截: " + decision_snap);
+                        // 数据未就绪与条件不满足分开提示——前者是"等一等"，
+                        // 后者是"这里不该买"，用户看日志时需要能区分
+                        const char* why = verdict.data_block ? "三层数据未就绪，暂不开仓"
+                                                             : "三层决策拦截";
+                        if (bot.last_action != why) {
+                            bot.last_action = why;
+                            log(bot.cfg.symbol + " " + why + ": " + decision_snap +
+                                (verdict.data_block
+                                 ? "（数据到齐后自动放行；新上市品种需等日线21根+4h线60根历史）"
+                                 : ""));
                         }
                     }
                 }

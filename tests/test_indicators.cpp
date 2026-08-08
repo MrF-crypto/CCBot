@@ -290,7 +290,16 @@ int main() {
         CHECK(dc::evaluate(t3).headroom_block, "净空1.0<1.5应触发拦截");
         auto t4 = in; t4.htf_ok = false;
         auto v4 = dc::evaluate(t4);
-        CHECK(v4.htf_missing && v4.pass(), "宏观数据缺失应fail-open放行并标注");
+        CHECK(v4.htf_missing && v4.pass(), "影子模式下宏观数据缺失应放行并标注");
+        // strict 模式（启用拦截）：数据缺失等同条件不满足，不放行
+        auto s1 = in; s1.strict = true; s1.htf_ok = false;
+        auto sv1 = dc::evaluate(s1);
+        CHECK(sv1.data_block && !sv1.pass(), "strict模式宏观数据缺失应拦截");
+        auto s2 = in; s2.strict = true; s2.sr_ok = false;
+        auto sv2 = dc::evaluate(s2);
+        CHECK(sv2.data_block && !sv2.pass(), "strict模式结构数据缺失应拦截");
+        auto s3 = in; s3.strict = true;      // 数据齐全时 strict 不应改变结果
+        CHECK(dc::evaluate(s3).pass(), "strict模式数据齐全应正常放行");
         auto t5 = in; t5.is_long = false; t5.htf_pct_b = 0.1;
         CHECK(dc::evaluate(t5).htf_block, "做空%B=0.1应镜像触发低位拦截");
     }

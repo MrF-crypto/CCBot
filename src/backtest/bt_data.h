@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <memory>
 #include <cstdint>
 
 // 回测数据层：CSV 解析 → 质检 → 二进制缓存。
@@ -60,6 +61,33 @@ bool load_csv(const std::string& path, Series& out, QualityReport& rep, std::str
 // 返回合并后的连续序列。任一文件失败即整体失败
 bool load_csv_multi(const std::vector<std::string>& paths, Series& out,
                     QualityReport& rep, std::string& err);
+
+// ── 流式读取器：全市场回测用 ─────────────────────────────────────────────────
+// 596 品种全量载入需 36GB 内存，装不下。改为每品种只在内存保留一个小缓冲区
+// （默认8192根≈600KB），读完自动从磁盘续填——内存占用与品种数线性但系数极小
+class BarStream {
+public:
+    bool open(const std::string& symbol, std::vector<std::string> paths);
+    // 取下一根；无更多数据返回 false
+    bool next(Bar& out);
+    // 预览下一根的时间戳（不消费）；无数据返回 0
+    int64_t peek_ts();
+    const std::string& symbol() const { return symbol_; }
+
+private:
+    bool refill();
+
+    std::string symbol_;
+    std::vector<std::string> paths_;
+    size_t file_idx_ = 0;
+    std::shared_ptr<void> fh_;       // ifstream（避免头文件引入 <fstream>）
+    std::vector<Bar> buf_;
+    size_t pos_ = 0;
+    int64_t last_ts_ = 0;
+    bool header_done_ = false;
+    // 列下标（按表头定位，不写死顺序）
+    int i_ts_=-1, i_o_=-1, i_h_=-1, i_l_=-1, i_c_=-1, i_v_=-1, i_qv_=-1, i_sp_=-1, i_fr_=-1;
+};
 
 // 二进制缓存：加载一次CSV要几秒，缓存后毫秒级（参数网格要反复读同一份数据）
 bool save_cache(const std::string& path, const Series& s);

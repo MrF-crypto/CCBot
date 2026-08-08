@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.1.0 LANGUAGES CXX)
+project(CCGMonitor VERSION 3.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,6 +93,7 @@ add_executable(ccbot_backtest
     src/backtest/bt_main.cpp
     src/backtest/bt_data.cpp
     src/backtest/bt_replay.cpp
+    src/backtest/bt_portfolio.cpp
     src/core/ccg_engine.cpp     # 回测跑引擎本尊，不是仿制品
 )
 target_include_directories(ccbot_backtest PRIVATE ${CMAKE_SOURCE_DIR}/src)

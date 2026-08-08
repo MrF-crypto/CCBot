@@ -142,36 +142,36 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
             return false;
         }
 
-        c.strat_type    = parse_strat(get_str(bo, "strat_type", "martingale"));
+        c.strat_type    = parse_strat(get_str(bo, "strat_type", "linear"));
         c.direction     = parse_dir(dir_s);
         c.budget_usdt   = get_num(bo, "budget_usdt", 3000.0);
         c.leverage      = (int)get_num(bo, "leverage", 3);
-        c.max_entries   = (int)get_num(bo, "max_entries", 6);
+        c.max_entries   = (int)get_num(bo, "max_entries", 7);
         c.interval_pct  = get_num(bo, "interval_pct", 8.0);
         c.trail_entry   = get_num(bo, "trail_entry", 1.0);
         c.tp_pct        = get_num(bo, "tp_pct", 5.0);
         c.trail_tp      = get_num(bo, "trail_tp", 2.0);
         c.auto_restart  = get_bool(bo, "auto_restart", true);
-        c.cooldown_secs = (int)get_num(bo, "cooldown_secs", 60.0);
+        c.cooldown_secs = (int)get_num(bo, "cooldown_secs", 300.0);
         c.stop_loss_pct = get_num(bo, "stop_loss_pct", 0.0);
 
-        c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "immediate"));
+        c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "indicator"));
         c.kline_interval  = get_str(bo, "kline_interval", "1h");
         c.boll_period     = (int)get_num(bo, "boll_period", 20.0);
         c.boll_mult       = get_num(bo, "boll_mult", 2.0);
         c.use_rsi_filter  = get_bool(bo, "use_rsi_filter", true);
         c.rsi_period      = (int)get_num(bo, "rsi_period", 14.0);
         c.rsi_threshold   = get_num(bo, "rsi_threshold", 30.0);
-        c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "snapshot"));
+        c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "cross"));
         c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", 25.0);
-        c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", false);
-        c.min_profit_floor  = get_num(bo, "min_profit_floor", 0.3);
-        c.use_trend_filter  = get_bool(bo, "use_trend_filter", false);
+        c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", true);
+        c.min_profit_floor  = get_num(bo, "min_profit_floor", 3.5);
+        c.use_trend_filter  = get_bool(bo, "use_trend_filter", true);
         c.trend_interval    = get_str(bo, "trend_interval", "4h");
         c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", 200.0);
-        c.sr_radar          = get_bool(bo, "sr_radar", false);
+        c.sr_radar          = get_bool(bo, "sr_radar", true);
         c.sr_interval       = get_str(bo, "sr_interval", "4h");
-        c.smart_gates         = get_bool(bo, "smart_gates", false);
+        c.smart_gates         = get_bool(bo, "smart_gates", true);
         c.use_htf_filter      = get_bool(bo, "use_htf_filter", true);
         c.htf_interval        = get_str(bo, "htf_interval", "1d");
         c.htf_pos_max         = get_num(bo, "htf_pos_max", 0.60);

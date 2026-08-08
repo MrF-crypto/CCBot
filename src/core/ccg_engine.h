@@ -44,18 +44,22 @@ struct CcgConfig {
     // Indicator=等 BOLL+RSI 信号满足才开首仓，之后网格加仓/止盈止损逻辑不变
     enum class EntryMode { Immediate, Indicator };
 
+    // ⚠ 默认值 = 回测实证最优组合（BTC/ETH/SOL/BNB 2025-01~2026-08，walk-forward 4段）：
+    //   递增曲线 / 7层 / 保底利润3.5% / 指标首单 RSI25-30反转确认 / 动态W /
+    //   趋势过滤 / SR雷达 / 三层拦截(%B0.60 + 净空3.0)
+    //   实证依据见 docs/BACKTEST.md。这些只影响【新建】bot，已有 bot 从配置文件恢复
     std::string symbol;
-    StratType   strat_type   = StratType::Martingale;
+    StratType   strat_type   = StratType::Linear;   // 递增：均价压得动且深层资金不爆炸
     Direction   direction    = Direction::Long;
     double      budget_usdt  = 3000.0;   // 预算资金（每个方向）
-    int         max_entries  = 6;        // 最大加仓层数（共做单数）
+    int         max_entries  = 7;        // 最大加仓层数：7层在3.0%/3.5%两档均最优
     int         leverage     = 3;
-    double      interval_pct = 8.0;      // 间隔比例 %（下跌多少触发下一仓条件）
-    double      trail_entry  = 1.0;      // 追踪建仓 %（到达间隔后反弹多少才真正入场）
-    double      tp_pct       = 5.0;      // 整体止盈 %（均价回升多少止盈）
-    double      trail_tp     = 2.0;      // 追踪止盈 %（达到止盈后回落多少才平仓）
+    double      interval_pct = 8.0;      // 间隔比例 %（动态W模式下不生效）
+    double      trail_entry  = 1.0;      // 追踪建仓 %（动态W模式下不生效）
+    double      tp_pct       = 5.0;      // 整体止盈 %（动态W模式下不生效）
+    double      trail_tp     = 2.0;      // 追踪止盈 %（动态W模式下不生效）
     bool        auto_restart  = true;
-    int         cooldown_secs = 60;
+    int         cooldown_secs = 300;     // 回测用值；60秒在高位区会立刻回补
     double      stop_loss_pct = 0.0;   // 均价跌幅超过此值强制平仓（0=禁用）
 
     // RSI 确认方式：Snapshot=当前这一刻 RSI 到没到阈值就行；
@@ -64,15 +68,16 @@ struct CcgConfig {
     enum class RsiConfirmMode { Snapshot, CrossFromOversold };
 
     // 指标信号首单（entry_mode == Indicator 时才生效）
-    EntryMode   entry_mode     = EntryMode::Immediate;
+    EntryMode   entry_mode     = EntryMode::Indicator;   // 实证：立即开仓跳过了微观扳机层
     std::string kline_interval = "1h";
     int         boll_period    = 20;
     double      boll_mult      = 2.0;
     bool        use_rsi_filter = true;
-    int         rsi_period     = 14;
+    int         rsi_period     = 14;      // 实证：周期7太敏感、21太迟钝
     double      rsi_threshold  = 30.0;   // 多：RSI≥此值；空：RSI≤(100-此值)
-    RsiConfirmMode rsi_confirm_mode = RsiConfirmMode::Snapshot;
-    double         rsi_oversold_th  = 25.0;  // CrossFromOversold 模式：先跌破这个值才算探过底
+    // 实证最强的一条对照：同阈值下瞬时快照 -798U vs 反转确认 +203U
+    RsiConfirmMode rsi_confirm_mode = RsiConfirmMode::CrossFromOversold;
+    double         rsi_oversold_th  = 25.0;  // 25/30 位于"探底甜点×窄确认带"的交汇处
 
     // 动态W模式（v2.3+）：把整个策略的锚点从"固定百分比"换成"布林带本身"——
     //   补仓锚定下轨：除了跌够动态间隔，价格还必须在带外（统计超卖位）才补
@@ -80,21 +85,24 @@ struct CcgConfig {
     //   间距自适应：间隔/追踪参数由实时带宽W推导（见 dynamic_params.h），不再用配置里的固定值
     // 带子在下跌趋势中整体下移时梯子跟着走，均价贴着下轨，带内震荡就能完成多头周期。
     // 指标数据超时（>180s无更新）时冻结新补仓/止盈激活，宁可错过不可乱做。
-    bool   dynamic_band_mode = false;
-    double min_profit_floor  = 0.3;   // 动态模式止盈激活的最低盈利%（覆盖手续费+微利）
+    bool   dynamic_band_mode = true;
+    // 实证：保底利润是影响最大的单一参数。0.3%→3.5% 收益翻数倍（利润厚度）；
+    // 但超过 4% 后回撤暴涨（持仓更久扛更深浮亏），8% 时收益/回撤只剩 0.5。
+    // 3.5% 在收益/回撤维度是全部测试的最优点（0.83）
+    double min_profit_floor  = 3.5;
 
     // 趋势状态机（v2.5+）：高周期（默认4h EMA200 + 中轨斜率）判定空头态时
     //   1) 暂停开新首仓（网格最怕的单边下跌里不接飞刀）
     //   2) 已有仓位的补仓间隔自动放大 1.5 倍（子弹省着打）
     // 趋势数据缺失/过期时不拦（fail-open）：这是增强过滤，不该因为断数据把交易卡死
-    bool        use_trend_filter = false;
+    bool        use_trend_filter = true;
     std::string trend_interval   = "4h";
     int         trend_ema_period = 200;
 
     // SR雷达（v2.6+，影子模式）：自动检测支撑/阻力区域（摆动点聚类+FVG），
     // 价格触区时告警+记录，【不参与下单决策】——先积累"程序的眼睛"的准确率数据，
     // 执行接线是后续阶段的事。检测计算在应用层（GUI/headless），引擎只存配置
-    bool        sr_radar    = false;
+    bool        sr_radar    = true;      // 三层决策的结构数据来源，默认开
     std::string sr_interval = "4h";
 
     // ── v3.0 三层决策（宏观%B + 结构定位）────────────────────────────────────
@@ -105,7 +113,8 @@ struct CcgConfig {
     //   净空比 2.5/3.0/4.0 均 4/4 段正收益（参数高原），而 1.5/2.0 在大跌段(S3)
     //     严重亏损（-0.37）→ 门槛的分水岭在 2.0 与 2.5 之间，取高原中心 3.0
     //   %B 阈值 0.60 为 4/4 段，0.80 仅 2/4 段（拦得太松≈没拦，且偶发误拦有害）
-    bool        smart_gates        = false;
+    // smart_gates=true 时数据缺失【不放行】（strict）——闸门既然开了就该真守住
+    bool        smart_gates        = true;
     bool        use_htf_filter     = true;    // 宏观：日线%B过滤（smart_gates开启后参与）
     std::string htf_interval       = "1d";
     double      htf_pos_max        = 0.60;    // 自由参数①：%B高于此值拦新首仓（做多）

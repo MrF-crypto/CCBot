@@ -66,7 +66,11 @@ inline double headroom_ratio(double price, double res_lo, double tp_distance) {
 // ── 三层判定 ─────────────────────────────────────────────────────────────────
 struct Inputs {
     bool is_long = true;
-    // 宏观：日线%B（htf_ok=false 表示数据缺失/过期 → fail-open 放行并标注）
+    // strict=true（启用拦截时）：数据缺失【等同条件不满足】，不开仓——既然明确
+    // 启用了闸门，闸门就该真的守住，"数据没到"和"条件不满足"同等对待。
+    // strict=false（影子模式）：数据缺失只标注不拦（反正影子模式本来就不拦）
+    bool strict = false;
+    // 宏观：日线%B（htf_ok=false 表示数据缺失/过期）
     bool   use_htf     = true;
     bool   htf_ok      = false;
     double htf_pct_b   = 0.5;
@@ -83,17 +87,21 @@ struct Verdict {
     bool htf_block      = false;   // 宏观：日线高位（做多）/低位（做空）
     bool support_block  = false;   // 结构：脚下无够格支撑
     bool headroom_block = false;   // 结构：头顶净空不足
-    bool htf_missing    = false;   // 数据缺失标注（fail-open，仅记录）
+    bool htf_missing    = false;   // 数据缺失标注
     bool sr_missing     = false;
+    bool data_block     = false;   // strict 模式下因数据缺失而拦截
 
-    bool pass() const { return !htf_block && !support_block && !headroom_block; }
+    bool pass() const {
+        return !htf_block && !support_block && !headroom_block && !data_block;
+    }
 };
 
 inline Verdict evaluate(const Inputs& in) {
     Verdict v;
     if (in.use_htf) {
         if (!in.htf_ok) {
-            v.htf_missing = true;   // fail-open：数据缺失不拦截
+            v.htf_missing = true;
+            if (in.strict) v.data_block = true;   // 严格模式：数据没到不开仓
         } else if (in.is_long ? (in.htf_pct_b > in.htf_pos_max)
                               : (in.htf_pct_b < 1.0 - in.htf_pos_max)) {
             v.htf_block = true;     // 做多拦高位；做空镜像拦低位
@@ -101,7 +109,8 @@ inline Verdict evaluate(const Inputs& in) {
     }
     if (in.use_sr) {
         if (!in.sr_ok) {
-            v.sr_missing = true;    // fail-open
+            v.sr_missing = true;
+            if (in.strict) v.data_block = true;
         } else {
             if (!in.at_support)              v.support_block  = true;
             if (in.headroom < in.headroom_min) v.headroom_block = true;
@@ -116,12 +125,13 @@ inline std::string summarize(const Inputs& in, const Verdict& v) {
         std::string s = std::to_string(x);
         return s.substr(0, s.find('.') + 3);   // 保留两位小数
     };
+    const char* miss = in.strict ? "缺失✗" : "缺失(放行)";
     std::string s = "%B=";
-    if (v.htf_missing)      s += "缺失(放行)";
+    if (v.htf_missing)      s += miss;
     else if (!in.use_htf)   s += "关";
     else                    s += num(in.htf_pct_b) + (v.htf_block ? "✗高位" : "✓");
     s += " | 支撑";
-    if (v.sr_missing)       s += "缺失(放行)";
+    if (v.sr_missing)       s += miss;
     else if (!in.use_sr)    s += "关";
     else                    s += v.support_block ? "✗无" : "✓在场";
     s += " | 净空";

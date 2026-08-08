@@ -11,16 +11,16 @@
     {
       "symbol": "BTCUSDT",
       "direction": "long",
-      "strat_type": "martingale",
+      "strat_type": "linear",
       "budget_usdt": 3000,
       "leverage": 3,
-      "max_entries": 6,
+      "max_entries": 7,
       "interval_pct": 8,
       "trail_entry": 1,
       "tp_pct": 5,
       "trail_tp": 2,
       "auto_restart": true,
-      "cooldown_secs": 60,
+      "cooldown_secs": 300,
       "stop_loss_pct": 0,
 
       "entry_mode": "indicator",
@@ -33,17 +33,17 @@
       "rsi_confirm_mode": "cross",
       "rsi_oversold_th": 25,
 
-      "dynamic_band_mode": false,
-      "min_profit_floor": 0.3,
+      "dynamic_band_mode": true,
+      "min_profit_floor": 3.5,
 
-      "use_trend_filter": false,
+      "use_trend_filter": true,
       "trend_interval": "4h",
       "trend_ema_period": 200,
 
-      "sr_radar": false,
+      "sr_radar": true,
       "sr_interval": "4h",
 
-      "smart_gates": false,
+      "smart_gates": true,
       "htf_pos_max": 0.60,
       "sr_headroom_ratio": 3.0,
       "use_sr_exit": false,
