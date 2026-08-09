@@ -602,6 +602,24 @@ bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
     return is_long ? (price >= bounce_th) : (price <= bounce_th);
 }
 
+// 补仓侧闸门：只作用于"深层"补仓（占资金大头且必然在暴跌中触发的那几层）。
+// 数据缺失一律放行——补仓闸门是减仓保护而非入场许可，断数据时卡住补仓会让
+// 已有仓位失去摊薄能力，风险方向反而更糟
+bool CcgEngine::dca_gate_blocked(const CcgBot& bot,
+                                 std::chrono::steady_clock::time_point now) const {
+    const int from = bot.cfg.dca_gate_from_layer;
+    if (from <= 0) return false;
+    // entries.size() 是已有层数，下一笔是第 size()+1 层
+    if ((int)bot.entries.size() + 1 < from) return false;
+
+    if (bot.cfg.dca_gate_trend && trend_active_bearish(bot, now)) return true;
+    if (bot.cfg.dca_gate_htf_min > 0) {
+        bool htf_fresh = bot.htf_ok && (now - bot.htf_time) < std::chrono::minutes(30);
+        if (htf_fresh && bot.htf_pct_b < bot.cfg.dca_gate_htf_min) return true;
+    }
+    return false;
+}
+
 bool CcgEngine::should_close(const CcgBot& bot, double price) const {
     if (bot.entries.empty()) return false;
     if (!bot.tp_reached)     return false;
@@ -829,8 +847,17 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 do_close.push_back({id, "追踪止盈"});
                 bot.pending = true;
             } else if (should_enter(bot, price)) {
-                do_entry.push_back(id);
-                bot.pending = true;
+                if (dca_gate_blocked(bot, host_.now_steady())) {
+                    std::string why = "第" + std::to_string(bot.entries.size() + 1) +
+                                      "层补仓被闸门拦下（深层资金保护）";
+                    if (bot.last_action != why) {
+                        bot.last_action = why;
+                        log(bot.cfg.symbol + " " + why);
+                    }
+                } else {
+                    do_entry.push_back(id);
+                    bot.pending = true;
+                }
             }
         }
     }

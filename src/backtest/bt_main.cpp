@@ -1118,10 +1118,29 @@ static int cmd_floor(int argc, char** argv) {
     // --res-variants：阻力侧计票门槛（1=只要有一票就认这堵墙，2=与支撑同门槛）
     const bool sweep_res = arg_flag(argc, argv, "--res-variants");
     auto res_list = parse_list(arg_str(argc, argv, "--res-confs", "0,1"));
+    // --dca-gate：补仓侧闸门。首仓只占预算3.6%，第5~7层占64.3%——这是唯一
+    // 作用在资金大头上的维度。扫描：起始层 × 闸门类型
+    const bool sweep_dca = arg_flag(argc, argv, "--dca-gate");
+    auto dcal_list = parse_list(arg_str(argc, argv, "--dca-layers", "4,5,6"));
+    auto dcab_list = parse_list(arg_str(argc, argv, "--dca-pctb",  "0.10"));
     struct Cfg { double floor; int layers; bool sr_exit; bool indep; bool lower;
-                 bool htp; double head; int res; };
+                 bool htp; double head; int res;
+                 int dca_from = 0; bool dca_trend = false; double dca_pctb = 0; };
     std::vector<Cfg> grid;
-    if (sweep_res) {
+    if (sweep_dca) {
+        CcgConfig def;
+        Cfg base{floor_list[0], (int)layer_list[0], false, def.sr_independent_conf,
+                 def.sr_lower_half_only, def.sr_headroom_true_tp, head_list[0], 0};
+        grid.push_back(base);                       // 基线：补仓无闸门
+        for (double L : dcal_list) {
+            Cfg c = base; c.dca_from = (int)L;
+            c.dca_trend = true;  c.dca_pctb = 0;   grid.push_back(c);   // 仅趋势
+            for (double b : dcab_list) {
+                c.dca_trend = false; c.dca_pctb = b; grid.push_back(c); // 仅%B下限
+                c.dca_trend = true;                  grid.push_back(c); // 两者
+            }
+        }
+    } else if (sweep_res) {
         CcgConfig def;
         for (double f : floor_list) for (double l : layer_list)
             for (double r : res_list) for (double hd : head_list)
@@ -1192,6 +1211,9 @@ static int cmd_floor(int argc, char** argv) {
                 c.sr_lower_half_only  = grid[ci].lower;
                 c.sr_headroom_true_tp = grid[ci].htp;
                 c.sr_res_min_conf     = grid[ci].res;
+                c.dca_gate_from_layer = grid[ci].dca_from;
+                c.dca_gate_trend      = grid[ci].dca_trend;
+                c.dca_gate_htf_min    = grid[ci].dca_pctb;
                 results[i] = run_portfolio(all, o);
                 size_t d = ++done;
                 if (d % 20 == 0) {
@@ -1212,7 +1234,16 @@ static int cmd_floor(int argc, char** argv) {
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
         char lb[64];
-        if (sweep_res)
+        if (sweep_dca) {
+            if (grid[ci].dca_from <= 0)
+                std::snprintf(lb, sizeof(lb), "基线(补仓无闸门)");
+            else
+                std::snprintf(lb, sizeof(lb), "第%d层起/%s%s%s", grid[ci].dca_from,
+                              grid[ci].dca_trend ? "空头停" : "",
+                              (grid[ci].dca_trend && grid[ci].dca_pctb > 0) ? "+" : "",
+                              grid[ci].dca_pctb > 0 ? "%B<0.10停" : "");
+        }
+        else if (sweep_res)
             std::snprintf(lb, sizeof(lb), "阻力门槛%s/净空%.1f/%d层",
                           grid[ci].res > 0 ? std::to_string(grid[ci].res).substr(0,1).c_str()
                                            : "同支撑", grid[ci].head, grid[ci].layers);

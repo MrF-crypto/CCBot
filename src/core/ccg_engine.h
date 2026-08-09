@@ -149,6 +149,24 @@ struct CcgConfig {
     // 唯一可取处：它是全部正收益组合里回撤最低的一条路径（净空2.5 时回撤
     // 1434 vs 基线 1973），极度厌恶回撤时可考虑
     bool        sr_headroom_true_tp = false;
+    // ── 补仓侧闸门（v3.3 实验）────────────────────────────────────────────────
+    // 三层决策目前只管首仓，而递增7层曲线下首仓仅占预算 1/28≈3.6%，第5~7层占
+    // 64.3%——96.4% 的资金走的是"跌够间隔+反弹确认"这条无宏观检查的路径，
+    // 且深层必然在暴跌中触发，正是最该检查的时刻检查最少。
+    // dca_gate_from_layer：从第几层起施加闸门（1-indexed，0=关闭）
+    // dca_gate_trend     ：高周期空头态暂停深层补仓
+    // dca_gate_htf_min   ：日线%B低于此值暂停深层补仓（0=关）。方向与首仓相反——
+    //   首仓要%B低（买跌），深层补仓怕的是%B长期贴住0（价格骑着下轨走=下跌趋势
+    //   而非均值回归，此时补仓是在给趋势送钱）
+    // 实测结论（市值前10，2025-01~2026-08 全量1m）：9 种组合【无一改善】，
+    // 基线在收益/回撤/周期三项上全胜。关键是【被拦的变体回撤反而更大】——
+    // 补仓不是回撤的成因，而是回撤的【修复机制】：拦掉深层补仓，均价降不下来，
+    // 止盈线（均价×1.035 与上轨取大）就更远，仓位被套得更久更深。
+    // 保留为实验开关，默认关，仅回测可达
+    int         dca_gate_from_layer = 0;
+    bool        dca_gate_trend      = false;
+    double      dca_gate_htf_min    = 0.0;
+
     bool        use_sr_exit        = false;   // 止盈锚定阻力区（独立开关，默认关）
     bool        use_structural_stop = false;  // 结构性止损（独立开关，默认关，仅动态W模式）
 };
@@ -336,6 +354,8 @@ private:
 
     void update_tracking  (CcgBot& bot, double price);
     bool should_enter     (const CcgBot& bot, double price) const;
+    bool dca_gate_blocked (const CcgBot& bot,
+                           std::chrono::steady_clock::time_point now) const;
     bool should_close     (const CcgBot& bot, double price) const;
     bool should_stop_loss (const CcgBot& bot, double price) const;
     void submit_entry   (const std::string& bot_id);
