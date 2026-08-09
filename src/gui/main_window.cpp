@@ -304,6 +304,8 @@ void MainWindow::save_bots() {
         o["htf_pos_max"]         = c.htf_pos_max;
         o["use_sr_gate"]         = c.use_sr_gate;
         o["sr_min_confluence"]   = c.sr_min_confluence;
+        o["sr_independent_conf"] = c.sr_independent_conf;
+        o["sr_lower_half_only"]  = c.sr_lower_half_only;
         o["sr_headroom_ratio"]   = c.sr_headroom_ratio;
         o["use_sr_exit"]         = c.use_sr_exit;
         o["use_structural_stop"] = c.use_structural_stop;
@@ -396,6 +398,8 @@ void MainWindow::load_and_restore_bots() {
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
         c.use_sr_gate         = o["use_sr_gate"].toBool(true);
         c.sr_min_confluence   = o["sr_min_confluence"].toInt(2);
+        c.sr_independent_conf = o["sr_independent_conf"].toBool(true);
+        c.sr_lower_half_only  = o["sr_lower_half_only"].toBool(false);
         c.sr_headroom_ratio   = o["sr_headroom_ratio"].toDouble(3.0);
         c.use_sr_exit         = o["use_sr_exit"].toBool(false);
         c.use_structural_stop = o["use_structural_stop"].toBool(false);
@@ -1157,7 +1161,7 @@ void MainWindow::checkSrTouches() {
             for (auto it2 = st.alerted.begin(); it2 != st.alerted.end();)
                 it2 = (now - it2->second > 4 * 3600 * 1000) ? st.alerted.erase(it2) : std::next(it2);
 
-            int conf = z.confluence();
+            int conf = z.confluence_independent();   // 与决策层同口径
             QString kind = QString::fromStdString(srzones::src_label(z));
             if (conf >= 2) kind += QString(" ×%1共振").arg(conf);
             QString msg = QString("[SR雷达] %1 价格 %2 进入区域[%3]（%4 ~ %5，评分%6，触碰%7次）")
@@ -1216,7 +1220,7 @@ void MainWindow::openSrZonesDialog(const std::string& symbol) {
                 return itc;
             };
             double dist = price > 0 ? (z.mid() - price) / price * 100.0 : 0;
-            int conf = z.confluence();
+            int conf = z.confluence_independent();   // 与决策层同口径
             table->setItem(i, 0, mk(QString::fromStdString(srzones::src_label(z))));
             table->setItem(i, 1, mk(conf >= 2 ? QString("×%1").arg(conf) : "-"));
             table->setItem(i, 2, mk(QString::number(z.lo, 'f', 4)));
@@ -1837,6 +1841,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             c.htf_interval      = existing->cfg.htf_interval;
             c.use_sr_gate       = existing->cfg.use_sr_gate;
             c.sr_min_confluence = existing->cfg.sr_min_confluence;
+            c.sr_independent_conf = existing->cfg.sr_independent_conf;
+            c.sr_lower_half_only  = existing->cfg.sr_lower_half_only;
             engine_->update_bot_cfg(existing->bot_id, c);
             log(QString("%1 %2 策略已更新").arg(symQ).arg(dirName), "OK");
             if (!existing->entries.empty() && c.leverage != existing->cfg.leverage) {
@@ -1941,7 +1947,10 @@ void MainWindow::onTick() {
             if (sit == srStates_.end() || sit->second.zones.empty()) continue;
             double price = ticker_->mid_price(b.cfg.symbol);
             if (price <= 0) continue;
-            auto dg = decision::digest_zones(sit->second.zones, price, b.cfg.sr_min_confluence);
+            decision::DigestOpts dop; dop.min_conf = b.cfg.sr_min_confluence;
+            dop.independent_conf = b.cfg.sr_independent_conf;
+            dop.lower_half_only  = b.cfg.sr_lower_half_only;
+            auto dg = decision::digest_zones(sit->second.zones, price, dop);
             double stop_level = (dg.deep_sup_lo > 0 && sit->second.atr > 0)
                                 ? dg.deep_sup_lo - 0.25 * sit->second.atr : 0;
             engine_->update_sr_structure(b.bot_id, dg.at_support, dg.sup_hi,

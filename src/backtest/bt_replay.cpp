@@ -190,7 +190,10 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
             sim->set_now(b.ts_ms);
             // 结构摘要按当前价实时提炼（与实盘每tick做的完全一致）
             if (!sr_zones.empty()) {
-                auto dg = decision::digest_zones(sr_zones, px, opt.cfg.sr_min_confluence);
+                decision::DigestOpts dop; dop.min_conf = opt.cfg.sr_min_confluence;
+                dop.independent_conf = opt.cfg.sr_independent_conf;
+                dop.lower_half_only  = opt.cfg.sr_lower_half_only;
+                auto dg = decision::digest_zones(sr_zones, px, dop);
                 double stop_lv = (dg.deep_sup_lo > 0 && sr_atr > 0)
                                  ? dg.deep_sup_lo - 0.25 * sr_atr : 0;
                 engine->update_sr_structure(bot_id, dg.at_support, dg.sup_hi, dg.res_lo, stop_lv);

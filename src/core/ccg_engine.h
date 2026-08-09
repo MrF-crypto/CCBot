@@ -120,6 +120,16 @@ struct CcgConfig {
     double      htf_pos_max        = 0.60;    // 自由参数①：%B高于此值拦新首仓（做多）
     bool        use_sr_gate        = true;    // 结构：支撑质量+净空检查
     int         sr_min_confluence  = 2;       // 够格区域的最低共振数
+    // 共振按【独立证据族】计票（摆动与其算术衍生的斐波归为一族）——见
+    // Zone::confluence_independent() 的完整论证。理论依据：共振提升置信度的前提
+    // 是证据独立，相关证据计两票等于虚报置信度；斐波是摆动极值的纯算术函数，
+    // 零新增信息。实测：收益 +19%、收益/回撤 +20%、周期数不降反升（伪共振区
+    // 同时也在阻力侧充当假墙，剔除后净空计算更准）
+    bool        sr_independent_conf = true;
+    // 价格须落在区域下半部才算踩住支撑。实测有害（周期 -28%、收益/回撤 -26%）：
+    // "砸穿 vs 踩住"的区分已由追踪建仓的反弹确认承担，此处再设一道是重复设防，
+    // 损失的机会大于避免的坏单。保留为可选，默认关
+    bool        sr_lower_half_only  = false;
     double      sr_headroom_ratio  = 3.0;     // 自由参数②：净空÷止盈距离下限
     bool        use_sr_exit        = false;   // 止盈锚定阻力区（独立开关，默认关）
     bool        use_structural_stop = false;  // 结构性止损（独立开关，默认关，仅动态W模式）

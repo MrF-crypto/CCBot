@@ -1107,10 +1107,23 @@ static int cmd_floor(int argc, char** argv) {
     std::vector<std::pair<int64_t,int64_t>> segs;
     for (int i = 0; i < nseg; ++i) segs.emplace_back(gmin + seg_len*i, gmin + seg_len*(i+1));
 
-    struct Cfg { double floor; int layers; bool sr_exit; };
+    // --sr-variants：扫描支撑判定的两个加固选项（独立共振计数 / 区内下半部约束）
+    // 替代原来的 sr_exit 维度（已证实是死功能）
+    const bool sweep_sr = arg_flag(argc, argv, "--sr-variants");
+    struct Cfg { double floor; int layers; bool sr_exit; bool indep; bool lower; };
     std::vector<Cfg> grid;
-    for (double f : floor_list) for (double l : layer_list) for (bool e : {true, false})
-        grid.push_back({f, (int)l, e});
+    if (sweep_sr) {
+        // 四种组合：基线 / 仅独立共振 / 仅下半部 / 两者都开
+        for (double f : floor_list) for (double l : layer_list)
+            for (auto [ic, lh] : {std::pair<bool,bool>{false,false}, {true,false},
+                                  {false,true}, {true,true}})
+                grid.push_back({f, (int)l, false, ic, lh});
+    } else {
+        // 非扫描模式：跟随 CcgConfig 的当前默认值（现为独立共振），不写死
+        CcgConfig def;
+        for (double f : floor_list) for (double l : layer_list) for (bool e : {true, false})
+            grid.push_back({f, (int)l, e, def.sr_independent_conf, def.sr_lower_half_only});
+    }
 
     const size_t total = grid.size() * segs.size();
     const unsigned nth = std::max(1u, std::min({max_threads,
@@ -1151,6 +1164,8 @@ static int cmd_floor(int argc, char** argv) {
                 c.sr_radar = true; c.smart_gates = true;
                 c.htf_pos_max = 0.60; c.sr_headroom_ratio = 3.0;
                 c.use_sr_exit = grid[ci].sr_exit;
+                c.sr_independent_conf = grid[ci].indep;
+                c.sr_lower_half_only  = grid[ci].lower;
                 results[i] = run_portfolio(all, o);
                 size_t d = ++done;
                 if (d % 20 == 0) {
@@ -1170,9 +1185,14 @@ static int cmd_floor(int argc, char** argv) {
     std::vector<Sc> scores;
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
-        char lb[48];
-        std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/%s", grid[ci].floor, grid[ci].layers,
-                      grid[ci].sr_exit ? "锚定" : "上轨");
+        char lb[64];
+        if (sweep_sr)
+            std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/%s%s", grid[ci].floor, grid[ci].layers,
+                          grid[ci].indep ? "独立共振" : "朴素共振",
+                          grid[ci].lower ? "+下半部" : "");
+        else
+            std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/%s", grid[ci].floor, grid[ci].layers,
+                          grid[ci].sr_exit ? "锚定" : "上轨");
         s.label = lb;
         for (size_t si = 0; si < segs.size(); ++si) {
             const auto& r = results[ci * segs.size() + si];
@@ -1182,6 +1202,7 @@ static int cmd_floor(int argc, char** argv) {
         }
         scores.push_back(s);
     }
+    const std::vector<Sc> scores_raw = scores;   // 保留与 grid 同序的副本（排序前）
     std::sort(scores.begin(), scores.end(), [](const Sc& a, const Sc& b){
         if (a.pos != b.pos) return a.pos > b.pos;
         double ra = a.dd > 1e-9 ? a.pnl/a.dd : -99, rb = b.dd > 1e-9 ? b.pnl/b.dd : -99;
@@ -1213,6 +1234,32 @@ static int cmd_floor(int argc, char** argv) {
         by_layer[s.layers].first += s.pnl; by_layer[s.layers].second++;
         by_exit[s.ex].first += s.pnl;      by_exit[s.ex].second++;
         floor_cycles[s.floor] += s.cycles;
+    }
+    if (sweep_sr) {
+        // 支撑加固选项的单维度效果（这次实验的核心）
+        struct B { double pnl=0, dd=0; int n=0, cyc=0, allpos=0; };
+        std::map<std::string, B> by_var;
+        for (size_t ci = 0; ci < grid.size(); ++ci) {
+            std::string k = std::string(grid[ci].indep ? "独立共振" : "朴素共振")
+                          + (grid[ci].lower ? "+下半部" : "      ");
+            auto& b = by_var[k];
+            b.pnl += scores_raw[ci].pnl; b.dd += scores_raw[ci].dd;
+            b.cyc += scores_raw[ci].cycles; ++b.n;
+            if (scores_raw[ci].pos == (int)segs.size()) ++b.allpos;
+        }
+        std::cout << "\n════════ 支撑判定加固效果（本次实验核心）════════\n"
+                  << std::left << std::setw(20) << "变体" << std::right
+                  << std::setw(12) << "平均盈亏" << std::setw(12) << "平均回撤"
+                  << std::setw(11) << "收益/撤" << std::setw(10) << "平均周期"
+                  << std::setw(12) << "4/4段占比\n";
+        for (const auto& [k, b] : by_var)
+            std::cout << std::left << std::setw(20) << k << std::right << std::fixed
+                      << std::setprecision(1) << std::setw(12) << (b.pnl/b.n)
+                      << std::setw(12) << (b.dd/b.n)
+                      << std::setprecision(3) << std::setw(11)
+                      << (b.dd > 1e-9 ? b.pnl/b.dd : 0)
+                      << std::setprecision(0) << std::setw(10) << (b.cyc/b.n)
+                      << std::setprecision(0) << std::setw(11) << (100*b.allpos/b.n) << "%\n";
     }
     std::cout << "\n════════ 规律①：保底利润（核心未知数）════════\n";
     std::cout << std::left << std::setw(12) << "保底%" << std::right

@@ -25,27 +25,38 @@ struct StructDigest {
     double deep_sup_lo = 0;    // 下方最深够格支撑区的下沿（结构止损参考位）
 };
 
+// 结构判定的两个可选加固（默认关=历史行为，效果由回测裁决）：
+//  independent_conf：共振按【独立证据族】计数（摆动与其派生的斐波归为一族）
+//  lower_half_only ：价格须落在区域【下半部】才算踩住支撑——区域最宽可达2×ATR，
+//                    刚碰到顶边和踩到区域底部的含义完全不同
+struct DigestOpts {
+    int  min_conf         = 2;
+    bool independent_conf = false;
+    bool lower_half_only  = false;
+};
+
 inline StructDigest digest_zones(const std::vector<srzones::Zone>& zones,
-                                 double price, int min_conf) {
+                                 double price, const DigestOpts& opt) {
     StructDigest d;
     if (zones.empty() || price <= 0) return d;
     d.ok = true;
     for (const auto& z : zones) {
-        if (z.confluence() < min_conf) continue;
+        int conf = opt.independent_conf ? z.confluence_independent() : z.confluence();
+        if (conf < opt.min_conf) continue;
         if (z.contains(price)) {
             // 正处区内：既是脚下支撑也可能是头顶阻力，按"支撑在场"处理
-            d.at_support = true;
+            if (!opt.lower_half_only || price <= z.mid()) d.at_support = true;
             if (d.sup_conf == 0 || z.lo > d.sup_lo) {
-                d.sup_lo = z.lo; d.sup_hi = z.hi; d.sup_conf = z.confluence();
+                d.sup_lo = z.lo; d.sup_hi = z.hi; d.sup_conf = conf;
             }
         } else if (z.hi < price) {                       // 下方支撑
             if (d.sup_conf == 0 || z.hi > d.sup_hi) {
-                d.sup_lo = z.lo; d.sup_hi = z.hi; d.sup_conf = z.confluence();
+                d.sup_lo = z.lo; d.sup_hi = z.hi; d.sup_conf = conf;
             }
             if (d.deep_sup_lo == 0 || z.lo < d.deep_sup_lo) d.deep_sup_lo = z.lo;
         } else {                                         // 上方阻力 (z.lo > price)
             if (d.res_conf == 0 || z.lo < d.res_lo) {
-                d.res_lo = z.lo; d.res_hi = z.hi; d.res_conf = z.confluence();
+                d.res_lo = z.lo; d.res_hi = z.hi; d.res_conf = conf;
             }
         }
     }
@@ -53,6 +64,13 @@ inline StructDigest digest_zones(const std::vector<srzones::Zone>& zones,
     if (d.at_support && (d.deep_sup_lo == 0 || d.sup_lo < d.deep_sup_lo))
         d.deep_sup_lo = d.sup_lo;
     return d;
+}
+
+// 兼容旧签名（等价于 DigestOpts{min_conf, false, false}）
+inline StructDigest digest_zones(const std::vector<srzones::Zone>& zones,
+                                 double price, int min_conf) {
+    DigestOpts o; o.min_conf = min_conf;
+    return digest_zones(zones, price, o);
 }
 
 // 头顶净空比：到上方最近阻力的距离 ÷ 预期止盈距离。

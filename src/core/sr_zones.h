@@ -39,22 +39,45 @@ struct Zone {
 
     double mid() const { return (lo + hi) / 2.0; }
     bool contains(double price) const { return price >= lo && price <= hi; }
-    // 共振数 = 叠加的独立来源类型个数
+    // 共振数 = 叠加的来源类型个数（朴素计数）
     int confluence() const {
         unsigned m = src_mask; int c = 0;
         while (m) { c += (int)(m & 1u); m >>= 1; }
         return c;
     }
+    // 独立共振数：按【证据族】计票，同族内多个来源只算一票。
+    //
+    // 为什么必须这样算——共振能提升置信度的前提是证据相互独立：
+    //   N 个独立方法各自误报率 p，全部同时误报的概率是 p^N；
+    //   若两方法完全相关（一个可由另一个推出），概率仍是 p，不是 p²。
+    //   即：把相关证据计为 2 票，等于虚报了一个数量级的置信度。
+    //
+    // 斐波那契与摆动点为何同族（可验证的代码事实，非推测）：
+    //   detect_fib() 取窗口内最高/最低点算 0.5/0.618/0.786 回撤位，而这两个极值点
+    //   按定义必然是摆动点。也就是说【给定摆动极值即可精确算出全部斐波位，无需
+    //   任何额外市场数据】——斐波是摆动点的纯算术衍生品，注入的新信息量为零。
+    //   反观 POC 来自成交量分布、FVG 来自三K跳空结构，都无法由价格极值推出，
+    //   是真正独立的数据通道。
+    //
+    // 后果：朴素计数下 "摆动+斐波" 计 2 票会静默架空 sr_min_confluence=2 这道
+    // "双重独立确认"门槛，放进一批实为单一证据的伪共振区。
+    int confluence_independent() const {
+        int c = 0;
+        if (src_mask & (SrcSwing | SrcFib)) ++c;   // 价格结构族（摆动点及其算术衍生）
+        if (src_mask & SrcPOC)              ++c;   // 成交量分布族
+        if (src_mask & SrcFVG)              ++c;   // 供需失衡族
+        return c;
+    }
 };
 
-// 来源标签（展示/告警用）
+// 来源标签（展示/告警用）。斐波带 * 标记——它与摆动同族，不额外计入独立共振
 inline std::string src_label(const Zone& z) {
     std::string s;
     auto add = [&](const char* name) { if (!s.empty()) s += "+"; s += name; };
     if (z.src_mask & SrcSwing) add(z.flipped ? "攻防转换" : "摆动");
     if (z.src_mask & SrcFVG)   add("FVG");
     if (z.src_mask & SrcPOC)   add("POC");
-    if (z.src_mask & SrcFib)   add("斐波");
+    if (z.src_mask & SrcFib)   add((z.src_mask & SrcSwing) ? "斐波*" : "斐波");
     return s.empty() ? "未知" : s;
 }
 

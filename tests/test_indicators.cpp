@@ -275,6 +275,31 @@ int main() {
         auto d2 = dc::digest_zones(zs, 96.0, 2);
         CHECK(d2.at_support,                     "价格96应判定为处于支撑区内");
 
+        // ── 独立共振计数：斐波是摆动的算术衍生品，同族只计一票 ────────────────
+        {
+            namespace sz2 = ccbot::srzones;
+            sz2::Zone z;
+            z.src_mask = sz2::SrcSwing | sz2::SrcFib;
+            CHECK(z.confluence() == 2,               "朴素计数：摆动+斐波 = 2");
+            CHECK(z.confluence_independent() == 1,   "独立计数：摆动+斐波同族 = 1");
+            z.src_mask = sz2::SrcSwing | sz2::SrcPOC;
+            CHECK(z.confluence_independent() == 2,   "摆动+POC 是独立证据 = 2");
+            z.src_mask = sz2::SrcSwing | sz2::SrcFib | sz2::SrcPOC | sz2::SrcFVG;
+            CHECK(z.confluence() == 4,               "朴素计数四来源 = 4");
+            CHECK(z.confluence_independent() == 3,   "独立计数上限为3族");
+            z.src_mask = sz2::SrcFib;
+            CHECK(z.confluence_independent() == 1,   "仅斐波（无摆动）仍计1族");
+
+            // 门槛效果：摆动+斐波区在独立计数下够不上 min_conf=2，不应算支撑
+            std::vector<sz2::Zone> zf = { mkz(95, 97, sz2::SrcSwing | sz2::SrcFib) };
+            dc::DigestOpts naive;  naive.min_conf = 2;
+            dc::DigestOpts indep;  indep.min_conf = 2; indep.independent_conf = true;
+            CHECK(dc::digest_zones(zf, 96.0, naive).at_support,
+                  "朴素计数下 摆动+斐波 通过双重确认门槛");
+            CHECK(!dc::digest_zones(zf, 96.0, indep).at_support,
+                  "独立计数下 摆动+斐波 应被门槛挡住（伪共振）");
+        }
+
         // 三层判定：基线全绿 → 四种拦截 → fail-open
         dc::Inputs in;
         in.is_long = true; in.use_htf = true; in.htf_ok = true; in.htf_pct_b = 0.5;

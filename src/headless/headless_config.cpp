@@ -116,6 +116,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
         "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max", "use_sr_gate",
         "sr_min_confluence", "sr_headroom_ratio", "use_sr_exit", "use_structural_stop",
+        "sr_independent_conf", "sr_lower_half_only",
     };
 
     for (auto elem : bots) {
@@ -177,6 +178,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.htf_pos_max         = get_num(bo, "htf_pos_max", 0.60);
         c.use_sr_gate         = get_bool(bo, "use_sr_gate", true);
         c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", 2.0);
+        c.sr_independent_conf = get_bool(bo, "sr_independent_conf", true);
+        c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", false);
         c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", 3.0);
         c.use_sr_exit         = get_bool(bo, "use_sr_exit", false);
         c.use_structural_stop = get_bool(bo, "use_structural_stop", false);

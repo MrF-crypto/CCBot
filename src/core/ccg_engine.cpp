@@ -220,6 +220,8 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.htf_pos_max         = new_cfg.htf_pos_max;
     cfg.use_sr_gate         = new_cfg.use_sr_gate;
     cfg.sr_min_confluence   = new_cfg.sr_min_confluence;
+    cfg.sr_independent_conf = new_cfg.sr_independent_conf;
+    cfg.sr_lower_half_only  = new_cfg.sr_lower_half_only;
     cfg.sr_headroom_ratio   = new_cfg.sr_headroom_ratio;
     cfg.use_sr_exit         = new_cfg.use_sr_exit;
     cfg.use_structural_stop = new_cfg.use_structural_stop;

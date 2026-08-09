@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
                     for (auto it2 = seen.begin(); it2 != seen.end();)
                         it2 = (now_ms - it2->second > 4 * 3600 * 1000) ? seen.erase(it2) : std::next(it2);
                     std::ostringstream ss;
-                    int conf = z.confluence();
+                    int conf = z.confluence_independent();   // 与决策层同口径
                     ss << "[SR雷达] " << sym << " 价格 " << price << " 进入区域["
                        << srzones::src_label(z);
                     if (conf >= 2) ss << " ×" << conf << "共振";
