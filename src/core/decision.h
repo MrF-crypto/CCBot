@@ -29,8 +29,13 @@ struct StructDigest {
 //  independent_conf：共振按【独立证据族】计数（摆动与其派生的斐波归为一族）
 //  lower_half_only ：价格须落在区域【下半部】才算踩住支撑——区域最宽可达2×ATR，
 //                    刚碰到顶边和踩到区域底部的含义完全不同
+// res_min_conf：阻力侧单独的计票门槛（0=沿用 min_conf）。两侧同门槛存在不对称：
+// 支撑够不上票数 ⇒ 判"无支撑" ⇒ 拦（保守）；阻力够不上票数 ⇒ 这堵墙被忽略 ⇒
+// 净空显示∞ ⇒ 放行（激进）。同一个门槛，一边把关一边放水。给阻力设更低的门槛
+// 可以让两侧都朝"保守"对齐——是否值得由回测裁决
 struct DigestOpts {
     int  min_conf         = 2;
+    int  res_min_conf     = 0;
     bool independent_conf = false;
     bool lower_half_only  = false;
 };
@@ -39,10 +44,12 @@ inline StructDigest digest_zones(const std::vector<srzones::Zone>& zones,
                                  double price, const DigestOpts& opt) {
     StructDigest d;
     if (zones.empty() || price <= 0) return d;
+    const int res_th = opt.res_min_conf > 0 ? opt.res_min_conf : opt.min_conf;
     d.ok = true;
     for (const auto& z : zones) {
         int conf = opt.independent_conf ? z.confluence_independent() : z.confluence();
-        if (conf < opt.min_conf) continue;
+        // 上方区域走阻力门槛，其余走支撑门槛
+        if (conf < (z.lo > price ? res_th : opt.min_conf)) continue;
         if (z.contains(price)) {
             // 正处区内：既是脚下支撑也可能是头顶阻力，按"支撑在场"处理
             if (!opt.lower_half_only || price <= z.mid()) d.at_support = true;

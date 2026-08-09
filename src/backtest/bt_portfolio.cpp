@@ -204,6 +204,7 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
                 sim->set_market(s.ser->symbol, px, b.spread);
                 if (!s.zones.empty()) {
                     decision::DigestOpts dop; dop.min_conf = cfg.sr_min_confluence;
+                    dop.res_min_conf = cfg.sr_res_min_conf;
                     dop.independent_conf = cfg.sr_independent_conf;
                     dop.lower_half_only  = cfg.sr_lower_half_only;
                     auto dg = decision::digest_zones(s.zones, px, dop);
@@ -380,6 +381,7 @@ PortfolioResult run_portfolio_stream(
                 sim->set_market(s.sym, px, b.spread);
                 if (!s.zones.empty()) {
                     decision::DigestOpts dop; dop.min_conf = cfg.sr_min_confluence;
+                    dop.res_min_conf = cfg.sr_res_min_conf;
                     dop.independent_conf = cfg.sr_independent_conf;
                     dop.lower_half_only  = cfg.sr_lower_half_only;
                     auto dg = decision::digest_zones(s.zones, px, dop);

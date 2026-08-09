@@ -191,6 +191,7 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
             // 结构摘要按当前价实时提炼（与实盘每tick做的完全一致）
             if (!sr_zones.empty()) {
                 decision::DigestOpts dop; dop.min_conf = opt.cfg.sr_min_confluence;
+                dop.res_min_conf = opt.cfg.sr_res_min_conf;
                 dop.independent_conf = opt.cfg.sr_independent_conf;
                 dop.lower_half_only  = opt.cfg.sr_lower_half_only;
                 auto dg = decision::digest_zones(sr_zones, px, dop);

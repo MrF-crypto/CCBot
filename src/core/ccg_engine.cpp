@@ -220,6 +220,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.htf_pos_max         = new_cfg.htf_pos_max;
     cfg.use_sr_gate         = new_cfg.use_sr_gate;
     cfg.sr_min_confluence   = new_cfg.sr_min_confluence;
+    cfg.sr_res_min_conf     = new_cfg.sr_res_min_conf;
     cfg.sr_independent_conf = new_cfg.sr_independent_conf;
     cfg.sr_lower_half_only  = new_cfg.sr_lower_half_only;
     cfg.sr_headroom_ratio   = new_cfg.sr_headroom_ratio;
@@ -751,6 +752,14 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     } else {
                         tp_dist = price * std::max(bot.cfg.dynamic_band_mode ? 1.0
                                                                              : bot.cfg.tp_pct, 0.1) / 100.0;
+                    }
+                    // 真实止盈距离：动态W模式还要满足"价格≥均价×(1+保底利润)"，
+                    // 首仓时均价即入场价，所以保底线就是 price×(1+floor)。两个条件
+                    // 取【更远】的那个才是真正要走的路
+                    if (bot.cfg.sr_headroom_true_tp && bot.cfg.dynamic_band_mode &&
+                        bot.cfg.min_profit_floor > 0) {
+                        tp_dist = std::max(tp_dist,
+                                           price * bot.cfg.min_profit_floor / 100.0);
                     }
                     // 净空：多头看上方阻力，空头镜像看下方支撑
                     double barrier = is_long ? bot.sr_res_lo

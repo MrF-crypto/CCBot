@@ -300,6 +300,29 @@ int main() {
                   "独立计数下 摆动+斐波 应被门槛挡住（伪共振）");
         }
 
+        // ── 阻力侧独立门槛：同门槛下"票数不够的墙"被忽略=净空虚高，可单独放宽 ──
+        {
+            namespace sz2 = ccbot::srzones;
+            // 脚下一个双族支撑（够格），头顶一个单族弱阻力（同门槛下够不上）
+            std::vector<sz2::Zone> zs = {
+                mkz(95, 97,   sz2::SrcSwing | sz2::SrcPOC),
+                mkz(105, 107, sz2::SrcSwing | sz2::SrcFib),
+            };
+            dc::DigestOpts sym;  sym.min_conf = 2; sym.independent_conf = true;
+            auto ds = dc::digest_zones(zs, 96.0, sym);
+            CHECK(ds.at_support,      "双族支撑区应被认作支撑");
+            CHECK(ds.res_lo == 0,     "同门槛下单族阻力被忽略（净空将显示∞）");
+
+            dc::DigestOpts asym = sym; asym.res_min_conf = 1;
+            auto da = dc::digest_zones(zs, 96.0, asym);
+            CHECK(da.at_support,      "放宽阻力门槛不应影响支撑判定");
+            CHECK(da.res_lo == 105,   "阻力门槛降到1后，单族墙被认出来");
+            // 净空随之从∞变成有限值
+            CHECK(dc::headroom_ratio(96.0, ds.res_lo, 1.0) >= 1e8, "无阻力=净空∞");
+            CHECK(std::fabs(dc::headroom_ratio(96.0, da.res_lo, 3.0) - 3.0) < 1e-9,
+                  "净空 = (阻力下沿-价格) ÷ 止盈距离");
+        }
+
         // 三层判定：基线全绿 → 四种拦截 → fail-open
         dc::Inputs in;
         in.is_long = true; in.use_htf = true; in.htf_ok = true; in.htf_pct_b = 0.5;

@@ -1110,19 +1110,43 @@ static int cmd_floor(int argc, char** argv) {
     // --sr-variants：扫描支撑判定的两个加固选项（独立共振计数 / 区内下半部约束）
     // 替代原来的 sr_exit 维度（已证实是死功能）
     const bool sweep_sr = arg_flag(argc, argv, "--sr-variants");
-    struct Cfg { double floor; int layers; bool sr_exit; bool indep; bool lower; };
+    // --headroom-tp：净空分母用"真实止盈距离(上轨与保底线取远)"vs 仅上轨距离
+    const bool sweep_htp = arg_flag(argc, argv, "--headroom-tp");
+    // 分母一改，比值的量纲就变了——3.0 不再是原来的含义，必须连门槛一起重扫，
+    // 否则"修分母"和"把闸门拧死"两个效应混在一起，分不清是谁造成的差异
+    auto head_list = parse_list(arg_str(argc, argv, "--heads", "3.0"));
+    // --res-variants：阻力侧计票门槛（1=只要有一票就认这堵墙，2=与支撑同门槛）
+    const bool sweep_res = arg_flag(argc, argv, "--res-variants");
+    auto res_list = parse_list(arg_str(argc, argv, "--res-confs", "0,1"));
+    struct Cfg { double floor; int layers; bool sr_exit; bool indep; bool lower;
+                 bool htp; double head; int res; };
     std::vector<Cfg> grid;
-    if (sweep_sr) {
+    if (sweep_res) {
+        CcgConfig def;
+        for (double f : floor_list) for (double l : layer_list)
+            for (double r : res_list) for (double hd : head_list)
+                grid.push_back({f, (int)l, false, def.sr_independent_conf,
+                                def.sr_lower_half_only, def.sr_headroom_true_tp,
+                                hd, (int)r});
+    } else if (sweep_htp) {
+        CcgConfig def;
+        for (double f : floor_list) for (double l : layer_list)
+            for (bool h : {false, true}) for (double hd : head_list)
+                grid.push_back({f, (int)l, false, def.sr_independent_conf,
+                                def.sr_lower_half_only, h, hd, 0});
+    } else if (sweep_sr) {
         // 四种组合：基线 / 仅独立共振 / 仅下半部 / 两者都开
         for (double f : floor_list) for (double l : layer_list)
             for (auto [ic, lh] : {std::pair<bool,bool>{false,false}, {true,false},
                                   {false,true}, {true,true}})
-                grid.push_back({f, (int)l, false, ic, lh});
+                grid.push_back({f, (int)l, false, ic, lh, false, head_list[0], 0});
     } else {
         // 非扫描模式：跟随 CcgConfig 的当前默认值（现为独立共振），不写死
         CcgConfig def;
         for (double f : floor_list) for (double l : layer_list) for (bool e : {true, false})
-            grid.push_back({f, (int)l, e, def.sr_independent_conf, def.sr_lower_half_only});
+            grid.push_back({f, (int)l, e, def.sr_independent_conf,
+                            def.sr_lower_half_only, def.sr_headroom_true_tp,
+                            head_list[0], def.sr_res_min_conf});
     }
 
     const size_t total = grid.size() * segs.size();
@@ -1162,10 +1186,12 @@ static int cmd_floor(int argc, char** argv) {
                 c.min_profit_floor = grid[ci].floor;
                 c.use_trend_filter = true;
                 c.sr_radar = true; c.smart_gates = true;
-                c.htf_pos_max = 0.60; c.sr_headroom_ratio = 3.0;
+                c.htf_pos_max = 0.60; c.sr_headroom_ratio = grid[ci].head;
                 c.use_sr_exit = grid[ci].sr_exit;
                 c.sr_independent_conf = grid[ci].indep;
                 c.sr_lower_half_only  = grid[ci].lower;
+                c.sr_headroom_true_tp = grid[ci].htp;
+                c.sr_res_min_conf     = grid[ci].res;
                 results[i] = run_portfolio(all, o);
                 size_t d = ++done;
                 if (d % 20 == 0) {
@@ -1186,7 +1212,15 @@ static int cmd_floor(int argc, char** argv) {
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
         char lb[64];
-        if (sweep_sr)
+        if (sweep_res)
+            std::snprintf(lb, sizeof(lb), "阻力门槛%s/净空%.1f/%d层",
+                          grid[ci].res > 0 ? std::to_string(grid[ci].res).substr(0,1).c_str()
+                                           : "同支撑", grid[ci].head, grid[ci].layers);
+        else if (sweep_htp)
+            std::snprintf(lb, sizeof(lb), "%s/净空%.1f/%d层",
+                          grid[ci].htp ? "真实止盈" : "仅上轨 ", grid[ci].head,
+                          grid[ci].layers);
+        else if (sweep_sr)
             std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/%s%s", grid[ci].floor, grid[ci].layers,
                           grid[ci].indep ? "独立共振" : "朴素共振",
                           grid[ci].lower ? "+下半部" : "");
