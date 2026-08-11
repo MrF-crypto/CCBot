@@ -149,6 +149,13 @@ struct CcgConfig {
     // 唯一可取处：它是全部正收益组合里回撤最低的一条路径（净空2.5 时回撤
     // 1434 vs 基线 1973），极度厌恶回撤时可考虑
     bool        sr_headroom_true_tp = false;
+    // 周期熊市总开关：BTC 级别的"这轮牛市结束了，全场停手"。
+    // 与 use_trend_filter（4h EMA200，战术级、按品种）不是一回事——那是躲回调，
+    // 这是躲整轮熊市。实证动机：2022 全年阴跌里两种保底利润都深亏（-1621/-3340），
+    // 纯多DCA在周期熊市没有能赢的参数组合，唯一出路是不进场。
+    // 熊市判定由应用层从 BTC 日线算好后 set_market_bearish() 喂入
+    bool        use_cycle_bear_switch = false;
+
     // ── 补仓侧闸门（v3.3 实验）────────────────────────────────────────────────
     // 三层决策目前只管首仓，而递增7层曲线下首仓仅占预算 1/28≈3.6%，第5~7层占
     // 64.3%——96.4% 的资金走的是"跌够间隔+反弹确认"这条无宏观检查的路径，
@@ -328,6 +335,11 @@ public:
     void update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi);
 
     // 写入趋势状态机快照（use_trend_filter 的 bot 由外层每几分钟拉取一次高周期趋势后回调）
+    // 账户级周期熊市标志（BTC日线驱动，全场共用一个）。与 set_max_total_margin
+    // 同级：不属于任何单个bot，由应用层统一喂入
+    void set_market_bearish(bool bearish);
+    bool market_bearish() const { return market_bearish_.load(); }
+
     void update_trend(const std::string& bot_id, bool bearish);
 
     // ── v3.0 结构数据写入（应用层喂入，同指标/趋势的快照模式）────────────────
@@ -371,6 +383,7 @@ private:
     TradeCb                        trade_cb_;
     std::atomic<int>               id_seq_{0};
     std::atomic<double>            max_total_margin_{0.0};
+    std::atomic<bool>   market_bearish_{false};
 };
 
 } // namespace ccbot

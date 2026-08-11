@@ -138,6 +138,40 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
     int64_t last_day = 0;
     const int lev = std::max(1, opt.base_cfg.leverage);
 
+    // ── 周期熊市判定：从 BTC 日线预先算好 {日序 -> 是否熊市} ─────────────────
+    // 逐日推进，不做前视：第 i 天的判定只用到第 i 天及之前的收盘。
+    // （仅 run_portfolio 实现；run_portfolio_stream 走流式读取、暂不支持）
+    std::map<int64_t, bool> bear_by_day;
+    const bool bear_on = (opt.bear_ma_days > 0 || opt.bear_dd_pct > 0);
+    if (bear_on) {
+        const Series* btc = nullptr;
+        for (const auto& s2 : all)
+            if (s2.symbol.rfind("BTC", 0) == 0) { btc = &s2; break; }
+        if (btc) {
+            auto dbars = aggregate(btc->bars, 86400000);
+            double peak = 0;
+            std::vector<double> closes;
+            for (const auto& bar : dbars) {
+                closes.push_back(bar.close);
+                peak = std::max(peak, bar.close);
+                bool ma_bear = true, dd_bear = true;
+                if (opt.bear_ma_days > 0) {
+                    int n = opt.bear_ma_days;
+                    if ((int)closes.size() < n) ma_bear = false;
+                    else {
+                        double sum = 0;
+                        for (size_t k = closes.size() - n; k < closes.size(); ++k) sum += closes[k];
+                        ma_bear = bar.close < sum / n;
+                    }
+                }
+                if (opt.bear_dd_pct > 0)
+                    dd_bear = peak > 0 && (peak - bar.close) / peak * 100.0 > opt.bear_dd_pct;
+                bear_by_day[bar.ts_ms / 86400000] = ma_bear && dd_bear;
+            }
+        }
+    }
+    int64_t bear_last_day = -1;
+
     // ── 时间轴合并推进：每分钟处理所有到期的品种 ────────────────────────────
     for (;;) {
         // 找当前最小时间戳
@@ -150,6 +184,16 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
         if (t == 0) break;
         if (opt.end_ms && t > opt.end_ms) break;
         vnow = t;
+
+        // 熊市标志每天更新一次，且用【前一天】的判定——当天日线还没收盘
+        if (bear_on) {
+            int64_t day = t / 86400000;
+            if (day != bear_last_day) {
+                bear_last_day = day;
+                auto it = bear_by_day.find(day - 1);
+                eng->set_market_bearish(it != bear_by_day.end() && it->second);
+            }
+        }
 
         for (auto& s : syms) {
             if (s.idx >= s.ser->bars.size()) continue;

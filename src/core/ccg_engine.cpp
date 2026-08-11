@@ -279,6 +279,10 @@ void CcgEngine::set_max_total_margin(double usdt) {
     max_total_margin_.store(std::max(0.0, usdt));
 }
 
+void CcgEngine::set_market_bearish(bool bearish) {
+    market_bearish_.store(bearish);
+}
+
 double CcgEngine::max_total_margin() const {
     return max_total_margin_.load();
 }
@@ -740,6 +744,17 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     if (bot.last_action != "空头趋势，暂停开首仓") {
                         bot.last_action = "空头趋势，暂停开首仓";
                         log(bot.cfg.symbol + " 处于高周期空头态，暂停开新首仓（趋势恢复后自动放行）");
+                    }
+                }
+
+                // 周期熊市总开关：BTC级别判定为熊市时全场暂停开新首仓。
+                // 只拦【新首仓】——已有仓位的补仓/止盈/止损一律不受影响，否则
+                // 等于在熊市里既不让摊薄也不让离场，是最糟的组合
+                if (can_enter && bot.cfg.use_cycle_bear_switch && market_bearish_.load()) {
+                    can_enter = false;
+                    if (bot.last_action != "周期熊市，全场暂停开首仓") {
+                        bot.last_action = "周期熊市，全场暂停开首仓";
+                        log(bot.cfg.symbol + " 周期熊市态，暂停开新首仓（BTC日线级别，转牛后自动放行）");
                     }
                 }
 

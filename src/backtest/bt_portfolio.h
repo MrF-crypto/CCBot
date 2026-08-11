@@ -20,6 +20,12 @@ struct PortfolioOptions {
     double     max_total_margin  = 0;      // 账户总保证金上限（0=按本金×0.9自动）
     int        max_positions     = 50;     // 最大同时持仓品种数
     int64_t    start_ms = 0, end_ms = 0;
+    // 周期熊市判定（BTC日线驱动，喂给 CcgEngine::set_market_bearish）。
+    // bear_ma_days>0：BTC日收盘 < N日均线；bear_dd_pct>0：距滚动峰值回撤超过此%。
+    // 两者都设则须【同时满足】才判熊——单看均线在震荡市会来回翻，单看回撤在
+    // 深跌后的反弹初期会一直判熊而错过最好的建仓区
+    int        bear_ma_days = 0;
+    double     bear_dd_pct  = 0;
 };
 
 struct SymbolStat {

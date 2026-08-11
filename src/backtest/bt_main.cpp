@@ -8,6 +8,7 @@
 #include "backtest/bt_portfolio.h"
 #include <filesystem>
 #include <iostream>
+#include <cstdlib>
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
@@ -223,6 +224,32 @@ static std::vector<std::string> parse_slist(const std::string& s) {
         else cur += c;
     }
     return v;
+}
+
+// --from / --to：只回放指定时间窗（YYYY-MM-DD，UTC）。数据目录里六年全在，
+// 用它把"拿老数据证伪"和"在老数据上重新调参"分开——前者只需固定参数跑一个窗。
+// days_from_civil（Howard Hinnant 算法），避免依赖 timegm 的平台差异
+static int64_t parse_day_ms(const std::string& d) {
+    if (d.size() < 10) return 0;
+    int y  = std::atoi(d.substr(0, 4).c_str());
+    int m  = std::atoi(d.substr(5, 2).c_str());
+    int dd = std::atoi(d.substr(8, 2).c_str());
+    if (y < 1970 || m < 1 || m > 12 || dd < 1) return 0;
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return ((int64_t)era * 146097 + (int64_t)doe - 719468) * 86400000LL;
+}
+
+// 把 --from/--to 应用到全局时间范围上（无参则原样返回）
+static bool clamp_window(int argc, char** argv, int64_t& gmin, int64_t& gmax) {
+    if (int64_t f0 = parse_day_ms(arg_str(argc, argv, "--from", ""))) gmin = std::max(gmin, f0);
+    if (int64_t t1 = parse_day_ms(arg_str(argc, argv, "--to",   ""))) gmax = std::min(gmax, t1);
+    if (gmax <= gmin) { std::cerr << "时间窗为空\n"; return false; }
+    std::cout << "时间窗: " << ts_to_str(gmin) << " ~ " << ts_to_str(gmax) << "\n";
+    return true;
 }
 
 static int cmd_sweep(int argc, char** argv) {
@@ -532,6 +559,7 @@ static int cmd_rsi(int argc, char** argv) {
         gmin = std::min(gmin, d.s.bars.front().ts_ms);
         gmax = std::max(gmax, d.s.bars.back().ts_ms);
     }
+    if (!clamp_window(argc, argv, gmin, gmax)) return 1;
     const int64_t seg_len = (gmax - gmin) / nseg;
     std::vector<std::pair<int64_t,int64_t>> segs;
     for (int i = 0; i < nseg; ++i) segs.emplace_back(gmin + seg_len*i, gmin + seg_len*(i+1));
@@ -1103,6 +1131,7 @@ static int cmd_floor(int argc, char** argv) {
         gmin = std::min(gmin, s.bars.front().ts_ms);
         gmax = std::max(gmax, s.bars.back().ts_ms);
     }
+    if (!clamp_window(argc, argv, gmin, gmax)) return 1;
     const int64_t seg_len = (gmax - gmin) / nseg;
     std::vector<std::pair<int64_t,int64_t>> segs;
     for (int i = 0; i < nseg; ++i) segs.emplace_back(gmin + seg_len*i, gmin + seg_len*(i+1));
@@ -1121,13 +1150,27 @@ static int cmd_floor(int argc, char** argv) {
     // --dca-gate：补仓侧闸门。首仓只占预算3.6%，第5~7层占64.3%——这是唯一
     // 作用在资金大头上的维度。扫描：起始层 × 闸门类型
     const bool sweep_dca = arg_flag(argc, argv, "--dca-gate");
+    // --bear-switch：周期熊市总开关。扫描 BTC日线均线周期 × 距峰值回撤阈值
+    const bool sweep_bear = arg_flag(argc, argv, "--bear-switch");
+    auto bma_list = parse_list(arg_str(argc, argv, "--bear-ma", "0,100,150,200"));
+    auto bdd_list = parse_list(arg_str(argc, argv, "--bear-dd", "0,20,30"));
     auto dcal_list = parse_list(arg_str(argc, argv, "--dca-layers", "4,5,6"));
     auto dcab_list = parse_list(arg_str(argc, argv, "--dca-pctb",  "0.10"));
     struct Cfg { double floor; int layers; bool sr_exit; bool indep; bool lower;
                  bool htp; double head; int res;
-                 int dca_from = 0; bool dca_trend = false; double dca_pctb = 0; };
+                 int dca_from = 0; bool dca_trend = false; double dca_pctb = 0;
+                 int bear_ma = 0; double bear_dd = 0; };
     std::vector<Cfg> grid;
-    if (sweep_dca) {
+    if (sweep_bear) {
+        CcgConfig def;
+        for (double f : floor_list) for (double L : layer_list)
+            for (double ma : bma_list) for (double dd : bdd_list) {
+                if (ma == 0 && dd == 0 && (f != floor_list[0] || L != layer_list[0])) {}
+                grid.push_back({f, (int)L, false, def.sr_independent_conf,
+                                def.sr_lower_half_only, def.sr_headroom_true_tp,
+                                head_list[0], 0, 0, false, 0, (int)ma, dd});
+            }
+    } else if (sweep_dca) {
         CcgConfig def;
         Cfg base{floor_list[0], (int)layer_list[0], false, def.sr_independent_conf,
                  def.sr_lower_half_only, def.sr_headroom_true_tp, head_list[0], 0};
@@ -1214,6 +1257,9 @@ static int cmd_floor(int argc, char** argv) {
                 c.dca_gate_from_layer = grid[ci].dca_from;
                 c.dca_gate_trend      = grid[ci].dca_trend;
                 c.dca_gate_htf_min    = grid[ci].dca_pctb;
+                c.use_cycle_bear_switch = (grid[ci].bear_ma > 0 || grid[ci].bear_dd > 0);
+                o.bear_ma_days          = grid[ci].bear_ma;
+                o.bear_dd_pct           = grid[ci].bear_dd;
                 results[i] = run_portfolio(all, o);
                 size_t d = ++done;
                 if (d % 20 == 0) {
@@ -1234,7 +1280,21 @@ static int cmd_floor(int argc, char** argv) {
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
         char lb[64];
-        if (sweep_dca) {
+        if (sweep_bear) {
+            if (grid[ci].bear_ma <= 0 && grid[ci].bear_dd <= 0)
+                std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/无熊市开关",
+                              grid[ci].floor, grid[ci].layers);
+            else if (grid[ci].bear_ma <= 0)
+                std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/回撤>%.0f%%",
+                              grid[ci].floor, grid[ci].layers, grid[ci].bear_dd);
+            else if (grid[ci].bear_dd <= 0)
+                std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/MA%d下方",
+                              grid[ci].floor, grid[ci].layers, grid[ci].bear_ma);
+            else
+                std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/MA%d+撤%.0f%%",
+                              grid[ci].floor, grid[ci].layers, grid[ci].bear_ma, grid[ci].bear_dd);
+        }
+        else if (sweep_dca) {
             if (grid[ci].dca_from <= 0)
                 std::snprintf(lb, sizeof(lb), "基线(补仓无闸门)");
             else
