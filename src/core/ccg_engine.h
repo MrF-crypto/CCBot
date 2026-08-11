@@ -149,6 +149,19 @@ struct CcgConfig {
     // 唯一可取处：它是全部正收益组合里回撤最低的一条路径（净空2.5 时回撤
     // 1434 vs 基线 1973），极度厌恶回撤时可考虑
     bool        sr_headroom_true_tp = false;
+    // ── 快进快出方案（v3.3 实验）─────────────────────────────────────────────
+    // 现行动态W止盈是【触上轨 且 盈利≥保底】双条件，本质是"等一个完整的带内摆动"。
+    // 另一种思路是"够本就跑"：不等上轨，盈利达标即激活追踪，靠高周转取胜。
+    // tp_floor_only=true 时止盈激活【只看保底利润】，不要求触上轨
+    bool        tp_floor_only  = false;
+    // 固定追踪止盈回调%（0=用动态W推导的 0.15W）。快进快出方案要把回调压到很小，
+    // 不能让它随带宽放大
+    double      fixed_trail_tp = 0.0;
+    // 首仓追踪建仓%（0=关，保持"在下轨内直接开"的现行为）。开启后首仓改为：
+    // 价格先跌破下轨，记录破轨后的最低点，自最低点反弹此比例才开首仓——
+    // 把"接飞刀"变成"等企稳"，代价是错过深V
+    double      first_entry_bounce_pct = 0.0;
+
     // 周期熊市总开关：BTC 级别的"这轮牛市结束了，全场停手"。
     // 与 use_trend_filter（4h EMA200，战术级、按品种）不是一回事——那是躲回调，
     // 这是躲整轮熊市。实证动机：2022 全年阴跌里两种保底利润都深亏（-1621/-3340），
@@ -220,6 +233,10 @@ struct CcgBot {
     double ind_rsi      = 50.0;
     // CrossFromOversold 模式：本轮"等待首单信号"期间，RSI 是否已经探底跌破过 rsi_oversold_th
     bool   ind_dipped   = false;
+    // 首仓追踪建仓状态（first_entry_bounce_pct>0 时用）：
+    // band_broken=本轮是否已跌破过下轨；band_extreme=破轨后的最低价
+    bool   band_broken  = false;
+    double band_extreme = 0;
     // 最近一次指标写入时间（steady_clock，默认epoch=从未更新过=视为过期）。
     // 动态W模式和指标首单都用它做数据新鲜度检查，避免拿几小时前的旧轨道值做决策
     std::chrono::steady_clock::time_point ind_time{};

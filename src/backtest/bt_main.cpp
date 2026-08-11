@@ -1152,6 +1152,12 @@ static int cmd_floor(int argc, char** argv) {
     const bool sweep_dca = arg_flag(argc, argv, "--dca-gate");
     // --bear-switch：周期熊市总开关。扫描 BTC日线均线周期 × 距峰值回撤阈值
     const bool sweep_bear = arg_flag(argc, argv, "--bear-switch");
+    // --tp-scheme：对比两套止盈方案
+    //   A 快进快出：不等上轨，盈利1.5~2.5%即激活追踪，回调0.2~0.5%平仓，首仓等反弹
+    //   B 上轨触发：保底仅0.3%，靠"穿破上轨"当激活条件，回调0.2~0.5%平仓
+    const bool sweep_tps  = arg_flag(argc, argv, "--tp-scheme");
+    auto ttp_list = parse_list(arg_str(argc, argv, "--trail-tps", "0.2,0.3,0.5"));
+    auto bnc_list = parse_list(arg_str(argc, argv, "--bounces",   "0.2,0.3,0.5"));
     auto bma_list = parse_list(arg_str(argc, argv, "--bear-ma", "0,100,150,200"));
     auto bdd_list = parse_list(arg_str(argc, argv, "--bear-dd", "0,20,30"));
     auto dcal_list = parse_list(arg_str(argc, argv, "--dca-layers", "4,5,6"));
@@ -1159,16 +1165,36 @@ static int cmd_floor(int argc, char** argv) {
     struct Cfg { double floor; int layers; bool sr_exit; bool indep; bool lower;
                  bool htp; double head; int res;
                  int dca_from = 0; bool dca_trend = false; double dca_pctb = 0;
-                 int bear_ma = 0; double bear_dd = 0; };
+                 int bear_ma = 0; double bear_dd = 0;
+                 int scheme = 0; bool floor_only = false;
+                 double ttp = 0, bounce = 0; };
     std::vector<Cfg> grid;
-    if (sweep_bear) {
+    if (sweep_tps) {
+        CcgConfig def;
+        Cfg base{floor_list[0], (int)layer_list[0], false, def.sr_independent_conf,
+                 def.sr_lower_half_only, def.sr_headroom_true_tp, head_list[0], 0,
+                 0, false, 0, 0, 0};
+        grid.push_back(base);                          // 基线=现行机制+现行动态回调
+        for (double tt : ttp_list) {
+            // 方案B：保底0.3% + 穿上轨激活 + 固定回调（首仓维持现行）
+            Cfg b = base; b.scheme = 2; b.floor = 0.3;
+            b.floor_only = false; b.ttp = tt; b.bounce = 0;
+            grid.push_back(b);
+            // 方案A：盈利达标即激活（不等上轨）+ 固定回调 + 首仓追踪建仓
+            for (double f : floor_list) for (double bn : bnc_list) {
+                Cfg a = base; a.scheme = 1; a.floor = f;
+                a.floor_only = true; a.ttp = tt; a.bounce = bn;
+                grid.push_back(a);
+            }
+        }
+    } else if (sweep_bear) {
         CcgConfig def;
         for (double f : floor_list) for (double L : layer_list)
             for (double ma : bma_list) for (double dd : bdd_list) {
                 if (ma == 0 && dd == 0 && (f != floor_list[0] || L != layer_list[0])) {}
                 grid.push_back({f, (int)L, false, def.sr_independent_conf,
                                 def.sr_lower_half_only, def.sr_headroom_true_tp,
-                                head_list[0], 0, 0, false, 0, (int)ma, dd});
+                                head_list[0], 0, 0, false, 0, (int)ma, dd, 0, false, 0, 0});
             }
     } else if (sweep_dca) {
         CcgConfig def;
@@ -1260,6 +1286,9 @@ static int cmd_floor(int argc, char** argv) {
                 c.use_cycle_bear_switch = (grid[ci].bear_ma > 0 || grid[ci].bear_dd > 0);
                 o.bear_ma_days          = grid[ci].bear_ma;
                 o.bear_dd_pct           = grid[ci].bear_dd;
+                c.tp_floor_only         = grid[ci].floor_only;
+                c.fixed_trail_tp        = grid[ci].ttp;
+                c.first_entry_bounce_pct = grid[ci].bounce;
                 results[i] = run_portfolio(all, o);
                 size_t d = ++done;
                 if (d % 20 == 0) {
@@ -1280,7 +1309,16 @@ static int cmd_floor(int argc, char** argv) {
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
         char lb[64];
-        if (sweep_bear) {
+        if (sweep_tps) {
+            if (grid[ci].scheme == 0)
+                std::snprintf(lb, sizeof(lb), "基线 保底%.1f%%/动态回调", grid[ci].floor);
+            else if (grid[ci].scheme == 2)
+                std::snprintf(lb, sizeof(lb), "B 上轨触发/保底0.3/回调%.1f", grid[ci].ttp);
+            else
+                std::snprintf(lb, sizeof(lb), "A 利润%.1f%%/回调%.1f/反弹%.1f",
+                              grid[ci].floor, grid[ci].ttp, grid[ci].bounce);
+        }
+        else if (sweep_bear) {
             if (grid[ci].bear_ma <= 0 && grid[ci].bear_dd <= 0)
                 std::snprintf(lb, sizeof(lb), "%.1f%%/%d层/无熊市开关",
                               grid[ci].floor, grid[ci].layers);

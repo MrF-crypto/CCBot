@@ -209,6 +209,9 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.rsi_oversold_th  = new_cfg.rsi_oversold_th;
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
     cfg.min_profit_floor  = new_cfg.min_profit_floor;
+    cfg.tp_floor_only     = new_cfg.tp_floor_only;
+    cfg.fixed_trail_tp    = new_cfg.fixed_trail_tp;
+    cfg.first_entry_bounce_pct = new_cfg.first_entry_bounce_pct;
     cfg.use_trend_filter  = new_cfg.use_trend_filter;
     cfg.trend_interval    = new_cfg.trend_interval;
     cfg.trend_ema_period  = new_cfg.trend_ema_period;
@@ -497,6 +500,7 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
     p.interval_pct = dynparams::interval_pct(W);
     p.trail_entry  = dynparams::trail_entry_pct(W);
     p.trail_tp     = dynparams::trail_tp_pct(W);
+    if (bot.cfg.fixed_trail_tp > 0) p.trail_tp = bot.cfg.fixed_trail_tp;
     return p;
 }
 
@@ -562,8 +566,10 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
                     bot.sr_sup_hi > target)
                     target = bot.sr_sup_hi;
             }
+            // tp_floor_only：不等上轨，盈利达标即可激活（"够本就跑"）
             bool band_cond = eff.fresh &&
-                (is_long ? (price >= target) : (price <= target));
+                (bot.cfg.tp_floor_only ||
+                 (is_long ? (price >= target) : (price <= target)));
             tp_hit = band_cond &&
                 (is_long ? (price >= floor_th) : (price <= floor_th));
             if (tp_hit && !bot.tp_reached) bot.tp_anchor = target;
@@ -683,6 +689,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 bot.avg_price = bot.total_qty = bot.total_cost = 0;
                 bot.interval_hit = bot.tp_reached = false;
                 bot.ind_dipped  = false;   // 新一轮等待信号，探底状态清零重新累积
+                bot.band_broken = false; bot.band_extreme = 0;   // 首仓追踪基准同样清零
                 bot.last_entry_price = price;
                 bot.dca_extreme = price;
                 bot.tp_extreme  = price;
@@ -725,6 +732,24 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 if (bot.cfg.entry_mode == CcgConfig::EntryMode::Indicator) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
                     bool priceCond = is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub);
+                    // 首仓追踪建仓：破轨后记极值，自极值反弹够比例才开——等企稳不接刀
+                    if (bot.cfg.first_entry_bounce_pct > 0) {
+                        if (priceCond) {
+                            bot.band_broken = true;
+                            bot.band_extreme = (bot.band_extreme <= 0)
+                                ? price
+                                : (is_long ? std::min(bot.band_extreme, price)
+                                           : std::max(bot.band_extreme, price));
+                        }
+                        if (bot.band_broken && bot.band_extreme > 0) {
+                            double bth = bot.band_extreme *
+                                (is_long ? (1.0 + bot.cfg.first_entry_bounce_pct / 100.0)
+                                         : (1.0 - bot.cfg.first_entry_bounce_pct / 100.0));
+                            priceCond = is_long ? (price >= bth) : (price <= bth);
+                        } else {
+                            priceCond = false;
+                        }
+                    }
                     bool rsiCond = true;
                     if (bot.cfg.use_rsi_filter) {
                         bool snapshotHit = is_long ? (bot.ind_rsi >= bot.cfg.rsi_threshold)
