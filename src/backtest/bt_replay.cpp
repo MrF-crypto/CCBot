@@ -218,7 +218,11 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
         if (sim->position_qty() > 0) ++in_pos_min;
         // 按天采样权益曲线
         int64_t day = b.ts_ms / 86400000;
-        if (day != last_day) { last_day = day; res.equity_curve.push_back(equity); }
+        if (day != last_day) {
+            last_day = day;
+            res.equity_curve.push_back(equity);
+            res.equity_days.emplace_back(b.ts_ms, equity);
+        }
     }
 
     res.total_pnl  = sim->realized() + sim->unrealized();

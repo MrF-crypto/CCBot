@@ -8,6 +8,7 @@
 #include "backtest/bt_portfolio.h"
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <cstdlib>
 #include <iomanip>
 #include <algorithm>
@@ -48,13 +49,63 @@ static bool arg_flag(int argc, char** argv, const std::string& key) {
     return false;
 }
 
+// --from / --to：只回放指定时间窗（YYYY-MM-DD，UTC）。数据目录里六年全在，
+// 用它把"拿老数据证伪"和"在老数据上重新调参"分开——前者只需固定参数跑一个窗。
+// days_from_civil（Howard Hinnant 算法），避免依赖 timegm 的平台差异
+static int64_t parse_day_ms(const std::string& d) {
+    if (d.size() < 10) return 0;
+    int y  = std::atoi(d.substr(0, 4).c_str());
+    int m  = std::atoi(d.substr(5, 2).c_str());
+    int dd = std::atoi(d.substr(8, 2).c_str());
+    if (y < 1970 || m < 1 || m > 12 || dd < 1) return 0;
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return ((int64_t)era * 146097 + (int64_t)doe - 719468) * 86400000LL;
+}
+
+// 把 --from/--to 应用到全局时间范围上（无参则原样返回）
+static bool clamp_window(int argc, char** argv, int64_t& gmin, int64_t& gmax) {
+    if (int64_t f0 = parse_day_ms(arg_str(argc, argv, "--from", ""))) gmin = std::max(gmin, f0);
+    if (int64_t t1 = parse_day_ms(arg_str(argc, argv, "--to",   ""))) gmax = std::min(gmax, t1);
+    if (gmax <= gmin) { std::cerr << "时间窗为空\n"; return false; }
+    std::cout << "时间窗: " << ts_to_str(gmin) << " ~ " << ts_to_str(gmax) << "\n";
+    return true;
+}
+
 static int cmd_run(int argc, char** argv) {
     std::string path = argv[2];
     Series s; QualityReport rep; std::string err;
-    if (path.size() > 4 && path.substr(path.size() - 4) == ".bin") {
+    if (fs::is_directory(path)) {
+        // 目录 + --symbol：跨年合并（与 sweep/floor 相同的加载方式）
+        std::string sym = arg_str(argc, argv, "--symbol", "BTC-USDT");
+        std::vector<std::string> files;
+        for (const auto& e : fs::recursive_directory_iterator(path))
+            if (e.is_regular_file() && e.path().filename().string() == sym + ".csv")
+                files.push_back(e.path().string());
+        std::sort(files.begin(), files.end());
+        if (files.empty()) { std::cerr << "目录下没有 " << sym << ".csv\n"; return 1; }
+        if (!load_csv_multi(files, s, rep, err)) { std::cerr << "失败: " << err << "\n"; return 1; }
+    } else if (path.size() > 4 && path.substr(path.size() - 4) == ".bin") {
         if (!load_cache(path, s)) { std::cerr << "读缓存失败\n"; return 1; }
     } else if (!load_csv(path, s, rep, err)) {
         std::cerr << "失败: " << err << "\n"; return 1;
+    }
+
+    // --from/--to 时间窗（裁剪已加载的K线）
+    {
+        int64_t f0 = parse_day_ms(arg_str(argc, argv, "--from", ""));
+        int64_t t1 = parse_day_ms(arg_str(argc, argv, "--to",   ""));
+        if (f0 || t1) {
+            std::vector<Bar> keep;
+            keep.reserve(s.bars.size());
+            for (const auto& b : s.bars)
+                if ((!f0 || b.ts_ms >= f0) && (!t1 || b.ts_ms < t1)) keep.push_back(b);
+            if (keep.empty()) { std::cerr << "时间窗为空\n"; return 1; }
+            s.bars.swap(keep);
+        }
     }
 
     ReplayOptions opt;
@@ -82,10 +133,18 @@ static int cmd_run(int argc, char** argv) {
                  : curve == "fibonacci"  ? CcgConfig::StratType::Fibonacci
                                          : CcgConfig::StratType::Linear;
 
+    // 首单模式由命令行完全决定，不继承 CcgConfig 的默认值（默认是指标首单，
+    // 不显式复位的话纯网格测试会被悄悄挂上 BOLL+RSI 条件）
     if (arg_flag(argc, argv, "--indicator")) {
         c.entry_mode = CcgConfig::EntryMode::Indicator;
         c.rsi_confirm_mode = CcgConfig::RsiConfirmMode::CrossFromOversold;
+    } else {
+        c.entry_mode     = CcgConfig::EntryMode::Immediate;   // 首单即开
+        c.use_rsi_filter = false;
     }
+    // 三层决策各开关同样显式复位，未指定 --gates 即全关
+    c.use_htf_filter = arg_flag(argc, argv, "--gates");
+    c.use_sr_gate    = arg_flag(argc, argv, "--gates");
     c.kline_interval  = arg_str(argc, argv, "--tf", "1h");
     c.rsi_threshold   = arg_num(argc, argv, "--rsi-th", 35);
     c.rsi_oversold_th = arg_num(argc, argv, "--rsi-os", 25);
@@ -97,6 +156,10 @@ static int cmd_run(int argc, char** argv) {
     c.smart_gates       = arg_flag(argc, argv, "--gates");
     c.htf_pos_max       = arg_num(argc, argv, "--htf-max", 0.80);
     c.sr_headroom_ratio = arg_num(argc, argv, "--headroom", 1.5);
+    // 快进快出方案（方案A）：盈利达标即激活追踪，不要求触上轨
+    c.tp_floor_only        = arg_flag(argc, argv, "--floor-only");
+    c.fixed_trail_tp       = arg_num(argc, argv, "--fixed-trail", 0);
+    c.first_entry_bounce_pct = arg_num(argc, argv, "--bounce", 0);
     c.use_sr_exit          = arg_flag(argc, argv, "--sr-exit");
     c.use_structural_stop  = arg_flag(argc, argv, "--struct-stop");
 
@@ -115,6 +178,16 @@ static int cmd_run(int argc, char** argv) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
     std::cout << r.to_text() << "  回放耗时  : " << ms << " ms\n";
+
+    // --equity-csv：导出日度权益曲线，供"底仓+网格"配比分析用
+    if (std::string ep = arg_str(argc, argv, "--equity-csv", ""); !ep.empty()) {
+        std::ofstream f(ep);
+        f << "date,equity\n";
+        for (const auto& [ts, eq] : r.equity_days)
+            f << ts_to_str(ts).substr(0, 10) << "," << std::fixed
+              << std::setprecision(2) << eq << "\n";
+        std::cout << "  权益曲线已写入 " << ep << "（" << r.equity_days.size() << " 天）\n";
+    }
     return 0;
 }
 
@@ -224,32 +297,6 @@ static std::vector<std::string> parse_slist(const std::string& s) {
         else cur += c;
     }
     return v;
-}
-
-// --from / --to：只回放指定时间窗（YYYY-MM-DD，UTC）。数据目录里六年全在，
-// 用它把"拿老数据证伪"和"在老数据上重新调参"分开——前者只需固定参数跑一个窗。
-// days_from_civil（Howard Hinnant 算法），避免依赖 timegm 的平台差异
-static int64_t parse_day_ms(const std::string& d) {
-    if (d.size() < 10) return 0;
-    int y  = std::atoi(d.substr(0, 4).c_str());
-    int m  = std::atoi(d.substr(5, 2).c_str());
-    int dd = std::atoi(d.substr(8, 2).c_str());
-    if (y < 1970 || m < 1 || m > 12 || dd < 1) return 0;
-    y -= m <= 2;
-    const int era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = (unsigned)(y - era * 400);
-    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return ((int64_t)era * 146097 + (int64_t)doe - 719468) * 86400000LL;
-}
-
-// 把 --from/--to 应用到全局时间范围上（无参则原样返回）
-static bool clamp_window(int argc, char** argv, int64_t& gmin, int64_t& gmax) {
-    if (int64_t f0 = parse_day_ms(arg_str(argc, argv, "--from", ""))) gmin = std::max(gmin, f0);
-    if (int64_t t1 = parse_day_ms(arg_str(argc, argv, "--to",   ""))) gmax = std::min(gmax, t1);
-    if (gmax <= gmin) { std::cerr << "时间窗为空\n"; return false; }
-    std::cout << "时间窗: " << ts_to_str(gmin) << " ~ " << ts_to_str(gmax) << "\n";
-    return true;
 }
 
 static int cmd_sweep(int argc, char** argv) {
@@ -1156,6 +1203,9 @@ static int cmd_floor(int argc, char** argv) {
     //   A 快进快出：不等上轨，盈利1.5~2.5%即激活追踪，回调0.2~0.5%平仓，首仓等反弹
     //   B 上轨触发：保底仅0.3%，靠"穿破上轨"当激活条件，回调0.2~0.5%平仓
     const bool sweep_tps  = arg_flag(argc, argv, "--tp-scheme");
+    // --bounce-only：在【现行机制】下单独扫描首仓追踪建仓比例（含 0=关）。
+    // 之前只在方案A里比过 0.2/0.3/0.5 三档，从没和"关掉"对比过
+    const bool sweep_bnc  = arg_flag(argc, argv, "--bounce-only");
     auto ttp_list = parse_list(arg_str(argc, argv, "--trail-tps", "0.2,0.3,0.5"));
     auto bnc_list = parse_list(arg_str(argc, argv, "--bounces",   "0.2,0.3,0.5"));
     auto bma_list = parse_list(arg_str(argc, argv, "--bear-ma", "0,100,150,200"));
@@ -1169,7 +1219,13 @@ static int cmd_floor(int argc, char** argv) {
                  int scheme = 0; bool floor_only = false;
                  double ttp = 0, bounce = 0; };
     std::vector<Cfg> grid;
-    if (sweep_tps) {
+    if (sweep_bnc) {
+        CcgConfig def;
+        for (double f : floor_list) for (double L : layer_list) for (double bn : bnc_list)
+            grid.push_back({f, (int)L, false, def.sr_independent_conf,
+                            def.sr_lower_half_only, def.sr_headroom_true_tp,
+                            head_list[0], 0, 0, false, 0, 0, 0, 0, false, 0, bn});
+    } else if (sweep_tps) {
         CcgConfig def;
         Cfg base{floor_list[0], (int)layer_list[0], false, def.sr_independent_conf,
                  def.sr_lower_half_only, def.sr_headroom_true_tp, head_list[0], 0,
@@ -1309,7 +1365,12 @@ static int cmd_floor(int argc, char** argv) {
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
         char lb[64];
-        if (sweep_tps) {
+        if (sweep_bnc)
+            std::snprintf(lb, sizeof(lb), "保底%.1f%%/%d层/首仓反弹%s",
+                          grid[ci].floor, grid[ci].layers,
+                          grid[ci].bounce > 0 ? std::to_string(grid[ci].bounce).substr(0,4).c_str()
+                                              : "关");
+        else if (sweep_tps) {
             if (grid[ci].scheme == 0)
                 std::snprintf(lb, sizeof(lb), "基线 保底%.1f%%/动态回调", grid[ci].floor);
             else if (grid[ci].scheme == 2)

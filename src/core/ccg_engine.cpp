@@ -29,26 +29,49 @@ static bool trend_active_bearish(const CcgBot& bot, std::chrono::steady_clock::t
            (now - bot.trend_time) < kTrendStale;
 }
 
-// ── 加仓比例序列（最多 10 层）──────────────────────────────────────────────────
-static std::vector<double> base_mult(CcgConfig::StratType t) {
+// ── 加仓比例序列（最多 kMaxLayers 层）────────────────────────────────────────
+// 按需生成而不是查固定表：层数上限从 10 提到 50 后，写死的表会静默截断预算分配。
+// ⚠ 指数型曲线（倍投/三倍/斐波/卢卡斯）在深层数下权重爆炸，首仓分到的预算会
+// 趋近于 0 导致下单量不足——大层数只对平推/递增有实际意义
+static std::vector<double> base_mult(CcgConfig::StratType t, int n) {
     using ST = CcgConfig::StratType;
+    std::vector<double> m;
+    m.reserve(n);
     switch (t) {
-    case ST::Flat:       return {1,1,1,1,1,1,1,1,1,1};
-    case ST::Martingale: return {1,1,2,2,4,4,8,8,16,16};
-    case ST::MartPlus:   return {1,1,2,3,5,8,13,21,34,55};
-    case ST::Triple:     return {1,3,9,27,81,243,729,2187,6561,19683};
-    case ST::Square:     return {1,4,9,16,25,36,49,64,81,100};
-    case ST::Fibonacci:  return {1,1,2,3,5,8,13,21,34,55};
-    case ST::Lucas:      return {2,1,3,4,7,11,18,29,47,76};
-    case ST::Linear:     return {1,2,3,4,5,6,7,8,9,10};
+    case ST::Flat:
+        m.assign(n, 1.0);
+        break;
+    case ST::Linear:
+        for (int i = 1; i <= n; ++i) m.push_back(i);
+        break;
+    case ST::Martingale:                      // 1,1,2,2,4,4,8,8...
+        for (int i = 0; i < n; ++i) m.push_back(std::pow(2.0, i / 2));
+        break;
+    case ST::Triple:
+        for (int i = 0; i < n; ++i) m.push_back(std::pow(3.0, i));
+        break;
+    case ST::Square:
+        for (int i = 1; i <= n; ++i) m.push_back((double)i * i);
+        break;
+    case ST::MartPlus:                        // 类斐波那契 1,1,2,3,5,8...
+    case ST::Fibonacci: {
+        double a = 1, b = 1;
+        for (int i = 0; i < n; ++i) { m.push_back(a); double c = a + b; a = b; b = c; }
+        break;
     }
-    return {1,1,1,1,1,1,1,1,1,1};
+    case ST::Lucas: {                         // 2,1,3,4,7,11...
+        double a = 2, b = 1;
+        for (int i = 0; i < n; ++i) { m.push_back(a); double c = a + b; a = b; b = c; }
+        break;
+    }
+    }
+    if (m.empty()) m.assign(n, 1.0);
+    return m;
 }
 
 std::vector<double> CcgEngine::entry_usdt(const CcgConfig& cfg) {
-    auto m = base_mult(cfg.strat_type);
-    int n = std::min(cfg.max_entries, (int)m.size());
-    m.resize(n);
+    int n = std::max(1, std::min(cfg.max_entries, kMaxLayers));
+    auto m = base_mult(cfg.strat_type, n);
     double total = 0;
     for (auto v : m) total += v;
     if (total <= 0) total = 1;
@@ -114,9 +137,9 @@ std::string CcgEngine::add_bot(const CcgConfig& raw_cfg) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
     CcgConfig cfg = raw_cfg;
-    // 层数夹逼到曲线表实际支持的范围：>10 会静默截断预算分配，且第11层起
-    // should_enter 永真造成每 tick 空转派发
-    cfg.max_entries = std::max(1, std::min(cfg.max_entries, 10));
+    // 层数夹逼到支持范围：超出上限会静默截断预算分配，且超出层 should_enter
+    // 永真造成每 tick 空转派发
+    cfg.max_entries = std::max(1, std::min(cfg.max_entries, kMaxLayers));
 
     // Both 在引擎内部所有 is_long 判断里都会走空头分支——"双向"必须由上层拆成
     // 两个独立 bot，直接传 Both 进来得到的是一个伪装成双向的纯空单，拒绝
@@ -184,7 +207,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     auto it = bots_.find(id);
     if (it == bots_.end()) return false;
     CcgConfig new_cfg = raw_cfg;
-    new_cfg.max_entries = std::max(1, std::min(new_cfg.max_entries, 10));
+    new_cfg.max_entries = std::max(1, std::min(new_cfg.max_entries, kMaxLayers));
     auto& cfg = it->second.cfg;
     // symbol/direction 是 bot 的身份标识，不允许通过编辑改变
     cfg.strat_type    = new_cfg.strat_type;
@@ -732,8 +755,17 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 if (bot.cfg.entry_mode == CcgConfig::EntryMode::Indicator) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
                     bool priceCond = is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub);
-                    // 首仓追踪建仓：破轨后记极值，自极值反弹够比例才开——等企稳不接刀
+                    // 首仓追踪建仓：破轨后记极值，自极值反弹够比例才开——等企稳不接刀。
+                    // ⚠ 反弹条件是【叠加】在超卖区之上的，不是替换：价格必须仍在中轨
+                    // 下方才算数。否则破轨一次就永久放行，价格涨到上轨附近照样开仓，
+                    // 等于把下轨过滤器整个关掉（曾经的实现缺陷，实测会让开仓数翻2.6倍）
                     if (bot.cfg.first_entry_bounce_pct > 0) {
+                        const double mid = (bot.ind_boll_lb + bot.ind_boll_ub) * 0.5;
+                        // 价格已回到中轨另一侧仍未触发 → 本轮超卖结束，解除武装重新等
+                        if (is_long ? (price > mid) : (price < mid)) {
+                            bot.band_broken = false;
+                            bot.band_extreme = 0;
+                        }
                         if (priceCond) {
                             bot.band_broken = true;
                             bot.band_extreme = (bot.band_extreme <= 0)
@@ -745,7 +777,9 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                             double bth = bot.band_extreme *
                                 (is_long ? (1.0 + bot.cfg.first_entry_bounce_pct / 100.0)
                                          : (1.0 - bot.cfg.first_entry_bounce_pct / 100.0));
-                            priceCond = is_long ? (price >= bth) : (price <= bth);
+                            // 反弹达标 且 仍在中轨下方（超卖区内）才开
+                            priceCond = (is_long ? (price >= bth && price <= mid)
+                                                 : (price <= bth && price >= mid));
                         } else {
                             priceCond = false;
                         }

@@ -35,6 +35,7 @@ struct BacktestResult {
     int    gate_block_sr  = 0;
     // 权益曲线（按天采样，画图用）
     std::vector<double> equity_curve;
+    std::vector<std::pair<int64_t,double>> equity_days;  // {日首时间戳, 权益}
 
     double win_rate()  const { return cycles ? 100.0 * wins / cycles : 0; }
     double profit_dd() const { return max_drawdown > 1e-9 ? total_pnl / max_drawdown : 0; }
