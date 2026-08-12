@@ -27,6 +27,7 @@ struct BacktestResult {
     int    wins           = 0;
     int    orders         = 0;
     double avg_layers     = 0;
+    double full_layer_pct = 0;   // 处于【满层】状态的时间占比（梯子用尽=失去摊薄能力）
     int    max_layers     = 0;
     double time_in_pos_pct = 0;   // 持仓时间占比
     // 三层决策统计（影子/启用都记）

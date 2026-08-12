@@ -231,6 +231,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.rsi_confirm_mode = new_cfg.rsi_confirm_mode;
     cfg.rsi_oversold_th  = new_cfg.rsi_oversold_th;
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
+    cfg.dyn_interval_mult = new_cfg.dyn_interval_mult;
     cfg.min_profit_floor  = new_cfg.min_profit_floor;
     cfg.tp_floor_only     = new_cfg.tp_floor_only;
     cfg.fixed_trail_tp    = new_cfg.fixed_trail_tp;
@@ -520,7 +521,7 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
     }
     p.dyn          = true;
     p.fresh        = (host_.now_steady() - bot.ind_time) < kIndStale;
-    p.interval_pct = dynparams::interval_pct(W);
+    p.interval_pct = dynparams::interval_pct(W, bot.cfg.dyn_interval_mult);
     p.trail_entry  = dynparams::trail_entry_pct(W);
     p.trail_tp     = dynparams::trail_tp_pct(W);
     if (bot.cfg.fixed_trail_tp > 0) p.trail_tp = bot.cfg.fixed_trail_tp;

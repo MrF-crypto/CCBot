@@ -20,7 +20,15 @@ inline double band_width_pct(double lb, double ub) {
 }
 
 // W 为百分比（如 2.0 表示 2%），返回值同样是百分比
-inline double interval_pct   (double W) { return clampv(W / 3.0,  0.3,  1.5); }
+// mult：补仓间隔倍数（1.0=原始设计）。夹逼上限同步放大，否则倍数一过 1.65
+// 就全被 1.5% 的上限吃掉、等于没调。
+// 动机：8层梯子在 mult=1 时只覆盖 6~10% 跌幅（W/3 夹逼后约 0.83~1.5%），
+// 而实际回撤动辄 40~68%——任何像样的下跌都会在头几天把梯子打光，
+// 之后就是一个没有摊薄能力、均价很高的裸多头
+inline double interval_pct   (double W, double mult = 1.0) {
+    if (mult <= 0) mult = 1.0;
+    return clampv(W / 3.0 * mult, 0.3, 1.5 * mult);
+}
 inline double trail_tp_pct   (double W) { return clampv(0.15 * W, 0.2,  0.6); }
 inline double trail_entry_pct(double W) { return clampv(0.10 * W, 0.15, 0.4); }
 

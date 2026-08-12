@@ -20,7 +20,8 @@ std::string BacktestResult::to_text() const {
       << "  周期数    : " << cycles << "   胜率 " << win_rate() << "%"
       << "   订单 " << orders << "\n"
       << "  层数      : 平均 " << avg_layers << " / 最大 " << max_layers
-      << "   持仓时间占比 " << time_in_pos_pct << "%\n"
+      << "   持仓 " << time_in_pos_pct << "%"
+      << "   满层 " << full_layer_pct << "%\n"
       << "  峰值名义  : " << max_notional << " U\n"
       << "  三层决策  : 放行 " << gate_pass << " / 宏观拦 " << gate_block_htf
       << " / 结构拦 " << gate_block_sr << "\n";
@@ -127,6 +128,7 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
     const double init_eq = opt.initial_equity;
     double peak_eq = init_eq, equity = init_eq;
     int64_t last_day = 0, in_pos_min = 0, total_min = 0;
+    int64_t full_min = 0;   // 处于满层状态的分钟数
     int64_t last_sr_calc = 0, last_slow_calc = 0;
     std::vector<srzones::Zone> sr_zones;
     double sr_atr = 0;
@@ -216,6 +218,9 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
         res.max_notional = std::max(res.max_notional, sim->position_qty() * b.close);
         ++total_min;
         if (sim->position_qty() > 0) ++in_pos_min;
+        // 满层 = 梯子用尽：此后既不能再摊薄，也只能干等价格回来
+        for (const auto& bt : engine->get_bots())
+            if ((int)bt.entries.size() >= bt.cfg.max_entries) { ++full_min; break; }
         // 按天采样权益曲线
         int64_t day = b.ts_ms / 86400000;
         if (day != last_day) {
@@ -232,6 +237,7 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
     res.orders     = sim->order_count();
     res.avg_layers = res.cycles ? (double)layer_sum / res.cycles : 0;
     res.time_in_pos_pct = total_min ? 100.0 * in_pos_min / total_min : 0;
+    res.full_layer_pct  = total_min ? 100.0 * full_min   / total_min : 0;
     return res;
 }
 

@@ -150,6 +150,7 @@ static int cmd_run(int argc, char** argv) {
     c.rsi_oversold_th = arg_num(argc, argv, "--rsi-os", 25);
 
     c.dynamic_band_mode = arg_flag(argc, argv, "--dynamic");
+    c.dyn_interval_mult = arg_num(argc, argv, "--int-mult", 1.0);
     c.min_profit_floor  = arg_num(argc, argv, "--floor", 0.3);
     c.use_trend_filter  = arg_flag(argc, argv, "--trend");
     c.sr_radar          = arg_flag(argc, argv, "--sr") || arg_flag(argc, argv, "--gates");
