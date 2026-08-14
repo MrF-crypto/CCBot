@@ -11,6 +11,9 @@ struct HeadlessConfig {
     std::string api_key;
     std::string api_secret;
     bool        testnet          = false;
+    // "futures"(默认) = 普通合约账户 fapi；"portfolio_margin" = 统一账户 papi。
+    // 统一账户没有测试网，选它时 testnet 会被强制置 false
+    std::string account_mode     = "futures";
     double      max_total_margin = 0;    // 0=不限，同 GUI 的账户总保证金上限
     std::string alert_webhook;           // 同 GUI 的关键事件提醒 webhook
     std::string state_path = "ccbot_state.json";   // 仓位运行时状态落盘路径，重启续跑用

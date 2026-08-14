@@ -130,6 +130,10 @@ int main(int argc, char** argv) {
     tc_cfg.api_key    = cfg.api_key;
     tc_cfg.api_secret = cfg.api_secret;
     tc_cfg.testnet    = cfg.testnet;
+    const bool is_pm  = (cfg.account_mode == "portfolio_margin");
+    tc_cfg.account_mode = is_pm ? TradingClient::AccountMode::PortfolioMargin
+                                : TradingClient::AccountMode::Futures;
+    const std::string net_name = cfg.testnet ? "测试网" : (is_pm ? "统一账户(主网)" : "主网");
 
     for (const auto& w : cfg.warnings) log_line("⚠ 配置警告: " + w, "WARN");
 
@@ -144,9 +148,10 @@ int main(int argc, char** argv) {
         { std::error_code ec; std::filesystem::remove(lock_path, ec); }
         return 1;
     }
-    log_line("连接成功 | " + std::string(cfg.testnet ? "测试网" : "主网") +
+    log_line("连接成功 | " + net_name +
              " | 权益 $" + std::to_string(info.total_equity) +
-             " | 可用 $" + std::to_string(info.available), "OK");
+             " | 可用 $" + std::to_string(info.available) +
+             (info.uni_mmr > 0 ? " | uniMMR " + std::to_string(info.uni_mmr) : ""), "OK");
 
     auto pool   = std::make_shared<ThreadPool>(4);
     auto engine = std::make_shared<CcgEngine>(client, pool);
@@ -401,7 +406,8 @@ int main(int argc, char** argv) {
                 auto acc = client->fetch_account();
                 if (acc.ok) {
                     log_line("心跳 | 权益 $" + std::to_string(acc.total_equity) +
-                             " | 可用 $" + std::to_string(acc.available));
+                             " | 可用 $" + std::to_string(acc.available) +
+                             (acc.uni_mmr > 0 ? " | uniMMR " + std::to_string(acc.uni_mmr) : ""));
                 } else {
                     log_line("心跳失败（网络异常?): " + acc.error, "ERR");
                     // -1021 = 时钟漂移超窗，立即重新对时自愈

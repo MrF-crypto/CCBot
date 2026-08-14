@@ -12,6 +12,9 @@ public:
         std::string api_key;
         std::string api_secret;
         bool        testnet = true;
+        // 0 = 普通合约账户(fapi)，1 = 统一账户/Portfolio Margin(papi)。
+        // 用 int 而不是 enum，避免 core 层反向依赖 net/trading_client.h
+        int         account_mode = 0;
     };
 
     static bool save(const Creds& c, const std::string& path);

@@ -105,6 +105,7 @@ private:
     QString      apiKey_;
     QString      apiSecret_;
     bool         testnet_ = false;
+    int          accountMode_ = 0;   // 0=普通合约(fapi)  1=统一账户(papi)
     QPushButton* btnConnect_;
     QLabel*      connLabel_;
     QLabel*      breatheDot_  = nullptr;   // 连接状态呼吸灯

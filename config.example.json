@@ -2,6 +2,7 @@
   "api_key": "你的Binance API Key",
   "api_secret": "你的Binance API Secret",
   "testnet": true,
+  "account_mode": "futures",
   "max_total_margin": 500,
   "alert_webhook": "",
   "state_path": "ccbot_state.json",

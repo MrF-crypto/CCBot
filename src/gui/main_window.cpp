@@ -212,6 +212,7 @@ void MainWindow::save_credentials() {
     c.api_key    = apiKey_.trimmed().toStdString();
     c.api_secret = apiSecret_.trimmed().toStdString();
     c.testnet    = testnet_;
+    c.account_mode = accountMode_;
     if (c.api_key.empty() || c.api_secret.empty()) return;
     if (!KeyStore::save(c, cred_path()))
         log("API Key 本地保存失败（DPAPI 加密或写盘出错）", "ERR");
@@ -222,8 +223,10 @@ void MainWindow::load_credentials() {
     if (!KeyStore::load(c, cred_path())) return;
     apiKey_    = QString::fromStdString(c.api_key);
     apiSecret_ = QString::fromStdString(c.api_secret);
-    testnet_   = c.testnet;
-    log("已自动载入保存的 API Key", "OK");
+    testnet_     = c.testnet;
+    accountMode_ = c.account_mode;
+    log(accountMode_ == 1 ? "已自动载入保存的 API Key（统一账户）"
+                          : "已自动载入保存的 API Key", "OK");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -664,9 +667,35 @@ void MainWindow::openSettingsDialog() {
     secretEdit->setPlaceholderText("API Secret");
     credForm->addRow("Secret:", secretEdit);
 
+    auto* modeCombo = new QComboBox();
+    modeCombo->addItem("普通合约账户（fapi）");
+    modeCombo->addItem("统一账户 / Portfolio Margin（papi）");
+    modeCombo->setCurrentIndex(accountMode_ == 1 ? 1 : 0);
+    credForm->addRow("账户类型:", modeCombo);
+
     auto* testnetBox = new QCheckBox("测试网（币安合约测试网，需要单独申请测试用Key）");
     testnetBox->setChecked(testnet_);
     credForm->addRow("", testnetBox);
+
+    auto* modeHint = new QLabel();
+    modeHint->setWordWrap(true);
+    modeHint->setStyleSheet("color:#8b949e;font-size:10px;");
+    credForm->addRow("", modeHint);
+
+    // 统一账户只有主网——币安没有为它开测试网。选中时把测试网勾选强制关掉并禁用，
+    // 免得用户以为可以先空跑验证，实际却拿主网的 Key 打到一个不存在的测试域名上
+    auto syncModeUi = [modeCombo, testnetBox, modeHint]() {
+        const bool pm = (modeCombo->currentIndex() == 1);
+        if (pm) testnetBox->setChecked(false);
+        testnetBox->setEnabled(!pm);
+        modeHint->setText(pm
+            ? "统一账户走 papi.binance.com，**没有测试网**，连上就是真金白银。"
+              "开通统一账户后，普通合约的 API 端点会失效，两种类型不能混用同一个账户的 Key。"
+            : "普通合约账户走 fapi.binance.com。若该账户已在币安开通统一账户，请改选上面那项。");
+    };
+    syncModeUi();
+    connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            &dlg, [syncModeUi](int) { syncModeUi(); });
 
     auto* credHint = new QLabel(
         connState_ == ConnState::Disconnected || connState_ == ConnState::Failed
@@ -723,9 +752,10 @@ void MainWindow::openSettingsDialog() {
 
     if (dlg.exec() != QDialog::Accepted) return;
 
-    apiKey_    = apiKeyEdit->text().trimmed();
-    apiSecret_ = secretEdit->text().trimmed();
-    testnet_   = testnetBox->isChecked();
+    apiKey_      = apiKeyEdit->text().trimmed();
+    apiSecret_   = secretEdit->text().trimmed();
+    accountMode_ = (modeCombo->currentIndex() == 1) ? 1 : 0;
+    testnet_     = (accountMode_ == 1) ? false : testnetBox->isChecked();
     save_credentials();
 
     bool ok;
@@ -1007,7 +1037,10 @@ void MainWindow::onConnect() {
     TradingClient::Config cfg;
     cfg.api_key    = key.toStdString();
     cfg.api_secret = secret.toStdString();
-    cfg.testnet    = testnet_;
+    cfg.account_mode = (accountMode_ == 1) ? TradingClient::AccountMode::PortfolioMargin
+                                           : TradingClient::AccountMode::Futures;
+    // 统一账户没有测试网，这里再兜一次底（设置弹窗已经禁用了勾选，但配置文件可能是手改的）
+    cfg.testnet    = (accountMode_ == 1) ? false : testnet_;
 
     // 无论本次连接是否成功都先保存，避免限流/网络失败导致密钥丢失、下次仍需手动输入
     save_credentials();
@@ -1062,7 +1095,9 @@ void MainWindow::onConnect() {
             });
 
             account_info_       = info;
-            connNetName_        = cfg.testnet ? "测试网" : "主网";
+            connNetName_        = cfg.testnet ? "测试网"
+                                  : (cfg.account_mode == TradingClient::AccountMode::PortfolioMargin
+                                     ? "统一账户" : "主网");
             alertedDisconnect_  = false;
             setConnState(ConnState::Connected);   // 顶部计时从此刻开始，文本由 updateHeader() 接管
 
@@ -1074,10 +1109,13 @@ void MainWindow::onConnect() {
             trendTickCount_ = 0;
             tick_timer_->start();
 
-            log(QString("连接成功 | %1 | 权益 $%2 | 可用 $%3")
-                .arg(cfg.testnet ? "测试网" : "主网")
+            log(QString("连接成功 | %1 | 权益 $%2 | 可用 $%3%4")
+                .arg(connNetName_)
                 .arg(info.total_equity, 0, 'f', 2)
-                .arg(info.available,    0, 'f', 2), "OK");
+                .arg(info.available,    0, 'f', 2)
+                .arg(info.uni_mmr > 0
+                     ? QString(" | uniMMR %1").arg(info.uni_mmr, 0, 'f', 2)
+                     : QString()), "OK");
 
             // 恢复上次保存的 Bot
             load_and_restore_bots();

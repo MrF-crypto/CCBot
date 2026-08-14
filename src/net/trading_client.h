@@ -10,17 +10,28 @@ namespace ccbot {
 // Binance USDT-M Futures REST API 客户端（同步 CURL + mbedtls HMAC）
 class TradingClient : public ITradingClient {
 public:
+    // 账户类型。两者是**不同的 API 域名和路径**，不是同一套接口的开关：
+    //   Futures         —— 普通合约账户，fapi.binance.com，/fapi/*
+    //   PortfolioMargin —— 统一账户，papi.binance.com，/papi/v1/um/*
+    // 统一账户没有测试网（币安只在主网提供），选它时 testnet 会被强制关掉。
+    enum class AccountMode { Futures = 0, PortfolioMargin = 1 };
+
     struct Config {
         std::string api_key;
         std::string api_secret;
         bool        testnet = true;
+        AccountMode account_mode = AccountMode::Futures;
     };
 
     struct AccountInfo {
         bool   ok               = false;
-        double total_equity     = 0;   // totalMarginBalance
-        double available        = 0;   // availableBalance
+        double total_equity     = 0;   // totalMarginBalance / accountEquity(统一账户)
+        double available        = 0;   // availableBalance / totalAvailableBalance(统一账户)
         double unrealized_pnl   = 0;   // totalUnrealizedProfit
+        // 统一账户维持保证金率（uniMMR）。统一账户是**全账户**统一算强平的，只看 UM
+        // 子账户的数字会低估风险，所以这个值要单独盯：<1.05 币安开始强制减仓。
+        // 0 = 普通合约账户，不适用
+        double uni_mmr          = 0;
         std::string error;
     };
 
@@ -159,6 +170,7 @@ public:
     void sync_server_time();
 
     bool is_testnet()   const { return cfg_.testnet; }
+    bool is_pm()        const { return cfg_.account_mode == AccountMode::PortfolioMargin; }
     bool is_dual_mode() const override { return dual_mode_; }
 
     // ── ITradingClient 实现（引擎通过接口调用，实盘走真实下单）──────────────
@@ -171,8 +183,23 @@ public:
     bool   set_leverage(const std::string& symbol, int lev) override;
 
 private:
+    // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换（listenKey 就没有
+    // um 前缀），所以用枚举查表，不做字符串拼接，免得漏改一处就打到错误的账户上。
+    enum class Ep {
+        Account, PositionRisk, OpenOrders, Order, AllOpenOrders,
+        PositionSideDual, Leverage, ListenKey,
+        PmAccount,     // 统一账户专属：/papi/v1/account（全账户视角，uniMMR 在这里）
+        CondOrder,     // 统一账户专属：条件单（STOP_MARKET / TAKE_PROFIT_MARKET）
+    };
+    const char* ep(Ep e) const;
+
+    OrderResult place_cond_market(const std::string& symbol, const char* order_type,
+                                   double stop_price, const std::string& entry_side,
+                                   double qty);
+
     Config      cfg_;
-    std::string base_;
+    std::string base_;       // 签名端点的域名（统一账户 = papi.binance.com）
+    std::string pub_base_;   // 公开行情端点的域名（永远是 fapi，papi 没有行情接口）
     bool        dual_mode_       = false;
     int64_t     time_offset_ms_  = 0;   // local_clock + offset = server_clock
 
@@ -193,6 +220,9 @@ private:
 
     std::string sign(const std::string& q) const;
     int64_t     ts_ms() const;
+
+    AccountInfo fetch_account_futures();
+    AccountInfo fetch_account_pm();
 
     // 带签名（需要 timestamp + HMAC）
     std::string http_get (const std::string& path, std::string params = "");

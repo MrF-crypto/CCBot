@@ -94,9 +94,30 @@ static bool binance_error(simdjson::dom::element& doc, std::string& err) {
 }
 
 // ── TradingClient ─────────────────────────────────────────────────────────────
+const char* TradingClient::ep(Ep e) const {
+    const bool pm = is_pm();
+    switch (e) {
+    case Ep::Account:          return pm ? "/papi/v1/um/account"           : "/fapi/v2/account";
+    case Ep::PositionRisk:     return pm ? "/papi/v1/um/positionRisk"      : "/fapi/v2/positionRisk";
+    case Ep::OpenOrders:       return pm ? "/papi/v1/um/openOrders"        : "/fapi/v1/openOrders";
+    case Ep::Order:            return pm ? "/papi/v1/um/order"             : "/fapi/v1/order";
+    case Ep::AllOpenOrders:    return pm ? "/papi/v1/um/allOpenOrders"     : "/fapi/v1/allOpenOrders";
+    case Ep::PositionSideDual: return pm ? "/papi/v1/um/positionSide/dual" : "/fapi/v1/positionSide/dual";
+    case Ep::Leverage:         return pm ? "/papi/v1/um/leverage"          : "/fapi/v1/leverage";
+    // listenKey 在统一账户下**没有** um 前缀，是全账户一条流
+    case Ep::ListenKey:        return pm ? "/papi/v1/listenKey"            : "/fapi/v1/listenKey";
+    case Ep::PmAccount:        return "/papi/v1/account";
+    case Ep::CondOrder:        return "/papi/v1/um/conditional/order";
+    }
+    return "";
+}
+
 TradingClient::TradingClient(const Config& cfg) : cfg_(cfg) {
-    base_ = cfg.testnet ? "https://testnet.binancefuture.com"
-                        : "https://fapi.binance.com";
+    // 公开行情永远走 fapi：papi 域名下**不存在** exchangeInfo/klines/premiumIndex/time，
+    // 打过去一律 404。所以行情和签名走两个 base，不能合并。
+    pub_base_ = cfg.testnet ? "https://testnet.binancefuture.com"
+                            : "https://fapi.binance.com";
+    base_ = is_pm() ? "https://papi.binance.com" : pub_base_;
 
     // Pre-warm persistent CURL pool: one handle per slot shares TCP+TLS across calls
     for (int i = 0; i < kCurlPoolSize; ++i) {
@@ -138,7 +159,7 @@ int64_t TradingClient::ts_ms() const {
 }
 
 std::string TradingClient::http_get_public(const std::string& path) {
-    std::string url  = base_ + path;
+    std::string url  = pub_base_ + path;
     std::string resp;
     CURL* c = curl_easy_init();
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
@@ -228,9 +249,30 @@ std::string TradingClient::http_del(const std::string& path, std::string params)
 }
 
 // ── API Methods ───────────────────────────────────────────────────────────────
+
+// 取字段并报告"到底有没有取到"。统一账户的部分字段币安会返回空串（""），
+// parse_dbl_str 对空串返回 0，光看返回值分不清"真的是0"和"没这个字段"——
+// 而这两者在余额展示上含义完全不同，所以要单独把 found 传出来。
+static double parse_dbl_str_opt(simdjson::dom::element obj, const char* key, bool& found) {
+    found = false;
+    std::string_view v;
+    if (obj[key].get(v) == simdjson::SUCCESS) {
+        if (v.empty()) return 0.0;
+        try { double d = std::stod(std::string(v)); found = true; return d; }
+        catch (...) { return 0.0; }
+    }
+    double d = 0;
+    if (obj[key].get(d) == simdjson::SUCCESS) { found = true; return d; }
+    return 0.0;
+}
+
 TradingClient::AccountInfo TradingClient::fetch_account() {
+    return is_pm() ? fetch_account_pm() : fetch_account_futures();
+}
+
+TradingClient::AccountInfo TradingClient::fetch_account_futures() {
     AccountInfo info;
-    auto resp = http_get("/fapi/v2/account", "recvWindow=5000");
+    auto resp = http_get(ep(Ep::Account), "recvWindow=5000");
     if (resp.empty()) { info.error = "无响应"; return info; }
 
     simdjson::dom::parser p;
@@ -249,9 +291,84 @@ TradingClient::AccountInfo TradingClient::fetch_account() {
     return info;
 }
 
+// 统一账户的余额要两个接口一起看：
+//   /papi/v1/um/account —— UM（U本位合约）子账户视角，字段名与 fapi 一致
+//   /papi/v1/account    —— 全账户视角，uniMMR / accountEquity / totalAvailableBalance
+// 强平是按**全账户**算的，所以 uniMMR 必须取到；而"可用于开仓的钱"用全账户口径
+// （totalAvailableBalance）才对——现货抵押品折算进来的额度只体现在这里。
+TradingClient::AccountInfo TradingClient::fetch_account_pm() {
+    AccountInfo info;
+    simdjson::dom::parser p1, p2;
+
+    // ① UM 子账户：未实现盈亏，以及 totalAvailableBalance 缺失时的兜底
+    auto um_resp = http_get(ep(Ep::Account), "recvWindow=5000");
+    if (um_resp.empty()) { info.error = "统一账户无响应（papi）"; return info; }
+
+    simdjson::dom::element um;
+    auto um_ps = simdjson::padded_string(um_resp);
+    if (p1.parse(um_ps).get(um) != simdjson::SUCCESS) {
+        info.error = "统一账户JSON解析失败";
+        return info;
+    }
+    if (binance_error(um, info.error)) return info;
+
+    bool f = false;
+    info.unrealized_pnl = parse_dbl_str_opt(um, "totalUnrealizedProfit", f);
+    double um_equity    = parse_dbl_str_opt(um, "totalMarginBalance", f);
+    bool   has_um_eq    = f;
+    double um_avail     = parse_dbl_str_opt(um, "availableBalance", f);
+    bool   has_um_av    = f;
+
+    // 顶层没有汇总字段时，从 assets[] 里挑 USDT 那条（币安两种形态都出现过）
+    if (!has_um_eq || !has_um_av) {
+        simdjson::dom::array assets;
+        if (um["assets"].get(assets) == simdjson::SUCCESS) {
+            for (auto a : assets) {
+                std::string_view name;
+                if (a["asset"].get(name) != simdjson::SUCCESS || name != "USDT") continue;
+                if (!has_um_eq) { um_equity = parse_dbl_str_opt(a, "marginBalance",    f); has_um_eq = f; }
+                if (!has_um_av) { um_avail  = parse_dbl_str_opt(a, "availableBalance", f); has_um_av = f; }
+                bool fu = false;
+                double upnl = parse_dbl_str_opt(a, "unrealizedProfit", fu);
+                if (fu && info.unrealized_pnl == 0.0) info.unrealized_pnl = upnl;
+                break;
+            }
+        }
+    }
+
+    // ② 全账户：uniMMR + 权益 + 可用
+    auto acc_resp = http_get(ep(Ep::PmAccount), "recvWindow=5000");
+    double pm_equity = 0, pm_avail = 0;
+    bool has_pm_eq = false, has_pm_av = false;
+    if (!acc_resp.empty()) {
+        simdjson::dom::element acc;
+        auto acc_ps = simdjson::padded_string(acc_resp);
+        if (p2.parse(acc_ps).get(acc) == simdjson::SUCCESS) {
+            std::string ignore;
+            if (!binance_error(acc, ignore)) {
+                info.uni_mmr = parse_dbl_str_opt(acc, "uniMMR", f);
+                pm_equity    = parse_dbl_str_opt(acc, "accountEquity", f);        has_pm_eq = f;
+                pm_avail     = parse_dbl_str_opt(acc, "totalAvailableBalance", f); has_pm_av = f;
+            }
+        }
+    }
+
+    info.total_equity = has_pm_eq ? pm_equity : um_equity;
+    info.available    = has_pm_av ? pm_avail  : um_avail;
+
+    // 两个接口都没给出权益 —— 宁可报连接失败，也不要在界面上显示"权益 $0"：
+    // 那会让人以为账户是空的，或者误判风控还有多少余量
+    if (!has_pm_eq && !has_um_eq) {
+        info.error = "统一账户余额字段解析失败（papi 返回结构与预期不符）";
+        return info;
+    }
+    info.ok = true;
+    return info;
+}
+
 std::vector<TradingClient::Position> TradingClient::fetch_positions() {
     std::vector<Position> result;
-    auto resp = http_get("/fapi/v2/positionRisk", "recvWindow=5000");
+    auto resp = http_get(ep(Ep::PositionRisk), "recvWindow=5000");
     if (resp.empty()) return result;
 
     simdjson::dom::parser p;
@@ -291,7 +408,7 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions() {
 
 std::vector<TradingClient::OpenOrder> TradingClient::fetch_open_orders() {
     std::vector<OpenOrder> result;
-    auto resp = http_get("/fapi/v1/openOrders", "recvWindow=5000");
+    auto resp = http_get(ep(Ep::OpenOrders), "recvWindow=5000");
     if (resp.empty()) return result;
 
     simdjson::dom::parser p;
@@ -356,7 +473,7 @@ static std::string make_client_order_id() {
 TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
                                                        const std::string& client_order_id) {
     OrderResult r;
-    auto resp = http_get("/fapi/v1/order",
+    auto resp = http_get(ep(Ep::Order),
                          "symbol=" + sym + "&origClientOrderId=" + client_order_id +
                          "&recvWindow=5000");
     if (resp.empty()) { r.error = "无响应"; r.uncertain = true; return r; }
@@ -407,7 +524,7 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
             + "&newClientOrderId=" + coid
             + "&newOrderRespType=RESULT&recvWindow=5000" + extra;
 
-        auto resp = http_post("/fapi/v1/order", body);
+        auto resp = http_post(ep(Ep::Order), body);
 
         // 可疑响应统一走查单恢复：空响应（超时/断网）和"非空但不是JSON"（网关5xx
         // HTML页、Cloudflare拦截页、被截断的响应）都意味着【订单状态未知】——
@@ -475,7 +592,7 @@ TradingClient::OrderResult TradingClient::place_limit(const std::string& sym,
         oss << "&reduceOnly=true";
     }
 
-    auto resp = http_post("/fapi/v1/order", oss.str());
+    auto resp = http_post(ep(Ep::Order), oss.str());
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
@@ -490,7 +607,7 @@ TradingClient::OrderResult TradingClient::place_limit(const std::string& sym,
 }
 
 bool TradingClient::fetch_position_mode() {
-    auto resp = http_get("/fapi/v1/positionSide/dual", "recvWindow=5000");
+    auto resp = http_get(ep(Ep::PositionSideDual), "recvWindow=5000");
     if (resp.empty()) return false;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -503,7 +620,7 @@ bool TradingClient::fetch_position_mode() {
 }
 
 bool TradingClient::cancel_order(const std::string& sym, const std::string& order_id) {
-    auto resp = http_del("/fapi/v1/order",
+    auto resp = http_del(ep(Ep::Order),
         "symbol=" + sym + "&orderId=" + order_id + "&recvWindow=5000");
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -514,7 +631,7 @@ bool TradingClient::cancel_order(const std::string& sym, const std::string& orde
 }
 
 bool TradingClient::cancel_all_orders(const std::string& sym) {
-    auto resp = http_del("/fapi/v1/allOpenOrders",
+    auto resp = http_del(ep(Ep::AllOpenOrders),
         "symbol=" + sym + "&recvWindow=5000");
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -548,7 +665,7 @@ bool TradingClient::close_all_positions() {
 }
 
 bool TradingClient::set_leverage(const std::string& sym, int lev) {
-    auto resp = http_post("/fapi/v1/leverage",
+    auto resp = http_post(ep(Ep::Leverage),
         "symbol=" + sym + "&leverage=" + std::to_string(lev));
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -609,7 +726,7 @@ void TradingClient::http_del_unsigned(const std::string& path, const std::string
 
 // ── ListenKey（UserData Stream 用）───────────────────────────────────────────
 std::string TradingClient::create_listen_key() {
-    auto resp = http_post_unsigned("/fapi/v1/listenKey");
+    auto resp = http_post_unsigned(ep(Ep::ListenKey));
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
@@ -620,12 +737,12 @@ std::string TradingClient::create_listen_key() {
 }
 
 bool TradingClient::keepalive_listen_key(const std::string& key) {
-    http_put_unsigned("/fapi/v1/listenKey", "listenKey=" + key);
+    http_put_unsigned(ep(Ep::ListenKey), "listenKey=" + key);
     return true;
 }
 
 void TradingClient::delete_listen_key(const std::string& key) {
-    http_del_unsigned("/fapi/v1/listenKey", "listenKey=" + key);
+    http_del_unsigned(ep(Ep::ListenKey), "listenKey=" + key);
 }
 
 // ── LOT_SIZE / 价格精度缓存 ───────────────────────────────────────────────────
@@ -653,7 +770,7 @@ const TradingClient::SymbolInfo& TradingClient::get_symbol_info(const std::strin
     }
 
     SymbolInfo info;
-    auto resp = http_get("/fapi/v1/exchangeInfo", "symbol=" + sym);
+    auto resp = http_get_public("/fapi/v1/exchangeInfo?symbol=" + sym);
     if (!resp.empty()) {
         simdjson::dom::parser p;
         simdjson::dom::element doc;
@@ -739,24 +856,31 @@ double TradingClient::round_price(const std::string& sym, double price) {
 }
 
 // ── TP/SL 条件市价单（显式数量 + reduceOnly，兼容所有账户模式）─────────────
+// 统一账户下条件单**不走** /papi/v1/um/order —— 那个端点只收 LIMIT/MARKET，
+// 发 STOP_MARKET 会被拒。条件单是独立的一套：
+//   路径   /papi/v1/um/conditional/order
+//   参数   type → strategyType
+//   返回   orderId → strategyId（撤单时也要用 strategyId，不是 orderId）
 TradingClient::OrderResult
-TradingClient::place_tp_market(const std::string& sym, double stop_price,
-                                const std::string& entry_side, double qty) {
+TradingClient::place_cond_market(const std::string& sym, const char* order_type,
+                                  double stop_price, const std::string& entry_side,
+                                  double qty) {
     OrderResult r;
     stop_price = round_price(sym, stop_price);
-    if (stop_price <= 0) { r.error = "TP价格取整后为0，跳过"; return r; }
+    if (stop_price <= 0) { r.error = std::string(order_type) + "价格取整后为0，跳过"; return r; }
 
     std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
     const auto& info = get_symbol_info(sym);
     const int price_dp = step_decimals(info.tick_size);
     const int qty_dp   = step_decimals(info.effective_market_step());
     qty = round_qty(sym, qty);
-    if (qty <= 0) { r.error = "TP数量取整后为0，跳过"; return r; }
+    if (qty <= 0) { r.error = std::string(order_type) + "数量取整后为0，跳过"; return r; }
 
+    const bool pm = is_pm();
     std::ostringstream oss;
     oss << "symbol=" << sym
         << "&side=" << close_side
-        << "&type=TAKE_PROFIT_MARKET"
+        << (pm ? "&strategyType=" : "&type=") << order_type
         << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
         << "&quantity=" << std::setprecision(qty_dp) << qty
         << "&reduceOnly=true"
@@ -766,53 +890,28 @@ TradingClient::place_tp_market(const std::string& sym, double stop_price,
     if (dual_mode_)
         oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
 
-    auto resp = http_post("/fapi/v1/order", oss.str());
+    auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), oss.str());
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; return r; }
     if (binance_error(doc, r.error)) return r;
-    int64_t oid = 0; doc["orderId"].get(oid);
+    int64_t oid = 0;
+    doc[pm ? "strategyId" : "orderId"].get(oid);
     r.order_id = std::to_string(oid); r.ok = true;
     return r;
 }
 
 TradingClient::OrderResult
+TradingClient::place_tp_market(const std::string& sym, double stop_price,
+                                const std::string& entry_side, double qty) {
+    return place_cond_market(sym, "TAKE_PROFIT_MARKET", stop_price, entry_side, qty);
+}
+
+TradingClient::OrderResult
 TradingClient::place_sl_market(const std::string& sym, double stop_price,
                                 const std::string& entry_side, double qty) {
-    OrderResult r;
-    stop_price = round_price(sym, stop_price);
-    if (stop_price <= 0) { r.error = "SL价格取整后为0，跳过"; return r; }
-
-    std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
-    const auto& info = get_symbol_info(sym);
-    const int price_dp = step_decimals(info.tick_size);
-    const int qty_dp   = step_decimals(info.effective_market_step());
-    qty = round_qty(sym, qty);
-    if (qty <= 0) { r.error = "SL数量取整后为0，跳过"; return r; }
-
-    std::ostringstream oss;
-    oss << "symbol=" << sym
-        << "&side=" << close_side
-        << "&type=STOP_MARKET"
-        << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
-        << "&quantity=" << std::setprecision(qty_dp) << qty
-        << "&reduceOnly=true"
-        << "&workingType=MARK_PRICE"
-        << "&priceProtect=false"
-        << "&recvWindow=5000";
-    if (dual_mode_)
-        oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
-
-    auto resp = http_post("/fapi/v1/order", oss.str());
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; return r; }
-    if (binance_error(doc, r.error)) return r;
-    int64_t oid = 0; doc["orderId"].get(oid);
-    r.order_id = std::to_string(oid); r.ok = true;
-    return r;
+    return place_cond_market(sym, "STOP_MARKET", stop_price, entry_side, qty);
 }
 
 // ── RSI（1h K线，公开接口）────────────────────────────────────────────────────

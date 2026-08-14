@@ -89,7 +89,19 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     out.api_key           = get_str(root, "api_key", "");
     out.api_secret        = get_str(root, "api_secret", "");
     out.testnet           = get_bool(root, "testnet", false);
+    out.account_mode      = get_str(root, "account_mode", "futures");
     out.max_total_margin  = get_num(root, "max_total_margin", 0.0);
+
+    if (out.account_mode != "futures" && out.account_mode != "portfolio_margin") {
+        err = "account_mode 只能是 \"futures\" 或 \"portfolio_margin\"，收到: " + out.account_mode;
+        return false;
+    }
+    // 统一账户只有主网。配置里两个都写了就以 account_mode 为准并告警，
+    // 而不是拿主网的 Key 去打测试网域名然后报一堆看不懂的鉴权错
+    if (out.account_mode == "portfolio_margin" && out.testnet) {
+        out.testnet = false;
+        out.warnings.push_back("统一账户没有测试网，testnet=true 已被忽略（按主网连接）");
+    }
     out.alert_webhook     = get_str(root, "alert_webhook", "");
     out.state_path        = get_str(root, "state_path", "ccbot_state.json");
     out.log_path          = get_str(root, "log_path", "");

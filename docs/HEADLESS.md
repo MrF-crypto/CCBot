@@ -33,6 +33,7 @@ cmake --build build --config Release --target ccbot_headless
 |---|---|
 | `api_key` / `api_secret` | Binance API 凭证，**明文存在配置文件里**，务必 `chmod 600` 并且不要提交到git（`.gitignore` 已经排除了 `config.json`，只有 `config.example.json` 模板会被提交） |
 | `testnet` | `true`=连测试网，`false`=连真实账户，强烈建议先用 `true` 跑通 |
+| `account_mode` | `"futures"`（默认）=普通合约账户，走 `fapi.binance.com`；`"portfolio_margin"`=统一账户，走 `papi.binance.com`。**统一账户没有测试网**，填了 `testnet: true` 会被忽略并告警。账户在币安开通统一账户后，普通合约的 API 端点就失效了，两者不能混用同一个账户的 Key |
 | `max_total_margin` | 账户总保证金上限（USDT），`0`=不限，同图形界面版设置里的那个 |
 | `alert_webhook` | 企业微信/飞书/Telegram webhook，触发硬止损、启动连接失败时推送 |
 | `state_path` | 仓位运行时状态落盘路径，重启续跑用，默认 `ccbot_state.json` |

@@ -108,3 +108,14 @@ target_include_directories(ccg_indicator_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(MSVC)
     target_compile_options(ccg_indicator_tests PRIVATE /utf-8)
 endif()
+
+# ── 凭证存储格式测试（含加账户类型字段后的向后兼容）──────────────────────────
+add_executable(ccg_key_store_tests tests/test_key_store.cpp src/core/key_store.cpp)
+target_include_directories(ccg_key_store_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(ccg_key_store_tests PRIVATE /utf-8)
+    target_link_libraries(ccg_key_store_tests PRIVATE crypt32)
+elseif(APPLE)
+    target_link_libraries(ccg_key_store_tests PRIVATE
+        "-framework Security" "-framework CoreFoundation")
+endif()

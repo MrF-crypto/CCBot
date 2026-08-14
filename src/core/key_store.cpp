@@ -169,7 +169,8 @@ namespace ccbot {
 
 bool KeyStore::save(const Creds& c, const std::string& path) {
     std::string plain = c.api_key + "\n" + c.api_secret + "\n" +
-                        (c.testnet ? "1" : "0");
+                        (c.testnet ? "1" : "0") + "\n" +
+                        std::to_string(c.account_mode);
     return backend_save(plain, path);
 }
 
@@ -184,7 +185,17 @@ bool KeyStore::load(Creds& c, const std::string& path) {
 
     c.api_key    = plain.substr(0, p1);
     c.api_secret = plain.substr(p1 + 1, p2 - p1 - 1);
-    c.testnet    = (plain.substr(p2 + 1) == "1");
+
+    // 第4行是后加的账户类型。旧密文只有3行，此时整个尾巴就是 testnet 标志，
+    // 账户类型退回默认的普通合约——升级后已保存的凭证要照常能读出来
+    size_t p3 = plain.find('\n', p2 + 1);
+    if (p3 == std::string::npos) {
+        c.testnet      = (plain.substr(p2 + 1) == "1");
+        c.account_mode = 0;
+    } else {
+        c.testnet      = (plain.substr(p2 + 1, p3 - p2 - 1) == "1");
+        c.account_mode = (plain.substr(p3 + 1) == "1") ? 1 : 0;
+    }
     return true;
 }
 
