@@ -151,6 +151,7 @@ static int cmd_run(int argc, char** argv) {
 
     c.dynamic_band_mode = arg_flag(argc, argv, "--dynamic");
     c.dyn_interval_mult = arg_num(argc, argv, "--int-mult", 1.0);
+    c.dyn_fixed_interval = arg_num(argc, argv, "--int-fixed", 0.0);
     c.min_profit_floor  = arg_num(argc, argv, "--floor", 0.3);
     c.use_trend_filter  = arg_flag(argc, argv, "--trend");
     c.sr_radar          = arg_flag(argc, argv, "--sr") || arg_flag(argc, argv, "--gates");
@@ -159,6 +160,7 @@ static int cmd_run(int argc, char** argv) {
     c.sr_headroom_ratio = arg_num(argc, argv, "--headroom", 1.5);
     // 快进快出方案（方案A）：盈利达标即激活追踪，不要求触上轨
     c.tp_floor_only        = arg_flag(argc, argv, "--floor-only");
+    c.tp_fixed_profit      = arg_num(argc, argv, "--tp-fixed", 0.0);
     c.fixed_trail_tp       = arg_num(argc, argv, "--fixed-trail", 0);
     c.first_entry_bounce_pct = arg_num(argc, argv, "--bounce", 0);
     c.use_sr_exit          = arg_flag(argc, argv, "--sr-exit");
@@ -1207,6 +1209,13 @@ static int cmd_floor(int argc, char** argv) {
     // --bounce-only：在【现行机制】下单独扫描首仓追踪建仓比例（含 0=关）。
     // 之前只在方案A里比过 0.2/0.3/0.5 三档，从没和"关掉"对比过
     const bool sweep_bnc  = arg_flag(argc, argv, "--bounce-only");
+    // --int-fixed-sweep：动态W推导的间隔 vs 固定常数间隔（结构锚定保持不变）。
+    // 0 = 动态。用来回答"自适应本身有没有价值"
+    const bool sweep_intf = arg_flag(argc, argv, "--int-fixed-sweep");
+    // --tpfix-sweep：固定利润止盈线（与上轨路径是【或】关系）。0=关=纯上轨路径
+    const bool sweep_tpf  = arg_flag(argc, argv, "--tpfix-sweep");
+    auto tpf_list = parse_list(arg_str(argc, argv, "--tp-fixeds", "0,3,4,5,6,8,10"));
+    auto intf_list = parse_list(arg_str(argc, argv, "--int-fixeds", "0,0.8,1.0,1.2,1.5,2.0"));
     auto ttp_list = parse_list(arg_str(argc, argv, "--trail-tps", "0.2,0.3,0.5"));
     auto bnc_list = parse_list(arg_str(argc, argv, "--bounces",   "0.2,0.3,0.5"));
     auto bma_list = parse_list(arg_str(argc, argv, "--bear-ma", "0,100,150,200"));
@@ -1218,9 +1227,22 @@ static int cmd_floor(int argc, char** argv) {
                  int dca_from = 0; bool dca_trend = false; double dca_pctb = 0;
                  int bear_ma = 0; double bear_dd = 0;
                  int scheme = 0; bool floor_only = false;
-                 double ttp = 0, bounce = 0; };
+                 double ttp = 0, bounce = 0; double int_fixed = 0;
+                 double tp_fixed = 0; };
     std::vector<Cfg> grid;
-    if (sweep_bnc) {
+    if (sweep_tpf) {
+        CcgConfig def;
+        for (double f : floor_list) for (double L : layer_list) for (double tf : tpf_list)
+            grid.push_back({f, (int)L, false, def.sr_independent_conf,
+                            def.sr_lower_half_only, def.sr_headroom_true_tp,
+                            head_list[0], 0, 0, false, 0, 0, 0, 0, false, 0, 0, 0, tf});
+    } else if (sweep_intf) {
+        CcgConfig def;
+        for (double f : floor_list) for (double L : layer_list) for (double iv : intf_list)
+            grid.push_back({f, (int)L, false, def.sr_independent_conf,
+                            def.sr_lower_half_only, def.sr_headroom_true_tp,
+                            head_list[0], 0, 0, false, 0, 0, 0, 0, false, 0, 0, iv});
+    } else if (sweep_bnc) {
         CcgConfig def;
         for (double f : floor_list) for (double L : layer_list) for (double bn : bnc_list)
             grid.push_back({f, (int)L, false, def.sr_independent_conf,
@@ -1332,6 +1354,9 @@ static int cmd_floor(int argc, char** argv) {
                 c.use_trend_filter = true;
                 c.sr_radar = true; c.smart_gates = true;
                 c.htf_pos_max = 0.60; c.sr_headroom_ratio = grid[ci].head;
+                c.tp_fixed_profit    = grid[ci].tp_fixed;
+                c.dyn_fixed_interval = sweep_intf ? grid[ci].int_fixed
+                                     : arg_num(argc, argv, "--int-fixed", 0.0);
                 c.use_sr_exit = grid[ci].sr_exit;
                 c.sr_independent_conf = grid[ci].indep;
                 c.sr_lower_half_only  = grid[ci].lower;
@@ -1366,7 +1391,21 @@ static int cmd_floor(int argc, char** argv) {
     for (size_t ci = 0; ci < grid.size(); ++ci) {
         Sc s; s.floor = grid[ci].floor; s.layers = grid[ci].layers; s.ex = grid[ci].sr_exit;
         char lb[64];
-        if (sweep_bnc)
+        if (sweep_tpf) {
+            if (grid[ci].tp_fixed <= 0)
+                std::snprintf(lb, sizeof(lb), "仅上轨路径 保底%.1f%%", grid[ci].floor);
+            else
+                std::snprintf(lb, sizeof(lb), "保底%.1f%% 或 固定%.0f%%",
+                              grid[ci].floor, grid[ci].tp_fixed);
+        }
+        else if (sweep_intf) {
+            if (grid[ci].int_fixed <= 0)
+                std::snprintf(lb, sizeof(lb), "动态 W/3 (%d层)", grid[ci].layers);
+            else
+                std::snprintf(lb, sizeof(lb), "固定 %.1f%% (%d层)",
+                              grid[ci].int_fixed, grid[ci].layers);
+        }
+        else if (sweep_bnc)
             std::snprintf(lb, sizeof(lb), "保底%.1f%%/%d层/首仓反弹%s",
                           grid[ci].floor, grid[ci].layers,
                           grid[ci].bounce > 0 ? std::to_string(grid[ci].bounce).substr(0,4).c_str()

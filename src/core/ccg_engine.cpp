@@ -232,8 +232,10 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.rsi_oversold_th  = new_cfg.rsi_oversold_th;
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
     cfg.dyn_interval_mult = new_cfg.dyn_interval_mult;
+    cfg.dyn_fixed_interval = new_cfg.dyn_fixed_interval;
     cfg.min_profit_floor  = new_cfg.min_profit_floor;
     cfg.tp_floor_only     = new_cfg.tp_floor_only;
+    cfg.tp_fixed_profit   = new_cfg.tp_fixed_profit;
     cfg.fixed_trail_tp    = new_cfg.fixed_trail_tp;
     cfg.first_entry_bounce_pct = new_cfg.first_entry_bounce_pct;
     cfg.use_trend_filter  = new_cfg.use_trend_filter;
@@ -521,7 +523,9 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
     }
     p.dyn          = true;
     p.fresh        = (host_.now_steady() - bot.ind_time) < kIndStale;
-    p.interval_pct = dynparams::interval_pct(W, bot.cfg.dyn_interval_mult);
+    p.interval_pct = bot.cfg.dyn_fixed_interval > 0
+                     ? bot.cfg.dyn_fixed_interval
+                     : dynparams::interval_pct(W, bot.cfg.dyn_interval_mult);
     p.trail_entry  = dynparams::trail_entry_pct(W);
     p.trail_tp     = dynparams::trail_tp_pct(W);
     if (bot.cfg.fixed_trail_tp > 0) p.trail_tp = bot.cfg.fixed_trail_tp;
@@ -594,8 +598,17 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             bool band_cond = eff.fresh &&
                 (bot.cfg.tp_floor_only ||
                  (is_long ? (price >= target) : (price <= target)));
-            tp_hit = band_cond &&
-                (is_long ? (price >= floor_th) : (price <= floor_th));
+            // 路径B：够到固定利润线就收割，不等上轨（与路径A 是【或】关系）
+            bool fixed_cond = false;
+            if (bot.cfg.tp_fixed_profit > 0 && bot.avg_price > 0 && eff.fresh) {
+                double fx = bot.avg_price *
+                    (is_long ? (1.0 + bot.cfg.tp_fixed_profit / 100.0)
+                             : (1.0 - bot.cfg.tp_fixed_profit / 100.0));
+                fixed_cond = is_long ? (price >= fx) : (price <= fx);
+            }
+            tp_hit = (band_cond &&
+                      (is_long ? (price >= floor_th) : (price <= floor_th)))
+                     || fixed_cond;
             if (tp_hit && !bot.tp_reached) bot.tp_anchor = target;
         } else {
             double tp_th = bot.avg_price *
