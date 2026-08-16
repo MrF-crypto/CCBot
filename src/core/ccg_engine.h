@@ -69,6 +69,22 @@ struct CcgConfig {
     int         cooldown_secs = 300;     // 回测用值；60秒在高位区会立刻回补
     double      stop_loss_pct = 0.0;   // 均价跌幅超过此值强制平仓（0=禁用）
 
+    // ── 交易所侧灾难止损（默认关）────────────────────────────────────────────
+    // 均价下方 x% 处在【交易所】挂一张 STOP_MARKET + closePosition 单。
+    // 与 stop_loss_pct 的区别是决定性的：stop_loss_pct 活在本进程里，程序崩了、
+    // 断电了、窗口被误关了就什么都不剩；这一张单子挂在币安服务器上，进程死了
+    // 它还在。这是唯一的进程外保护。
+    //
+    // 每次补仓成交后按新均价重挂（均价会随补仓下移，止损位跟着下移）。
+    // 取值要**远离正常止盈区间**——它只防瀑布，不参与常规交易。网格策略天然要
+    // 吃深度回撤，设太紧会在正常的补仓过程中被打掉，把浮亏变成实亏。
+    // 建议：满层理论跌幅再留一段余量（比如满层跌 20% 的配置设 30~35）。
+    // 用【独立开关】而不是"比例=0 即关闭"：这个功能会把浮亏变成实亏，是否启用
+    // 属于策略取向而非参数调优，必须是一个明确的是/否，不能藏在一个数字里。
+    // 分开之后也能关掉它而不丢失已经配好的比例。
+    bool        use_disaster_stop = false;
+    double      disaster_stop_pct = 30.0;   // 仅在 use_disaster_stop=true 时生效
+
     // RSI 确认方式：Snapshot=当前这一刻 RSI 到没到阈值就行；
     // CrossFromOversold=必须先探底跌破 rsi_oversold_th，之后再回穿 rsi_threshold 才算数
     // （更严格的"动能反转"确认，避免在强趋势下跌中过早进场）
@@ -323,6 +339,11 @@ struct CcgBot {
     // 检查要把它计入，否则多品种在同一 tick 窗口齐过闸会集体超限
     double inflight_margin = 0;
 
+    // 交易所侧灾难止损单。order_id 落盘，重启后先撤旧单再按当前均价重挂，
+    // 避免遗留一张触发价对不上新均价的孤儿单
+    std::string disaster_stop_id;
+    double      disaster_stop_price = 0;
+
     // 统计
     double realized_pnl = 0;
     int    cycle_count  = 0;
@@ -380,6 +401,8 @@ public:
 
     // 账户级总保证金上限（所有 bot 加起来），0=不限。超过时暂缓开新的首仓，
     // 已有仓位的加仓/止盈止损不受影响——防止同时配置太多品种时风险失控
+    // 重启恢复仓位后调用：重建所有交易所侧灾难止损单
+    void   resync_disaster_stops();
     void   set_max_total_margin(double usdt);
     double max_total_margin() const;
     double total_margin_used() const;   // 当前所有 bot 已用保证金合计
@@ -441,6 +464,9 @@ private:
                            std::chrono::steady_clock::time_point now) const;
     bool should_close     (const CcgBot& bot, double price) const;
     bool should_stop_loss (const CcgBot& bot, double price) const;
+    // 交易所侧灾难止损单的挂/改/撤（在线程池里跑，内部不持 mtx_ 做 HTTP）
+    void sync_disaster_stop  (const std::string& bot_id);
+    void cancel_disaster_stop(const std::string& bot_id);
     void submit_entry   (const std::string& bot_id);
     void submit_close   (const std::string& bot_id, const std::string& reason);
     void log            (const std::string& msg);

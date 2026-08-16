@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.4.0 LANGUAGES CXX)
+project(CCGMonitor VERSION 3.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 # ── 核心引擎/网络代码：GUI 版和无界面(headless)版共用，不含任何 Qt/Windows 专属代码 ──
 set(CORE_SOURCES
     src/core/ccg_engine.cpp
+    src/core/funding_ledger.cpp
     src/net/trading_client.cpp
     src/net/book_ticker_stream.cpp
     src/net/alert.cpp
@@ -107,6 +108,27 @@ add_executable(ccg_indicator_tests tests/test_indicators.cpp)
 target_include_directories(ccg_indicator_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(MSVC)
     target_compile_options(ccg_indicator_tests PRIVATE /utf-8)
+endif()
+
+# ── 风控闸门测试（保证金上限 / 交易所侧灾难止损单）：用假客户端单跑引擎 ────────
+add_executable(ccg_risk_tests tests/test_risk_gates.cpp src/core/ccg_engine.cpp)
+target_include_directories(ccg_risk_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_risk_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_risk_tests PRIVATE /utf-8)
+endif()
+
+# ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
+add_executable(ccg_funding_tests tests/test_funding.cpp src/core/funding_ledger.cpp
+                                 src/net/trading_client.cpp)
+target_include_directories(ccg_funding_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_funding_tests PRIVATE ${CORE_LIBS})
+if(WIN32)
+    target_link_libraries(ccg_funding_tests PRIVATE crypt32 ws2_32 wsock32)
+    target_compile_definitions(ccg_funding_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_options(ccg_funding_tests PRIVATE /utf-8)
 endif()
 
 # ── 凭证存储格式测试（含加账户类型字段后的向后兼容）──────────────────────────

@@ -108,6 +108,7 @@ const char* TradingClient::ep(Ep e) const {
     case Ep::ListenKey:        return pm ? "/papi/v1/listenKey"            : "/fapi/v1/listenKey";
     case Ep::PmAccount:        return "/papi/v1/account";
     case Ep::CondOrder:        return "/papi/v1/um/conditional/order";
+    case Ep::Income:           return pm ? "/papi/v1/um/income"            : "/fapi/v1/income";
     }
     return "";
 }
@@ -902,6 +903,66 @@ TradingClient::place_cond_market(const std::string& sym, const char* order_type,
     return r;
 }
 
+// ── 灾难止损单：STOP_MARKET + closePosition ───────────────────────────────────
+// 与 place_cond_market 的区别：不带 quantity / reduceOnly（币安对 closePosition
+// 同时带这两者会直接拒单），仓位平掉后交易所自动撤销。
+std::string TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
+                                                const std::string& entry_side) {
+    stop_price = round_price(sym, stop_price);
+    if (stop_price <= 0) return "";
+
+    const std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
+    const auto& info = get_symbol_info(sym);
+    const int price_dp = step_decimals(info.tick_size);
+    const bool pm = is_pm();
+
+    std::ostringstream oss;
+    oss << "symbol=" << sym
+        << "&side=" << close_side
+        << (pm ? "&strategyType=" : "&type=") << "STOP_MARKET"
+        << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
+        << "&closePosition=true"
+        << "&workingType=MARK_PRICE"   // 用标记价，避免插针成交价误触发
+        << "&priceProtect=true"
+        << "&recvWindow=5000";
+    if (dual_mode_)
+        oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
+
+    auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), oss.str());
+    if (resp.empty()) return "";
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return "";
+    std::string err;
+    if (binance_error(doc, err)) return "";
+    int64_t oid = 0;
+    doc[pm ? "strategyId" : "orderId"].get(oid);
+    return oid > 0 ? std::to_string(oid) : "";
+}
+
+bool TradingClient::cancel_disaster_stop(const std::string& sym,
+                                          const std::string& order_id) {
+    if (order_id.empty()) return true;
+    const bool pm = is_pm();
+    // 统一账户的条件单不在普通撤单端点上，且用 strategyId 而不是 orderId
+    auto resp = http_del(pm ? ep(Ep::CondOrder) : ep(Ep::Order),
+        "symbol=" + sym + (pm ? "&strategyId=" : "&orderId=") + order_id +
+        "&recvWindow=5000");
+    if (resp.empty()) return false;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
+    std::string err;
+    if (binance_error(doc, err)) {
+        // -2011 Unknown order：单子已经不在了（已触发/已被交易所自动撤销），
+        // 对调用方而言目的已达成，算成功——否则会陷入无意义的重试
+        return err.find("-2011") != std::string::npos;
+    }
+    return true;
+}
+
 TradingClient::OrderResult
 TradingClient::place_tp_market(const std::string& sym, double stop_price,
                                 const std::string& entry_side, double qty) {
@@ -1071,16 +1132,66 @@ std::vector<TradingClient::Bar> TradingClient::fetch_bars(
     return out;
 }
 
-double TradingClient::fetch_mark_price(const std::string& sym) {
+TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) {
+    PremiumInfo info;
     auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + sym);
-    if (resp.empty()) return 0.0;
+    if (resp.empty()) return info;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return 0.0;
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return info;
     std::string_view mp;
-    if (doc["markPrice"].get(mp) != simdjson::SUCCESS) return 0.0;
-    try { return std::stod(std::string(mp)); } catch (...) { return 0.0; }
+    if (doc["markPrice"].get(mp) != simdjson::SUCCESS) return info;
+    try { info.mark_price = std::stod(std::string(mp)); } catch (...) { return info; }
+    if (info.mark_price <= 0) return info;
+    std::string_view fr;
+    if (doc["lastFundingRate"].get(fr) == simdjson::SUCCESS) {
+        try { info.funding_rate = std::stod(std::string(fr)); } catch (...) {}
+    }
+    doc["nextFundingTime"].get(info.next_ms);
+    info.ok = true;
+    return info;
+}
+
+double TradingClient::fetch_mark_price(const std::string& sym) {
+    return fetch_premium(sym).mark_price;
+}
+
+std::vector<TradingClient::FundingRecord>
+TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
+                                     const std::string& sym) {
+    std::vector<FundingRecord> out;
+    std::string params = "incomeType=FUNDING_FEE&limit=1000";
+    if (!sym.empty())   params += "&symbol=" + sym;
+    if (start_ms > 0)   params += "&startTime=" + std::to_string(start_ms);
+    if (end_ms   > 0)   params += "&endTime="   + std::to_string(end_ms);
+    params += "&recvWindow=5000";
+
+    auto resp = http_get(ep(Ep::Income), params);
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    if (doc.get(arr) != simdjson::SUCCESS) return out;   // 错误对象而非数组
+
+    for (auto e : arr) {
+        FundingRecord r;
+        std::string_view sv;
+        if (e["symbol"].get(sv) == simdjson::SUCCESS) r.symbol = std::string(sv);
+        if (e["income"].get(sv) == simdjson::SUCCESS) {
+            try { r.income = std::stod(std::string(sv)); } catch (...) { continue; }
+        }
+        // time 币安有时给数字有时给字符串，两种都收
+        if (e["time"].get(r.time) != simdjson::SUCCESS) {
+            if (e["time"].get(sv) == simdjson::SUCCESS) {
+                try { r.time = std::stoll(std::string(sv)); } catch (...) {}
+            }
+        }
+        if (!r.symbol.empty() && r.time > 0) out.push_back(r);
+    }
+    return out;
 }
 
 } // namespace ccbot

@@ -1,6 +1,7 @@
 // ccbot_headless：无图形界面版本，配置文件驱动，Windows/Linux 都能编译运行。
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
 #include "core/ccg_engine.h"
+#include "core/funding_ledger.h"
 #include "core/sr_zones.h"
 #include "core/decision.h"
 #include "core/thread_pool.h"
@@ -228,6 +229,9 @@ int main(int argc, char** argv) {
                 send_webhook(cfg.alert_webhook, msg);
             }
         }
+        // 对账之后重建交易所侧灾难止损单——必须等本地持仓收敛到真相，
+        // 否则会照着一个错误的均价挂止损
+        engine->resync_disaster_stops();
     }
 
     BookTickerStream ticker(cfg.testnet);
@@ -251,6 +255,26 @@ int main(int argc, char** argv) {
     std::map<std::string, std::map<long long, int64_t>> sr_alert_dedup;
     auto fetch_pool = std::make_shared<ThreadPool>(2);
 
+    // ── 资金费账本 ───────────────────────────────────────────────────────────
+    // 只记账不参与决策：永续每 8 小时结算一次，这是真实划走的现金，不是浮亏。
+    // 对长期持有的仓位，它是唯一一笔价格涨回来也拿不回的成本
+    FundingLedger funding;
+    const std::string funding_path = cfg.state_path + ".funding";
+    funding.load(funding_path);
+    bool funding_backfilled = false;
+    std::atomic<bool> fund_busy{false};
+    std::set<std::string> fund_alerted;   // 年化超阈值已告警的品种
+
+    // ── 看门狗状态 ───────────────────────────────────────────────────────────
+    // 交易系统最阴的故障不是崩溃（崩溃至少进程没了，外部能看出来），而是
+    // "进程还在、但已经不干活了"：喂价全部返回0、心跳一直失败、循环卡住。
+    // 这种状态下仓位无人管理，而所有监控指标看起来都活着。
+    const std::string alive_path = cfg.state_path + ".alive";
+    std::map<std::string, int> stall_ticks;    // sym → 连续取不到价格的 tick 数
+    std::set<std::string> stall_alerted;       // 已告警的品种，恢复后清除
+    std::atomic<int> hb_fail_streak{0};
+    std::atomic<bool> hb_alerted{false};
+
     int tick_n = 0;
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -262,7 +286,47 @@ int main(int argc, char** argv) {
         for (const auto& sym : symbols) {
             double price = ticker.mid_price(sym);   // 内置10秒陈旧保护，冻结价返回0
             if (price <= 0) price = client->fetch_mark_price(sym);
-            if (price > 0) engine->tick(sym, price);
+            if (price > 0) {
+                engine->tick(sym, price);
+                stall_ticks[sym] = 0;
+                if (stall_alerted.erase(sym)) {
+                    log_line(sym + " 行情已恢复", "OK");
+                    if (!webhook.empty()) {
+                        std::thread([w = webhook, s = sym]() {
+                            send_webhook(w, "[ccbot] " + s + " 行情已恢复，策略判定重新运行");
+                        }).detach();
+                    }
+                }
+            } else {
+                // WS 冻结 + REST 也拿不到价：该品种的止盈/止损/补仓全部停摆。
+                // 有持仓的时候这等同于仓位无人看管，必须叫人
+                int n = ++stall_ticks[sym];
+                bool has_pos = false;
+                for (const auto& b : bots)
+                    if (b.cfg.symbol == sym && b.total_qty > 0) has_pos = true;
+                if (n == 20 && has_pos && !stall_alerted.count(sym)) {   // 约1分钟
+                    stall_alerted.insert(sym);
+                    log_line(sym + " 连续1分钟取不到价格，该品种策略判定已停摆（有持仓!）", "ERR");
+                    if (!webhook.empty()) {
+                        std::thread([w = webhook, s = sym]() {
+                            send_webhook(w, "[ccbot] ⚠ " + s + " 连续1分钟取不到价格，"
+                                            "止盈/止损/补仓全部停摆，且该品种有持仓——请检查网络");
+                        }).detach();
+                    }
+                }
+            }
+        }
+
+        // ── 1c) 心跳文件（dead-man's switch）：每 tick 写入当前时间戳。
+        //     外部看门狗（systemd WatchdogSec / cron）检查这个文件的年龄就能发现
+        //     "进程还在但循环卡住"——这是日志和进程存活检查都发现不了的故障
+        {
+            std::ofstream hf(alive_path, std::ios::trunc);
+            if (hf) {
+                hf << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch()).count()
+                   << " tick=" << tick_n << " bots=" << bots.size() << "\n";
+            }
         }
 
         // ── 1b) v3.0 结构摘要喂入（纯本地计算）────────────────────────────────
@@ -402,20 +466,110 @@ int main(int argc, char** argv) {
         // ── 6) 心跳（异步，约1分钟一次）─────────────────────────────────────
         if (tick_n % 20 == 0 && !hb_busy.load()) {
             hb_busy.store(true);
-            fetch_pool->submit([client, &hb_busy]() {
+            fetch_pool->submit([client, &hb_busy, &hb_fail_streak, &hb_alerted, w = webhook]() {
                 auto acc = client->fetch_account();
                 if (acc.ok) {
                     log_line("心跳 | 权益 $" + std::to_string(acc.total_equity) +
                              " | 可用 $" + std::to_string(acc.available) +
                              (acc.uni_mmr > 0 ? " | uniMMR " + std::to_string(acc.uni_mmr) : ""));
+                    hb_fail_streak.store(0);
+                    if (hb_alerted.exchange(false) && !w.empty())
+                        send_webhook(w, "[ccbot] 账户接口已恢复");
+                    // 统一账户按【全账户】算强平，uniMMR 是唯一能看到真实距离的数。
+                    // 1.05 是币安开始强制减仓的线，留出余量在 1.3 就叫人
+                    if (acc.uni_mmr > 0 && acc.uni_mmr < 1.3) {
+                        log_line("⚠ uniMMR " + std::to_string(acc.uni_mmr) +
+                                 " 已接近强平线（1.05 起强制减仓）", "ERR");
+                        if (!w.empty())
+                            send_webhook(w, "[ccbot] ⚠ 统一账户 uniMMR " +
+                                            std::to_string(acc.uni_mmr) +
+                                            "，接近强平线（1.05 起强制减仓），请立即处理");
+                    }
                 } else {
                     log_line("心跳失败（网络异常?): " + acc.error, "ERR");
                     // -1021 = 时钟漂移超窗，立即重新对时自愈
                     if (acc.error.find("-1021") != std::string::npos)
                         client->sync_server_time();
+                    // 连续3次（约3分钟）失败才告警：偶发抖动不值得半夜叫醒人
+                    if (hb_fail_streak.fetch_add(1) + 1 >= 3 && !hb_alerted.exchange(true) && !w.empty())
+                        send_webhook(w, "[ccbot] ⚠ 账户接口连续3次拉取失败：" + acc.error);
                 }
                 hb_busy.store(false);
             });
+        }
+
+        // ── 6b) 资金费：费率约5分钟一刷，历史流水约1小时一同步 ──────────────
+        if (tick_n % 100 == 1 && !fund_busy.load()) {
+            fund_busy.store(true);
+            std::vector<std::string> fsyms(symbols.begin(), symbols.end());
+            // 首次补历史的起点 = 最早那笔持仓的建仓时间
+            int64_t earliest = 0;
+            for (const auto& b : bots) {
+                if (b.entries.empty()) continue;
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              b.entries.front().time.time_since_epoch()).count();
+                if (ms > 0 && (earliest == 0 || ms < earliest)) earliest = ms;
+            }
+            const bool do_hist  = !funding_backfilled || (tick_n % 1200 == 1);
+            const int64_t bfill = funding_backfilled ? 0 : earliest;
+            fetch_pool->submit([client, &funding, &fund_busy, &funding_backfilled,
+                                fsyms, do_hist, bfill, funding_path]() {
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch()).count();
+                for (const auto& s : fsyms) {
+                    auto pi = client->fetch_premium(s);
+                    if (pi.ok) funding.set_rate(s, pi.funding_rate, pi.next_ms, now_ms);
+                }
+                if (do_hist) {
+                    int added = sync_funding_ledger(*client, funding, fsyms, bfill);
+                    if (!funding_backfilled) {
+                        funding_backfilled = true;
+                        double sum = 0;
+                        for (const auto& s : funding.symbols()) sum += funding.get(s).total;
+                        log_line("资金费账本已同步 " + std::to_string(added) +
+                                 " 条流水，累计 " + std::to_string(sum) + " USDT",
+                                 sum < 0 ? "WARN" : "OK");
+                    }
+                    funding.save(funding_path);
+                }
+                fund_busy.store(false);
+            });
+        }
+
+        // ── 6c) 资金费日志与告警（本地计算，零开销）──────────────────────────
+        //  告警只报告【持有成本变了】，从不建议平仓——持有决策是使用者的事
+        if (tick_n % 20 == 0) {
+            for (const auto& b : bots) {
+                if (b.total_qty <= 0) continue;
+                auto fe = funding.get(b.cfg.symbol);
+                if (fe.rate_ms == 0) continue;
+                const double ann = FundingLedger::annualized_pct(fe.rate);
+                if (fe.since_open != 0) {
+                    const bool is_long = (b.cfg.direction == CcgConfig::Direction::Long);
+                    double be = FundingLedger::effective_breakeven(
+                        b.avg_price, b.total_qty, fe.since_open, is_long);
+                    log_line("资金费 | " + b.cfg.symbol +
+                             " 本轮已付 " + std::to_string(-fe.since_open) + " USDT" +
+                             " | 年化 " + std::to_string(-ann) + "%" +
+                             " | 回本价 " + std::to_string(b.avg_price) +
+                             " → " + std::to_string(be));
+                }
+                // 年化持有成本跨过 30% 才叫人，回落到 20% 以下才解除（迟滞，防边界刷屏）
+                if (ann > 30.0 && !fund_alerted.count(b.cfg.symbol)) {
+                    fund_alerted.insert(b.cfg.symbol);
+                    log_line("⚠ " + b.cfg.symbol + " 资金费年化已达 " +
+                             std::to_string(ann) + "%，持有成本显著上升", "WARN");
+                    if (!webhook.empty()) {
+                        std::thread([w = webhook, s = b.cfg.symbol, ann]() {
+                            send_webhook(w, "[ccbot] " + s + " 资金费年化 " +
+                                            std::to_string(ann) + "%，持有成本显著上升"
+                                            "（仅告知，策略未做任何改变）");
+                        }).detach();
+                    }
+                } else if (ann < 20.0) {
+                    fund_alerted.erase(b.cfg.symbol);
+                }
+            }
         }
 
         // ── 7) 服务器时间重对时（约1小时一次）：时钟漂移超 recvWindow 会让所有
@@ -427,6 +581,18 @@ int main(int argc, char** argv) {
 
     log_line("收到退出信号，保存状态后退出");
     save_headless_state(cfg.state_path, engine->get_bots());
+    funding.save(funding_path);
+    // 退出也要通知：进程停了就等于所有本地风控停了，只剩交易所侧的灾难止损单。
+    // 这条消息本身就是"从现在起没人在管"的信号
+    {
+        int with_pos = 0;
+        for (const auto& b : engine->get_bots()) if (b.total_qty > 0) ++with_pos;
+        if (!webhook.empty())
+            send_webhook(webhook, "[ccbot] 进程已退出（" + std::to_string(with_pos) +
+                                  " 个品种仍有持仓）——本地止盈/止损从此刻停止，"
+                                  "仅交易所侧灾难止损单仍然有效");
+    }
+    { std::error_code ec; std::filesystem::remove(alive_path, ec); }
     ticker.stop();
     { std::error_code ec; std::filesystem::remove(lock_path, ec); }
     return 0;

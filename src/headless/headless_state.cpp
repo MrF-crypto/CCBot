@@ -80,6 +80,8 @@ void save_headless_state(const std::string& path, const std::vector<CcgBot>& bot
            << "\"realized_pnl\":"  << b.realized_pnl << ","
            << "\"cycle_count\":"   << b.cycle_count << ","
            << "\"cooldown_until_ms\":" << tp_to_ms(b.cooldown_until) << ","
+           << "\"disaster_stop_id\":\"" << b.disaster_stop_id << "\","
+           << "\"disaster_stop_price\":" << b.disaster_stop_price << ","
            << "\"entries\":[";
         bool first_e = true;
         for (const auto& e : b.entries) {
@@ -166,6 +168,8 @@ std::vector<CcgBot> load_headless_state(const std::string& path, const std::vect
         bot.realized_pnl      = get_num(o, "realized_pnl", 0.0);
         bot.cycle_count       = (int)get_num(o, "cycle_count", 0.0);
         bot.cooldown_until    = ms_to_tp((int64_t)get_num(o, "cooldown_until_ms", 0.0));
+        bot.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
+        bot.disaster_stop_price = get_num(o, "disaster_stop_price", 0.0);
 
         simdjson::dom::array entries;
         if (o["entries"].get(entries) == simdjson::SUCCESS) {

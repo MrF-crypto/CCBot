@@ -24,6 +24,19 @@ public:
     virtual double round_qty(const std::string& symbol, double qty) = 0;
     virtual bool   set_leverage(const std::string& symbol, int lev)  = 0;
     virtual bool   is_dual_mode() const = 0;
+
+    // ── 交易所侧灾难止损单（进程外兜底）──────────────────────────────────────
+    // 本地的追踪止盈/硬止损全都活在进程里，程序崩溃、断电、误关窗口之后仓位就
+    // 完全裸奔。这两个方法在交易所挂一张 STOP_MARKET + closePosition 的单子，
+    // 只防瀑布、不参与正常止盈，进程死了它还在。
+    //
+    // 默认空实现：回测的 SimClient 不需要它（回测里进程不会崩），只有实盘
+    // TradingClient 覆盖。返回空串 = 未挂上（不支持或失败）。
+    virtual std::string place_disaster_stop(const std::string& /*symbol*/,
+                                            double /*stop_price*/,
+                                            const std::string& /*entry_side*/) { return ""; }
+    virtual bool cancel_disaster_stop(const std::string& /*symbol*/,
+                                      const std::string& /*order_id*/) { return true; }
 };
 
 } // namespace ccbot

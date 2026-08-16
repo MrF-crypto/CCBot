@@ -140,6 +140,27 @@ public:
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);
 
+    // ── 资金费 ───────────────────────────────────────────────────────────────
+    // premiumIndex 一次返回标记价 + 当前费率 + 下次结算时间，我们原先只取了标记价
+    // 就把后两个丢了。对"套住就长期持有"的用法，费率就是持有成本的定价
+    struct PremiumInfo {
+        bool    ok           = false;
+        double  mark_price   = 0;
+        double  funding_rate = 0;   // 本期费率（正数=多头付给空头）
+        int64_t next_ms      = 0;   // 下次结算时间
+    };
+    PremiumInfo fetch_premium(const std::string& symbol);
+
+    // 历史资金费流水。income 带符号，负数=你付出去的。
+    // 币安不带时间范围时只返回最近7天，所以补历史要按7天窗口分页（见 funding_ledger）
+    struct FundingRecord {
+        std::string symbol;
+        double      income = 0;
+        int64_t     time   = 0;
+    };
+    std::vector<FundingRecord> fetch_funding_income(int64_t start_ms, int64_t end_ms,
+                                                    const std::string& symbol = "");
+
     // 持仓模式检测（连接时调用一次）
     bool fetch_position_mode();
 
@@ -181,6 +202,14 @@ public:
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;
+    // 灾难止损单：STOP_MARKET + closePosition=true。
+    // 用 closePosition 而不是"显式数量+reduceOnly"，因为补仓会让仓位不断变大，
+    // 显式数量的单子会立刻过期失真；closePosition 永远平掉整个仓位，且仓位归零
+    // 时交易所自动撤单，不留垃圾挂单
+    std::string place_disaster_stop(const std::string& symbol, double stop_price,
+                                    const std::string& entry_side) override;
+    bool cancel_disaster_stop(const std::string& symbol,
+                              const std::string& order_id) override;
 
 private:
     // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换（listenKey 就没有
@@ -190,6 +219,7 @@ private:
         PositionSideDual, Leverage, ListenKey,
         PmAccount,     // 统一账户专属：/papi/v1/account（全账户视角，uniMMR 在这里）
         CondOrder,     // 统一账户专属：条件单（STOP_MARKET / TAKE_PROFIT_MARKET）
+        Income,        // 资金费/手续费流水
     };
     const char* ep(Ep e) const;
 

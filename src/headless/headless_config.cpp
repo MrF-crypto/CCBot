@@ -122,7 +122,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     static const std::set<std::string> known_keys = {
         "symbol", "direction", "strat_type", "budget_usdt", "leverage", "max_entries",
         "interval_pct", "trail_entry", "tp_pct", "trail_tp", "auto_restart",
-        "cooldown_secs", "stop_loss_pct", "entry_mode", "kline_interval",
+        "cooldown_secs", "stop_loss_pct", "use_disaster_stop", "disaster_stop_pct",
+        "entry_mode", "kline_interval",
         "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
         "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",
         "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
@@ -167,6 +168,13 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.auto_restart  = get_bool(bo, "auto_restart", true);
         c.cooldown_secs = (int)get_num(bo, "cooldown_secs", 300.0);
         c.stop_loss_pct = get_num(bo, "stop_loss_pct", 0.0);
+        c.use_disaster_stop = get_bool(bo, "use_disaster_stop", false);
+        c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", 30.0);
+        // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
+        // 而使用者以为仓位已经有进程外保护了
+        if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
+            out.warnings.push_back(c.symbol + " 配了 disaster_stop_pct 但 use_disaster_stop 不是 true，"
+                                              "交易所侧灾难止损单【未启用】");
 
         c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "indicator"));
         c.kline_interval  = get_str(bo, "kline_interval", "1h");

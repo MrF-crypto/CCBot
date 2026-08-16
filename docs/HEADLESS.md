@@ -109,3 +109,138 @@ journalctl -u ccbot -f
 ```
 
 `config.json` 建议 `chmod 600`，`WorkingDirectory` 目录也建议只给运行用户权限，避免API Key被其他用户读到。
+
+## 看门狗：发现"进程还在但不干活了"
+
+交易系统最阴的故障不是崩溃——崩溃至少进程没了，`Restart=on-failure` 会拉起来。
+真正危险的是**进程活着但循环停摆**：喂价全部返回 0、心跳一直失败、卡在某个网络调用上。
+这种状态下仓位无人管理，而 `systemctl status` 显示一切正常。
+
+程序每个 tick（3秒）会把当前时间戳写进 `<state_path>.alive`（默认
+`ccbot_state.json.alive`）。**这个文件的年龄就是循环的心跳。** 正常退出时会删掉它。
+
+### 方式一：systemd 定时器检查文件年龄
+
+```ini
+# /etc/systemd/system/ccbot-watchdog.service
+[Unit]
+Description=ccbot liveness check
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ccbot/watchdog.sh
+```
+
+```ini
+# /etc/systemd/system/ccbot-watchdog.timer
+[Unit]
+Description=run ccbot liveness check every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+#!/bin/bash
+# /opt/ccbot/watchdog.sh —— 心跳文件超过 60 秒没更新就重启服务并告警
+ALIVE=/opt/ccbot/ccbot_state.json.alive
+HOOK='https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>'
+
+# 文件不存在 = 进程正常退出或从未启动，交给 systemd 处理，这里不插手
+[ -f "$ALIVE" ] || exit 0
+
+AGE=$(( $(date +%s) - $(stat -c %Y "$ALIVE") ))
+if [ "$AGE" -gt 60 ]; then
+    curl -s -X POST "$HOOK" -H 'Content-Type: application/json'          -d "{\"text\":\"[watchdog] ccbot 心跳停止 ${AGE}s，正在重启\"}"
+    systemctl restart ccbot
+fi
+```
+
+```bash
+sudo chmod +x /opt/ccbot/watchdog.sh
+sudo systemctl enable --now ccbot-watchdog.timer
+```
+
+重启是安全的：启动时会从落盘状态恢复仓位、跟交易所对账、并重建交易所侧灾难止损单。
+
+### 方式二：只告警不重启
+
+把 `systemctl restart ccbot` 去掉即可。行情剧烈时自动重启会错过几十秒的判定窗口，
+如果你更怕"自动操作在不该动的时候动手"，就只发告警、人工决定。
+
+## 程序自己会叫的几种情况
+
+配了 `alert_webhook` 之后，这些事件会主动推送——不用盯日志：
+
+| 事件 | 触发条件 |
+|---|---|
+| 启动连接失败 | 启动时拉不到账户 |
+| 启动对账不一致 | 落盘仓位与交易所实际持仓对不上 |
+| **行情停摆** | 某品种连续 1 分钟取不到价格，**且该品种有持仓** |
+| **账户接口连续失败** | 心跳连续 3 次失败（约 3 分钟）；恢复后也会通知 |
+| **uniMMR 接近强平** | 统一账户 uniMMR < 1.3（币安 1.05 起强制减仓） |
+| 触发硬止损 | 本地硬止损平仓 |
+| **进程退出** | 收到退出信号时，附带"还有几个品种有持仓" |
+
+最后一条值得单独说：**进程一停，所有本地风控就停了**，只剩交易所侧的灾难止损单
+（`disaster_stop_pct`，见下）。这条消息本身就是"从现在起没人在管仓位"的信号。
+
+## 资金费账本：一笔看不见的真实成本
+
+永续合约每 8 小时结算一次资金费。**这是真实划走的现金，不是浮亏**——价格涨回来
+也拿不回来。对"套住就长期持有"的用法，它是持有成本的全部定价。
+
+0.01%/8h ≈ **年化 11%**。一个被套一年的多单，光资金费就吃掉 11%。
+
+程序会自动记账，无需配置：
+
+- **费率**约 5 分钟刷一次（公开接口，不占签名限流）
+- **历史流水**约 1 小时同步一次（`/fapi/v1/income`，统一账户走 `/papi/v1/um/income`）
+- 首次运行按最早那笔持仓的建仓时间往回补，7 天一窗分页，最多 30 窗（约 7 个月）
+- 账本落在 `<state_path>.funding`，与 bot 生命周期无关（按**品种**记账，不按 bot——
+  交易所是按"账户×品种"收费的，同品种多 bot 无法真实归属）
+
+日志里每分钟一行：
+
+```
+资金费 | BTCUSDT 本轮已付 12.480000 USDT | 年化 -11.0% | 回本价 60000.00 → 60832.00
+```
+
+**回本价**那一项是关键：已付的资金费摊到每一份持仓上，就是均价之外还要多涨的部分。
+它把"利息"换算成了你真正关心的单位。
+
+年化持有成本超过 30% 会推一条告警（回落到 20% 以下解除）。**这条告警只告知成本变化，
+不建议平仓**——持有决策是你的事，账本只负责让你看得见。
+
+它不并进 `realized_pnl`：那个数是按平仓周期结算的，而资金费属于持有期。两个数分开
+显示，口径才不会混。
+
+## 唯一的进程外保护：`disaster_stop_pct`
+
+本地的追踪止盈、硬止损、结构止损**全都活在进程里**。程序崩溃、断电、被 OOM
+杀掉之后，它们一个都不剩。
+
+`disaster_stop_pct`（每个 bot 单独配，0=关，默认关）会在**币安服务器上**挂一张
+`STOP_MARKET` + `closePosition` 单，位置在均价下方该比例处。每次补仓拉低均价后
+自动撤旧挂新；平仓后自动撤销；重启对账完成后自动重建。
+
+```json
+{ "symbol": "BTCUSDT", "use_disaster_stop": true, "disaster_stop_pct": 32, ... }
+```
+
+`use_disaster_stop` 是独立开关，**默认 false**。只写 `disaster_stop_pct` 不写开关的话
+功能不会生效——启动时会明确告警，不让它静默地什么都不做。
+
+**如果你的策略是「套住就长线持有、只要标的不归零就等」，这个功能与你的取向冲突**：
+它会把浮亏变成实亏。保持关闭即可，那正是默认值。
+
+**取值要远离正常止盈区间。** 网格策略天然要吃深度回撤，设太紧会在正常的补仓过程中
+被打掉，把浮亏变成实亏。参考算法：按你的层数和间隔算出满层时的理论跌幅，再留一段
+余量（满层跌 20% 的配置设 30~35）。
+
+它不参与常规交易，只防瀑布。
+

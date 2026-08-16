@@ -19,6 +19,7 @@
 #include <set>
 
 #include "core/ccg_engine.h"
+#include "core/funding_ledger.h"
 #include "core/sr_zones.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
@@ -61,7 +62,8 @@ private:
     void openStrategyDialog(const std::string& symbol);
 
     // ── SR雷达（v2.6 影子模式：检测+告警+展示，不参与下单）──
-    void refreshSrZones();                                // 定期重算区域（约15分钟一次）
+    void refreshSrZones();
+    void refreshFunding();                                // 定期重算区域（约15分钟一次）
     void checkSrTouches();                                // 每tick检查价格是否触区
     void openSrZonesDialog(const std::string& symbol);    // 右键查看区域列表
     void refreshStats();
@@ -76,6 +78,7 @@ private:
     std::string trade_path()   const;
     std::string settings_path() const;
     std::string log_path()      const;
+    std::string funding_path()  const;
     void save_credentials();
     void load_credentials();
     void save_bots();
@@ -159,6 +162,11 @@ private:
     std::map<std::string, SrState> srStates_;
     int srTickCount_    = 0;
     int trendTickCount_ = 0;
+    int fundTickCount_  = 0;
+    // 资金费账本：每 8 小时结算一次的真实现金流出，不是浮亏。
+    // 只记账不参与任何交易决策
+    FundingLedger     funding_;
+    bool              fundingBackfilled_ = false;
 
     // 周期性拉取的防堆积守卫：上一批任务没跑完就跳过本批。没有守卫的话，
     // bot 数量多时（31个×每个~0.3s）批量任务的生产速度会超过消化速度，
@@ -168,6 +176,7 @@ private:
     std::atomic<bool> srFetchBusy_{false};
     std::atomic<bool> accFetchBusy_{false};
     std::atomic<bool> posFetchBusy_{false};
+    std::atomic<bool> fundFetchBusy_{false};
 
     // ── 日志 ──
     QTextEdit* logBox_ = nullptr;

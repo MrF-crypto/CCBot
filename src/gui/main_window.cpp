@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.4.0");
+    setWindowTitle("CCG 合约监控  v3.5.0");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -197,6 +197,10 @@ std::string MainWindow::settings_path() const {
     return (portable_data_dir() + "/ccg_settings.json").toStdString();
 }
 
+std::string MainWindow::funding_path() const {
+    return (portable_data_dir() + "/ccg_funding.json").toStdString();
+}
+
 std::string MainWindow::log_path() const {
     QString dir = portable_data_dir() + "/logs";
     QDir().mkpath(dir);
@@ -284,6 +288,8 @@ void MainWindow::save_bots() {
         o["auto_restart"] = c.auto_restart;
         o["cooldown_secs"]= c.cooldown_secs;
         o["stop_loss_pct"]= c.stop_loss_pct;
+        o["use_disaster_stop"] = c.use_disaster_stop;
+        o["disaster_stop_pct"] = c.disaster_stop_pct;
 
         o["entry_mode"]     = (int)c.entry_mode;
         o["kline_interval"] = QString::fromStdString(c.kline_interval);
@@ -330,6 +336,9 @@ void MainWindow::save_bots() {
         o["realized_pnl"]      = b.realized_pnl;
         o["cycle_count"]       = b.cycle_count;
         o["cooldown_until_ms"] = tp_to_ms(b.cooldown_until);
+        // 交易所侧灾难止损单号：重启后据此撤掉旧单再按当前均价重挂
+        o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
+        o["disaster_stop_price"] = b.disaster_stop_price;
 
         QJsonArray entries;
         for (const auto& e : b.entries) {
@@ -378,6 +387,8 @@ void MainWindow::load_and_restore_bots() {
         c.auto_restart = o["auto_restart"].toBool(true);
         c.cooldown_secs= o["cooldown_secs"].toInt(300);
         c.stop_loss_pct= o["stop_loss_pct"].toDouble(0.0);
+        c.use_disaster_stop = o["use_disaster_stop"].toBool(false);
+        c.disaster_stop_pct = o["disaster_stop_pct"].toDouble(30.0);
 
         c.entry_mode     = (CcgConfig::EntryMode)o["entry_mode"].toInt(1);
         c.kline_interval = o["kline_interval"].toString("1h").toStdString();
@@ -425,6 +436,8 @@ void MainWindow::load_and_restore_bots() {
         bot.realized_pnl      = o["realized_pnl"].toDouble();
         bot.cycle_count       = o["cycle_count"].toInt();
         bot.cooldown_until    = ms_to_tp((qint64)o["cooldown_until_ms"].toDouble());
+        bot.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
+        bot.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         for (const auto& ev : o["entries"].toArray()) {
             auto eo = ev.toObject();
             CcgEntry e;
@@ -938,15 +951,15 @@ void MainWindow::buildUi() {
         monLbl->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding:2px 0;");
         tv->addWidget(monLbl);
 
-        // Bot 表格 — 15 列
-        botTable_ = new QTableWidget(0, 15);
+        // Bot 表格 — 17 列
+        botTable_ = new QTableWidget(0, 17);
         botTable_->setHorizontalHeaderLabels(
             {"#","品种","方向","策略","层进度",
              "均价","最新成交价","延迟","浮动P&L","保证金","收益率","强平价",
-             "已实现","状态","操作"});
+             "资金费","年化","已实现","状态","操作"});
         auto* hdr = botTable_->horizontalHeader();
         hdr->setSectionResizeMode(QHeaderView::Stretch);
-        for (int c : {0, 4, 7, 13})
+        for (int c : {0, 4, 7, 15})
             hdr->setSectionResizeMode(c, QHeaderView::Fixed);
         hdr->resizeSection(0, 26);
         hdr->resizeSection(4, 54);
@@ -1119,6 +1132,7 @@ void MainWindow::onConnect() {
 
             // 恢复上次保存的 Bot
             load_and_restore_bots();
+            funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
             // 本地状态是错的，带着错误均价继续跑会把止盈止损全算错
@@ -1136,8 +1150,69 @@ void MainWindow::onConnect() {
                         QString msg = QString("[CCGMonitor] 启动对账发现 %1 处不一致，详见日志").arg(issues.size());
                         sendAlert(msg);
                     }
+                    // 对账之后再重建交易所侧灾难止损单：必须等本地持仓收敛到真相，
+                    // 否则会照着一个错误的均价挂止损
+                    engine_->resync_disaster_stops();
                 }, Qt::QueuedConnection);
             });
+        }, Qt::QueuedConnection);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 资金费账本刷新。
+// 这是【账本】不是风控：只记录和展示持有成本，不参与任何交易决策。
+// 永续合约每 8 小时结算一次资金费，这笔钱是真实划走的现金——价格涨回来也拿不回，
+// 所以它和"浮亏"性质完全不同，必须单独看得见。
+// ─────────────────────────────────────────────────────────────────────────────
+void MainWindow::refreshFunding() {
+    if (!client_ || !engine_) return;
+    if (fundFetchBusy_.exchange(true)) return;   // 上一批没跑完就跳过
+
+    // 收集所有品种，以及"最早的建仓时间"用作首次补历史的起点
+    std::vector<std::string> syms;
+    int64_t earliest = 0;
+    std::set<std::string> seen;
+    for (const auto& b : engine_->get_bots()) {
+        if (seen.insert(b.cfg.symbol).second) syms.push_back(b.cfg.symbol);
+        if (!b.entries.empty()) {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          b.entries.front().time.time_since_epoch()).count();
+            if (ms > 0 && (earliest == 0 || ms < earliest)) earliest = ms;
+        }
+    }
+    if (syms.empty()) { fundFetchBusy_.store(false); return; }
+
+    const bool do_history = !fundingBackfilled_ || (fundTickCount_ % 1200 == 1);
+    const int64_t backfill = fundingBackfilled_ ? 0 : earliest;
+
+    run_async([this, syms, do_history, backfill]() {
+        auto now_ms = QDateTime::currentMSecsSinceEpoch();
+        // ① 当前费率（公开接口，不占签名限流）
+        for (const auto& s : syms) {
+            auto pi = client_->fetch_premium(s);
+            if (pi.ok) funding_.set_rate(s, pi.funding_rate, pi.next_ms, now_ms);
+        }
+        // ② 历史流水（签名接口，权重较高，所以低频）
+        int added = 0;
+        if (do_history)
+            added = sync_funding_ledger(*client_, funding_, syms, backfill);
+
+        QMetaObject::invokeMethod(this, [this, added, do_history]() {
+            if (do_history) {
+                if (!fundingBackfilled_) {
+                    fundingBackfilled_ = true;
+                    double sum = 0;
+                    for (const auto& s : funding_.symbols()) sum += funding_.get(s).total;
+                    if (added > 0)
+                        log(QString("资金费账本已同步 %1 条流水，累计 %2 USDT")
+                            .arg(added).arg(sum, 0, 'f', 2),
+                            sum < 0 ? "WARN" : "OK");
+                }
+                funding_.save(funding_path());
+            }
+            refreshBotTable();
+            fundFetchBusy_.store(false);
         }, Qt::QueuedConnection);
     });
 }
@@ -1481,6 +1556,26 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* trailTpEdit  = mkEdit ("止盈追踪%:",     prefill ? prefill->cfg.trail_tp     : 2.0);
     auto* cooldownEdit = mkEditI("冷却(s):",       prefill ? prefill->cfg.cooldown_secs: 300);
     auto* stopLossEdit = mkEdit ("止损%(0=禁用):", prefill ? prefill->cfg.stop_loss_pct : 0.0);
+    auto* disStopBox = new QCheckBox("在交易所挂灾难止损单（进程外保护）");
+    disStopBox->setChecked(prefill ? prefill->cfg.use_disaster_stop : false);
+    form->addRow("", disStopBox);
+    auto* disStopEdit  = mkEdit ("　└ 触发位置：均价下方%:",
+                                 prefill ? prefill->cfg.disaster_stop_pct : 30.0);
+    // 没勾选时把比例框灰掉：启用与否是策略取向，不该藏在"这个数字是不是0"里
+    disStopEdit->setEnabled(disStopBox->isChecked());
+    connect(disStopBox, &QCheckBox::toggled, disStopEdit, &QWidget::setEnabled);
+    {
+        auto* h = new QLabel(
+            "在【交易所】挂一张 STOP_MARKET 单（均价下方该比例处），程序崩溃/断电/"
+            "误关窗口后它依然生效——这是唯一的进程外保护。上面那个\"止损%\"只活在本进程里。\n"
+            "⚠ 它会把浮亏变成实亏。如果你的策略是「套住就长线持有、只要不归零就等」，"
+            "那这个功能与你的取向冲突，保持不勾选即可（默认就是不勾）。\n"
+            "⚠ 勾选的话只防瀑布，不参与常规止盈：网格天然要吃深度回撤，设太紧会在正常"
+            "补仓过程中被打掉。建议留足余量（满层跌 20% 的配置设 30~35）。");
+        h->setWordWrap(true);
+        h->setStyleSheet("color:#8b949e;font-size:10px;");
+        form->addRow("", h);
+    }
 
     auto* autoRestartBox = new QCheckBox("自动重启");
     autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
@@ -1835,6 +1930,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.auto_restart  = autoRestartBox->isChecked();
     cfg.cooldown_secs = to_i(cooldownEdit,  300);
     cfg.stop_loss_pct = to_d(stopLossEdit,  0.0);
+    cfg.use_disaster_stop = disStopBox->isChecked();
+    cfg.disaster_stop_pct = to_d(disStopEdit, 30.0);
 
     cfg.entry_mode     = (entryModeBox->currentIndex() == 1)
                         ? CcgConfig::EntryMode::Indicator : CcgConfig::EntryMode::Immediate;
@@ -1976,6 +2073,10 @@ void MainWindow::onTick() {
     // SR雷达：区域每 300 tick（约15分钟）重算一次（首tick立刻算），触区检查每tick做（本地、零开销）
     if (srTickCount_++ % 300 == 0) refreshSrZones();
     checkSrTouches();
+
+    // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
+    // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
+    if (fundTickCount_++ % 100 == 0) refreshFunding();
 
     // v3.0 结构摘要喂入引擎：每tick按当前价重算"脚下支撑/头顶阻力/结构止损位"
     // （纯本地计算零开销；区域本体15分钟一换，摘要跟着价格实时变）
@@ -2289,8 +2390,41 @@ void MainWindow::refreshBotTable() {
         double liq = has_real_pos ? pit->second.liq_price : 0;
         botTable_->setItem(i, 11, mkc(liq > 0 ? fmt_price(liq) : "--", QColor("#d29922")));
 
-        botTable_->setItem(i, 12, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
-        botTable_->setItem(i, 13, mkc(state_s, state_c));
+        // 资金费：本轮持仓已付（负数=付出去的钱）。这是【已实现的现金流出】，
+        // 不是浮亏——价格涨回来也拿不回，所以和"已实现P&L"分开显示，不并进去
+        auto fe = funding_.get(b.cfg.symbol);
+        QString fund_s = "--";
+        QColor  fund_c("#8b949e");
+        if (fe.since_open != 0) {
+            fund_s = QString("%1%2").arg(fe.since_open >= 0 ? "+" : "").arg(fe.since_open, 0, 'f', 2);
+            fund_c = fe.since_open >= 0 ? QColor("#3fb950") : QColor("#f85149");
+        }
+        auto* fitem = mkc(fund_s, fund_c);
+        if (fe.since_open < 0 && b.avg_price > 0 && b.total_qty > 0) {
+            // 把利息换算成使用者真正关心的单位：还要多涨多少才回本
+            double be = FundingLedger::effective_breakeven(
+                b.avg_price, b.total_qty, fe.since_open,
+                b.cfg.direction == CcgConfig::Direction::Long);
+            fitem->setToolTip(QString("本轮持仓已付资金费 %1 USDT\n"
+                                      "回本价被推高：%2 → %3（+%4%）")
+                              .arg(-fe.since_open, 0, 'f', 2)
+                              .arg(fmt_price(b.avg_price)).arg(fmt_price(be))
+                              .arg((be / b.avg_price - 1.0) * 100.0, 0, 'f', 2));
+        }
+        botTable_->setItem(i, 12, fitem);
+
+        // 年化：当前费率 × 3次/天 × 365。费率随时在变，这是"此刻的持有成本速率"
+        QString ann_s = "--";
+        QColor  ann_c("#8b949e");
+        if (fe.rate_ms > 0) {
+            double ann = FundingLedger::annualized_pct(fe.rate);
+            ann_s = QString("%1%2%").arg(ann >= 0 ? "-" : "+").arg(std::abs(ann), 0, 'f', 1);
+            ann_c = ann > 30 ? QColor("#f85149") : (ann > 0 ? QColor("#d29922") : QColor("#3fb950"));
+        }
+        botTable_->setItem(i, 13, mkc(ann_s, ann_c));
+
+        botTable_->setItem(i, 14, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
+        botTable_->setItem(i, 15, mkc(state_s, state_c));
 
         // 操作列
         std::string bid  = b.bot_id;
@@ -2351,7 +2485,7 @@ void MainWindow::refreshBotTable() {
         opL->addWidget(btnDel);
         opL->addStretch();
 
-        botTable_->setCellWidget(i, 14, opW);
+        botTable_->setCellWidget(i, 16, opW);
     }
 
     // 汇总

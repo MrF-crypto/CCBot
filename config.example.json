@@ -11,6 +11,8 @@
   "bots": [
     {
       "symbol": "BTCUSDT",
+      "use_disaster_stop": false,
+      "disaster_stop_pct": 30,
       "direction": "long",
       "strat_type": "linear",
       "budget_usdt": 3000,

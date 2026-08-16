@@ -221,6 +221,8 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.auto_restart   = new_cfg.auto_restart;
     cfg.cooldown_secs  = new_cfg.cooldown_secs;
     cfg.stop_loss_pct  = new_cfg.stop_loss_pct;
+    cfg.use_disaster_stop = new_cfg.use_disaster_stop;
+    cfg.disaster_stop_pct = new_cfg.disaster_stop_pct;
     cfg.entry_mode     = new_cfg.entry_mode;
     cfg.kline_interval = new_cfg.kline_interval;
     cfg.boll_period    = new_cfg.boll_period;
@@ -935,7 +937,28 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 do_close.push_back({id, "追踪止盈"});
                 bot.pending = true;
             } else if (should_enter(bot, price)) {
-                if (dca_gate_blocked(bot, host_.now_steady())) {
+                // 账户级总保证金上限：补仓同样受约束。
+                // 此前这道闸只挡首仓，已建仓的 bot 可以一路补到把账户吃光——
+                // 统一账户下更危险，保证金池是全账户共享的，一个品种深度补仓
+                // 会把其他品种一起拖进强平
+                double cap_d = max_total_margin_.load();
+                bool   cap_blocked = false;
+                if (cap_d > 0) {
+                    auto   sizes_d = entry_usdt(bot.cfg);
+                    size_t lvl_d   = bot.entries.size();
+                    double next_margin = (lvl_d < sizes_d.size() && bot.cfg.leverage > 0)
+                                         ? sizes_d[lvl_d] / bot.cfg.leverage : 0;
+                    cap_blocked = (total_margin_used() + next_margin > cap_d);
+                }
+                if (cap_blocked) {
+                    std::string why = "第" + std::to_string(bot.entries.size() + 1) +
+                                      "层补仓达到账户总保证金上限，暂缓";
+                    if (bot.last_action != why) {
+                        bot.last_action = why;
+                        log(bot.cfg.symbol + " " + why + "（$" +
+                            std::to_string((int)cap_d) + "）");
+                    }
+                } else if (dca_gate_blocked(bot, host_.now_steady())) {
                     std::string why = "第" + std::to_string(bot.entries.size() + 1) +
                                       "层补仓被闸门拦下（深层资金保护）";
                     if (bot.last_action != why) {
@@ -952,6 +975,93 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
     for (const auto& id         : do_entry) submit_entry(id);
     for (const auto& [id, reason]: do_close) submit_close(id, reason);
+}
+
+// ── 交易所侧灾难止损单 ────────────────────────────────────────────────────────
+// 挂在币安服务器上，进程死了它还在。每次仓位变化后按新均价重挂。
+// 全程在线程池线程里跑；HTTP 调用期间【不持锁】，只在读参数和写回结果时短暂持锁。
+void CcgEngine::sync_disaster_stop(const std::string& bot_id) {
+    std::string sym, side, old_id;
+    double target = 0, old_price = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        auto it = bots_.find(bot_id);
+        if (it == bots_.end()) return;
+        const auto& b = it->second;
+        if (!b.cfg.use_disaster_stop || b.cfg.disaster_stop_pct <= 0) return;
+        if (b.total_qty <= 0 || b.avg_price <= 0) return;
+
+        const bool is_long = (b.cfg.direction == CcgConfig::Direction::Long);
+        target = b.avg_price * (is_long ? (1.0 - b.cfg.disaster_stop_pct / 100.0)
+                                        : (1.0 + b.cfg.disaster_stop_pct / 100.0));
+        sym    = b.cfg.symbol;
+        side   = is_long ? "BUY" : "SELL";
+        old_id = b.disaster_stop_id;
+        old_price = b.disaster_stop_price;
+    }
+    if (target <= 0) return;
+
+    // 触发价没有实质变化就不动它——每次补仓都撤了重挂会平白消耗限流额度，
+    // 而且撤单和挂单之间有个没有保护的空窗
+    if (!old_id.empty() && old_price > 0 &&
+        std::fabs(target - old_price) / old_price < 0.001) return;
+
+    // 先挂新的再撤旧的？不行——closePosition 单同一方向只能存在一张，
+    // 币安会拒掉第二张。只能先撤后挂，空窗期无法避免，所以尽量少动（上面的阈值）
+    if (!old_id.empty()) client_->cancel_disaster_stop(sym, old_id);
+
+    std::string new_id = client_->place_disaster_stop(sym, target, side);
+
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    if (new_id.empty()) {
+        // 挂单失败是**必须让人看见**的：仓位此刻没有任何进程外保护
+        it->second.disaster_stop_id.clear();
+        it->second.disaster_stop_price = 0;
+        log("⚠ " + sym + " 交易所侧灾难止损单挂单失败——该仓位当前没有进程外保护，"
+            "下次仓位变化时会自动重试");
+        return;
+    }
+    it->second.disaster_stop_id    = new_id;
+    it->second.disaster_stop_price = target;
+    log(sym + " 交易所侧灾难止损单已挂 @$" + std::to_string((int)target) +
+        "（均价 -" + std::to_string(it->second.cfg.disaster_stop_pct) + "%，进程死了也在）");
+}
+
+// 重启后重建交易所侧保护：把记着的触发价清零，强制走一遍"撤旧单+按当前均价重挂"。
+// 不能只依赖落盘的 order_id——程序不在的这段时间里那张单可能已经触发或被手动撤掉，
+// 本地记录并不代表交易所上还有
+void CcgEngine::resync_disaster_stops() {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        for (auto& [id, b] : bots_) {
+            if (!b.cfg.use_disaster_stop || b.cfg.disaster_stop_pct <= 0) continue;
+            if (b.total_qty <= 0 || b.avg_price <= 0) continue;
+            b.disaster_stop_price = 0;   // 清零 = 强制重挂
+            ids.push_back(id);
+        }
+    }
+    for (const auto& id : ids)
+        host_.submit([this, id]() { sync_disaster_stop(id); });
+}
+
+void CcgEngine::cancel_disaster_stop(const std::string& bot_id) {
+    std::string sym, id;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        auto it = bots_.find(bot_id);
+        if (it == bots_.end()) return;
+        if (it->second.disaster_stop_id.empty()) return;
+        sym = it->second.cfg.symbol;
+        id  = it->second.disaster_stop_id;
+        // 先在本地清掉：即便撤单请求失败，仓位也已经平了，交易所侧的
+        // closePosition 单会因为无仓可平而自动失效，不该继续记在账上
+        it->second.disaster_stop_id.clear();
+        it->second.disaster_stop_price = 0;
+    }
+    client_->cancel_disaster_stop(sym, id);
 }
 
 // ── 异步入场（在线程池中执行 HTTP 下单）──────────────────────────────────────
@@ -1050,6 +1160,10 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 bot.last_action = "第" + std::to_string(level+1) + "仓@" +
                                   std::to_string((int)fill_price);
                 log(ss.str());
+                // 仓位变了（均价下移），交易所侧的灾难止损单要跟着改。
+                // 派到线程池另跑，不阻塞本次下单回调
+                if (cfg.use_disaster_stop && cfg.disaster_stop_pct > 0)
+                    host_.submit([this, bot_id]() { sync_disaster_stop(bot_id); });
             } else if (r.uncertain) {
                 // 网络中断连查单都失败：订单可能已成交但本地没记录。绝不能下个tick
                 // 盲目重试（可能双倍仓位）——停掉该bot，等联网后由对账功能恢复真相
@@ -1213,6 +1327,11 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                        << " 累计=" << bot.realized_pnl << "U";
                     if (dust_only) ss << "（含忽略灰尘 " << std::to_string(total_qty - closed_qty) << "）";
                     log(ss.str());
+                    // 仓位已清空：撤掉交易所侧的灾难止损单。
+                    // closePosition 单在无仓可平时币安会自动失效，但不撤会留在挂单
+                    // 列表里，下一轮开仓时同方向再挂一张会被拒
+                    if (!bot.disaster_stop_id.empty())
+                        host_.submit([this, bot_id]() { cancel_disaster_stop(bot_id); });
 
                     bot.entries.clear();
                     bot.total_qty = bot.total_cost = bot.avg_price = 0;
