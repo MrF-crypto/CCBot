@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.5.4");
+    setWindowTitle("CCG 合约监控  v3.5.5");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -122,6 +122,8 @@ MainWindow::~MainWindow() {
     if (ticker_) ticker_->stop();
     if (tick_timer_) tick_timer_->stop();
     if (ob_timer_)   ob_timer_->stop();
+    // 落盘去抖可能还压着最后几笔没写，退出前强制刷一次，否则关程序会丢
+    if (tradesDirty_) save_trades(true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,7 +467,30 @@ void MainWindow::load_and_restore_bots() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 持久化：交易明细
 // ─────────────────────────────────────────────────────────────────────────────
-void MainWindow::save_trades() {
+// 成交明细落盘。
+// 两处长跑保护：
+//  ① trades_ 有上限（kMaxTrades），超出丢弃最早的——否则向量无限增长，
+//     而且这里是【全量重写】，1万条以后每平一笔仓都要把1万条重新序列化一遍
+//  ② 写盘去抖：密集平仓（多品种同时止盈）时合并成一次写，不要每笔都落盘
+void MainWindow::save_trades(bool force) {
+    if (trades_.size() > kMaxTrades) {
+        const size_t drop = trades_.size() - kMaxTrades;
+        trades_.erase(trades_.begin(), trades_.begin() + drop);
+        log(QString("成交记录已达 %1 条上限，丢弃最早的 %2 条（完整历史见日志文件）")
+            .arg(kMaxTrades).arg(drop), "WARN");
+    }
+
+    if (!force) {
+        // 距上次落盘不足 kTradeSaveMinMs 就只置脏，交给后面的写入合并
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (lastTradeSaveMs_ != 0 && now - lastTradeSaveMs_ < kTradeSaveMinMs) {
+            tradesDirty_ = true;
+            return;
+        }
+        lastTradeSaveMs_ = now;
+    }
+    tradesDirty_ = false;
+
     QJsonArray arr;
     for (const auto& t : trades_) {
         QJsonObject o;
@@ -794,10 +819,13 @@ void MainWindow::log(const QString& msg, const QString& level) {
                       : (level == "WARN") ? "#d29922"
                       : (level == "ERR")  ? "#f85149"
                                           : "#8b949e";
-        logBox_->append(QString("<font color='%1'>%2 %3</font>")
-                        .arg(color).arg(ts).arg(msg.toHtmlEscaped()));
+        // appendHtml 保留按级别着色；滚动到底只在用户本来就贴着底部时做，
+        // 否则往回翻日志时会被不断拽回去
         auto* sb = logBox_->verticalScrollBar();
-        sb->setValue(sb->maximum());
+        const bool atBottom = (sb->value() >= sb->maximum() - 4);
+        logBox_->appendHtml(QString("<font color='%1'>%2 %3</font>")
+                            .arg(color).arg(ts).arg(msg.toHtmlEscaped()));
+        if (atBottom) sb->setValue(sb->maximum());
     }
 
     // 落盘，重启/崩溃后能复盘——按天分文件，QFile 原生支持中文路径，不会碰到
@@ -1007,10 +1035,15 @@ void MainWindow::buildUi() {
         logHdr->setStyleSheet("color:#8b949e;font-size:11px;padding:2px 0;");
         logLay->addWidget(logHdr);
 
-        logBox_ = new QTextEdit();
+        // QPlainTextEdit 而不是 QTextEdit：前者有原生的 setMaximumBlockCount，
+        // 超出自动丢弃最早的行。原先用 QTextEdit + append() 从不裁剪，3 秒一个 tick
+        // 连跑几周会把几十万条富文本节点常驻内存——这台机器上的仓位要持有几个月，
+        // 这是必然会撞上的增长点。完整日志照常按天落盘，界面只留最近的
+        logBox_ = new QPlainTextEdit();
         logBox_->setReadOnly(true);
         logBox_->setMaximumHeight(160);
-        logBox_->setStyleSheet("QTextEdit{font-size:11px;font-family:Consolas;}");
+        logBox_->setMaximumBlockCount(kLogMaxLines);
+        logBox_->setStyleSheet("QPlainTextEdit{font-size:11px;font-family:Consolas;}");
         logLay->addWidget(logBox_);
 
         vSplit->addWidget(logW);
@@ -1993,11 +2026,20 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             }
         }
 
-        // 汇总条：参考界面是紧凑的一行。总间隔用【实际的几何累计跌幅】而不是
-        // 层数×间隔——引擎的间隔是相对上一层逐层复利的，线性相乘会高估总跌幅
+        // 汇总条：参考界面是紧凑的一行。总间隔 = 首仓价到满层价的【实际】跌幅。
+        // 两点容易算错：
+        //  ① 间隔是相对上一层逐层复利的，"层数×间隔"会大幅高估（8层×8% 线性得
+        //     64%，实际只有 40%）
+        //  ② 单层步长不是 (1-间隔)，而是 (1-间隔)×(1+追踪建仓)——跌到位只是触发，
+        //     还要反弹 trail% 才真正成交，反弹把跌幅吐回去一部分
+        // 无实时价时的回退公式必须和有价时算的是同一个东西，否则同一个标签在
+        // 两种情况下含义不同
+        const double stepFactor = is_short
+            ? (1.0 + interv / 100.0) * (1.0 - trail / 100.0)
+            : (1.0 - interv / 100.0) * (1.0 + trail / 100.0);
         double totalDrop = (livePrice > 0 && finalPrice > 0)
             ? std::abs(finalPrice / livePrice - 1.0) * 100.0
-            : (1.0 - std::pow(1.0 - interv / 100.0, std::max(0, n - 1))) * 100.0;
+            : std::abs(1.0 - std::pow(stepFactor, std::max(0, n - 1))) * 100.0;
 
         QString line1 = QString("单数:%1  |  总量:%2  |  总间隔:%3%  |  杠杆:%4x  |  "
                                 "名义价值:$%5  |  需要保证金:$%6")
@@ -2266,6 +2308,9 @@ void MainWindow::onTick() {
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
     if (fundTickCount_++ % 100 == 0) refreshFunding();
 
+    // 成交明细的延迟落盘：save_trades 做了去抖，被压下的写在这里补上
+    if (tradesDirty_) save_trades(true);
+
     // v3.0 结构摘要喂入引擎：每tick按当前价重算"脚下支撑/头顶阻力/结构止损位"
     // （纯本地计算零开销；区域本体15分钟一换，摘要跟着价格实时变）
     if (engine_ && ticker_) {
@@ -2444,6 +2489,8 @@ void MainWindow::refreshBotTable() {
 
     auto bots = engine_->get_bots();
     botTable_->setRowCount((int)bots.size());
+    // 行数变了就把键表整体作废——行与 bot 的对应关系已经错位
+    if (opRowKeys_.size() != bots.size()) opRowKeys_.assign(bots.size(), QString());
 
     int running = 0, cooling = 0, stopped = 0;
     double total_unreal = 0, total_real = 0;
@@ -2601,9 +2648,21 @@ void MainWindow::refreshBotTable() {
         botTable_->setItem(i, 12, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
         botTable_->setItem(i, 13, mkc(state_s, state_c));
 
-        // 操作列
+        // 操作列。
+        // 这一列原先【每次刷新都整套重建】——3秒一次 × 每行3个按钮，31个bot就是
+        // 每3秒销毁重建近百个控件。除了浪费，还有个真实的交互 bug：点击那一瞬间
+        // 正好赶上刷新，按钮被 setCellWidget 销毁，这一下点击就丢了（表现为"点了没反应"）。
+        // 现在按"影响按钮外观/行为的状态"做键，键没变就原样留着不动。
         std::string bid  = b.bot_id;
         bool        is_stopped = (b.state == CcgBot::State::Stopped);
+        const QString opKey = QString("%1|%2|%3")
+            .arg(QString::fromStdString(bid))
+            .arg(is_stopped ? 1 : 0)
+            .arg(b.entries.empty() ? 0 : 1);   // 平仓按钮的可用性只取决于有没有持仓
+        if (i < (int)opRowKeys_.size() && opRowKeys_[i] == opKey
+            && botTable_->cellWidget(i, 14) != nullptr) {
+            continue;   // 本行按钮无需变动，跳过重建（后面没有别的列了）
+        }
 
         auto* opW = new QWidget();
         auto* opL = new QHBoxLayout(opW);
@@ -2690,6 +2749,7 @@ void MainWindow::refreshBotTable() {
         opL->addStretch();
 
         botTable_->setCellWidget(i, 14, opW);
+        if (i < (int)opRowKeys_.size()) opRowKeys_[i] = opKey;
     }
 
     // 汇总

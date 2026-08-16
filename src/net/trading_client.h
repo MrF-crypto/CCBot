@@ -136,6 +136,9 @@ public:
     };
     std::vector<Bar> fetch_bars(const std::string& symbol,
                                 const std::string& interval, int limit);
+    // 统一的 K 线拉取+解析（fetch_rsi/fetch_indicators/fetch_trend/fetch_bars 共用）
+    std::vector<Bar> fetch_klines(const std::string& symbol,
+                                  const std::string& interval, int limit);
 
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);

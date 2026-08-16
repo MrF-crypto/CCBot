@@ -1095,6 +1095,20 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
 
             const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                      ? "BUY" : "SELL";
+            // price 由 tick() 保证 >0 才会派发到这里，但一旦为0，usdt/price 得到的是
+            // inf，而下面的 qty<=0 检查【拦不住 inf】——会带着一个无穷大的数量去下单。
+            // 显式挡一道，代价是一行
+            if (price <= 0) {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto it = bots_.find(bot_id);
+                if (it != bots_.end()) {
+                    it->second.pending = false;
+                    it->second.inflight_margin = 0;
+                    it->second.last_action = "无有效价格，跳过本次开仓";
+                }
+                log(cfg.symbol + " 第" + std::to_string(level+1) + "仓：价格无效，跳过");
+                return;
+            }
             double qty = client_->round_qty(cfg.symbol, usdt / price);
             if (qty <= 0) {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);

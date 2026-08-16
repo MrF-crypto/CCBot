@@ -6,6 +6,7 @@
 #include <QLineEdit>
 #include <QComboBox>
 #include <QTextEdit>
+#include <QPlainTextEdit>
 #include <QTimer>
 #include <QCheckBox>
 #include <QSplitter>
@@ -29,6 +30,13 @@
 namespace ccg {
 
 using namespace ccbot;
+
+// ── 长跑上限 ─────────────────────────────────────────────────────────────────
+// 这个程序的设计用法是连续挂几个月，任何"每次事件追加一条、从不裁剪"的结构
+// 都会变成必然的增长点。完整历史照常落盘，内存里只留最近的部分。
+inline constexpr int    kLogMaxLines   = 3000;    // 日志框保留行数
+inline constexpr size_t kMaxTrades     = 20000;   // 内存/落盘保留的成交记录条数
+inline constexpr int    kTradeSaveMinMs = 3000;   // 成交落盘的最小间隔（合并密集平仓）
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -85,7 +93,7 @@ private:
     void load_credentials();
     void save_bots();
     void load_and_restore_bots();
-    void save_trades();
+    void save_trades(bool force = false);
     void load_trades();
     void save_settings();
     void load_settings();
@@ -143,9 +151,13 @@ private:
     // ── 实盘监控表（右键品种 → 策略配置弹窗）──
     QTableWidget* botTable_    = nullptr;
     QLabel*       summaryLabel_ = nullptr;
+    // 操作列按钮的重建键：键没变就不重建控件（避免点击被刷新吞掉）
+    std::vector<QString> opRowKeys_;
 
     // ── 交易明细 / 盈利统计 ──
     std::vector<TradeRecord> trades_;
+    qint64 lastTradeSaveMs_ = 0;   // 落盘去抖
+    bool   tradesDirty_     = false;
     QLabel*       statsLabel_ = nullptr;
 
     // symbol + "_L"/"_S" → 交易所真实持仓（强平价来源，随 tick_timer_ 每 3s 刷新一次）
@@ -183,7 +195,7 @@ private:
     std::atomic<bool> fundFetchBusy_{false};
 
     // ── 日志 ──
-    QTextEdit* logBox_ = nullptr;
+    QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的
 };
 
 } // namespace ccg

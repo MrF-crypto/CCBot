@@ -975,122 +975,12 @@ TradingClient::place_sl_market(const std::string& sym, double stop_price,
     return place_cond_market(sym, "STOP_MARKET", stop_price, entry_side, qty);
 }
 
-// ── RSI（1h K线，公开接口）────────────────────────────────────────────────────
-double TradingClient::fetch_rsi(const std::string& sym,
-                                 const std::string& interval, int period) {
-    std::string path = "/fapi/v1/klines?symbol=" + sym +
-                       "&interval=" + interval +
-                       "&limit=" + std::to_string(period + 20);
-    auto resp = http_get_public(path);
-    if (resp.empty()) return 50.0;
-
-    simdjson::dom::parser p;
-    simdjson::dom::array arr;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return 50.0;
-
-    std::vector<double> closes;
-    for (auto kline : arr) {
-        simdjson::dom::array ka;
-        if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
-        std::string_view close_s;
-        auto it = ka.begin();
-        for (int i = 0; i < 4 && it != ka.end(); ++i, ++it); // index 4 = close
-        if (it == ka.end()) continue;
-        (*it).get(close_s);
-        try { closes.push_back(std::stod(std::string(close_s))); } catch (...) {}
-    }
-
-    return indicators::rsi(closes, period);
-}
-
-// ── BOLL + RSI 快照（一次K线拉取，两个指标一起算）───────────────────────────────
-TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
-        const std::string& sym, const std::string& interval,
-        int boll_period, double boll_mult, int rsi_period) {
-    IndicatorSnapshot out;
-    int need = std::max(boll_period, rsi_period + 20) + 5;
-    std::string path = "/fapi/v1/klines?symbol=" + sym +
-                       "&interval=" + interval +
-                       "&limit=" + std::to_string(need);
-    auto resp = http_get_public(path);
-    if (resp.empty()) return out;
-
-    simdjson::dom::parser p;
-    simdjson::dom::array arr;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
-
-    std::vector<double> closes;
-    for (auto kline : arr) {
-        simdjson::dom::array ka;
-        if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
-        std::string_view close_s;
-        auto it = ka.begin();
-        for (int i = 0; i < 4 && it != ka.end(); ++i, ++it); // index 4 = close
-        if (it == ka.end()) continue;
-        (*it).get(close_s);
-        try { closes.push_back(std::stod(std::string(close_s))); } catch (...) {}
-    }
-    if (closes.empty()) return out;
-
-    out.price = closes.back();
-
-    auto boll = indicators::bollinger(closes, boll_period, boll_mult);
-    out.boll_ub = boll.ub;
-    out.boll_mb = boll.mb;
-    out.boll_lb = boll.lb;
-    out.rsi     = indicators::rsi(closes, rsi_period);
-
-    out.ok = boll.ok;
-    return out;
-}
-
-// ── 高周期趋势快照（趋势状态机）───────────────────────────────────────────────
-TradingClient::TrendSnapshot TradingClient::fetch_trend(
-        const std::string& sym, const std::string& interval,
-        int ema_period, int slope_bars) {
-    TrendSnapshot out;
-    int need = ema_period + slope_bars + 25;
-    std::string path = "/fapi/v1/klines?symbol=" + sym +
-                       "&interval=" + interval +
-                       "&limit=" + std::to_string(std::min(need, 1500));
-    auto resp = http_get_public(path);
-    if (resp.empty()) return out;
-
-    simdjson::dom::parser p;
-    simdjson::dom::array arr;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
-
-    std::vector<double> closes;
-    for (auto kline : arr) {
-        simdjson::dom::array ka;
-        if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
-        std::string_view close_s;
-        auto it = ka.begin();
-        for (int i = 0; i < 4 && it != ka.end(); ++i, ++it); // index 4 = close
-        if (it == ka.end()) continue;
-        (*it).get(close_s);
-        try { closes.push_back(std::stod(std::string(close_s))); } catch (...) {}
-    }
-    if ((int)closes.size() < ema_period + slope_bars) return out;   // 新币历史不够，不判定趋势
-
-    out.price   = closes.back();
-    out.ema_val = indicators::ema(closes, ema_period);
-    double mb_now  = indicators::sma_at(closes, 20, 0);
-    double mb_prev = indicators::sma_at(closes, 20, slope_bars);
-    if (out.ema_val <= 0 || mb_prev <= 0) return out;
-    out.mb_slope_pct = (mb_now - mb_prev) / mb_prev * 100.0;
-
-    // 空头态双条件：价格在 EMA 之下 且 中轨明显下拐（-0.2%阈值防横盘抖动）
-    out.bearish = (out.price < out.ema_val) && (out.mb_slope_pct < -0.2);
-    out.ok = true;
-    return out;
-}
-
-// ── 完整 OHLCV K线（SR区域检测用）────────────────────────────────────────────
-std::vector<TradingClient::Bar> TradingClient::fetch_bars(
+// ── K线拉取+解析（统一入口）─────────────────────────────────────────────────
+// 原先 fetch_rsi / fetch_indicators / fetch_trend / fetch_bars 四处各自拼一遍
+// URL、各自解析一遍数组，四份几乎相同的代码。改动 K 线口径时漏掉一处就会出现
+// "指标和趋势用的不是同一批数据"这种极难查的问题，所以合成一处。
+// 只要收盘价的调用方多解析 4 个字段，几百根 K 线的开销可以忽略。
+std::vector<TradingClient::Bar> TradingClient::fetch_klines(
         const std::string& sym, const std::string& interval, int limit) {
     std::vector<Bar> out;
     std::string path = "/fapi/v1/klines?symbol=" + sym +
@@ -1104,6 +994,7 @@ std::vector<TradingClient::Bar> TradingClient::fetch_bars(
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
 
+    out.reserve(arr.size());
     for (auto kline : arr) {
         simdjson::dom::array ka;
         if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
@@ -1130,6 +1021,70 @@ std::vector<TradingClient::Bar> TradingClient::fetch_bars(
         if (ok) out.push_back(b);
     }
     return out;
+}
+
+static std::vector<double> closes_of(const std::vector<TradingClient::Bar>& bars) {
+    std::vector<double> c;
+    c.reserve(bars.size());
+    for (const auto& b : bars) c.push_back(b.close);
+    return c;
+}
+
+// ── RSI（1h K线，公开接口）────────────────────────────────────────────────────
+double TradingClient::fetch_rsi(const std::string& sym,
+                                 const std::string& interval, int period) {
+    auto closes = closes_of(fetch_klines(sym, interval, period + 20));
+    if (closes.empty()) return 50.0;
+    return indicators::rsi(closes, period);
+}
+
+// ── BOLL + RSI 快照（一次K线拉取，两个指标一起算）───────────────────────────────
+TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
+        const std::string& sym, const std::string& interval,
+        int boll_period, double boll_mult, int rsi_period) {
+    IndicatorSnapshot out;
+    int need = std::max(boll_period, rsi_period + 20) + 5;
+    auto closes = closes_of(fetch_klines(sym, interval, need));
+    if (closes.empty()) return out;
+
+    out.price = closes.back();
+
+    auto boll = indicators::bollinger(closes, boll_period, boll_mult);
+    out.boll_ub = boll.ub;
+    out.boll_mb = boll.mb;
+    out.boll_lb = boll.lb;
+    out.rsi     = indicators::rsi(closes, rsi_period);
+
+    out.ok = boll.ok;
+    return out;
+}
+
+// ── 高周期趋势快照（趋势状态机）───────────────────────────────────────────────
+TradingClient::TrendSnapshot TradingClient::fetch_trend(
+        const std::string& sym, const std::string& interval,
+        int ema_period, int slope_bars) {
+    TrendSnapshot out;
+    int need = ema_period + slope_bars + 25;
+    auto closes = closes_of(fetch_klines(sym, interval, need));
+    if ((int)closes.size() < ema_period + slope_bars) return out;   // 新币历史不够，不判定趋势
+
+    out.price   = closes.back();
+    out.ema_val = indicators::ema(closes, ema_period);
+    double mb_now  = indicators::sma_at(closes, 20, 0);
+    double mb_prev = indicators::sma_at(closes, 20, slope_bars);
+    if (out.ema_val <= 0 || mb_prev <= 0) return out;
+    out.mb_slope_pct = (mb_now - mb_prev) / mb_prev * 100.0;
+
+    // 空头态双条件：价格在 EMA 之下 且 中轨明显下拐（-0.2%阈值防横盘抖动）
+    out.bearish = (out.price < out.ema_val) && (out.mb_slope_pct < -0.2);
+    out.ok = true;
+    return out;
+}
+
+// ── 完整 OHLCV K线（SR区域检测用）────────────────────────────────────────────
+std::vector<TradingClient::Bar> TradingClient::fetch_bars(
+        const std::string& sym, const std::string& interval, int limit) {
+    return fetch_klines(sym, interval, limit);
 }
 
 TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) {
