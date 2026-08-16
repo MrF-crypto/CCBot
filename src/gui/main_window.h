@@ -113,6 +113,8 @@ private:
     QLabel*      connLabel_;
     QLabel*      breatheDot_  = nullptr;   // 连接状态呼吸灯
     QLabel*      equityLabel_ = nullptr;   // 权益/可用，顶部常驻
+    QLabel*      mmrLabel_    = nullptr;   // uniMMR，顶部常驻（仅统一账户）
+    QLabel*      fundLabel_   = nullptr;   // 累计资金费，顶部常驻（非零时才显示）
     QLabel*      pnlBadge_    = nullptr;   // 累计已实现盈亏徽标，顶部常驻
 
     // NetworkError：曾经连接成功，但账户接口连续拉取失败（网络断了/VPN掉了这种），

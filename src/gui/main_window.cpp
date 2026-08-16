@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.5.0");
+    setWindowTitle("CCG 合约监控  v3.5.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -867,6 +867,19 @@ void MainWindow::buildUi() {
         equityLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
         row->addWidget(equityLabel_);
 
+        // 统一账户维持保证金率：统一账户按【全账户】算强平，只看子账户会低估风险。
+        // 它和权益是同一类东西（账户级健康度），所以并排放、同样的字号
+        mmrLabel_ = new QLabel();
+        mmrLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
+        mmrLabel_->setVisible(false);          // 普通合约账户不适用，直接不占位
+        row->addWidget(mmrLabel_);
+
+        // 账户累计资金费：真实划走的现金（非浮亏），只在非零时显示，避免挤占顶部栏
+        fundLabel_ = new QLabel();
+        fundLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
+        fundLabel_->setVisible(false);
+        row->addWidget(fundLabel_);
+
         pnlBadge_ = new QLabel("盈亏 $0.00");
         pnlBadge_->setStyleSheet(
             "QLabel{color:#8b949e;font-size:11px;background:#21262d;"
@@ -951,15 +964,18 @@ void MainWindow::buildUi() {
         monLbl->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding:2px 0;");
         tv->addWidget(monLbl);
 
-        // Bot 表格 — 17 列
-        botTable_ = new QTableWidget(0, 17);
+        // Bot 表格 — 15 列。
+        // 资金费不进这张表：它是【账户级慢变量】（8小时才结算一次），而这张表是
+        // 每3秒刷新的【逐品种实时行】。混在一起既挤掉实时数据的宽度，也不符合它
+        // 的性质——账户合计放顶部栏，逐品种细节放"均价"列的悬停提示
+        botTable_ = new QTableWidget(0, 15);
         botTable_->setHorizontalHeaderLabels(
             {"#","品种","方向","策略","层进度",
              "均价","最新成交价","延迟","浮动P&L","保证金","收益率","强平价",
-             "资金费","年化","已实现","状态","操作"});
+             "已实现","状态","操作"});
         auto* hdr = botTable_->horizontalHeader();
         hdr->setSectionResizeMode(QHeaderView::Stretch);
-        for (int c : {0, 4, 7, 15})
+        for (int c : {0, 4, 7, 13})
             hdr->setSectionResizeMode(c, QHeaderView::Fixed);
         hdr->resizeSection(0, 26);
         hdr->resizeSection(4, 54);
@@ -2351,7 +2367,27 @@ void MainWindow::refreshBotTable() {
         botTable_->setItem(i, 3,  mkc(QString::fromStdString(CcgEngine::strat_name(b.cfg.strat_type)),
                                        QColor("#8b949e")));
         botTable_->setItem(i, 4,  mkc(layers,                     QColor("#58a6ff")));
-        botTable_->setItem(i, 5,  mkc(fmt_price(disp_avg),        QColor("#8b949e")));
+        // 均价 + 资金费修正后的回本价（悬停）。放在均价上是有道理的：回本价本质
+        // 就是被资金费修正过的均价——对长期持有的用法，那才是真正要盯的数
+        auto* avg_item = mkc(fmt_price(disp_avg), QColor("#8b949e"));
+        {
+            auto fe = funding_.get(b.cfg.symbol);
+            if (fe.since_open < 0 && b.avg_price > 0 && b.total_qty > 0) {
+                double be = FundingLedger::effective_breakeven(
+                    b.avg_price, b.total_qty, fe.since_open,
+                    b.cfg.direction == CcgConfig::Direction::Long);
+                avg_item->setText(fmt_price(disp_avg) + " *");
+                avg_item->setToolTip(
+                    QString("均价 %1\n本轮持仓已付资金费 %2 USDT\n回本价 %3（+%4%）\n"
+                            "当前费率年化 %5%")
+                    .arg(fmt_price(b.avg_price))
+                    .arg(-fe.since_open, 0, 'f', 2)
+                    .arg(fmt_price(be))
+                    .arg((be / b.avg_price - 1.0) * 100.0, 0, 'f', 2)
+                    .arg(-FundingLedger::annualized_pct(fe.rate), 0, 'f', 1));
+            }
+        }
+        botTable_->setItem(i, 5,  avg_item);
 
         // 最新成交价 + 延迟：来自 WebSocket aggTrade 流，独立于策略引擎的 tick 价格
         auto tick = ticker_ ? ticker_->get(b.cfg.symbol) : BookTickerStream::Tick{};
@@ -2390,41 +2426,8 @@ void MainWindow::refreshBotTable() {
         double liq = has_real_pos ? pit->second.liq_price : 0;
         botTable_->setItem(i, 11, mkc(liq > 0 ? fmt_price(liq) : "--", QColor("#d29922")));
 
-        // 资金费：本轮持仓已付（负数=付出去的钱）。这是【已实现的现金流出】，
-        // 不是浮亏——价格涨回来也拿不回，所以和"已实现P&L"分开显示，不并进去
-        auto fe = funding_.get(b.cfg.symbol);
-        QString fund_s = "--";
-        QColor  fund_c("#8b949e");
-        if (fe.since_open != 0) {
-            fund_s = QString("%1%2").arg(fe.since_open >= 0 ? "+" : "").arg(fe.since_open, 0, 'f', 2);
-            fund_c = fe.since_open >= 0 ? QColor("#3fb950") : QColor("#f85149");
-        }
-        auto* fitem = mkc(fund_s, fund_c);
-        if (fe.since_open < 0 && b.avg_price > 0 && b.total_qty > 0) {
-            // 把利息换算成使用者真正关心的单位：还要多涨多少才回本
-            double be = FundingLedger::effective_breakeven(
-                b.avg_price, b.total_qty, fe.since_open,
-                b.cfg.direction == CcgConfig::Direction::Long);
-            fitem->setToolTip(QString("本轮持仓已付资金费 %1 USDT\n"
-                                      "回本价被推高：%2 → %3（+%4%）")
-                              .arg(-fe.since_open, 0, 'f', 2)
-                              .arg(fmt_price(b.avg_price)).arg(fmt_price(be))
-                              .arg((be / b.avg_price - 1.0) * 100.0, 0, 'f', 2));
-        }
-        botTable_->setItem(i, 12, fitem);
-
-        // 年化：当前费率 × 3次/天 × 365。费率随时在变，这是"此刻的持有成本速率"
-        QString ann_s = "--";
-        QColor  ann_c("#8b949e");
-        if (fe.rate_ms > 0) {
-            double ann = FundingLedger::annualized_pct(fe.rate);
-            ann_s = QString("%1%2%").arg(ann >= 0 ? "-" : "+").arg(std::abs(ann), 0, 'f', 1);
-            ann_c = ann > 30 ? QColor("#f85149") : (ann > 0 ? QColor("#d29922") : QColor("#3fb950"));
-        }
-        botTable_->setItem(i, 13, mkc(ann_s, ann_c));
-
-        botTable_->setItem(i, 14, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
-        botTable_->setItem(i, 15, mkc(state_s, state_c));
+        botTable_->setItem(i, 12, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
+        botTable_->setItem(i, 13, mkc(state_s, state_c));
 
         // 操作列
         std::string bid  = b.bot_id;
@@ -2485,7 +2488,7 @@ void MainWindow::refreshBotTable() {
         opL->addWidget(btnDel);
         opL->addStretch();
 
-        botTable_->setCellWidget(i, 16, opW);
+        botTable_->setCellWidget(i, 14, opW);
     }
 
     // 汇总
@@ -2511,6 +2514,42 @@ void MainWindow::refreshBotTable() {
         } else {
             equityLabel_->setText("权益: --   可用: --");
             equityLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
+        }
+    }
+
+    // 顶部常驻：uniMMR（仅统一账户）。币安 1.05 起强制减仓，所以 1.3 以下标红、
+    // 2.0 以下标黄。无持仓时币安返回一个极大的哨兵值，显示成 ∞ 而不是一串数字
+    if (mmrLabel_) {
+        const bool has_mmr = account_info_.ok && account_info_.uni_mmr > 0;
+        mmrLabel_->setVisible(has_mmr);
+        if (has_mmr) {
+            const double m = account_info_.uni_mmr;
+            QString v = (m >= 1e6) ? QString("∞") : QString::number(m, 'f', 2);
+            QString col = (m < 1.3) ? "#f85149" : (m < 2.0) ? "#d29922" : "#e6edf3";
+            mmrLabel_->setText(QString("   uniMMR: %1").arg(v));
+            mmrLabel_->setStyleSheet(QString("color:%1;font-size:11px;").arg(col));
+            mmrLabel_->setToolTip(
+                "统一账户维持保证金率（全账户口径）。\n"
+                "币安在 1.05 开始强制减仓——这是唯一能看到真实强平距离的数，\n"
+                "只看 U 本位子账户的保证金会低估风险。");
+        }
+    }
+
+    // 顶部常驻：账户累计资金费。只在非零时显示——没持过仓的时候不该占顶部栏的位置
+    if (fundLabel_) {
+        double sum = 0;
+        for (const auto& sy : funding_.symbols()) sum += funding_.get(sy).total;
+        const bool show = (sum != 0);
+        fundLabel_->setVisible(show);
+        if (show) {
+            fundLabel_->setText(QString("   资金费: %1$%2")
+                .arg(sum >= 0 ? "+" : "-").arg(std::abs(sum), 0, 'f', 2));
+            fundLabel_->setStyleSheet(QString("color:%1;font-size:11px;")
+                .arg(sum >= 0 ? "#3fb950" : "#f85149"));
+            fundLabel_->setToolTip(
+                "所有品种累计的资金费（永续每8小时结算一次）。\n"
+                "这是【真实划走的现金】，不是浮亏——价格涨回来也拿不回来。\n"
+                "逐品种明细见表格里\"均价\"列的悬停提示（带 * 的行）。");
         }
     }
 }
