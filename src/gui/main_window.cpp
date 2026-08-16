@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.5.2");
+    setWindowTitle("CCG 合约监控  v3.5.3");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1854,7 +1854,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     tierTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     tierTable->setMaximumHeight(220);
     tierTable->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
-    tierTable->setAlternatingRowColors(true);
+    // 不开斑马纹：全局样式表没定义 alternate-background-color，Qt 会退回默认调色板
+    // 的浅灰，在这套深色皮肤上格格不入；项目里其他表格也都不用它，行的区分交给
+    // 已有的 gridline-color
     dv->addWidget(tierTable);
 
     auto* tierSummary = new QLabel();
