@@ -62,6 +62,8 @@ private:
     void openStrategyDialog(const std::string& symbol);
 
     // ── SR雷达（v2.6 影子模式：检测+告警+展示，不参与下单）──
+    // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
+    bool confirmDanger(const QString& title, const QString& body, const QString& okText);
     void refreshSrZones();
     void refreshFunding();                                // 定期重算区域（约15分钟一次）
     void checkSrTouches();                                // 每tick检查价格是否触区

@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.5.3");
+    setWindowTitle("CCG 合约监控  v3.5.4");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1576,7 +1576,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* disStopBox = new QCheckBox("在交易所挂灾难止损单（进程外保护）");
     disStopBox->setChecked(prefill ? prefill->cfg.use_disaster_stop : false);
     form->addRow("", disStopBox);
-    auto* disStopEdit  = mkEdit ("　└ 触发位置：均价下方%:",
+    // 缩进表示"这是上面那个勾选框的子项"。原先用 └ 制表符，小字号下会被认成字母 L
+    auto* disStopEdit  = mkEdit ("　　触发位置：均价下方%:",
                                  prefill ? prefill->cfg.disaster_stop_pct : 30.0);
     // 没勾选时把比例框灰掉：启用与否是策略取向，不该藏在"这个数字是不是0"里
     disStopEdit->setEnabled(disStopBox->isChecked());
@@ -2156,8 +2157,38 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 危险操作的二次确认。
+// 默认按钮刻意设成【取消】：这些按钮和常用按钮挨着，误点之后再顺手敲一下
+// 回车/空格就等于确认了，那和没有确认框一样
+bool MainWindow::confirmDanger(const QString& title, const QString& body,
+                               const QString& okText) {
+    QMessageBox box(this);
+    box.setWindowTitle(title);
+    box.setText(body);
+    box.setIcon(QMessageBox::Warning);
+    auto* okBtn     = box.addButton(okText, QMessageBox::AcceptRole);
+    auto* cancelBtn = box.addButton("取消",  QMessageBox::RejectRole);
+    box.setDefaultButton(cancelBtn);
+    box.setEscapeButton(cancelBtn);
+    okBtn->setStyleSheet("QPushButton{background:#3d1a1a;color:#f85149;padding:4px 14px;}");
+    box.exec();
+    return box.clickedButton() == okBtn;
+}
+
 void MainWindow::onStopAll() {
     if (!engine_) return;
+    int running = 0, withPos = 0;
+    for (const auto& b : engine_->get_bots()) {
+        if (b.state != CcgBot::State::Stopped) ++running;
+        if (b.total_qty > 0) ++withPos;
+    }
+    if (!confirmDanger("确认全部停止",
+            QString("将停止 %1 个运行中的 Bot，并关闭 Tick 定时器。\n\n"
+                    "持仓【不会】被平掉，但止盈、止损、补仓全部暂停——"
+                    "当前有 %2 个品种持仓，停止期间它们不再受任何本地策略管理。\n\n"
+                    "确定要停止吗？").arg(running).arg(withPos),
+            "全部停止")) return;
+
     engine_->stop_all();
     tick_timer_->stop();
     log("所有Bot已停止，Tick定时器已关闭", "WARN");
@@ -2167,10 +2198,26 @@ void MainWindow::onStopAll() {
 
 void MainWindow::onClearStopped() {
     if (!engine_) return;
-    int n = 0;
+    int n = 0, withPos = 0;
+    for (const auto& b : engine_->get_bots()) {
+        if (b.state != CcgBot::State::Stopped) continue;
+        ++n;
+        if (b.total_qty > 0) ++withPos;
+    }
+    if (n == 0) { log("没有已停止的 Bot 可清除"); return; }
+
+    QString warn = withPos > 0
+        ? QString("\n\n⚠ 其中 %1 个仍有持仓！删除后本地不再跟踪这些仓位，"
+                  "它们会变成交易所上无人管理的孤儿仓位（不会被平掉）。").arg(withPos)
+        : QString();
+    if (!confirmDanger("确认清除已停止的 Bot",
+            QString("将删除 %1 个已停止的 Bot 配置。%2\n\n确定要清除吗？").arg(n).arg(warn),
+            "清除")) return;
+
+    int done = 0;
     for (const auto& b : engine_->get_bots())
-        if (b.state == CcgBot::State::Stopped) { engine_->remove_bot(b.bot_id); ++n; }
-    if (n > 0) log(QString("已清除 %1 个已停止Bot").arg(n));
+        if (b.state == CcgBot::State::Stopped) { engine_->remove_bot(b.bot_id); ++done; }
+    if (done > 0) log(QString("已清除 %1 个已停止Bot").arg(done), withPos > 0 ? "WARN" : "INFO");
     refreshBotTable();
     save_bots();
 }
@@ -2593,23 +2640,52 @@ void MainWindow::refreshBotTable() {
         btnClose->setStyleSheet(
             "QPushButton{background:#3d2d0a;color:#d29922;font-size:11px;padding:0 6px;}"
             "QPushButton:disabled{background:#21262d;color:#484f58;}");
-        connect(btnClose, &QPushButton::clicked, [this, bid]() {
-            if (!engine_) return;
-            engine_->close_bot(bid);   // 异步市价平仓，完成后由 log 回调刷新表格
-            log("已发送平仓请求（若无持仓或订单正在处理中会自动忽略）", "WARN");
-        });
+        // 二次确认：平仓是【立刻市价成交、动真钱、不可撤销】的操作，
+        // 而这个按钮就挨着"停止"和"删除"，误点代价太大
+        {
+            QString csym = QString::fromStdString(b.cfg.symbol);
+            QString cdir = QString::fromStdString(CcgEngine::dir_name(b.cfg.direction));
+            double  cqty = b.total_qty, cavg = b.avg_price, cunr = unreal;
+            connect(btnClose, &QPushButton::clicked, [this, bid, csym, cdir, cqty, cavg, cunr]() {
+                if (!engine_) return;
+                if (!confirmDanger("确认平仓",
+                        QString("%1 %2\n持仓 %3   均价 $%4\n当前浮动盈亏 %5$%6\n\n"
+                                "将【立刻市价平掉全部持仓】，成交后不可撤销。\n\n确定要平仓吗？")
+                            .arg(csym).arg(cdir)
+                            .arg(cqty, 0, 'f', 6).arg(cavg, 0, 'f', 4)
+                            .arg(cunr >= 0 ? "+" : "-").arg(std::abs(cunr), 0, 'f', 2),
+                        "立刻平仓")) return;
+                engine_->close_bot(bid);   // 异步市价平仓，完成后由 log 回调刷新表格
+                log("已发送平仓请求（若无持仓或订单正在处理中会自动忽略）", "WARN");
+            });
+        }
         opL->addWidget(btnClose);
 
         auto* btnDel = new QPushButton("删除");
         btnDel->setFixedHeight(20);
         btnDel->setStyleSheet(
             "QPushButton{background:#2d333b;color:#8b949e;font-size:11px;padding:0 6px;}");
-        connect(btnDel, &QPushButton::clicked, [this, bid]() {
-            if (!engine_) return;
-            engine_->remove_bot(bid);
-            refreshBotTable();
-            save_bots();
-        });
+        // 二次确认：删除本身不平仓，但会让本地不再跟踪这个仓位——
+        // 有持仓时删掉等于亲手制造一个无人管理的孤儿仓位
+        {
+            QString dsym = QString::fromStdString(b.cfg.symbol);
+            double  dqty = b.total_qty;
+            connect(btnDel, &QPushButton::clicked, [this, bid, dsym, dqty]() {
+                if (!engine_) return;
+                QString warn = dqty > 0
+                    ? QString("\n\n⚠ 该 Bot 仍持有 %1 的仓位！删除【不会】平掉它，"
+                              "但本地从此不再跟踪——它会变成交易所上无人管理的孤儿仓位，"
+                              "没有任何止盈止损。").arg(dqty, 0, 'f', 6)
+                    : QString();
+                if (!confirmDanger("确认删除 Bot",
+                        QString("将删除 %1 的 Bot 配置。%2\n\n确定要删除吗？")
+                            .arg(dsym).arg(warn),
+                        "删除")) return;
+                engine_->remove_bot(bid);
+                refreshBotTable();
+                save_bots();
+            });
+        }
         opL->addWidget(btnDel);
         opL->addStretch();
 
