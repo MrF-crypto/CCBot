@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.5.1");
+    setWindowTitle("CCG 合约监控  v3.5.2");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1536,9 +1536,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     form->setSpacing(8);
 
     auto* dirBox = new QComboBox();
-    dirBox->addItem("多(Long)");
-    dirBox->addItem("空(Short)");
-    dirBox->addItem("双向(Both)");
+    dirBox->addItem("多");
+    dirBox->addItem("空");
+    dirBox->addItem("双向");
     if (longBot && shortBot)      dirBox->setCurrentIndex(2);
     else if (prefill)             dirBox->setCurrentIndex(
         prefill->cfg.direction == CcgConfig::Direction::Short ? 1 : 0);
@@ -1546,8 +1546,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     form->addRow("方向:", dirBox);
 
     auto* stratBox = new QComboBox();
-    for (const char* s : {"平推(Flat)","倍投(Mart)","倍投Plus","三倍(Triple)",
-                           "平方(Sq)","斐波那契","卢卡斯","递增(Lin)"})
+    // 顺序必须与 CcgConfig::StratType 的枚举顺序一致（下拉框按索引存取）
+    for (const char* s : {"平推","倍投","倍投Plus","三倍",
+                           "平方","斐波那契","卢卡斯","递增"})
         stratBox->addItem(s);
     stratBox->setCurrentIndex(prefill ? (int)prefill->cfg.strat_type : 7);   // 默认递增（实证最优）
     form->addRow("策略:", stratBox);
@@ -1783,19 +1784,77 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             [previewDipped, refreshIndPreview]() { *previewDipped = false; refreshIndPreview(); });
     updateIndVisible();
 
-    auto* tierLbl = new QLabel("层级分配预览（第1仓~第N仓各需要多少资金、预计建仓价与浮亏）");
-    tierLbl->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding-top:4px;");
-    dv->addWidget(tierLbl);
+    // 标题行：左边说明，右边快速增减层数（改的是上面的"最大层数"输入框，
+    // 预览会跟着刷新——比手动去改那个框直观）
+    auto* tierHead = new QWidget();
+    auto* tierHeadL = new QHBoxLayout(tierHead);
+    tierHeadL->setContentsMargins(0, 4, 0, 0);
+    tierHeadL->setSpacing(6);
 
-    auto* tierTable = new QTableWidget(0, 8);
-    tierTable->setHorizontalHeaderLabels(
-        {"层", "名义价值", "占比%", "保证金", "预计建仓价", "预计数量", "预计浮亏", "触发条件"});
-    tierTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    tierTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
-    tierTable->horizontalHeader()->resizeSection(0, 34);
+    auto* tierLbl = new QLabel("层级分配预览（各层资金、预计建仓价、浮亏；横向可滚动）");
+    tierLbl->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;");
+    tierHeadL->addWidget(tierLbl);
+    tierHeadL->addStretch();
+
+    auto mkStepBtn = [](const QString& t) {
+        auto* b = new QPushButton(t);
+        b->setFixedSize(22, 20);
+        b->setStyleSheet("QPushButton{background:#21262d;color:#8b949e;font-size:13px;"
+                         "border:1px solid #30363d;border-radius:3px;}"
+                         "QPushButton:hover{border-color:#58a6ff;color:#58a6ff;}");
+        return b;
+    };
+    auto* btnTierMinus = mkStepBtn("−");
+    auto* btnTierPlus  = mkStepBtn("+");
+    btnTierMinus->setToolTip("减少一层");
+    btnTierPlus->setToolTip("增加一层");
+    tierHeadL->addWidget(btnTierMinus);
+    tierHeadL->addWidget(btnTierPlus);
+    dv->addWidget(tierHead);
+
+    connect(btnTierMinus, &QPushButton::clicked, &dlg, [maxEntEdit]() {
+        int v = maxEntEdit->text().toInt();
+        if (v > 1) maxEntEdit->setText(QString::number(v - 1));   // textChanged 会触发预览刷新
+    });
+    connect(btnTierPlus, &QPushButton::clicked, &dlg, [maxEntEdit]() {
+        int v = maxEntEdit->text().toInt();
+        if (v < kMaxLayers) maxEntEdit->setText(QString::number(v + 1));
+    });
+
+    // 列宽固定 + 横向滚动（而不是 Stretch 挤在一屏里）：列一多，Stretch 会把每列
+    // 压到看不清。参考界面同样是固定列宽配横向滚动条
+    static const struct { const char* head; int w; } kTierCols[] = {
+        {"单",           44},
+        {"名义价值",     86},
+        {"占比%",        56},
+        {"保证金",       80},
+        {"间隔%",        62},
+        {"追踪建仓%",    76},
+        {"止盈%",        62},
+        {"止盈回降%",    76},
+        {"预计建仓价",   96},
+        {"实际建仓价",   96},
+        {"预计数量",     88},
+        {"浮动盈亏",     84},
+        {"满层浮亏",     84},
+    };
+    constexpr int kTierColN = (int)(sizeof(kTierCols) / sizeof(kTierCols[0]));
+
+    auto* tierTable = new QTableWidget(0, kTierColN);
+    {
+        QStringList heads;
+        for (const auto& c : kTierCols) heads << c.head;
+        tierTable->setHorizontalHeaderLabels(heads);
+        auto* th = tierTable->horizontalHeader();
+        th->setSectionResizeMode(QHeaderView::Fixed);
+        for (int i = 0; i < kTierColN; ++i) th->resizeSection(i, kTierCols[i].w);
+        th->setStretchLastSection(true);
+    }
     tierTable->verticalHeader()->setVisible(false);
     tierTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     tierTable->setMaximumHeight(220);
+    tierTable->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    tierTable->setAlternatingRowColors(true);
     dv->addWidget(tierTable);
 
     auto* tierSummary = new QLabel();
@@ -1844,8 +1903,22 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             return it;
         };
 
-        double sumMargin = 0, sumLoss = 0;
+        double sumMargin = 0, sumLoss = 0, sumQty = 0, sumUnreal = 0;
         bool   haveLoss  = livePrice > 0;
+
+        // 动态W模式下间隔/追踪/止盈是运行时按实时带宽算出来的，写死一个数字是骗人的
+        const bool dynMode = dynBandBox->isChecked();
+        const QString dynTxt = "动态";
+        double tpPct    = tpEdit->text().toDouble();
+        double tpTrail  = trailTpEdit->text().toDouble();
+
+        // 编辑一个已有持仓的 bot 时，把每层的真实成交价和当前浮盈填进去；
+        // 新建时这些列是空的（参考界面同样是未成交显示 0）
+        const std::vector<CcgEntry>* filled = (prefill && !prefill->entries.empty())
+                                              ? &prefill->entries : nullptr;
+
+        auto right = Qt::AlignRight | Qt::AlignVCenter;
+        auto dim   = QColor("#484f58");
 
         tierTable->setRowCount(n);
         for (int i = 0; i < n; ++i) {
@@ -1854,46 +1927,91 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             double margin = usdt / lev;
             sumMargin += margin;
 
-            QString trigger = (i == 0) ? "首仓入场"
-                : QString("较上层%1%2%%3%").arg(is_short ? "涨" : "跌").arg(interv, 0, 'f', 1)
-                      .arg(QString("→反弹%1%").arg(trail, 0, 'f', 1));
-
+            int c = 0;
             QColor usdt_col = (i == 0) ? QColor("#58a6ff") : QColor("#3fb950");
-            tierTable->setItem(i, 0, mkc(QString("第%1").arg(i+1), QColor("#8b949e")));
-            tierTable->setItem(i, 1, mkc(QString("$%1").arg(usdt, 0, 'f', 1), usdt_col,
-                                          Qt::AlignRight | Qt::AlignVCenter));
-            tierTable->setItem(i, 2, mkc(QString("%1%").arg(pct, 0, 'f', 1), QColor("#d29922")));
-            tierTable->setItem(i, 3, mkc(QString("$%1").arg(margin, 0, 'f', 2), QColor("#e6edf3"),
-                                          Qt::AlignRight | Qt::AlignVCenter));
+            tierTable->setItem(i, c++, mkc(QString("第%1单").arg(i+1), QColor("#8b949e")));
+            tierTable->setItem(i, c++, mkc(QString("$%1").arg(usdt, 0, 'f', 1), usdt_col, right));
+            tierTable->setItem(i, c++, mkc(QString("%1%").arg(pct, 0, 'f', 1), QColor("#d29922")));
+            tierTable->setItem(i, c++, mkc(QString("$%1").arg(margin, 0, 'f', 2),
+                                            QColor("#e6edf3"), right));
 
+            // 逐层参数：首仓没有"间隔/追踪建仓"这回事
+            tierTable->setItem(i, c++, mkc(i == 0 ? "--" : (dynMode ? dynTxt : QString::number(interv, 'f', 1)),
+                                            i == 0 ? dim : (dynMode ? QColor("#a371f7") : QColor("#8b949e"))));
+            tierTable->setItem(i, c++, mkc(i == 0 ? "--" : (dynMode ? dynTxt : QString::number(trail, 'f', 1)),
+                                            i == 0 ? dim : (dynMode ? QColor("#a371f7") : QColor("#8b949e"))));
+            tierTable->setItem(i, c++, mkc(dynMode ? dynTxt : QString::number(tpPct, 'f', 1),
+                                            dynMode ? QColor("#a371f7") : QColor("#8b949e")));
+            tierTable->setItem(i, c++, mkc(dynMode ? dynTxt : QString::number(tpTrail, 'f', 1),
+                                            dynMode ? QColor("#a371f7") : QColor("#8b949e")));
+
+            // 预计建仓价 / 实际建仓价 / 预计数量
+            double price = (livePrice > 0) ? predPrice[i] : 0.0;
+            double qty   = (price > 0) ? usdt / price : 0.0;
+            tierTable->setItem(i, c++, price > 0
+                ? mkc(QString::number(price, 'f', 4), QColor("#e6edf3"), right)
+                : mkc("--", dim));
+
+            double realPx = 0, realQty = 0;
+            if (filled && i < (int)filled->size()) {
+                realPx  = (*filled)[i].price;
+                realQty = (*filled)[i].qty;
+            }
+            tierTable->setItem(i, c++, realPx > 0
+                ? mkc(QString::number(realPx, 'f', 4), QColor("#58a6ff"), right)
+                : mkc("0", dim));
+
+            tierTable->setItem(i, c++, qty > 0
+                ? mkc(QString::number(qty, 'f', 6), QColor("#8b949e"), right)
+                : mkc("--", dim));
+            sumQty += qty;
+
+            // 浮动盈亏（当前）：只有已成交的层才有，按真实成交价对现价算
+            if (realPx > 0 && realQty > 0 && livePrice > 0) {
+                double up = is_short ? (realPx - livePrice) * realQty
+                                     : (livePrice - realPx) * realQty;
+                sumUnreal += up;
+                tierTable->setItem(i, c++, mkc(QString("%1$%2").arg(up >= 0 ? "+" : "-")
+                                                 .arg(std::abs(up), 0, 'f', 2),
+                                                up >= 0 ? QColor("#3fb950") : QColor("#f85149"), right));
+            } else {
+                tierTable->setItem(i, c++, mkc(realPx > 0 ? "--" : "0", dim));
+            }
+
+            // 满层浮亏：跌(涨)到最后一层时，这一层的账面亏损
             if (livePrice > 0) {
-                double price = predPrice[i];
-                double qty   = (price > 0) ? usdt / price : 0.0;
-                double loss  = is_short ? qty * (finalPrice - price) : qty * (price - finalPrice);
+                double loss = is_short ? qty * (finalPrice - price) : qty * (price - finalPrice);
                 loss = std::max(0.0, loss);
                 sumLoss += loss;
-                tierTable->setItem(i, 4, mkc(QString::number(price, 'f', 4), QColor("#e6edf3"),
-                                              Qt::AlignRight | Qt::AlignVCenter));
-                tierTable->setItem(i, 5, mkc(QString::number(qty, 'f', 6), QColor("#8b949e"),
-                                              Qt::AlignRight | Qt::AlignVCenter));
-                tierTable->setItem(i, 6, mkc(QString("$%1").arg(loss, 0, 'f', 2),
-                                              QColor("#f85149"), Qt::AlignRight | Qt::AlignVCenter));
+                tierTable->setItem(i, c++, mkc(QString("$%1").arg(loss, 0, 'f', 2),
+                                                QColor("#f85149"), right));
             } else {
-                tierTable->setItem(i, 4, mkc("--", QColor("#484f58")));
-                tierTable->setItem(i, 5, mkc("--", QColor("#484f58")));
-                tierTable->setItem(i, 6, mkc("--", QColor("#484f58")));
+                tierTable->setItem(i, c++, mkc("--", dim));
             }
-            tierTable->setItem(i, 7, mkc(trigger, QColor("#8b949e"),
-                                          Qt::AlignLeft | Qt::AlignVCenter));
         }
 
-        double totalInterval = maxEnt * interv;
-        QString line1 = QString("共%1层 | 总间隔 %2%3 | 名义价值(预算) $%4 | %5x杠杆 | 保证金合计 $%6")
-            .arg(n).arg(totalInterval, 0, 'f', 1).arg("%")
-            .arg(budget, 0, 'f', 0).arg(lev).arg(sumMargin, 0, 'f', 2);
+        // 汇总条：参考界面是紧凑的一行。总间隔用【实际的几何累计跌幅】而不是
+        // 层数×间隔——引擎的间隔是相对上一层逐层复利的，线性相乘会高估总跌幅
+        double totalDrop = (livePrice > 0 && finalPrice > 0)
+            ? std::abs(finalPrice / livePrice - 1.0) * 100.0
+            : (1.0 - std::pow(1.0 - interv / 100.0, std::max(0, n - 1))) * 100.0;
+
+        QString line1 = QString("单数:%1  |  总量:%2  |  总间隔:%3%  |  杠杆:%4x  |  "
+                                "名义价值:$%5  |  需要保证金:$%6")
+            .arg(n)
+            .arg(sumQty > 0 ? QString::number(sumQty, 'f', 4) : "--")
+            .arg(totalDrop, 0, 'f', 1)
+            .arg(lev)
+            .arg(budget, 0, 'f', 0)
+            .arg(sumMargin, 0, 'f', 2);
         QString line2 = haveLoss
-            ? QString("预估浮亏合计（跌/涨到第%1层时）$%2   |   全部建仓完成共需准备资金 ≈ $%3")
-                  .arg(n).arg(sumLoss, 0, 'f', 2).arg(sumMargin + sumLoss, 0, 'f', 2)
+            ? QString("满层浮亏合计:$%1  |  全部建仓共需准备:≈$%2%3")
+                  .arg(sumLoss, 0, 'f', 2)
+                  .arg(sumMargin + sumLoss, 0, 'f', 2)
+                  .arg(sumUnreal != 0
+                       ? QString("  |  当前总浮动盈亏:%1$%2")
+                             .arg(sumUnreal >= 0 ? "+" : "-").arg(std::abs(sumUnreal), 0, 'f', 2)
+                       : QString())
             : QString("暂无实时价格，预计建仓价/浮亏/需要资金 待订阅行情后显示");
         tierSummary->setText(line1 + "\n" + line2);
     };
@@ -1904,6 +2022,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     connect(levEdit,      &QLineEdit::textChanged, &dlg, refreshTier);
     connect(stratBox, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, refreshTier);
     connect(dirBox,   QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, refreshTier);
+    // 预览新增了"止盈%/止盈回降%"两列和"动态"标记，这三个控件也要触发刷新，
+    // 否则改了止盈参数预览还停在旧值上
+    connect(tpEdit,      &QLineEdit::textChanged, &dlg, refreshTier);
+    connect(trailTpEdit, &QLineEdit::textChanged, &dlg, refreshTier);
+    connect(dynBandBox,  &QCheckBox::toggled,     &dlg, [refreshTier](bool) { refreshTier(); });
     refreshTier();
 
     if (longBot && shortBot) {
