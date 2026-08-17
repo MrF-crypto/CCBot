@@ -73,7 +73,8 @@ private:
     // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
     void refreshSrZones();
-    void refreshFunding();                                // 定期重算区域（约15分钟一次）
+    void refreshFunding();
+    void refreshMtfBands();   // 多周期梯子的 4h/12h 档带值（1h/1d 由别处顺带喂）                                // 定期重算区域（约15分钟一次）
     void openSrZonesDialog(const std::string& symbol);    // 右键查看区域列表
     void refreshStats();
     void openTradeHistoryDialog();
@@ -189,6 +190,7 @@ private:
     std::atomic<bool> accFetchBusy_{false};
     std::atomic<bool> posFetchBusy_{false};
     std::atomic<bool> fundFetchBusy_{false};
+    std::atomic<bool> mtfFetchBusy_{false};
 
     // ── 日志 ──
     QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的

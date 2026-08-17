@@ -29,6 +29,75 @@ static bool trend_active_bearish(const CcgBot& bot, std::chrono::steady_clock::t
            (now - bot.trend_time) < kTrendStale;
 }
 
+// ── 多周期梯子 ───────────────────────────────────────────────────────────────
+// 四档固定 1h / 4h / 12h / 1d。各档新鲜度阈值不同：高周期的带算得晚一点无所谓，
+// 低周期的带过几分钟就偏旧了
+static constexpr std::chrono::seconds kMtfStale[4] = {
+    std::chrono::seconds(300),    // 1h
+    std::chrono::seconds(900),    // 4h
+    std::chrono::seconds(1800),   // 12h
+    std::chrono::seconds(3600),   // 1d
+};
+static const char* kMtfName[4] = { "1h", "4h", "12h", "1d" };
+
+// 各档层数分配。手动填 "3,2,2,1" 优先；空则按 3:2:2:1 权重铺到 max_entries。
+// 层数不足 4 时从最深的档往前砍——深档是"罕见事件才解锁"的保险层，
+// 层数紧张时优先保证浅层有子弹
+std::array<int,4> CcgEngine::mtf_tier_alloc(const CcgConfig& cfg) {
+    const int n = std::max(1, std::min(cfg.max_entries, kMaxLayers));
+    std::array<int,4> out{0,0,0,0};
+
+    // ① 手动指定
+    if (!cfg.mtf_tier_layers.empty()) {
+        int idx = 0, cur = 0; bool has = false;
+        for (char ch : cfg.mtf_tier_layers) {
+            if (ch >= '0' && ch <= '9') { cur = cur * 10 + (ch - '0'); has = true; }
+            else if (has) { if (idx < 4) out[idx++] = cur; cur = 0; has = false; }
+        }
+        if (has && idx < 4) out[idx++] = cur;
+        int sum = out[0] + out[1] + out[2] + out[3];
+        if (sum > 0) {
+            // 与 max_entries 对不齐时以 max_entries 为准，从最深档裁剪/补足
+            for (int t = 3; t >= 0 && sum > n; --t) {
+                int cut = std::min(out[t], sum - n);
+                out[t] -= cut; sum -= cut;
+            }
+            if (sum < n) out[0] += (n - sum);
+            return out;
+        }
+    }
+
+    // ② 按 3:2:2:1 权重铺满
+    static constexpr int wgt[4] = {3, 2, 2, 1};
+    const int wsum = 8;
+    int used = 0;
+    for (int t = 0; t < 4; ++t) { out[t] = n * wgt[t] / wsum; used += out[t]; }
+    for (int t = 0; t < 4 && used < n; ++t) { ++out[t]; ++used; }   // 余数补给浅档
+
+    // ③ 层数不足以铺满四档时，从最深的档往前砍
+    for (int t = 3; t >= 1; --t) {
+        if (out[0] + out[1] + out[2] + out[3] <= n && out[t] > 0) break;
+    }
+    for (int t = 3; t >= 0; --t) {
+        if (out[t] == 0) continue;
+        int total = out[0] + out[1] + out[2] + out[3];
+        if (total <= n) break;
+        int cut = std::min(out[t], total - n);
+        out[t] -= cut;
+    }
+    return out;
+}
+
+// 第 slot 个槽位（0-based）归属哪一档
+static int mtf_tier_of_slot(const std::array<int,4>& alloc, int slot) {
+    int acc = 0;
+    for (int t = 0; t < 4; ++t) {
+        acc += alloc[t];
+        if (slot < acc) return t;
+    }
+    return 3;   // 超出分配（配置与层数对不齐）时归最深档，宁严勿松
+}
+
 // ── 加仓比例序列（最多 kMaxLayers 层）────────────────────────────────────────
 // 按需生成而不是查固定表：层数上限从 10 提到 50 后，写死的表会静默截断预算分配。
 // ⚠ 指数型曲线（倍投/三倍/斐波/卢卡斯）在深层数下权重爆炸，首仓分到的预算会
@@ -235,6 +304,10 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
     cfg.dyn_interval_mult = new_cfg.dyn_interval_mult;
     cfg.dyn_fixed_interval = new_cfg.dyn_fixed_interval;
+    cfg.mtf_ladder         = new_cfg.mtf_ladder;
+    cfg.mtf_tier_layers    = new_cfg.mtf_tier_layers;
+    cfg.mtf_k              = new_cfg.mtf_k;
+    cfg.mtf_min_gap_pct    = new_cfg.mtf_min_gap_pct;
     cfg.min_profit_floor  = new_cfg.min_profit_floor;
     cfg.tp_floor_only     = new_cfg.tp_floor_only;
     cfg.tp_fixed_profit   = new_cfg.tp_fixed_profit;
@@ -432,6 +505,15 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
     return issues;
 }
 
+void CcgEngine::update_mtf_band(const std::string& bot_id, int tier, double lb, double ub) {
+    if (tier < 0 || tier > 3 || lb <= 0 || ub <= lb) return;
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    auto& b = it->second.mtf_band[tier];
+    b.lb = lb; b.ub = ub; b.t = host_.now_steady();
+}
+
 void CcgEngine::update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
@@ -556,7 +638,35 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
 
     if (!bot.interval_hit) {
         bool triggered = is_long ? (price <= interval_th) : (price >= interval_th);
-        if (eff.dyn) {
+        if (bot.cfg.mtf_ladder) {
+            // ── 多周期梯子：接管间距推导（止盈那半完全不动）──────────────────
+            // 第 i 槽必须先跌破【它所属档位】的布林下轨，且相对上一笔成交价
+            // 再跌够最小间距。两个条件都满足才武装追踪建仓。
+            const auto alloc = mtf_tier_alloc(bot.cfg);
+            const int  tier  = mtf_tier_of_slot(alloc, (int)bot.entries.size());
+            const auto& tb   = bot.mtf_band[tier];
+            const auto  age  = host_.now_steady() - tb.t;
+
+            // 该档带数据不新鲜就冻结——宁可错过不可乱买（与动态W同原则）
+            bool ok = (tb.lb > 0 && tb.ub > tb.lb && age < kMtfStale[tier]);
+
+            // ① 跌破该档下轨（实时价判定，与动态W一致；追踪建仓那步本身防抖）
+            if (ok) ok = is_long ? (price <= tb.lb) : (price >= tb.ub);
+
+            // ② 最小间距 = max(k × 该档带宽, 兜底地板)。
+            //    瀑布是高波动事件，带子撑开时地板跟着撑开，正好挡住"四档同时
+            //    触发、整个梯子打在崩盘顶部"——这是纯固定百分比挡不住的
+            if (ok) {
+                const double mb = (tb.ub + tb.lb) * 0.5;
+                const double bandw = (mb > 0) ? (tb.ub - tb.lb) / mb * 100.0 : 0.0;
+                const double gap = std::max(bot.cfg.mtf_k * bandw,
+                                            bot.cfg.mtf_min_gap_pct);
+                const double gap_th = bot.last_entry_price *
+                    (is_long ? (1.0 - gap / 100.0) : (1.0 + gap / 100.0));
+                ok = is_long ? (price <= gap_th) : (price >= gap_th);
+            }
+            triggered = ok;
+        } else if (eff.dyn) {
             // 动态W模式：补仓锚定布林带——除了跌够动态间隔，价格还必须在带外
             // （多：≤下轨；空：≥上轨），即"当前统计意义上的超卖/超买位"才武装补仓。
             // 指标数据过期时冻结武装（fresh=false），宁可错过不可乱买

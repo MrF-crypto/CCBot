@@ -115,6 +115,10 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
 
     // ── 高周期序列 ──────────────────────────────────────────────────────────
     TfSeries tf_ind, tf_trend, tf_htf, tf_sr;
+    // 多周期梯子的四档：1h / 4h / 12h / 1d（固定，不跟随 kline_interval）
+    TfSeries tf_mtf[4];
+    { const int64_t P[4] = {3600000LL, 14400000LL, 43200000LL, 86400000LL};
+      for (int i = 0; i < 4; ++i) tf_mtf[i].period_ms = P[i]; }
     tf_ind.period_ms   = interval_ms(opt.cfg.kline_interval);
     tf_trend.period_ms = interval_ms(opt.cfg.trend_interval);
     tf_htf.period_ms   = interval_ms(opt.cfg.htf_interval);
@@ -139,6 +143,7 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
 
         vnow_ms = b.ts_ms;
         tf_ind.feed(b); tf_trend.feed(b); tf_htf.feed(b); tf_sr.feed(b);
+        if (opt.cfg.mtf_ladder) for (auto& t : tf_mtf) t.feed(b);
 
         // ① 指标（每根1m更新，与实盘每3秒刷新等价）
         {
@@ -149,6 +154,18 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
                 if (bo.ok) engine->update_indicator(bot_id, bo.lb, bo.ub, rsi);
             }
         }
+        // ①b 多周期梯子的四档带值。1h 档每根1m更新（与实盘每3秒刷新等价），
+        //    4h/12h/1d 跟慢速批次（实盘也是几分钟才拉一次高周期K线）
+        if (opt.cfg.mtf_ladder) {
+            for (int t = 0; t < 4; ++t) {
+                if (t > 0 && b.ts_ms - last_slow_calc < 300000) continue;
+                auto c = tf_mtf[t].closes_live();
+                if ((int)c.size() < opt.cfg.boll_period + 1) continue;
+                auto bo = indicators::bollinger(c, opt.cfg.boll_period, opt.cfg.boll_mult);
+                if (bo.ok) engine->update_mtf_band(bot_id, t, bo.lb, bo.ub);
+            }
+        }
+
         // ② 趋势 + 日线%B（每5分钟，与实盘同频）
         if (b.ts_ms - last_slow_calc >= 300000) {
             last_slow_calc = b.ts_ms;

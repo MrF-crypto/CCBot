@@ -361,7 +361,11 @@ int main(int argc, char** argv) {
                         auto snap = client->fetch_indicators(b.cfg.symbol, b.cfg.kline_interval,
                                                               b.cfg.boll_period, b.cfg.boll_mult,
                                                               b.cfg.rsi_period);
-                        if (snap.ok) engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
+                        if (!snap.ok) continue;
+                        engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
+                        // 复用：指标拉的就是 1h 带，正好是多周期梯子的第0档
+                        if (b.cfg.mtf_ladder && b.cfg.kline_interval == "1h")
+                            engine->update_mtf_band(b.bot_id, 0, snap.boll_lb, snap.boll_ub);
                     }
                     ind_busy.store(false);
                 });
@@ -399,16 +403,17 @@ int main(int argc, char** argv) {
 
         // ── 4) 趋势状态机 + v3.0日线%B（每约5分钟，异步同班车）────────────────
         if ((tick_n - 1) % 100 == 0 && !trend_busy.load()) {
-            std::vector<CcgBot> need, htf_need;
+            std::vector<CcgBot> need, htf_need, mtf_need;
             for (const auto& b : bots) {
                 if (b.state == CcgBot::State::Stopped) continue;
                 if (b.cfg.use_trend_filter) need.push_back(b);
                 // %B 对所有非停止 bot 持续保鲜（立即开仓/冷却重进的首仓才赶得上数据）
                 if (b.cfg.use_htf_filter) htf_need.push_back(b);
+                if (b.cfg.mtf_ladder)     mtf_need.push_back(b);
             }
-            if (!need.empty() || !htf_need.empty()) {
+            if (!need.empty() || !htf_need.empty() || !mtf_need.empty()) {
                 trend_busy.store(true);
-                fetch_pool->submit([client, engine, need, htf_need, &trend_busy]() {
+                fetch_pool->submit([client, engine, need, htf_need, mtf_need, &trend_busy]() {
                     for (const auto& b : need) {
                         auto t = client->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
                                                       b.cfg.trend_ema_period);
@@ -420,6 +425,29 @@ int main(int argc, char** argv) {
                         if (!snap.ok) continue;
                         double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
                         engine->update_htf(b.bot_id, pb);
+                        // 复用：宏观层拉的就是日线带，正好是第3档
+                        if (b.cfg.mtf_ladder && b.cfg.htf_interval == "1d")
+                            engine->update_mtf_band(b.bot_id, 3, snap.boll_lb, snap.boll_ub);
+                    }
+                    // 多周期梯子还差 4h / 12h 两档（1h 和 1d 上面顺带喂了）。
+                    // 每个开了该模式的 bot 只多 2 个公开接口请求
+                    for (const auto& b : mtf_need) {
+                        const char* tf[2] = {"4h", "12h"};
+                        for (int ti = 1; ti <= 2; ++ti) {
+                            auto ms = client->fetch_indicators(b.cfg.symbol, tf[ti-1],
+                                                               b.cfg.boll_period, b.cfg.boll_mult, 14);
+                            if (ms.ok) engine->update_mtf_band(b.bot_id, ti, ms.boll_lb, ms.boll_ub);
+                        }
+                        if (b.cfg.kline_interval != "1h") {
+                            auto ms = client->fetch_indicators(b.cfg.symbol, "1h",
+                                                               b.cfg.boll_period, b.cfg.boll_mult, 14);
+                            if (ms.ok) engine->update_mtf_band(b.bot_id, 0, ms.boll_lb, ms.boll_ub);
+                        }
+                        if (b.cfg.htf_interval != "1d") {
+                            auto ms = client->fetch_indicators(b.cfg.symbol, "1d",
+                                                               b.cfg.boll_period, b.cfg.boll_mult, 14);
+                            if (ms.ok) engine->update_mtf_band(b.bot_id, 3, ms.boll_lb, ms.boll_ub);
+                        }
                     }
                     trend_busy.store(false);
                 });

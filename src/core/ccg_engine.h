@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
+#include <array>
 
 namespace ccbot {
 
@@ -134,6 +135,27 @@ struct CcgConfig {
     // 想降回撤应该【降预算】而不是放宽间隔：间隔×1.0+预算33% 得到相同回撤
     // (1519 vs 1453) 但利润是 5.7 倍 (810 vs 141)。默认保持 1.0
     double dyn_interval_mult = 1.0;
+
+    // ── 多周期梯子（v3.7 实验，默认关）────────────────────────────────────────
+    // 把补仓间距的来源从"一个参数"换成"市场结构本身"：梯子是 N 个有序槽位，
+    // 槽位 i 归属某一档，填第 i 槽必须先跌破【该档周期】的布林下轨。
+    // 四档固定为 1h / 4h / 12h / 1d——带宽大致按 √T 缩放，所以间距天然递增，
+    // 越深的层需要越极端的证据才解锁（"跌破日线下轨"是统计上罕见的事件）。
+    //
+    // 动机：固定间隔在浅回调里也会一路补下去，导致弹药在到底之前就打光
+    // （实测所有品种都打满层）。多周期档位让浅回调只消耗第一档。
+    //
+    // ⚠ 只接管【补仓间距的推导】，止盈那半（触上轨+保底利润）完全不动。
+    bool        mtf_ladder = false;
+    // 各档层数，如 "3,2,2,1"。空=按 3:2:2:1 权重自动分配到 max_entries；
+    // 层数不足 4 时从最深的档往前砍（N=3 → 2/1/0/0，只用 1h 和 4h）
+    std::string mtf_tier_layers = "";
+    // 最小间距 = max(mtf_k × 该档带宽, mtf_min_gap_pct)。
+    // 前者自适应：瀑布本身是高波动事件，带子撑开时地板跟着撑开，正好挡住
+    // "四档同时触发、整个梯子打在崩盘顶部"这个失效模式；
+    // 后者兜底：带数据过期或异常收窄时不至于失去地板
+    double      mtf_k           = 0.5;
+    double      mtf_min_gap_pct = 2.0;
 
     // 固定补仓间隔%（0=用 W/3 推导）。存在的唯一目的是回答一个从没被干净验证过
     // 的问题：动态W的"自适应"本身有没有创造价值？
@@ -312,6 +334,15 @@ struct CcgBot {
     // band_broken=本轮是否已跌破过下轨；band_extreme=破轨后的最低价
     bool   band_broken  = false;
     double band_extreme = 0;
+    // ── 多周期梯子的四档布林带（mtf_ladder 时用）────────────────────────────
+    // 下标 0=1h 1=4h 2=12h 3=1d。各档新鲜度阈值不同：1d 的带 20 分钟前算的
+    // 完全没问题，1h 的带 20 分钟就偏旧了
+    struct TfBand {
+        double lb = 0, ub = 0;
+        std::chrono::steady_clock::time_point t{};
+    };
+    TfBand mtf_band[4];
+
     // 最近一次指标写入时间（steady_clock，默认epoch=从未更新过=视为过期）。
     // 动态W模式和指标首单都用它做数据新鲜度检查，避免拿几小时前的旧轨道值做决策
     std::chrono::steady_clock::time_point ind_time{};
@@ -432,6 +463,10 @@ public:
 
     // 写入指标信号快照（UI 异步拉取 BOLL/RSI 后回调，仅用于 entry_mode==Indicator 的首单判定）
     void update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi);
+    // 多周期梯子的档位带值（tier: 0=1h 1=4h 2=12h 3=1d）
+    void update_mtf_band(const std::string& bot_id, int tier, double lb, double ub);
+    // 各档层数分配（解析 mtf_tier_layers，空则按 3:2:2:1 权重）。公开供 GUI 预览用
+    static std::array<int,4> mtf_tier_alloc(const CcgConfig& cfg);
 
     // 写入趋势状态机快照（use_trend_filter 的 bot 由外层每几分钟拉取一次高周期趋势后回调）
     // 账户级周期熊市标志（BTC日线驱动，全场共用一个）。与 set_max_total_margin

@@ -152,6 +152,11 @@ static int cmd_run(int argc, char** argv) {
     c.dynamic_band_mode = arg_flag(argc, argv, "--dynamic");
     c.dyn_interval_mult = arg_num(argc, argv, "--int-mult", 1.0);
     c.dyn_fixed_interval = arg_num(argc, argv, "--int-fixed", 0.0);
+    // 多周期梯子：槽位按档位归属，第 i 槽必须跌破该档周期的下轨才武装
+    c.mtf_ladder      = arg_flag(argc, argv, "--mtf");
+    c.mtf_tier_layers = arg_str(argc, argv, "--mtf-tiers", "");
+    c.mtf_k           = arg_num(argc, argv, "--mtf-k", 0.5);
+    c.mtf_min_gap_pct = arg_num(argc, argv, "--mtf-gap", 2.0);
     c.min_profit_floor  = arg_num(argc, argv, "--floor", 0.3);
     c.use_trend_filter  = arg_flag(argc, argv, "--trend");
     c.sr_radar          = arg_flag(argc, argv, "--sr") || arg_flag(argc, argv, "--gates");

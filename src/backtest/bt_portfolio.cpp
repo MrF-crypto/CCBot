@@ -66,6 +66,7 @@ struct SymState {
     size_t idx = 0;                 // 当前读到第几根
     std::string bot_id;
     TfState tf_ind, tf_trend, tf_htf, tf_sr;
+    TfState tf_mtf[4];   // 多周期梯子：1h/4h/12h/1d 固定
     std::vector<srzones::Zone> zones;
     double atr = 0;
     int64_t last_sr = 0, last_slow = 0;
@@ -123,6 +124,8 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
         st.tf_htf.period   = interval_ms(cfg.htf_interval);
         st.tf_sr.period    = interval_ms(cfg.sr_interval);
         if (!st.tf_ind.period)   st.tf_ind.period = 3600000;
+        { const int64_t P[4]={3600000LL,14400000LL,43200000LL,86400000LL};
+          for (int i=0;i<4;++i) st.tf_mtf[i].period = P[i]; }
         if (!st.tf_trend.period) st.tf_trend.period = 14400000;
         if (!st.tf_htf.period)   st.tf_htf.period = 86400000;
         if (!st.tf_sr.period)    st.tf_sr.period = 14400000;
@@ -203,6 +206,8 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
 
             s.tf_ind.feed(b); s.tf_trend.feed(b); s.tf_htf.feed(b); s.tf_sr.feed(b);
             const auto& cfg = opt.base_cfg;
+            // 多周期梯子的四档聚合（循环变量不能叫 t——外层 t 是当前时间戳）
+            if (cfg.mtf_ladder) for (auto& mt : s.tf_mtf) mt.feed(b);
 
             // 指标
             {
@@ -211,6 +216,16 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
                     auto bo = indicators::bollinger(c, cfg.boll_period, cfg.boll_mult);
                     if (bo.ok) eng->update_indicator(s.bot_id, bo.lb, bo.ub,
                                                      indicators::rsi(c, cfg.rsi_period));
+                }
+            }
+            // 多周期梯子四档带值：1h 档跟指标同频，4h/12h/1d 跟慢速批次
+            if (cfg.mtf_ladder) {
+                for (int ti = 0; ti < 4; ++ti) {
+                    if (ti > 0 && b.ts_ms - s.last_slow < 300000) continue;
+                    const auto& mc = s.tf_mtf[ti].live();
+                    if ((int)mc.size() < cfg.boll_period + 1) continue;
+                    auto mbo = indicators::bollinger(mc, cfg.boll_period, cfg.boll_mult);
+                    if (mbo.ok) eng->update_mtf_band(s.bot_id, ti, mbo.lb, mbo.ub);
                 }
             }
             // 趋势 + 日线%B（5分钟一次）
@@ -305,6 +320,7 @@ PortfolioResult run_portfolio_stream(
         Bar pending{};
         bool has_pending = false;
         TfState tf_ind, tf_trend, tf_htf, tf_sr;
+        TfState tf_mtf[4];   // 多周期梯子：1h/4h/12h/1d 固定
         std::vector<srzones::Zone> zones;
         double atr = 0;
         int64_t last_sr = 0, last_slow = 0;
@@ -350,6 +366,8 @@ PortfolioResult run_portfolio_stream(
         ss->tf_htf.period   = interval_ms(cfg.htf_interval);
         ss->tf_sr.period    = interval_ms(cfg.sr_interval);
         if (!ss->tf_ind.period)   ss->tf_ind.period = 3600000;
+        { const int64_t P[4]={3600000LL,14400000LL,43200000LL,86400000LL};
+          for (int i=0;i<4;++i) ss->tf_mtf[i].period = P[i]; }
         if (!ss->tf_trend.period) ss->tf_trend.period = 14400000;
         if (!ss->tf_htf.period)   ss->tf_htf.period = 86400000;
         if (!ss->tf_sr.period)    ss->tf_sr.period = 14400000;
@@ -384,6 +402,7 @@ PortfolioResult run_portfolio_stream(
             if (opt.start_ms && b.ts_ms < opt.start_ms) continue;
 
             s.tf_ind.feed(b); s.tf_trend.feed(b); s.tf_htf.feed(b); s.tf_sr.feed(b);
+            if (cfg.mtf_ladder) for (auto& mt : s.tf_mtf) mt.feed(b);
 
             {
                 const auto& c = s.tf_ind.live();
@@ -391,6 +410,16 @@ PortfolioResult run_portfolio_stream(
                     auto bo = indicators::bollinger(c, cfg.boll_period, cfg.boll_mult);
                     if (bo.ok) eng->update_indicator(s.bot_id, bo.lb, bo.ub,
                                                      indicators::rsi(c, cfg.rsi_period));
+                }
+            }
+            // 多周期梯子四档带值：1h 档跟指标同频，4h/12h/1d 跟慢速批次
+            if (cfg.mtf_ladder) {
+                for (int ti = 0; ti < 4; ++ti) {
+                    if (ti > 0 && b.ts_ms - s.last_slow < 300000) continue;
+                    const auto& mc = s.tf_mtf[ti].live();
+                    if ((int)mc.size() < cfg.boll_period + 1) continue;
+                    auto mbo = indicators::bollinger(mc, cfg.boll_period, cfg.boll_mult);
+                    if (mbo.ok) eng->update_mtf_band(s.bot_id, ti, mbo.lb, mbo.ub);
                 }
             }
             if (b.ts_ms - s.last_slow >= 300000) {

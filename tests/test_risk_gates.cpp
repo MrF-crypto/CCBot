@@ -239,11 +239,59 @@ static void test_place_failure_is_loud() {
           "失败后本地不记单号（下次仓位变化会自动重试）");
 }
 
+
+// ── 用例5：多周期梯子的档位分配 ──────────────────────────────────────────────
+// 分配逻辑边界很多（手动/权重/层数不足/求和对不齐），而它决定"第几层用哪个
+// 周期的下轨"——错一位整个梯子的间距就全错了
+static void test_mtf_alloc() {
+    std::printf("\n── 用例5：多周期梯子档位分配 ──\n");
+    auto A = [](int n, const char* spec) {
+        CcgConfig c; c.max_entries = n; c.mtf_tier_layers = spec;
+        return CcgEngine::mtf_tier_alloc(c);
+    };
+    auto eq = [](std::array<int,4> g, int a, int b, int c, int d, const std::string& what) {
+        bool ok = (g[0]==a && g[1]==b && g[2]==c && g[3]==d);
+        std::printf("%s  %s (期望 %d/%d/%d/%d，实际 %d/%d/%d/%d)\n",
+            ok?"[ OK ]":"[FAIL]", what.c_str(), a,b,c,d, g[0],g[1],g[2],g[3]);
+        if (!ok) ++g_fail;
+    };
+
+    eq(A(8, "3,2,2,1"), 3,2,2,1, "手动 3/2/2/1");
+    eq(A(8, ""),        3,2,2,1, "空 → 按 3:2:2:1 权重（8层正好整除）");
+    eq(A(8, "2,2,2,2"), 2,2,2,2, "手动 2/2/2/2");
+    eq(A(8, "4,2,1,1"), 4,2,1,1, "手动 4/2/1/1");
+
+    // 求和与 max_entries 对不齐：以 max_entries 为准，从最深档裁剪/补足
+    eq(A(8, "3,3,3,3"), 3,3,2,0, "手动求和12>8 → 从最深档往前砍");
+    eq(A(8, "1,1,1,1"), 5,1,1,1, "手动求和4<8 → 差额补给浅档");
+
+    // 层数不足以铺满四档
+    eq(A(3, ""),        2,1,0,0, "3层 → 只用 1h 和 4h（深档砍掉）");
+    eq(A(1, ""),        1,0,0,0, "1层 → 只有首仓，全在 1h 档");
+    eq(A(2, ""),        1,1,0,0, "2层");
+
+    // 大层数
+    auto g16 = A(16, "");
+    int sum16 = g16[0]+g16[1]+g16[2]+g16[3];
+    std::printf("%s  16层按权重求和=16 (实际 %d：%d/%d/%d/%d)\n",
+        sum16==16?"[ OK ]":"[FAIL]", sum16, g16[0],g16[1],g16[2],g16[3]);
+    if (sum16 != 16) ++g_fail;
+
+    // 任何配置下总和都必须等于 max_entries——否则会出现"有槽位却没有档位归属"
+    for (int n : {1,2,3,5,8,13,20,50}) {
+        auto g = A(n, "");
+        int sum = g[0]+g[1]+g[2]+g[3];
+        if (sum != n) { std::printf("[FAIL]  %d层求和=%d\n", n, sum); ++g_fail; }
+    }
+    std::printf("[ OK ]  1~50 层的权重分配求和恒等于层数\n");
+}
+
 int main() {
     test_dca_margin_cap();
     test_disaster_stop_lifecycle();
     test_disabled_by_default();
     test_place_failure_is_loud();
+    test_mtf_alloc();
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

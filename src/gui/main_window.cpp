@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.6.0");
+    setWindowTitle("CCG 合约监控  v3.7.0");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -304,6 +304,10 @@ void MainWindow::save_bots() {
         o["rsi_oversold_th"]  = c.rsi_oversold_th;
         o["dynamic_band_mode"] = c.dynamic_band_mode;
         o["min_profit_floor"]  = c.min_profit_floor;
+        o["mtf_ladder"]        = c.mtf_ladder;
+        o["mtf_tier_layers"]   = QString::fromStdString(c.mtf_tier_layers);
+        o["mtf_k"]             = c.mtf_k;
+        o["mtf_min_gap_pct"]   = c.mtf_min_gap_pct;
         o["use_trend_filter"]  = c.use_trend_filter;
         o["trend_interval"]    = QString::fromStdString(c.trend_interval);
         o["trend_ema_period"]  = c.trend_ema_period;
@@ -403,6 +407,10 @@ void MainWindow::load_and_restore_bots() {
         c.rsi_oversold_th  = o["rsi_oversold_th"].toDouble(25.0);
         c.dynamic_band_mode = o["dynamic_band_mode"].toBool(true);
         c.min_profit_floor  = o["min_profit_floor"].toDouble(3.5);
+        c.mtf_ladder        = o["mtf_ladder"].toBool(false);
+        c.mtf_tier_layers   = o["mtf_tier_layers"].toString().toStdString();
+        c.mtf_k             = o["mtf_k"].toDouble(0.5);
+        c.mtf_min_gap_pct   = o["mtf_min_gap_pct"].toDouble(2.0);
         c.use_trend_filter  = o["use_trend_filter"].toBool(true);
         c.trend_interval    = o["trend_interval"].toString("4h").toStdString();
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
@@ -1209,6 +1217,41 @@ void MainWindow::onConnect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 多周期梯子：补齐 4h / 12h 两档的布林带。
+// 1h 和 1d 两档由指标拉取和宏观%B拉取顺带喂了（它们本来就在拉那两个周期的带），
+// 所以这里每个 bot 只多 2 个公开接口请求——限流治理还没做，能省则省。
+// ─────────────────────────────────────────────────────────────────────────────
+void MainWindow::refreshMtfBands() {
+    if (!client_ || !engine_) return;
+    if (mtfFetchBusy_.exchange(true)) return;
+
+    struct Need { std::string bot_id, symbol; int tier; std::string interval; int period; double mult; };
+    std::vector<Need> needs;
+    for (const auto& b : engine_->get_bots()) {
+        if (!b.cfg.mtf_ladder || b.state == CcgBot::State::Stopped) continue;
+        needs.push_back({b.bot_id, b.cfg.symbol, 1, "4h",  b.cfg.boll_period, b.cfg.boll_mult});
+        needs.push_back({b.bot_id, b.cfg.symbol, 2, "12h", b.cfg.boll_period, b.cfg.boll_mult});
+        // 指标/宏观用的不是 1h / 1d 时，那两档也得自己拉
+        if (b.cfg.kline_interval != "1h")
+            needs.push_back({b.bot_id, b.cfg.symbol, 0, "1h", b.cfg.boll_period, b.cfg.boll_mult});
+        if (b.cfg.htf_interval != "1d")
+            needs.push_back({b.bot_id, b.cfg.symbol, 3, "1d", b.cfg.boll_period, b.cfg.boll_mult});
+    }
+    if (needs.empty()) { mtfFetchBusy_.store(false); return; }
+
+    run_async([this, needs]() {
+        for (const auto& n : needs) {
+            auto snap = client_->fetch_indicators(n.symbol, n.interval, n.period, n.mult, 14);
+            if (!snap.ok) continue;
+            QMetaObject::invokeMethod(this, [this, n, snap]() {
+                if (engine_) engine_->update_mtf_band(n.bot_id, n.tier, snap.boll_lb, snap.boll_ub);
+            }, Qt::QueuedConnection);
+        }
+        mtfFetchBusy_.store(false);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 资金费账本刷新。
 // 这是【账本】不是风控：只记录和展示持有成本，不参与任何交易决策。
 // 永续合约每 8 小时结算一次资金费，这笔钱是真实划走的现金——价格涨回来也拿不回，
@@ -1620,6 +1663,46 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     form->addRow("", dynBandBox);
     auto* floorEdit = mkEdit("保底利润%(动态模式):",
                              prefill ? prefill->cfg.min_profit_floor : 3.5);
+
+    // ── 多周期梯子（v3.7 实验，默认关）────────────────────────────────────────
+    auto* mtfBox = new QCheckBox("多周期梯子（补仓档位锚定 1h/4h/12h/1d 下轨，越深的层要求越极端）");
+    mtfBox->setChecked(prefill ? prefill->cfg.mtf_ladder : false);
+    mtfBox->setToolTip(
+        "把补仓间距的来源从固定参数换成市场结构：梯子是 N 个有序槽位，\n"
+        "第 i 槽必须先跌破【它所属档位】那个周期的布林下轨，才武装追踪建仓。\n"
+        "带宽大致按 √T 缩放，所以 1h→4h→12h→1d 的间距天然递增，\n"
+        "浅回调只消耗第一档，深层弹药留给真正的大跌。\n\n"
+        "⚠ 实验功能，尚未经过完整回测验证。BTC 2021 单年的初步对照里它输给\n"
+        "现行动态W（收益/回撤 0.69 vs 3.08）——原因是补仓变克制之后，拉均价\n"
+        "的能力被削弱，仓位摊薄不下去。它的论点在持续阴跌里才成立，需要实盘\n"
+        "或完整回测积累数据。开启前请明白这一点。\n"
+        "只接管补仓间距，止盈那半（触上轨+保底利润）完全不变。");
+    form->addRow("", mtfBox);
+
+    auto* mtfTiersEdit = new QLineEdit(prefill ? QString::fromStdString(prefill->cfg.mtf_tier_layers) : "");
+    mtfTiersEdit->setPlaceholderText("留空=按 3:2:2:1 权重自动分配");
+    form->addRow("　　各档层数(1h,4h,12h,1d):", mtfTiersEdit);
+    auto* mtfKEdit   = mkEdit("　　最小间距系数k(×该档带宽):",
+                              prefill ? prefill->cfg.mtf_k : 0.5);
+    auto* mtfGapEdit = mkEdit("　　最小间距兜底%:",
+                              prefill ? prefill->cfg.mtf_min_gap_pct : 2.0);
+    {
+        auto* h = new QLabel(
+            "最小间距 = max(k × 该档带宽, 兜底%)，相对上一笔成交价。前者自适应——"
+            "瀑布本身是高波动事件，带子撑开时地板跟着撑开，挡住「四档同时触发、"
+            "整个梯子打在崩盘顶部」；后者防止带数据异常时失去地板。");
+        h->setWordWrap(true);
+        h->setStyleSheet("color:#8b949e;font-size:10px;");
+        form->addRow("", h);
+    }
+    auto syncMtfUi = [mtfBox, mtfTiersEdit, mtfKEdit, mtfGapEdit]() {
+        const bool on = mtfBox->isChecked();
+        mtfTiersEdit->setEnabled(on);
+        mtfKEdit->setEnabled(on);
+        mtfGapEdit->setEnabled(on);
+    };
+    syncMtfUi();
+    connect(mtfBox, &QCheckBox::toggled, &dlg, [syncMtfUi](bool) { syncMtfUi(); });
 
     // SR 雷达不再是独立选项：它是三层拦截/止盈锚/结构止损的【内部数据源】，
     // 由下面那几个开关自动带上（见提交时的 cfg.sr_radar 赋值）。
@@ -2096,6 +2179,10 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.rsi_oversold_th  = to_d(rsiOversoldEdit, 25.0);
     cfg.dynamic_band_mode = dynBandBox->isChecked();
     cfg.min_profit_floor  = to_d(floorEdit, 3.5);
+    cfg.mtf_ladder        = mtfBox->isChecked();
+    cfg.mtf_tier_layers   = mtfTiersEdit->text().trimmed().toStdString();
+    cfg.mtf_k             = to_d(mtfKEdit,   0.5);
+    cfg.mtf_min_gap_pct   = to_d(mtfGapEdit, 2.0);
     cfg.use_trend_filter  = trendBox->isChecked();
     cfg.smart_gates         = smartBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
@@ -2254,8 +2341,12 @@ void MainWindow::onTick() {
                                                        b.cfg.boll_period, b.cfg.boll_mult,
                                                        b.cfg.rsi_period);
                 if (!snap.ok) continue;
-                QMetaObject::invokeMethod(this, [this, bid = b.bot_id, snap]() {
-                    if (engine_) engine_->update_indicator(bid, snap.boll_lb, snap.boll_ub, snap.rsi);
+                const bool tier0 = b.cfg.mtf_ladder && b.cfg.kline_interval == "1h";
+                QMetaObject::invokeMethod(this, [this, bid = b.bot_id, snap, tier0]() {
+                    if (!engine_) return;
+                    engine_->update_indicator(bid, snap.boll_lb, snap.boll_ub, snap.rsi);
+                    // 复用：指标拉的就是 1h 带，正好是多周期梯子的第0档，不必再拉一次
+                    if (tier0) engine_->update_mtf_band(bid, 0, snap.boll_lb, snap.boll_ub);
                 }, Qt::QueuedConnection);
             }
             indFetchBusy_.store(false);
@@ -2267,7 +2358,7 @@ void MainWindow::onTick() {
 
     // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
-    if (fundTickCount_++ % 100 == 0) refreshFunding();
+    if (fundTickCount_++ % 100 == 0) { refreshFunding(); refreshMtfBands(); }
 
     // 成交明细的延迟落盘：save_trades 做了去抖，被压下的写在这里补上
     if (tradesDirty_) save_trades(true);
@@ -2325,8 +2416,12 @@ void MainWindow::onTick() {
                                                            20, 2.0, 14);
                     if (!snap.ok) continue;
                     double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
-                    QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb]() {
-                        if (engine_) engine_->update_htf(bid, pb);
+                    const bool tier3 = b.cfg.mtf_ladder && b.cfg.htf_interval == "1d";
+                    QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb, snap, tier3]() {
+                        if (!engine_) return;
+                        engine_->update_htf(bid, pb);
+                        // 复用：宏观层拉的就是日线带，正好是第3档
+                        if (tier3) engine_->update_mtf_band(bid, 3, snap.boll_lb, snap.boll_ub);
                     }, Qt::QueuedConnection);
                 }
                 trendFetchBusy_.store(false);
