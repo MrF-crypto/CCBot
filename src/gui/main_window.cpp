@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.5.5");
+    setWindowTitle("CCG 合约监控  v3.6.0");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1304,39 +1304,9 @@ void MainWindow::refreshSrZones() {
     });
 }
 
-void MainWindow::checkSrTouches() {
-    if (!ticker_) return;
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    for (auto& [sym, st] : srStates_) {
-        if (st.zones.empty()) continue;
-        double price = ticker_->mid_price(sym);
-        if (price <= 0) continue;
-
-        for (const auto& z : st.zones) {
-            if (!z.contains(price)) continue;
-            // 去重：每个区域独立2小时冷却（相邻区域边界横跳不再刷屏）
-            long long zkey = (long long)std::llround(z.mid() * 1e4);
-            auto ait = st.alerted.find(zkey);
-            if (ait != st.alerted.end() && (now - ait->second) < 2 * 3600 * 1000) break;
-            st.alerted[zkey] = now;
-            // 清理过期条目，防止长期运行无限增长
-            for (auto it2 = st.alerted.begin(); it2 != st.alerted.end();)
-                it2 = (now - it2->second > 4 * 3600 * 1000) ? st.alerted.erase(it2) : std::next(it2);
-
-            int conf = z.confluence_independent();   // 与决策层同口径
-            QString kind = QString::fromStdString(srzones::src_label(z));
-            if (conf >= 2) kind += QString(" ×%1共振").arg(conf);
-            QString msg = QString("[SR雷达] %1 价格 %2 进入区域[%3]（%4 ~ %5，评分%6，触碰%7次）")
-                .arg(QString::fromStdString(sym)).arg(price, 0, 'f', 4).arg(kind)
-                .arg(z.lo, 0, 'f', 4).arg(z.hi, 0, 'f', 4)
-                .arg(z.score, 0, 'f', 1).arg(z.touches);
-            log(msg, "WARN");
-            sendAlert(msg);
-            break;   // 一个tick最多报一个区域
-        }
-    }
-}
-
+// 触区告警已移除：SR 区域现在是三层拦截的内部数据源，不再是需要人盯的事件。
+// 它每 tick 都可能触发，是运行日志里最占地方的一类，而拦截生效后"价格进了某个区域"
+// 本身并不需要人做任何事——该拦的闸门已经拦了。
 void MainWindow::openSrZonesDialog(const std::string& symbol) {
     auto it = srStates_.find(symbol);
     double price = ticker_ ? ticker_->mid_price(symbol) : 0;
@@ -1651,15 +1621,10 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* floorEdit = mkEdit("保底利润%(动态模式):",
                              prefill ? prefill->cfg.min_profit_floor : 3.5);
 
-    // ── SR雷达（v2.6 影子模式）───────────────────────────────────────────────
-    auto* srBox = new QCheckBox("SR雷达（自动检测支撑/阻力区+触区告警，不参与下单）");
-    srBox->setChecked(prefill ? prefill->cfg.sr_radar : true);
-    srBox->setToolTip(
-        "自动检测该品种 4h 级别的支撑/阻力区域（摆动点聚类+攻防转换+FVG缺口），\n"
-        "约15分钟刷新一次。价格触及区域时打日志+webhook告警（同区域2小时去重）。\n"
-        "右键品种→【支撑/阻力区...】查看当前区域列表。\n"
-        "影子模式：只观察不下单——先验证'程序的眼睛'准不准，执行接线是下一阶段。");
-    form->addRow("", srBox);
+    // SR 雷达不再是独立选项：它是三层拦截/止盈锚/结构止损的【内部数据源】，
+    // 由下面那几个开关自动带上（见提交时的 cfg.sr_radar 赋值）。
+    // 曾经暴露成勾选框，是影子模式时期"先验证眼睛准不准"的遗留——那个阶段已经过去，
+    // 而留着它只会让人把结构层的数据源关掉、把闸门变成永久 fail-open。
 
     // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
     auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
@@ -2132,18 +2097,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.dynamic_band_mode = dynBandBox->isChecked();
     cfg.min_profit_floor  = to_d(floorEdit, 3.5);
     cfg.use_trend_filter  = trendBox->isChecked();
-    cfg.sr_radar          = srBox->isChecked();
     cfg.smart_gates         = smartBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
     cfg.sr_headroom_ratio   = to_d(headroomEdit, 3.0);
     cfg.use_sr_exit         = srExitBox->isChecked();
     cfg.use_structural_stop = structStopBox->isChecked();
-    // 防呆：三层拦截/止盈锚/结构止损都依赖SR雷达数据——开了它们却没开雷达，
-    // 结构层会静默地永久fail-open（形同虚设）。自动带上并提示
-    if ((cfg.smart_gates || cfg.use_sr_exit || cfg.use_structural_stop) && !cfg.sr_radar) {
-        cfg.sr_radar = true;
-        log("已自动开启SR雷达：三层决策/止盈锚/结构止损依赖它的区域数据", "WARN");
-    }
+    // SR 雷达跟着依赖它的功能自动开关，用户不再单独控制：
+    // 开了三层拦截却没有区域数据，结构层会静默地永久 fail-open（闸门形同虚设）；
+    // 反过来三个都没开时雷达也没有存在意义，白占 K 线拉取额度
+    cfg.sr_radar = cfg.smart_gates || cfg.use_sr_exit || cfg.use_structural_stop;
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -2302,7 +2264,6 @@ void MainWindow::onTick() {
 
     // SR雷达：区域每 300 tick（约15分钟）重算一次（首tick立刻算），触区检查每tick做（本地、零开销）
     if (srTickCount_++ % 300 == 0) refreshSrZones();
-    checkSrTouches();
 
     // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
@@ -2484,6 +2445,21 @@ void MainWindow::refreshPositions() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Bot 表格刷新
 // ─────────────────────────────────────────────────────────────────────────────
+// 动态W模式下"保底达标"只是必要条件：还要价格触及上轨才会激活追踪止盈。
+// 只显示"已达标"会让人以为马上就要平仓了
+static QString bot_tp_hint(const CcgBot& b, bool floor_ok) {
+    if (b.ind_boll_ub <= 0)
+        return QStringLiteral("上轨数据未就绪");
+    const bool is_long = (b.cfg.direction != CcgConfig::Direction::Short);
+    const double band = is_long ? b.ind_boll_ub : b.ind_boll_lb;
+    const bool touched = is_long ? (b.current_price >= band) : (b.current_price <= band);
+    if (touched && floor_ok) return QStringLiteral("上轨已触及 + 保底达标 → 追踪止盈已可激活");
+    if (!floor_ok)           return QString("还需价格涨到 %1 才够保底").arg(
+                                    b.avg_price * (1.0 + b.cfg.min_profit_floor / 100.0), 0, 'f', 4);
+    return QString("保底已达标，但还需触及%1轨 %2")
+           .arg(is_long ? "上" : "下").arg(band, 0, 'f', 4);
+}
+
 void MainWindow::refreshBotTable() {
     if (!engine_) { botTable_->setRowCount(0); return; }
 
@@ -2639,7 +2615,35 @@ void MainWindow::refreshBotTable() {
         QString roi_s = (margin > 0)
             ? QString("%1%2%").arg(roi >= 0 ? "+" : "").arg(roi, 0, 'f', 1)
             : "--";
-        botTable_->setItem(i, 10, mkc(roi_s, roi >= 0 ? QColor("#3fb950") : QColor("#f85149")));
+        auto* roi_item = mkc(roi_s, roi >= 0 ? QColor("#3fb950") : QColor("#f85149"));
+        // 这一列是【杠杆后的资金回报率】（浮盈÷保证金），而止盈用的所有 % 都是
+        // 【价格相对均价的涨幅】——两者差一个杠杆倍数。盯着这一列判断"快到止盈没"
+        // 会系统性误判：3倍杠杆下保底利润 2% 触发时，这里显示的是 +6%。
+        // 悬停把两个口径并排放出来，消掉这个误读
+        if (margin > 0 && b.avg_price > 0 && b.current_price > 0) {
+            const bool is_long = (b.cfg.direction != CcgConfig::Direction::Short);
+            double gain = (is_long ? (b.current_price / b.avg_price - 1.0)
+                                   : (1.0 - b.current_price / b.avg_price)) * 100.0;
+            const double floor_pct = b.cfg.min_profit_floor;
+            QString tip = QString("浮动盈亏 $%1\n保证金 $%2\n收益率 %3%4%（已按 %5x 杠杆放大）\n\n"
+                                  "── 止盈实际看的是价格涨幅 ──\n价格涨幅 %6%7%")
+                .arg(unreal, 0, 'f', 2).arg(margin, 0, 'f', 2)
+                .arg(roi >= 0 ? "+" : "").arg(roi, 0, 'f', 1).arg(b.cfg.leverage)
+                .arg(gain >= 0 ? "+" : "").arg(gain, 0, 'f', 2);
+            if (b.cfg.dynamic_band_mode) {
+                tip += QString("（保底线 %1%，%2）")
+                    .arg(floor_pct, 0, 'f', 1)
+                    .arg(gain >= floor_pct ? "已达标" : "未达标");
+                // 达标只是必要条件：动态W下还要触上轨才激活追踪止盈
+                tip += QString("\n%1").arg(bot_tp_hint(b, gain >= floor_pct));
+            } else {
+                tip += QString("（止盈线 %1%，%2）")
+                    .arg(b.cfg.tp_pct, 0, 'f', 1)
+                    .arg(gain >= b.cfg.tp_pct ? "已达标" : "未达标");
+            }
+            roi_item->setToolTip(tip);
+        }
+        botTable_->setItem(i, 10, roi_item);
 
         // 强平价：来自交易所真实持仓（refreshPositions() 每 3s 拉取一次），本地无法准确估算
         double liq = has_real_pos ? pit->second.liq_price : 0;

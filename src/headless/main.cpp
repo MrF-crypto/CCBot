@@ -251,8 +251,6 @@ int main(int argc, char** argv) {
     std::mutex sr_mtx;   // sr_zones_map/sr_atr_map 由拉取线程写、主循环读
     std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
     std::map<std::string, double> sr_atr_map;   // 区域计算时的ATR（结构止损位推导）
-    // 告警去重：sym → (区域mid×1e4 → 上次告警ms)。每区域独立冷却，防边界横跳刷屏
-    std::map<std::string, std::map<long long, int64_t>> sr_alert_dedup;
     auto fetch_pool = std::make_shared<ThreadPool>(2);
 
     // ── 资金费账本 ───────────────────────────────────────────────────────────
@@ -395,37 +393,9 @@ int main(int argc, char** argv) {
                 });
             }
         }
-        {
-            std::lock_guard<std::mutex> lk(sr_mtx);
-            for (const auto& [sym, zones] : sr_zones_map) {
-                double price = ticker.mid_price(sym);
-                if (price <= 0) continue;
-                for (const auto& z : zones) {
-                    if (!z.contains(price)) continue;
-                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    auto& seen = sr_alert_dedup[sym];
-                    long long zkey = (long long)std::llround(z.mid() * 1e4);
-                    auto ait = seen.find(zkey);
-                    if (ait != seen.end() && now_ms - ait->second < 2 * 3600 * 1000) break;
-                    seen[zkey] = now_ms;
-                    for (auto it2 = seen.begin(); it2 != seen.end();)
-                        it2 = (now_ms - it2->second > 4 * 3600 * 1000) ? seen.erase(it2) : std::next(it2);
-                    std::ostringstream ss;
-                    int conf = z.confluence_independent();   // 与决策层同口径
-                    ss << "[SR雷达] " << sym << " 价格 " << price << " 进入区域["
-                       << srzones::src_label(z);
-                    if (conf >= 2) ss << " ×" << conf << "共振";
-                    ss << "]（" << z.lo << " ~ " << z.hi << "，评分" << z.score
-                       << "，触碰" << z.touches << "次）";
-                    log_line(ss.str(), "WARN");
-                    if (!webhook.empty()) {
-                        std::thread([w = webhook, text = ss.str()]() { send_webhook(w, text); }).detach();
-                    }
-                    break;
-                }
-            }
-        }
+        // 触区告警已移除：SR 区域现在是三层拦截的内部数据源，不再是需要人盯的事件。
+        // 它每 tick 都可能触发，是运行日志里最占地方的一类，而拦截生效后
+        // "价格进了某个区域"本身并不需要人做任何事——该拦的闸门已经拦了。
 
         // ── 4) 趋势状态机 + v3.0日线%B（每约5分钟，异步同班车）────────────────
         if ((tick_n - 1) % 100 == 0 && !trend_busy.load()) {

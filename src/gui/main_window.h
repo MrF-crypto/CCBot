@@ -74,7 +74,6 @@ private:
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
     void refreshSrZones();
     void refreshFunding();                                // 定期重算区域（约15分钟一次）
-    void checkSrTouches();                                // 每tick检查价格是否触区
     void openSrZonesDialog(const std::string& symbol);    // 右键查看区域列表
     void refreshStats();
     void openTradeHistoryDialog();
@@ -171,9 +170,6 @@ private:
         std::vector<srzones::Zone> zones;
         double atr = 0;           // 区域计算时的ATR（结构止损位推导用）
         qint64 computed_ms = 0;   // 上次重算时间
-        // 告警去重：每个区域（按中点标识）独立记冷却时间。只记"上一个区域"的话，
-        // 价格在两个相邻区域边界来回横跳会 A→B→A→B 每次都触发，十分钟刷几十条
-        std::map<long long, qint64> alerted;   // llround(mid×1e4) → 上次告警ms
     };
     std::map<std::string, SrState> srStates_;
     int srTickCount_    = 0;

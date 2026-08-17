@@ -622,13 +622,7 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             bot.tp_reached = true;
             bot.tp_extreme = price;
             if (eff.dyn) {
-                // 影子对照：未启用阻力锚时，记录"若启用会更早在哪激活"供两周后对比
-                std::string extra;
-                if (!bot.cfg.use_sr_exit && bot.sr_ok &&
-                    bot.sr_res_lo > bot.avg_price && bot.sr_res_lo < bot.ind_boll_ub)
-                    extra = "（参考：若启用阻力锚将更早在 " +
-                            std::to_string(bot.sr_res_lo) + " 激活）";
-                log(bot.cfg.symbol + " 止盈追踪激活 @" + std::to_string(price) + extra);
+                log(bot.cfg.symbol + " 止盈追踪激活 @" + std::to_string(price));
             }
         }
         if (bot.tp_reached) {
@@ -747,16 +741,13 @@ void CcgEngine::tick(const std::string& symbol, double price) {
             update_tracking(bot, price);
 
             // v3.0 结构性止损（仅多头+动态W模式）：价格持续跌破参考位（最深支撑下沿
-            // -0.25×ATR）20个tick≈1分钟才触发——插针防护。影子模式只记录一次不平仓
+            // -0.25×ATR）20个tick≈1分钟才触发——插针防护。未启用时不再打影子日志
             bool struct_stop_fire = false;
             if (!bot.entries.empty() && bot.cfg.direction == CcgConfig::Direction::Long &&
                 bot.cfg.dynamic_band_mode && bot.sr_stop_level > 0 && bot.sr_ok &&
                 (host_.now_steady() - bot.sr_time) < std::chrono::minutes(30)) {
                 if (price < bot.sr_stop_level) {
                     ++bot.struct_stop_ticks;
-                    if (bot.struct_stop_ticks == 20 && !bot.cfg.use_structural_stop)
-                        log("[决策] " + bot.cfg.symbol + " 已持续跌破结构止损位 " +
-                            std::to_string(bot.sr_stop_level) + "（影子：未启用结构止损，仅记录）");
                     if (bot.struct_stop_ticks >= 20 && bot.cfg.use_structural_stop)
                         struct_stop_fire = true;
                 } else {
@@ -833,17 +824,19 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     }
                 }
 
-                // v3.0 三层决策（宏观%B + 结构定位）：smart_gates=false 时纯影子——
-                // 只在首仓真正派发时把判定快照写进日志；true 时新增两层真实拦截
+                // v3.0 三层决策（宏观%B + 结构定位）。
+                // 影子模式（算了但不拦、只写快照日志）已移除：它属于"先验证程序的眼睛
+                // 准不准"的阶段，那个阶段已经结束。现在 smart_gates 关掉就是完全不参与，
+                // 不再空跑一遍判定去刷日志。
                 std::string decision_snap;
-                if (can_enter) {
+                if (can_enter && bot.cfg.smart_gates) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
                     auto snow = host_.now_steady();
 
                     decision::Inputs din;
                     din.is_long     = is_long;
-                    // 启用拦截时数据缺失同样不放行：宁可错过不可乱开
-                    din.strict      = bot.cfg.smart_gates;
+                    // 数据缺失不放行：宁可错过不可乱开
+                    din.strict      = true;
                     din.use_htf     = bot.cfg.use_htf_filter;
                     din.htf_ok      = bot.htf_ok && (snow - bot.htf_time) < std::chrono::minutes(30);
                     din.htf_pct_b   = bot.htf_pct_b;
@@ -884,7 +877,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     auto verdict  = decision::evaluate(din);
                     decision_snap = decision::summarize(din, verdict);
 
-                    if (!verdict.pass() && bot.cfg.smart_gates) {
+                    if (!verdict.pass()) {
                         can_enter = false;
                         // 数据未就绪与条件不满足分开提示——前者是"等一等"，
                         // 后者是"这里不该买"，用户看日志时需要能区分
@@ -920,11 +913,11 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     bot.inflight_margin = first_margin;
                     do_entry.push_back(id);
                     bot.pending = true;
-                    // v3.0 决策快照随首仓派发落日志（影子模式的数据积累点）
+                    // 决策快照随首仓派发落日志
                     if (!decision_snap.empty())
+                        // 保留：一轮只打一次，是事后复盘"这单当初凭什么开"的唯一依据
                         log("[决策] " + bot.cfg.symbol + " 首仓派发 @" +
-                            std::to_string(price) + " | " + decision_snap +
-                            (bot.cfg.smart_gates ? "" : " (影子)"));
+                            std::to_string(price) + " | " + decision_snap);
                 }
             } else if (should_stop_loss(bot, price)) {
                 // 硬止损优先于追踪止盈
