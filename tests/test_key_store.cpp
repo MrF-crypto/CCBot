@@ -73,7 +73,15 @@ int main() {
         check(r.account_mode == 1,    "  account_mode=1 保持");
     }
 
-    // ③ 向后兼容：升级前保存的3行密文
+    // ③④ 向后兼容：升级前保存的 3 行密文。
+    // macOS 的后端是【系统钥匙串】，path 参数根本不用——写一个明文文件再 load，
+    // 读到的仍是钥匙串里上一个用例存进去的值，这两条在 mac 上没有意义。
+    // （CI 首次覆盖 macOS 时立刻报错才发现，此前只在 Windows 上跑过。）
+    // Windows(DPAPI 文件) 与 Linux(明文文件兜底) 仍然覆盖这段解析逻辑，
+    // 而它本身是平台无关的共享代码
+#if defined(__APPLE__)
+    std::printf("[SKIP]  旧版格式兼容用例（macOS 用钥匙串后端，不经过文件）\n");
+#else
     {
         check(write_legacy_blob(path, "OLDKEY\nOLDSEC\n1"), "造一份旧版3行密文");
 
@@ -94,6 +102,7 @@ int main() {
         check(r.testnet == false,   "  testnet=false 正确");
         check(r.account_mode == 0,  "  account_mode=0 正确");
     }
+#endif
 
     std::remove(path.c_str());
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
