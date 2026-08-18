@@ -28,7 +28,11 @@ public:
         int    order_min_gap_ms = 0;      // 订单不额外铺平
     };
 
-    explicit RateGate(Limits lim = {}) : lim_(lim) {}
+    // 不用 `RateGate(Limits lim = {})`：那个默认实参要求在类定义内部就取到
+    // Limits 的默认成员初始化器，Clang 严格执行这条规则并报错（MSVC 放行）。
+    // 拆成两个构造函数就没有这个问题
+    RateGate() = default;
+    explicit RateGate(Limits lim) : lim_(lim) {}
 
     // 发请求【前】调用。会在必要时阻塞当前线程。
     // is_order=true 的请求只在封禁期间被拦，不参与软限速。
@@ -52,7 +56,7 @@ public:
 private:
     using clock = std::chrono::steady_clock;
     mutable std::mutex mtx_;
-    Limits  lim_;
+    Limits  lim_{};
     int     used_weight_ = 0;
     clock::time_point weight_at_{};
     clock::time_point ban_until_{};
