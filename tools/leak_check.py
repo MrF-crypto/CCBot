@@ -18,6 +18,15 @@ import re
 import sys
 from pathlib import Path
 
+# Windows CI 的控制台默认不是 UTF-8，直接 print 中文会抛 UnicodeEncodeError
+# 把整个门禁弄挂（实测过）。errors='replace' 保证再冷门的环境也不会因为编码问题
+# 让检查本身失败——门禁只该因为"真的有问题"而失败
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # 允许出现在发布包里的文件后缀（Windows / macOS / Linux 三平台合集）。
 # 无后缀文件单独处理：macOS/Linux 的可执行文件没有后缀
 ALLOWED_SUFFIX = {".dll", ".exe", ".dylib", ".so"}

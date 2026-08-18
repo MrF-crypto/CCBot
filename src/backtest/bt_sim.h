@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cmath>   // std::floor —— GCC 不会间接带进来
 
 // 模拟撮合器：实现 ITradingClient，让回测跑【引擎本尊】。
 // 成交模型：市价单在当前价上按【该分钟的真实买卖价差】滑点成交（数据里的

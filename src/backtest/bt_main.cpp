@@ -8,6 +8,7 @@
 #include "backtest/bt_portfolio.h"
 #include <filesystem>
 #include <iostream>
+#include <cmath>
 #include <fstream>
 #include <cstdlib>
 #include <iomanip>
