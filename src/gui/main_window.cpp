@@ -103,7 +103,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.8.2");
+    setWindowTitle("CCG 合约监控  v3.8.3");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -2774,6 +2774,10 @@ void MainWindow::refreshBotTable() {
                         // 答案就在这里（趋势/三层/保证金）——这个字段以前完全不上界面
                         if (!b.last_action.empty())
                             signal_tip += "\n当前引擎记录：" + QString::fromStdString(b.last_action);
+                        // 完整判据快照带实时数字，每 tick 刷新——"信号已满足却不开仓"
+                        // 时，这一行直接告诉你是三条里的哪一条把它挡住的
+                        if (!b.last_decision.empty())
+                            signal_tip += "\n三层判据：" + QString::fromStdString(b.last_decision);
                     }
                 } else {
                     // 「立即开仓」模式没有指标信号这道闸，所以卡住的原因只可能来自
@@ -2789,6 +2793,8 @@ void MainWindow::refreshBotTable() {
                                  "（同一原因只打一次，不会重复刷）。";
                     if (!b.last_action.empty())
                         signal_tip += "\n\n当前引擎记录：" + QString::fromStdString(b.last_action);
+                    if (!b.last_decision.empty())
+                        signal_tip += "\n三层判据：" + QString::fromStdString(b.last_decision);
                 }
             } else {
                 state_s = b.cfg.dynamic_band_mode ? "运行中·动态W" : "运行中";

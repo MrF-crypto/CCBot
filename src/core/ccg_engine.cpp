@@ -1002,6 +1002,9 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
                     auto verdict  = decision::evaluate(din);
                     decision_snap = decision::summarize(din, verdict);
+                    // 每次判定都刷新（不管放行还是拦截），界面据此显示实时判据。
+                    // 与 last_action 分开：那个是去重键，必须保持稳定
+                    bot.last_decision = decision_snap;
 
                     if (!verdict.pass()) {
                         can_enter = false;

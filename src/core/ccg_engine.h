@@ -396,7 +396,12 @@ struct CcgBot {
 
     std::chrono::system_clock::time_point start_time;
     std::chrono::system_clock::time_point cooldown_until;
+    // last_action 同时是【日志去重键】：只有它变了才打新日志。所以它必须是稳定的
+    // 短字符串，不能塞进带实时数字的详情——否则每个 tick 都不相等，日志会 3 秒刷一条
     std::string last_action;
+    // 三层决策的完整快照（"%B=0.34✓ | 支撑✗无 | 净空0.42✗不足"）。每次判定都更新，
+    // 不参与去重，纯供界面展示——"信号已满足却不开仓"时，答案就在这里
+    std::string last_decision;
 };
 
 // ─── 交易明细：每次平仓（止盈/止损/手动）产生一条记录 ─────────────────────────
