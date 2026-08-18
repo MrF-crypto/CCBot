@@ -1,0 +1,147 @@
+# Windows 构建与发布。
+#
+# 存在的理由：开发机只有 MSVC，本机"编译通过"不代表别的平台能编（v3.9.0 首次打 tag
+# 时 macOS 就因为一处 Clang 严格规则失败了）。反过来，Windows 是主要发布平台，
+# 却一直靠人工编译、人工打包、人工做泄漏检查——最危险的一步全靠自觉。
+#
+# 这条流水线做三件本机做不到的事：
+#   ① 推 main 就跑，不用等发布那一刻才暴露问题
+#   ② 跑【全部】测试套件（macOS 那条历史上只跑了 1/6）
+#   ③ 泄漏检查是硬门禁，不通过就没有产物 —— 凭证不可能被打进公开 Release
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 最小权限：默认只读。只有打 tag 的发布步骤需要写，单独在那一步声明
+permissions:
+  contents: read
+
+env:
+  VCPKG_TAG: '2026.07.29'          # 与 macOS 流水线保持同一版本，避免依赖漂移
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # Action 全部钉到 commit SHA 而不是 @v4：标签是可以被重新指向的，
+      # 供应链攻击的常见入口就是劫持一个被广泛引用的 Action 标签
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up vcpkg
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$VCPKG_TAG" https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      # 依赖二进制缓存：第一次要编 Qt（几十分钟），之后命中缓存只要几分钟。
+      # restore + save 拆开而不是用 actions/cache：构建失败时也要把已编好的包存下来，
+      # 否则每次调试失败都从零重编所有依赖
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-win-
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Save vcpkg binary cache (even on failure)
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+
+      - name: Upload vcpkg failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: vcpkg-failure-logs-windows
+          path: |
+            build/vcpkg-manifest-install.log
+            ${{ runner.temp }}/vcpkg/buildtrees/*/*.log
+          if-no-files-found: ignore
+
+      # 全部测试套件。历史上 CI 只跑了指标那一套，风控闸门/资金费/限流/订单路径/
+      # 凭证存储五套都没跑过——那等于测试写了却没人守着
+      - name: Run all test suites
+        shell: bash
+        run: |
+          set -e
+          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
+                   ccg_funding_tests ccg_rate_tests ccg_order_tests; do
+            echo "── $t ──"
+            ./build/Release/$t.exe
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          mkdir -p pkg/platforms
+          cd build/Release
+          cp CCGMonitor.exe *.dll ../../pkg/
+          cp platforms/qwindows.dll ../../pkg/platforms/
+          cd ../..
+          ls -la pkg | head -30
+
+      # 硬门禁：白名单校验 + 内嵌版本号核对。
+      # 不通过则整个 job 失败，没有任何产物产生 —— data/ 里的 API 凭证、持仓状态、
+      # 交易记录不可能被打进公开 Release
+      - name: Leak check (hard gate)
+        shell: bash
+        run: |
+          VER=""
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
+          if [ -n "$VER" ]; then
+            python tools/leak_check.py pkg --expect-version "$VER" --exe CCGMonitor.exe
+          else
+            python tools/leak_check.py pkg
+          fi
+
+      - name: Zip
+        shell: bash
+        run: |
+          VER="${GITHUB_REF#refs/tags/}"
+          [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
+          cd pkg && 7z a "../ccbot-$VER-win64.zip" . >/dev/null
+          cd .. && ls -la ccbot-*.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ccbot-win64
+          path: ccbot-*.zip
+
+  # 发布单独一个 job：只有它需要写权限，且只在打 tag 时运行。
+  # 权限范围越窄，一旦某个 Action 被投毒能造成的破坏越小
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: ccbot-win64
+      - name: Attach to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: ccbot-*.zip
+          fail_on_unmatched_files: true

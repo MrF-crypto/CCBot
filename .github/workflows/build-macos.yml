@@ -6,13 +6,17 @@
 name: build-macos
 
 on:
-  workflow_dispatch:
   push:
+    branches: [main]              # 推 main 就跑：不要等到发布那一刻才发现编不过
     tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
-# 把产物挂到 Release 需要 contents 写权限（默认令牌是只读的，attach 步骤会 403）
+# 默认只读。挂载 Release 需要写权限，但只给那一步（见 job 级 permissions）——
+# 权限范围越窄，一旦某个 Action 被投毒能造成的破坏越小
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -27,8 +31,10 @@ jobs:
             runner: macos-15-intel
             triplet: x64-osx
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write          # 仅为最后一步的 Release 挂载
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install build tools
         # autoconf 系列是 libb2（qtbase 依赖）的构建要求，runner 没预装
@@ -44,7 +50,7 @@ jobs:
       # 否则每次调试失败都要从零重编所有依赖
       - name: Restore vcpkg binary cache
         id: vcpkg-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.cache/vcpkg/archives
           key: vcpkg-osx-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}
@@ -62,7 +68,7 @@ jobs:
 
       - name: Save vcpkg binary cache (even on failure)
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.cache/vcpkg/archives
           key: vcpkg-osx-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
@@ -70,7 +76,7 @@ jobs:
       # 依赖编译失败时把 vcpkg 的详细日志传出来，否则只能看到 BUILD_FAILED 一个词
       - name: Upload vcpkg failure logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: vcpkg-failure-logs-${{ matrix.arch }}
           path: |
@@ -78,23 +84,44 @@ jobs:
             /Users/runner/vcpkg/buildtrees/*/*.log
           if-no-files-found: ignore
 
-      - name: Run unit tests
-        run: ./build/ccg_indicator_tests
+      # 全部测试套件。此前只跑指标那一套，风控闸门/资金费/限流/订单路径/凭证存储
+      # 五套都没跑过——测试写了却没人守着
+      - name: Run all test suites
+        run: |
+          set -e
+          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests                    ccg_funding_tests ccg_rate_tests ccg_order_tests; do
+            echo "── $t ──"
+            ./build/$t
+          done
 
       - name: Package
         run: |
           mkdir -p pkg
           cp build/CCGMonitor build/ccbot_headless pkg/
+
+      # 硬门禁：白名单校验 + 内嵌版本号核对。mac 包此前完全没有这一步
+      - name: Leak check (hard gate)
+        run: |
+          VER=""
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
+          if [ -n "$VER" ]; then
+            python3 tools/leak_check.py pkg --expect-version "$VER" --exe CCGMonitor
+          else
+            python3 tools/leak_check.py pkg
+          fi
+
+      - name: Zip
+        run: |
           cd pkg && zip -r ../ccbot-macos-${{ matrix.arch }}.zip .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ccbot-macos-${{ matrix.arch }}
           path: ccbot-macos-${{ matrix.arch }}.zip
 
       - name: Attach to release (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: ccbot-macos-${{ matrix.arch }}.zip

@@ -1,0 +1,135 @@
+# Linux 构建（ccbot_headless）。
+#
+# 两个目的：
+#   ① 可移植性门禁 —— 第三个编译器（GCC）。v3.9.0 那次就是 MSVC 放行、Clang 拒绝；
+#      GCC 又有自己的严格之处，多一个编译器就多一层保险
+#   ② 产出预编译的 Linux 二进制 —— headless 要跑在 VPS 上，而此前只能自己 clone 编，
+#      需要在服务器上装 vcpkg、编一堆依赖，门槛不低
+#
+# GUI 在 Linux 不构建（CMakeLists 是 `if(WIN32 OR APPLE)`），这里只编 headless
+# 与全部测试。vcpkg.json 把 Qt 标了 platform:windows，所以 Linux 上不会去装 Qt。
+name: build-linux
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_TAG: '2026.07.29'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool
+
+      - name: Set up vcpkg
+        run: |
+          git clone --depth 1 --branch "$VCPKG_TAG" https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-linux-
+
+      - name: Configure
+        run: |
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-linux
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Save vcpkg binary cache (even on failure)
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+
+      - name: Upload vcpkg failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: vcpkg-failure-logs-linux
+          path: |
+            build/vcpkg-manifest-install.log
+            ${{ runner.temp }}/vcpkg/buildtrees/*/*.log
+          if-no-files-found: ignore
+
+      - name: Run all test suites
+        run: |
+          set -e
+          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
+                   ccg_funding_tests ccg_rate_tests ccg_order_tests; do
+            echo "── $t ──"
+            ./build/$t
+          done
+
+      - name: Package
+        run: |
+          set -e
+          mkdir -p pkg
+          cp build/ccbot_headless pkg/
+          cp config.example.json pkg/
+          chmod +x pkg/ccbot_headless
+
+      # 泄漏检查同样是硬门禁。config.example.json 是模板（不含真凭证），但白名单
+      # 只放行可执行文件，所以要在检查【之后】再放进 zip
+      - name: Leak check (hard gate)
+        run: |
+          rm -f pkg/config.example.json
+          VER=""
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
+          if [ -n "$VER" ]; then
+            python3 tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless
+          else
+            python3 tools/leak_check.py pkg
+          fi
+          cp config.example.json pkg/
+
+      - name: Zip
+        run: |
+          VER="${GITHUB_REF#refs/tags/}"
+          [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
+          cd pkg && zip -r "../ccbot-$VER-linux-x64.zip" . && cd ..
+          ls -la ccbot-*.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ccbot-linux-x64
+          path: ccbot-*.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: ccbot-linux-x64
+      - name: Attach to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: ccbot-*.zip
+          fail_on_unmatched_files: true
