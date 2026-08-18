@@ -103,7 +103,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.8.1");
+    setWindowTitle("CCG 合约监控  v3.8.2");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1756,15 +1756,10 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     addSub(dcaForm, "最小间距系数 k（×该档带宽）", mtfKEdit);
     auto* mtfGapEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.mtf_min_gap_pct : 2.0));
     addSub(dcaForm, "最小间距兜底%", mtfGapEdit);
-    {
-        auto* h = new QLabel(
-            "最小间距 = max(k × 该档带宽, 兜底%)，相对上一笔成交价。前者自适应——"
-            "瀑布本身是高波动事件，带子撑开时地板跟着撑开，挡住「四档同时触发、"
-            "整个梯子打在崩盘顶部」；后者防止带数据异常时失去地板。");
-        h->setWordWrap(true);
-        h->setStyleSheet("color:#8b949e;font-size:10px;");
-        form->addRow("", h);
-    }
+    addHint(dcaForm,
+        "最小间距 = max(k × 该档带宽, 兜底%)，相对上一笔成交价。前者自适应——"
+        "瀑布本身是高波动事件，带子撑开时地板跟着撑开，挡住「四档同时触发、"
+        "整个梯子打在崩盘顶部」；后者防止带数据异常时失去地板。");
     auto syncMtfUi = [mtfBox, mtfTiersEdit, mtfKEdit, mtfGapEdit]() {
         const bool on = mtfBox->isChecked();
         mtfTiersEdit->setEnabled(on);
@@ -1789,13 +1784,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     addCheck(dcaForm, trendBox);
     // 多周期梯子接管间距推导后，×1.5 那一半会被整个覆盖掉（不是叠加）——
     // 不说明的话，同时勾两个的人会以为"空头态补仓更保守"，而那件事不会发生
-    {
-        auto* h = new QLabel("⚠ 开启【多周期梯子】后，其中「补仓间隔×1.5」不生效"
-                             "（间距完全由档位带宽推导）；「空头态暂停新首仓」照常生效。");
-        h->setWordWrap(true);
-        h->setStyleSheet("color:#8b949e;font-size:10px;");
-        form->addRow("", h);
-    }
+    addHint(dcaForm, "⚠ 开启【多周期梯子】后，其中「补仓间隔×1.5」不生效"
+                     "（间距完全由档位带宽推导）；「空头态暂停新首仓」照常生效。");
 
 
     // ── v3.0 三层决策 ────────────────────────────────────────────────────────
@@ -1824,13 +1814,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "实测阻力侧门槛放宽是灾难，说明这条判据有真实信息量。");
     addCheck(gateForm, headBox);
 
-    {
-        auto* h = new QLabel("三条平级独立，全不勾 = 三层决策完全不参与。"
-                             "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
-        h->setWordWrap(true);
-        h->setStyleSheet("color:#8b949e;font-size:10px;");
-        form->addRow("", h);
-    }
+    addHint(gateForm, "三条平级独立，全不勾 = 三层决策完全不参与。"
+                      "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
     auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
     auto* headroomEdit = mkEditIn(gateForm, "净空比下限:", prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
     auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
@@ -1859,7 +1844,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     auto* rsiFilterBox = new QCheckBox("启用RSI过滤");
     rsiFilterBox->setChecked(prefill ? prefill->cfg.use_rsi_filter : true);
-    indForm->addRow("", rsiFilterBox);
+    indForm->addRow(rsiFilterBox);   // 与其余勾选框同一条对齐轴
     auto* rsiPeriodEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.rsi_period : 14));
     indForm->addRow("RSI周期:", rsiPeriodEdit);
     auto* rsiThEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.rsi_threshold : 30.0));
@@ -2737,6 +2722,9 @@ void MainWindow::refreshBotTable() {
                     signal_tip.clear();
                     if (!b.ind_ok) {
                         state_s = "等待·取数中";
+                        signal_tip = "还没取到该品种的指标数据（BOLL/RSI）。\n"
+                                     "刚添加或刚连接时正常，约 5 分钟内会拉到。\n"
+                                     "长时间停在这里通常是该品种 K 线拉取失败——检查品种名是否正确。";
                     } else if (std::chrono::steady_clock::now() - b.ind_time >= kIndStale) {
                         state_s = "等待·数据过期"; state_c = QColor("#d29922");
                         signal_tip = "指标数据超过 180 秒未更新，信号判定已冻结（宁可错过不可乱开）。\n"
@@ -2782,9 +2770,25 @@ void MainWindow::refreshBotTable() {
                                 .arg(b.cfg.rsi_threshold, 0, 'f', 0).arg(rsiOk ? "✓" : "✗");
                         }
                         signal_tip += "\n\n两条都满足后才会走到三层拦截；在那之前不会有任何拦截日志。";
+                        // 引擎自己记的最近一次判定结果。信号已满足却不开仓时，
+                        // 答案就在这里（趋势/三层/保证金）——这个字段以前完全不上界面
+                        if (!b.last_action.empty())
+                            signal_tip += "\n当前引擎记录：" + QString::fromStdString(b.last_action);
                     }
                 } else {
+                    // 「立即开仓」模式没有指标信号这道闸，所以卡住的原因只可能来自
+                    // 后面三道。这些状态本来只反映在 last_action 里（不上表格），
+                    // 界面上一样是个黑盒
                     state_s = "等待首仓"; state_c = QColor("#58a6ff");
+                    signal_tip = "立即开仓模式：没有指标信号这道闸，理论上下一个 tick 就会开首仓。\n"
+                                 "若长时间停在这里，只可能被后面三道之一挡住：\n"
+                                 "  ① 趋势过滤——高周期空头态暂停新首仓\n"
+                                 "  ② 三层拦截——高位 / 支撑 / 净空任一不满足\n"
+                                 "  ③ 账户总保证金上限——已用额度不够再开一仓\n"
+                                 "具体是哪一条，看运行日志里该品种最近的一条拦截提示"
+                                 "（同一原因只打一次，不会重复刷）。";
+                    if (!b.last_action.empty())
+                        signal_tip += "\n\n当前引擎记录：" + QString::fromStdString(b.last_action);
                 }
             } else {
                 state_s = b.cfg.dynamic_band_mode ? "运行中·动态W" : "运行中";
