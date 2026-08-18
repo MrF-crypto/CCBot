@@ -1,4 +1,5 @@
 #include "net/trading_client.h"
+#include "net/rate_gate.h"
 #include "core/indicators.h"
 #include <curl/curl.h>
 #include <mbedtls/md.h>
@@ -53,6 +54,13 @@ static double floor_to_step(double val, double step);
 
 // ── CURL helpers ──────────────────────────────────────────────────────────────
 static size_t curl_write(char* ptr, size_t sz, size_t n, void* ud) {
+    ((std::string*)ud)->append(ptr, sz * n);
+    return sz * n;
+}
+
+// 响应头收集：币安在 X-MBX-USED-WEIGHT-1M 里回报本分钟已用权重，
+// 这是限流闸门的权威数据源（比在本地维护权重表可靠）
+static size_t curl_header(char* ptr, size_t sz, size_t n, void* ud) {
     ((std::string*)ud)->append(ptr, sz * n);
     return sz * n;
 }
@@ -114,6 +122,11 @@ const char* TradingClient::ep(Ep e) const {
 }
 
 TradingClient::TradingClient(const Config& cfg) : cfg_(cfg) {
+    // 统一账户(papi) 的 IP 权重上限比 fapi 高一倍多
+    RateGate::Limits lim;
+    lim.weight_per_min = is_pm() ? 6000 : 2400;
+    gate_ = std::make_shared<RateGate>(lim);
+
     // 公开行情永远走 fapi：papi 域名下**不存在** exchangeInfo/klines/premiumIndex/time，
     // 打过去一律 404。所以行情和签名走两个 base，不能合并。
     pub_base_ = cfg.testnet ? "https://testnet.binancefuture.com"
@@ -160,15 +173,29 @@ int64_t TradingClient::ts_ms() const {
 }
 
 std::string TradingClient::http_get_public(const std::string& path) {
+    if (test_hook_) {
+        FakeReply fr;
+        if (test_hook_("GET", path, "", fr)) {
+            gate_->observe(fr.code, fr.headers, fr.body);
+            return fr.body;
+        }
+    }
     std::string url  = pub_base_ + path;
-    std::string resp;
+    std::string resp, rhdr;
+    // 公开行情按 IP 计权重，和签名请求共用同一个配额——这里是请求量最大的一类
+    // （31品种×每5分钟的指标+趋势批次），突发风险主要来自它
+    gate_->acquire(false);
     CURL* c = curl_easy_init();
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_perform(c);
+    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    gate_->observe(code, rhdr, resp);
     curl_easy_cleanup(c);
     return resp;
 }
@@ -194,22 +221,41 @@ void TradingClient::sync_server_time() {
 }
 
 std::string TradingClient::http_get(const std::string& path, std::string params) {
+    if (test_hook_) {
+        FakeReply fr;
+        if (test_hook_("GET", path, params, fr)) {
+            gate_->observe(fr.code, fr.headers, fr.body);
+            return fr.body;
+        }
+    }
     if (!params.empty()) {
         params += "&timestamp=" + std::to_string(ts_ms());
         params += "&signature=" + sign(params);
     }
     std::string url = base_ + path + (params.empty() ? "" : "?" + params);
-    std::string resp;
+    std::string resp, rhdr;
     struct curl_slist* hdrs = nullptr;
+    gate_->acquire(false);
     CURL* c = make_curl(cfg_.api_key, resp, hdrs);
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
     curl_easy_perform(c);
+    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    gate_->observe(code, rhdr, resp);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(c);
     return resp;
 }
 
 std::string TradingClient::http_post(const std::string& path, std::string params) {
+    if (test_hook_) {
+        FakeReply fr;
+        if (test_hook_("POST", path, params, fr)) {
+            gate_->observe(fr.code, fr.headers, fr.body);
+            return fr.body;
+        }
+    }
     params += "&timestamp=" + std::to_string(ts_ms());
     params += "&signature=" + sign(params);
     std::string url  = base_ + path;
@@ -224,26 +270,47 @@ std::string TradingClient::http_post(const std::string& path, std::string params
     }
     if (!slot) { lk = std::unique_lock<std::mutex>(curl_pool_[0].mtx); slot = &curl_pool_[0]; }
 
+    // 订单请求享有优先权：只在真正被封禁时才等，不参与权重软限速。
+    // 平仓/止损延迟直接对应资金损失，而拉一次指标晚几秒无所谓
+    gate_->acquire(true);
+
+    std::string rhdr;
     CURL* c = static_cast<CURL*>(slot->handle);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_POST, 1L);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, params.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)params.size());
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
     curl_easy_perform(c);
+    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    gate_->observe(code, rhdr, resp);
     return resp;
 }
 
 std::string TradingClient::http_del(const std::string& path, std::string params) {
+    if (test_hook_) {
+        FakeReply fr;
+        if (test_hook_("DELETE", path, params, fr)) {
+            gate_->observe(fr.code, fr.headers, fr.body);
+            return fr.body;
+        }
+    }
     params += "&timestamp=" + std::to_string(ts_ms());
     params += "&signature=" + sign(params);
     std::string url  = base_ + path + "?" + params;
-    std::string resp;
+    std::string resp, rhdr;
     struct curl_slist* hdrs = nullptr;
+    gate_->acquire(true);          // 撤单同属订单类，优先
     CURL* c = make_curl(cfg_.api_key, resp, hdrs);
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
     curl_easy_perform(c);
+    long dcode = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &dcode);
+    gate_->observe(dcode, rhdr, resp);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(c);
     return resp;
@@ -1147,6 +1214,12 @@ TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
         if (!r.symbol.empty() && r.time > 0) out.push_back(r);
     }
     return out;
+}
+
+
+TradingClient::RateStatus TradingClient::rate_status() const {
+    auto sn = gate_->snapshot();
+    return { sn.used_weight, sn.limit, sn.throttled, sn.rejected, sn.banned, sn.ban_left_ms };
 }
 
 } // namespace ccbot

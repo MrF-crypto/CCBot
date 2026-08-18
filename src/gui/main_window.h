@@ -124,6 +124,7 @@ private:
     QLabel*      breatheDot_  = nullptr;   // 连接状态呼吸灯
     QLabel*      equityLabel_ = nullptr;   // 权益/可用，顶部常驻
     QLabel*      mmrLabel_    = nullptr;   // uniMMR，顶部常驻（仅统一账户）
+    QLabel*      rateLabel_   = nullptr;   // 限流状态，仅在被限速/封禁时显示
     QLabel*      fundLabel_   = nullptr;   // 累计资金费，顶部常驻（非零时才显示）
     QLabel*      pnlBadge_    = nullptr;   // 累计已实现盈亏徽标，顶部常驻
 

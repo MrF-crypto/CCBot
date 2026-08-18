@@ -4,6 +4,10 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <memory>
+#include <functional>
+
+namespace ccbot { class RateGate; }
 
 namespace ccbot {
 
@@ -193,6 +197,20 @@ public:
     // 拉取 Binance 服务器时间，计算本机与服务器的时钟偏移（一次即可）
     void sync_server_time();
 
+    // ── 测试注入点 ──────────────────────────────────────────────────────────
+    // 订单路径（超时→查单恢复、部分成交、零成交、-1111重试）平时【永远不执行】，
+    // 只有网络出问题的那几秒才跑，也没法在实盘演练——所以必须能喂假响应。
+    // 钩子返回 true 表示"这次由我应答"，false 则照常走真实网络。
+    // 生产环境钩子为空，代码路径与未引入前完全一致
+    struct FakeReply { long code = 200; std::string headers; std::string body; };
+    using TestHook = std::function<bool(const std::string& method, const std::string& path,
+                                        const std::string& params, FakeReply& out)>;
+    void set_test_hook(TestHook h) { test_hook_ = std::move(h); }
+
+    // 限流状态（界面/日志展示用）
+    struct RateStatus { int used_weight, limit, throttled, rejected; bool banned; int64_t ban_left_ms; };
+    RateStatus rate_status() const;
+
     bool is_testnet()   const { return cfg_.testnet; }
     bool is_pm()        const { return cfg_.account_mode == AccountMode::PortfolioMargin; }
     bool is_dual_mode() const override { return dual_mode_; }
@@ -231,6 +249,10 @@ private:
                                    double qty);
 
     Config      cfg_;
+    // 限流闸门：所有 HTTP 出口都过它。放在传输层而不是各调用点——
+    // 这样订单路径的超时/查单恢复逻辑一行不用动
+    std::shared_ptr<RateGate> gate_;
+    TestHook    test_hook_;
     std::string base_;       // 签名端点的域名（统一账户 = papi.binance.com）
     std::string pub_base_;   // 公开行情端点的域名（永远是 fapi，papi 没有行情接口）
     bool        dual_mode_       = false;

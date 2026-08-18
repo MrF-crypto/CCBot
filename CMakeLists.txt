@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.8.3 LANGUAGES CXX)
+project(CCGMonitor VERSION 3.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +19,7 @@ set(CORE_SOURCES
     src/core/ccg_engine.cpp
     src/core/funding_ledger.cpp
     src/net/trading_client.cpp
+    src/net/rate_gate.cpp
     src/net/book_ticker_stream.cpp
     src/net/alert.cpp
 )
@@ -120,7 +121,8 @@ endif()
 
 # ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
 add_executable(ccg_funding_tests tests/test_funding.cpp src/core/funding_ledger.cpp
-                                 src/net/trading_client.cpp)
+                                 src/net/trading_client.cpp
+                                 src/net/rate_gate.cpp)
 target_include_directories(ccg_funding_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_funding_tests PRIVATE ${CORE_LIBS})
 if(WIN32)
@@ -129,6 +131,27 @@ if(WIN32)
 endif()
 if(MSVC)
     target_compile_options(ccg_funding_tests PRIVATE /utf-8)
+endif()
+
+# ── 订单路径测试（超时恢复/部分成交/零成交/-1111重试）：用假HTTP响应复现故障 ──
+add_executable(ccg_order_tests tests/test_order_path.cpp
+                               src/net/trading_client.cpp src/net/rate_gate.cpp)
+target_include_directories(ccg_order_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_order_tests PRIVATE ${CORE_LIBS})
+if(WIN32)
+    target_link_libraries(ccg_order_tests PRIVATE crypt32 ws2_32 wsock32)
+    target_compile_definitions(ccg_order_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_options(ccg_order_tests PRIVATE /utf-8)
+endif()
+
+# ── 限流闸门测试（时间相关逻辑，且坐在每一个 HTTP 出口上）────────────────────
+add_executable(ccg_rate_tests tests/test_rate_gate.cpp src/net/rate_gate.cpp)
+target_include_directories(ccg_rate_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_rate_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_rate_tests PRIVATE /utf-8)
 endif()
 
 # ── 凭证存储格式测试（含加账户类型字段后的向后兼容）──────────────────────────

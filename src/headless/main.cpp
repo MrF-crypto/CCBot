@@ -471,6 +471,16 @@ int main(int argc, char** argv) {
                              " | 可用 $" + std::to_string(acc.available) +
                              (acc.uni_mmr > 0 ? " | uniMMR " + std::to_string(acc.uni_mmr) : ""));
                     hb_fail_streak.store(0);
+                    // 限流状态：只在真的被限速/拒绝过时才打，平时不占日志
+                    auto rl = client->rate_status();
+                    if (rl.banned)
+                        log_line("⚠ 交易所限流封禁中，剩余 " +
+                                 std::to_string(rl.ban_left_ms / 1000) + " 秒", "ERR");
+                    else if (rl.throttled > 0 || rl.rejected > 0)
+                        log_line("限流 | 本分钟权重 " + std::to_string(rl.used_weight) +
+                                 "/" + std::to_string(rl.limit) +
+                                 " | 本地推迟 " + std::to_string(rl.throttled) +
+                                 " 次 | 交易所拒绝 " + std::to_string(rl.rejected) + " 次");
                     if (hb_alerted.exchange(false) && !w.empty())
                         send_webhook(w, "[ccbot] 账户接口已恢复");
                     // 统一账户按【全账户】算强平，uniMMR 是唯一能看到真实距离的数。

@@ -103,7 +103,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.8.3");
+    setWindowTitle("CCG 合约监控  v3.9.0");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -921,6 +921,12 @@ void MainWindow::buildUi() {
         mmrLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
         mmrLabel_->setVisible(false);          // 普通合约账户不适用，直接不占位
         row->addWidget(mmrLabel_);
+
+        // 限流状态：只在被限速或被封禁时出现
+        rateLabel_ = new QLabel();
+        rateLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
+        rateLabel_->setVisible(false);
+        row->addWidget(rateLabel_);
 
         // 账户累计资金费：真实划走的现金（非浮亏），只在非零时显示，避免挤占顶部栏
         fundLabel_ = new QLabel();
@@ -3066,6 +3072,33 @@ void MainWindow::refreshBotTable() {
                 "统一账户维持保证金率（全账户口径）。\n"
                 "币安在 1.05 开始强制减仓——这是唯一能看到真实强平距离的数，\n"
                 "只看 U 本位子账户的保证金会低估风险。");
+        }
+    }
+
+    // 顶部常驻：限流状态。只在被限速/被封禁时出现——平时不占位置，
+    // 出现即意味着请求量已经顶到交易所配额，是要处理的信号
+    if (rateLabel_ && client_) {
+        auto rs = client_->rate_status();
+        const bool show = rs.banned || rs.throttled > 0 || rs.rejected > 0;
+        rateLabel_->setVisible(show);
+        if (show) {
+            QString t;
+            QString col = "#8b949e";
+            if (rs.banned) {
+                t = QString("   限流: 已封禁 %1s").arg(rs.ban_left_ms / 1000);
+                col = "#f85149";
+            } else {
+                t = QString("   限流: %1/%2").arg(rs.used_weight).arg(rs.limit);
+                col = (rs.used_weight > rs.limit * 0.75) ? "#d29922" : "#8b949e";
+            }
+            rateLabel_->setText(t);
+            rateLabel_->setStyleSheet(QString("color:%1;font-size:11px;").arg(col));
+            rateLabel_->setToolTip(
+                QString("交易所 REST 配额（按 IP 计，权重由服务器响应头回报）\n"
+                        "本分钟已用 %1 / %2\n"
+                        "本地推迟过 %3 次请求，收到过 %4 次交易所限流拒绝\n\n"
+                        "订单请求享有优先权：只在真正被封禁时才等，不参与权重软限速。")
+                    .arg(rs.used_weight).arg(rs.limit).arg(rs.throttled).arg(rs.rejected));
         }
     }
 
