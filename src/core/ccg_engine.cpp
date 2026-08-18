@@ -14,7 +14,6 @@ namespace ccbot {
 // 指标数据有效期：超过这个时长没有新的 BOLL/RSI 写入就视为过期。
 // 正常情况下 UI/headless 每 3s 拉一次，180s 的余量足够容忍短暂网络抖动，
 // 又能保证断网/K线接口故障时不会拿几小时前的旧轨道值继续开仓补仓
-static constexpr auto kIndStale = std::chrono::seconds(180);
 
 // 趋势数据有效期：外层每 ~5 分钟拉一次 4h 级别趋势，30 分钟没更新视为过期。
 // 过期时趋势过滤自动失效（fail-open）——它是增强项，不该因断数据卡死交易

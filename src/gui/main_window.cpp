@@ -10,6 +10,7 @@
 #include <QHeaderView>
 #include <QSplitter>
 #include <QMessageBox>
+#include <QScrollArea>
 #include <QDateTime>
 #include <QColor>
 #include <QJsonDocument>
@@ -102,7 +103,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.8.0");
+    setWindowTitle("CCG 合约监控  v3.8.1");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -1027,7 +1028,7 @@ void MainWindow::buildUi() {
         hdr->resizeSection(0, 26);
         hdr->resizeSection(4, 54);
         hdr->resizeSection(7, 60);
-        hdr->resizeSection(13, 60);
+        hdr->resizeSection(13, 96);
         hdr->setSectionResizeMode(14, QHeaderView::Fixed);
         hdr->resizeSection(14, 175);
 
@@ -1586,11 +1587,70 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     QDialog dlg(this);
     dlg.setWindowTitle(QString("策略配置 - %1").arg(QString::fromStdString(symbol)));
-    dlg.resize(820, 820);
-    auto* dv = new QVBoxLayout(&dlg);
+    dlg.resize(860, 760);
 
-    auto* form = new QFormLayout();
-    form->setSpacing(8);
+    // 外层：滚动区 + 固定在底部的按钮。分组之后内容比一屏高，小屏笔记本上
+    // 原先的固定高度会把"保存"顶出屏幕外
+    auto* outer = new QVBoxLayout(&dlg);
+    outer->setContentsMargins(0, 0, 0, 0);
+    auto* scroll = new QScrollArea();
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto* canvas = new QWidget();
+    auto* dv = new QVBoxLayout(canvas);
+    dv->setContentsMargins(14, 12, 14, 12);
+    dv->setSpacing(14);
+    scroll->setWidget(canvas);
+    outer->addWidget(scroll, 1);
+
+    // 分组工厂：所有分组共用同一套外观与对齐，避免出现"一半分组一半裸表单"
+    // 这种两套组织方式并存的情况（改版前正是如此）
+    auto mkGroup = [&](const QString& title, const QString& color) {
+        auto* box = new QGroupBox(title);
+        box->setStyleSheet(QString("QGroupBox{color:%1;font-size:11px;font-weight:bold;"
+                                   "border:1px solid #21262d;border-radius:4px;"
+                                   "margin-top:8px;padding:10px 12px 8px;}"
+                                   "QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px;}")
+                           .arg(color));
+        auto* f = new QFormLayout(box);
+        f->setSpacing(7);
+        f->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        f->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+        dv->addWidget(box);
+        return f;
+    };
+    // 灰字说明统一样式，并且统一挂在所属分组的末尾——改版前它们散落在中间
+    auto addHint = [](QFormLayout* f, const QString& text) {
+        auto* h = new QLabel(text);
+        h->setWordWrap(true);
+        h->setStyleSheet("color:#8b949e;font-size:10px;");
+        f->addRow(h);            // 跨两列，不占标签列
+        return h;
+    };
+    // 勾选框：跨两列铺满，与输入框的字段列对齐同一条轴。
+    // 改版前用 addRow("", box)，勾选框从字段列开始、左边空一大片，
+    // 和右对齐的标签形成两条互不相干的对齐轴——这就是"看着不对称"的来源
+    auto addCheck = [](QFormLayout* f, QCheckBox* box) { f->addRow(box); };
+    // 子项缩进：改版前用全角空格撑，宽度依赖字体且会撑宽整个标签列
+    auto addSub = [](QFormLayout* f, const QString& label, QWidget* w) {
+        auto* row = new QWidget();
+        auto* hl = new QHBoxLayout(row);
+        hl->setContentsMargins(18, 0, 0, 0);
+        hl->setSpacing(8);
+        auto* lb = new QLabel(label);
+        lb->setStyleSheet("color:#8b949e;");
+        hl->addWidget(lb);
+        hl->addWidget(w, 1);
+        f->addRow(row);
+    };
+
+    // 五个分组一次建好，视觉顺序由这里决定——控件在代码里哪一行创建都不影响它
+    // 落在哪个分组，所以下面可以按"逻辑相关"归组，而不必迁就原来的书写顺序
+    auto* form      = mkGroup("基础参数", "#58a6ff");
+    auto* sigForm   = mkGroup("入场信号（首单怎么开）", "#a371f7");
+    auto* dcaForm   = mkGroup("补仓机制（跌了怎么加）", "#3fb950");
+    auto* gateForm  = mkGroup("入场拦截（什么时候不开）", "#d29922");
+    auto* riskForm  = mkGroup("风控与出场", "#f85149");
 
     auto* dirBox = new QComboBox();
     dirBox->addItem("多");
@@ -1610,15 +1670,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     stratBox->setCurrentIndex(prefill ? (int)prefill->cfg.strat_type : 7);   // 默认递增（实证最优）
     form->addRow("策略:", stratBox);
 
-    auto mkEdit = [&](const QString& label, double val) {
+    // 带目标分组的版本（旧版写死往 form 里塞，所有参数因此只能待在同一张扁平表里）
+    auto mkEditIn = [&](QFormLayout* f, const QString& label, double val) {
         auto* e = new QLineEdit(QString::number(val));
-        form->addRow(label, e);
+        f->addRow(label, e);
         return e;
     };
+    auto mkEdit  = [&](const QString& label, double val) { return mkEditIn(form, label, val); };
     auto mkEditI = [&](const QString& label, int val) {
-        auto* e = new QLineEdit(QString::number(val));
-        form->addRow(label, e);
-        return e;
+        return mkEditIn(form, label, (double)val);
     };
 
     auto* budgetEdit   = mkEdit ("预算USDT:",      prefill ? prefill->cfg.budget_usdt  : 3000.0);
@@ -1629,39 +1689,38 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* tpEdit       = mkEdit ("止盈%:",         prefill ? prefill->cfg.tp_pct       : 5.0);
     auto* trailTpEdit  = mkEdit ("止盈追踪%:",     prefill ? prefill->cfg.trail_tp     : 2.0);
     auto* cooldownEdit = mkEditI("冷却(s):",       prefill ? prefill->cfg.cooldown_secs: 300);
-    auto* stopLossEdit = mkEdit ("止损%(0=禁用):", prefill ? prefill->cfg.stop_loss_pct : 0.0);
+    auto* stopLossEdit = mkEditIn(riskForm, "本地止损%(0=禁用):",
+                                  prefill ? prefill->cfg.stop_loss_pct : 0.0);
     auto* disStopBox = new QCheckBox("在交易所挂灾难止损单（进程外保护）");
     disStopBox->setChecked(prefill ? prefill->cfg.use_disaster_stop : false);
-    form->addRow("", disStopBox);
+    addCheck(riskForm, disStopBox);
     // 缩进表示"这是上面那个勾选框的子项"。原先用 └ 制表符，小字号下会被认成字母 L
-    auto* disStopEdit  = mkEdit ("　　触发位置：均价下方%:",
-                                 prefill ? prefill->cfg.disaster_stop_pct : 30.0);
+    auto* disStopEdit  = new QLineEdit(QString::number(prefill ? prefill->cfg.disaster_stop_pct : 30.0));
+    addSub(riskForm, "触发位置：均价下方%", disStopEdit);
     // 没勾选时把比例框灰掉：启用与否是策略取向，不该藏在"这个数字是不是0"里
     disStopEdit->setEnabled(disStopBox->isChecked());
     connect(disStopBox, &QCheckBox::toggled, disStopEdit, &QWidget::setEnabled);
     {
-        auto* h = new QLabel(
+        QString t =
             "在【交易所】挂一张 STOP_MARKET 单（均价下方该比例处），程序崩溃/断电/"
             "误关窗口后它依然生效——这是唯一的进程外保护。上面那个\"止损%\"只活在本进程里。\n"
             "⚠ 它会把浮亏变成实亏。如果你的策略是「套住就长线持有、只要不归零就等」，"
             "那这个功能与你的取向冲突，保持不勾选即可（默认就是不勾）。\n"
             "⚠ 勾选的话只防瀑布，不参与常规止盈：网格天然要吃深度回撤，设太紧会在正常"
-            "补仓过程中被打掉。建议留足余量（满层跌 20% 的配置设 30~35）。");
-        h->setWordWrap(true);
-        h->setStyleSheet("color:#8b949e;font-size:10px;");
-        form->addRow("", h);
+            "补仓过程中被打掉。建议留足余量（满层跌 20% 的配置设 30~35）。";
+        addHint(riskForm, t);
     }
 
     auto* autoRestartBox = new QCheckBox("自动重启");
     autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
-    form->addRow("", autoRestartBox);
+    addCheck(form, autoRestartBox);
 
     auto* entryModeBox = new QComboBox();
     entryModeBox->addItem("立即开仓（一开监控就开首仓）");
     entryModeBox->addItem("指标信号（BOLL+RSI 满足才开首仓）");
     entryModeBox->setCurrentIndex(
         prefill ? (prefill->cfg.entry_mode == CcgConfig::EntryMode::Indicator ? 1 : 0) : 1);
-    form->addRow("首单模式:", entryModeBox);
+    sigForm->addRow("首单模式:", entryModeBox);
 
     // ── 动态W模式（v2.3）───────────────────────────────────────────────────────
     auto* dynBandBox = new QCheckBox("动态W模式（补仓锚定下轨/止盈锚定上轨/间距自适应带宽）");
@@ -1671,9 +1730,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "间隔=W/3、追踪止盈=0.15W、追踪建仓=0.1W（各有上下限夹逼）。\n"
         "补仓要求价格在带外（多:≤下轨），止盈要求触及对侧轨道且盈利≥保底利润。\n"
         "带子随趋势移动时梯子跟着走，均价贴着下轨，带内震荡即可完成周期。");
-    form->addRow("", dynBandBox);
-    auto* floorEdit = mkEdit("保底利润%(动态模式):",
-                             prefill ? prefill->cfg.min_profit_floor : 3.5);
+    addCheck(dcaForm, dynBandBox);
+    auto* floorEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.min_profit_floor : 3.5));
+    addSub(dcaForm, "保底利润%（动态模式）", floorEdit);
 
     // ── 多周期梯子（v3.7 实验，默认关）────────────────────────────────────────
     auto* mtfBox = new QCheckBox("多周期梯子（补仓档位锚定 1h/4h/12h/1d 下轨，越深的层要求越极端）");
@@ -1688,15 +1747,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "的能力被削弱，仓位摊薄不下去。它的论点在持续阴跌里才成立，需要实盘\n"
         "或完整回测积累数据。开启前请明白这一点。\n"
         "只接管补仓间距，止盈那半（触上轨+保底利润）完全不变。");
-    form->addRow("", mtfBox);
+    addCheck(dcaForm, mtfBox);
 
     auto* mtfTiersEdit = new QLineEdit(prefill ? QString::fromStdString(prefill->cfg.mtf_tier_layers) : "");
     mtfTiersEdit->setPlaceholderText("留空=按 3:2:2:1 权重自动分配");
-    form->addRow("　　各档层数(1h,4h,12h,1d):", mtfTiersEdit);
-    auto* mtfKEdit   = mkEdit("　　最小间距系数k(×该档带宽):",
-                              prefill ? prefill->cfg.mtf_k : 0.5);
-    auto* mtfGapEdit = mkEdit("　　最小间距兜底%:",
-                              prefill ? prefill->cfg.mtf_min_gap_pct : 2.0);
+    addSub(dcaForm, "各档层数 (1h,4h,12h,1d)", mtfTiersEdit);
+    auto* mtfKEdit   = new QLineEdit(QString::number(prefill ? prefill->cfg.mtf_k : 0.5));
+    addSub(dcaForm, "最小间距系数 k（×该档带宽）", mtfKEdit);
+    auto* mtfGapEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.mtf_min_gap_pct : 2.0));
+    addSub(dcaForm, "最小间距兜底%", mtfGapEdit);
     {
         auto* h = new QLabel(
             "最小间距 = max(k × 该档带宽, 兜底%)，相对上一笔成交价。前者自适应——"
@@ -1727,7 +1786,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "高周期趋势判定：价格在 4h EMA200 之下 且 中轨明显下拐 = 空头态。\n"
         "空头态期间不开新首仓（不接单边下跌的飞刀），已有仓位补仓间隔放大1.5倍。\n"
         "趋势数据每5分钟刷新一次；数据缺失时过滤自动失效，不会卡死交易。");
-    form->addRow("", trendBox);
+    addCheck(dcaForm, trendBox);
     // 多周期梯子接管间距推导后，×1.5 那一半会被整个覆盖掉（不是叠加）——
     // 不说明的话，同时勾两个的人会以为"空头态补仓更保守"，而那件事不会发生
     {
@@ -1746,7 +1805,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     htfBox->setChecked(prefill ? prefill->cfg.use_htf_filter : true);
     htfBox->setToolTip("大图景已经在高位时不追小回调。\n"
                        "%B = 价格在日线布林带中的相对位置，0=下轨 1=上轨。");
-    form->addRow("", htfBox);
+    addCheck(gateForm, htfBox);
 
     auto* supBox = new QCheckBox("② 支撑拦截：价格须正踩在够格支撑区【内部】");
     supBox->setChecked(prefill ? prefill->cfg.use_sr_support : true);
@@ -1755,7 +1814,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "够格 = 独立共振数≥2（摆动与其算术衍生的斐波归为一族，只计一票）。\n"
         "⚠ 这通常是三条里最紧的一条：区域厚度约 0.5×ATR，而价格大部分时间\n"
         "落在区域之间的空隙里。想放宽拦截先从这条入手。");
-    form->addRow("", supBox);
+    addCheck(gateForm, supBox);
 
     auto* headBox = new QCheckBox("③ 净空拦截：头顶到最近够格阻力的空间须够止盈");
     headBox->setChecked(prefill ? prefill->cfg.use_sr_headroom : true);
@@ -1763,7 +1822,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "净空比 = 到上方最近够格阻力的距离 ÷ 预期止盈距离。\n"
         "通俗说：赚到目标之前有没有一堵墙挡着。头顶无够格阻力时视为无限大（放行）。\n"
         "实测阻力侧门槛放宽是灾难，说明这条判据有真实信息量。");
-    form->addRow("", headBox);
+    addCheck(gateForm, headBox);
 
     {
         auto* h = new QLabel("三条平级独立，全不勾 = 三层决策完全不参与。"
@@ -1772,16 +1831,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         h->setStyleSheet("color:#8b949e;font-size:10px;");
         form->addRow("", h);
     }
-    auto* htfMaxEdit   = mkEdit("日线%B拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
-    auto* headroomEdit = mkEdit("净空比下限:",     prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
+    auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
+    auto* headroomEdit = mkEditIn(gateForm, "净空比下限:", prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
     auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
     srExitBox->setChecked(prefill ? prefill->cfg.use_sr_exit : false);
-    form->addRow("", srExitBox);
+    addCheck(riskForm, srExitBox);
     auto* structStopBox = new QCheckBox("结构性止损（持续跌破最深支撑区约1分钟平仓停机，仅动态W+多头）");
     structStopBox->setChecked(prefill ? prefill->cfg.use_structural_stop : false);
-    form->addRow("", structStopBox);
+    addCheck(riskForm, structStopBox);
 
-    dv->addLayout(form);
 
     // ── 指标信号配置（entryModeBox 选"指标信号"时才用得上）──────────────────────
     auto* indBox = new QGroupBox("指标信号配置");
@@ -1834,7 +1892,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     indPreviewLbl->setStyleSheet("color:#8b949e;font-size:11px;");
     indForm->addRow(indPreviewLbl);
 
-    dv->addWidget(indBox);
+    sigForm->addRow(indBox);
 
     // 弹窗关闭后异步回调不能再碰弹窗里的控件，靠这个存活标记判断
     auto dlgAlive = std::make_shared<std::atomic<bool>>(true);
@@ -2175,7 +2233,10 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     }
 
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
-    dv->addWidget(btnBox);
+    // 按钮固定在滚动区外：内容一长，放在里面会被滚出可视范围
+    { auto* bw = new QWidget(); auto* bl = new QHBoxLayout(bw);
+      bl->setContentsMargins(14, 6, 14, 12); bl->addWidget(btnBox);
+      outer->addWidget(bw); }
     connect(btnBox, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
 
@@ -2662,12 +2723,66 @@ void MainWindow::refreshBotTable() {
         total_real   += b.realized_pnl;
 
         QString state_s; QColor state_c;
+        QString signal_tip;   // 「等待信号」卡在哪一步的详细说明（挂状态列悬停）
         switch (b.state) {
         case CcgBot::State::Running:
             if (b.entries.empty()) {
                 if (b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) {
-                    state_s = b.ind_ok ? "等待信号" : "等待信号(取数中)";
-                    state_c = QColor("#a371f7");
+                    // 「等待信号」原先是个黑盒：价格没到下轨、RSI没探底、探底了没回穿、
+                    // 数据过期——四种情况长得一模一样，而拦截日志有去重（同一原因只打
+                    // 一次），所以日志里也看不出来。这里把卡点直接显示出来。
+                    // 注意：指标信号是第①道闸，它不过就走不到三层拦截，也就不会有
+                    // 任何拦截日志——这正是"一直没提示也不开单"的成因
+                    state_s = "等待信号"; state_c = QColor("#a371f7");
+                    signal_tip.clear();
+                    if (!b.ind_ok) {
+                        state_s = "等待·取数中";
+                    } else if (std::chrono::steady_clock::now() - b.ind_time >= kIndStale) {
+                        state_s = "等待·数据过期"; state_c = QColor("#d29922");
+                        signal_tip = "指标数据超过 180 秒未更新，信号判定已冻结（宁可错过不可乱开）。\n"
+                                     "通常是网络问题或该品种K线拉取失败。";
+                    } else {
+                        const bool is_long = (b.cfg.direction != CcgConfig::Direction::Short);
+                        const bool priceOk = is_long ? (b.current_price <= b.ind_boll_lb)
+                                                     : (b.current_price >= b.ind_boll_ub);
+                        bool rsiOk = true, needDip = false;
+                        if (b.cfg.use_rsi_filter) {
+                            const bool snap = is_long ? (b.ind_rsi >= b.cfg.rsi_threshold)
+                                                      : (b.ind_rsi <= 100.0 - b.cfg.rsi_threshold);
+                            if (b.cfg.rsi_confirm_mode == CcgConfig::RsiConfirmMode::CrossFromOversold) {
+                                needDip = !b.ind_dipped;
+                                rsiOk = b.ind_dipped && snap;
+                            } else rsiOk = snap;
+                        }
+                        if (!priceOk && !rsiOk)      state_s = "等待·破轨+RSI";
+                        else if (!priceOk)           state_s = "等待·破轨";
+                        else if (needDip)            state_s = "等待·RSI探底";
+                        else if (!rsiOk)             state_s = "等待·RSI回穿";
+                        else                         state_s = "信号已满足";   // 卡在后面的闸
+
+                        const double band = is_long ? b.ind_boll_lb : b.ind_boll_ub;
+                        signal_tip = QString("首仓要【同时】满足这两条：\n\n"
+                                             "① 价格%1轨：现价 %2 / %3轨 %4  %5\n"
+                                             "② RSI：当前 %6")
+                            .arg(is_long ? "破下" : "破上")
+                            .arg(b.current_price, 0, 'f', 4)
+                            .arg(is_long ? "下" : "上").arg(band, 0, 'f', 4)
+                            .arg(priceOk ? "✓" : "✗")
+                            .arg(b.ind_rsi, 0, 'f', 1);
+                        if (!b.cfg.use_rsi_filter) {
+                            signal_tip += "（RSI 过滤已关）";
+                        } else if (b.cfg.rsi_confirm_mode == CcgConfig::RsiConfirmMode::CrossFromOversold) {
+                            signal_tip += QString("\n   反转确认：需先探底跌破 %1（%2），再回穿 %3（%4）")
+                                .arg(b.cfg.rsi_oversold_th, 0, 'f', 0)
+                                .arg(b.ind_dipped ? "已探底✓" : "未探底✗")
+                                .arg(b.cfg.rsi_threshold, 0, 'f', 0)
+                                .arg(rsiOk ? "✓" : "✗");
+                        } else {
+                            signal_tip += QString("  需 ≥%1  %2")
+                                .arg(b.cfg.rsi_threshold, 0, 'f', 0).arg(rsiOk ? "✓" : "✗");
+                        }
+                        signal_tip += "\n\n两条都满足后才会走到三层拦截；在那之前不会有任何拦截日志。";
+                    }
                 } else {
                     state_s = "等待首仓"; state_c = QColor("#58a6ff");
                 }
@@ -2792,7 +2907,9 @@ void MainWindow::refreshBotTable() {
         botTable_->setItem(i, 11, mkc(liq > 0 ? fmt_price(liq) : "--", QColor("#d29922")));
 
         botTable_->setItem(i, 12, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
-        botTable_->setItem(i, 13, mkc(state_s, state_c));
+        auto* state_item = mkc(state_s, state_c);
+        if (!signal_tip.isEmpty()) state_item->setToolTip(signal_tip);
+        botTable_->setItem(i, 13, state_item);
 
         // 操作列。
         // 这一列原先【每次刷新都整套重建】——3秒一次 × 每行3个按钮，31个bot就是

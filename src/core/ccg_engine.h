@@ -16,6 +16,11 @@ namespace ccbot {
 // 指数型曲线在深层会让首仓预算趋近于0，不建议超过 10 层
 inline constexpr int kMaxLayers = 50;
 
+// 指标数据的有效期。超过这个时长视为过期：冻结新补仓/止盈激活/首仓信号判定。
+// 放头文件是为了让 GUI 的状态展示与引擎的判定用【同一个值】——两边各写一个
+// 180 的话，界面会说"数据新鲜"而引擎其实已经冻结了
+inline constexpr auto kIndStale = std::chrono::seconds(180);
+
 class ThreadPool;
 
 // 引擎的外部时间源与执行器（回测注入虚拟实现，实盘用默认真实实现）。
