@@ -326,12 +326,41 @@ int main() {
         // 三层判定：基线全绿 → 四种拦截 → fail-open
         dc::Inputs in;
         in.is_long = true; in.use_htf = true; in.htf_ok = true; in.htf_pct_b = 0.5;
-        in.htf_pos_max = 0.80; in.use_sr = true; in.sr_ok = true; in.at_support = true;
+        in.htf_pos_max = 0.80; in.use_sr_support = true; in.use_sr_headroom = true;
+        in.sr_ok = true; in.at_support = true;
         in.headroom = 5.0; in.headroom_min = 1.5;
         CHECK(dc::evaluate(in).pass(), "基线输入应全部通过");
 
         auto t1 = in; t1.htf_pct_b = 0.9;
         CHECK(dc::evaluate(t1).htf_block, "做多%B=0.9应触发高位拦截");
+        // ── 三条判据独立开关（v3.8）：只关一条时，另外两条必须照常工作 ──
+        {
+            auto only_head = in; only_head.use_sr_support = false;
+            only_head.at_support = false;          // 支撑不满足，但那条关了
+            CHECK(dc::evaluate(only_head).pass(), "只关支撑：无支撑也应放行");
+            only_head.headroom = 0.5;              // 净空不足，那条开着
+            CHECK(dc::evaluate(only_head).headroom_block, "只关支撑：净空仍应拦");
+
+            auto only_sup = in; only_sup.use_sr_headroom = false;
+            only_sup.headroom = 0.1;               // 净空不足，但那条关了
+            CHECK(dc::evaluate(only_sup).pass(), "只关净空：净空不足也应放行");
+            only_sup.at_support = false;
+            CHECK(dc::evaluate(only_sup).support_block, "只关净空：支撑仍应拦");
+
+            // 两条都关 → 结构层完全不参与，连数据缺失都不该拦
+            auto no_sr = in;
+            no_sr.use_sr_support = no_sr.use_sr_headroom = false;
+            no_sr.sr_ok = false; no_sr.strict = true;
+            CHECK(dc::evaluate(no_sr).pass(), "结构两条全关：区域数据缺失也不拦");
+
+            // 只开净空但数据缺失 → 仍要拦（净空的计算本就依赖区域数据）
+            auto head_missing = in;
+            head_missing.use_sr_support = false; head_missing.strict = true;
+            head_missing.sr_ok = false;
+            CHECK(dc::evaluate(head_missing).data_block,
+                  "只开净空且区域数据缺失：strict 下应拦");
+        }
+
         auto t2 = in; t2.at_support = false;
         CHECK(dc::evaluate(t2).support_block, "无支撑应触发拦截");
         auto t3 = in; t3.headroom = 1.0;

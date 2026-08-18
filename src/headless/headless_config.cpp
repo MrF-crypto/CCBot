@@ -129,6 +129,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "mtf_ladder", "mtf_tier_layers", "mtf_k", "mtf_min_gap_pct",
         "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
         "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max", "use_sr_gate",
+        "use_sr_support", "use_sr_headroom",
         "sr_min_confluence", "sr_headroom_ratio", "use_sr_exit", "use_structural_stop",
         "sr_independent_conf", "sr_lower_half_only",
     };
@@ -197,11 +198,24 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", 200.0);
         c.sr_radar          = get_bool(bo, "sr_radar", true);
         c.sr_interval       = get_str(bo, "sr_interval", "4h");
-        c.smart_gates         = get_bool(bo, "smart_gates", true);
         c.use_htf_filter      = get_bool(bo, "use_htf_filter", true);
         c.htf_interval        = get_str(bo, "htf_interval", "1d");
         c.htf_pos_max         = get_num(bo, "htf_pos_max", 0.60);
-        c.use_sr_gate         = get_bool(bo, "use_sr_gate", true);
+        // v3.8 迁移：老配置的 smart_gates 总开关为 false 时三层完全不参与，
+        // 升级后必须保持——否则老配置会突然开始拦截
+        {
+            const bool legacy_smart = get_bool(bo, "smart_gates", true);
+            const bool legacy_sr    = get_bool(bo, "use_sr_gate", true);
+            const bool has_new = (bo["use_sr_support"].error() == simdjson::SUCCESS);
+            if (has_new) {
+                c.use_sr_support  = get_bool(bo, "use_sr_support", true);
+                c.use_sr_headroom = get_bool(bo, "use_sr_headroom", true);
+            } else {
+                c.use_sr_support  = legacy_smart && legacy_sr;
+                c.use_sr_headroom = legacy_smart && legacy_sr;
+                if (!legacy_smart) c.use_htf_filter = false;
+            }
+        }
         c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", 2.0);
         c.sr_independent_conf = get_bool(bo, "sr_independent_conf", true);
         c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", false);

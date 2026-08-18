@@ -103,9 +103,9 @@ static CcgConfig base_cfg() {
     c.trail_entry  = 1.0;
     c.tp_pct       = 5.0;
     c.trail_tp     = 2.0;
-    c.smart_gates      = false;
     c.use_htf_filter   = false;
-    c.use_sr_gate      = false;
+    c.use_sr_support   = false;
+    c.use_sr_headroom  = false;
     c.use_trend_filter = false;
     c.sr_radar         = false;
     c.use_structural_stop = false;

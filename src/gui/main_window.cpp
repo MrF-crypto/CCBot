@@ -102,7 +102,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.7.0");
+    setWindowTitle("CCG 合约监控  v3.8.0");
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -313,11 +313,11 @@ void MainWindow::save_bots() {
         o["trend_ema_period"]  = c.trend_ema_period;
         o["sr_radar"]          = c.sr_radar;
         o["sr_interval"]       = QString::fromStdString(c.sr_interval);
-        o["smart_gates"]         = c.smart_gates;
         o["use_htf_filter"]      = c.use_htf_filter;
         o["htf_interval"]        = QString::fromStdString(c.htf_interval);
         o["htf_pos_max"]         = c.htf_pos_max;
-        o["use_sr_gate"]         = c.use_sr_gate;
+        o["use_sr_support"]      = c.use_sr_support;
+        o["use_sr_headroom"]     = c.use_sr_headroom;
         o["sr_min_confluence"]   = c.sr_min_confluence;
         o["sr_independent_conf"] = c.sr_independent_conf;
         o["sr_lower_half_only"]  = c.sr_lower_half_only;
@@ -416,11 +416,22 @@ void MainWindow::load_and_restore_bots() {
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
         c.sr_radar          = o["sr_radar"].toBool(true);
         c.sr_interval       = o["sr_interval"].toString("4h").toStdString();
-        c.smart_gates         = o["smart_gates"].toBool(true);
         c.use_htf_filter      = o["use_htf_filter"].toBool(true);
         c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
-        c.use_sr_gate         = o["use_sr_gate"].toBool(true);
+        // v3.8 迁移：老配置只有 smart_gates 总开关 + use_sr_gate。
+        // 总开关为 false 时三层完全不参与，升级后必须保持这个行为——否则
+        // 老 bot 会突然开始拦截
+        const bool legacy_smart = o["smart_gates"].toBool(true);
+        const bool legacy_sr    = o["use_sr_gate"].toBool(true);
+        if (o.contains("use_sr_support")) {
+            c.use_sr_support  = o["use_sr_support"].toBool(true);
+            c.use_sr_headroom = o["use_sr_headroom"].toBool(true);
+        } else {
+            c.use_sr_support  = legacy_smart && legacy_sr;
+            c.use_sr_headroom = legacy_smart && legacy_sr;
+        }
+        if (!o.contains("use_sr_support") && !legacy_smart) c.use_htf_filter = false;
         c.sr_min_confluence   = o["sr_min_confluence"].toInt(2);
         c.sr_independent_conf = o["sr_independent_conf"].toBool(true);
         c.sr_lower_half_only  = o["sr_lower_half_only"].toBool(false);
@@ -1717,16 +1728,50 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         "空头态期间不开新首仓（不接单边下跌的飞刀），已有仓位补仓间隔放大1.5倍。\n"
         "趋势数据每5分钟刷新一次；数据缺失时过滤自动失效，不会卡死交易。");
     form->addRow("", trendBox);
+    // 多周期梯子接管间距推导后，×1.5 那一半会被整个覆盖掉（不是叠加）——
+    // 不说明的话，同时勾两个的人会以为"空头态补仓更保守"，而那件事不会发生
+    {
+        auto* h = new QLabel("⚠ 开启【多周期梯子】后，其中「补仓间隔×1.5」不生效"
+                             "（间距完全由档位带宽推导）；「空头态暂停新首仓」照常生效。");
+        h->setWordWrap(true);
+        h->setStyleSheet("color:#8b949e;font-size:10px;");
+        form->addRow("", h);
+    }
+
 
     // ── v3.0 三层决策 ────────────────────────────────────────────────────────
-    auto* smartBox = new QCheckBox("三层决策拦截（不勾=影子模式：每笔首仓只记判定快照，不拦截）");
-    smartBox->setChecked(prefill ? prefill->cfg.smart_gates : true);
-    smartBox->setToolTip(
-        "宏观层：日线%B高于阈值拦新首仓（大图景太贵不买小回调）。\n"
-        "结构层：脚下须有共振≥2的支撑区 + 头顶净空÷止盈距离≥下限（无空间不开）。\n"
-        "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受此项控制。\n"
-        "建议先影子跑两周，用日志里的[决策]快照统计后再勾选启用。");
-    form->addRow("", smartBox);
+    // 三个判据平级独立（v3.8 起不再有"三层决策拦截"总开关）。
+    // 拆开的价值在可归因：绑在一起时无法知道拦截来自哪一条
+    auto* htfBox = new QCheckBox("① 高位拦截：日线%B 高于阈值不开新首仓");
+    htfBox->setChecked(prefill ? prefill->cfg.use_htf_filter : true);
+    htfBox->setToolTip("大图景已经在高位时不追小回调。\n"
+                       "%B = 价格在日线布林带中的相对位置，0=下轨 1=上轨。");
+    form->addRow("", htfBox);
+
+    auto* supBox = new QCheckBox("② 支撑拦截：价格须正踩在够格支撑区【内部】");
+    supBox->setChecked(prefill ? prefill->cfg.use_sr_support : true);
+    supBox->setToolTip(
+        "注意是「正处于区域内部」，不是「下方有支撑」——下方 2% 处有铁墙也不算。\n"
+        "够格 = 独立共振数≥2（摆动与其算术衍生的斐波归为一族，只计一票）。\n"
+        "⚠ 这通常是三条里最紧的一条：区域厚度约 0.5×ATR，而价格大部分时间\n"
+        "落在区域之间的空隙里。想放宽拦截先从这条入手。");
+    form->addRow("", supBox);
+
+    auto* headBox = new QCheckBox("③ 净空拦截：头顶到最近够格阻力的空间须够止盈");
+    headBox->setChecked(prefill ? prefill->cfg.use_sr_headroom : true);
+    headBox->setToolTip(
+        "净空比 = 到上方最近够格阻力的距离 ÷ 预期止盈距离。\n"
+        "通俗说：赚到目标之前有没有一堵墙挡着。头顶无够格阻力时视为无限大（放行）。\n"
+        "实测阻力侧门槛放宽是灾难，说明这条判据有真实信息量。");
+    form->addRow("", headBox);
+
+    {
+        auto* h = new QLabel("三条平级独立，全不勾 = 三层决策完全不参与。"
+                             "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
+        h->setWordWrap(true);
+        h->setStyleSheet("color:#8b949e;font-size:10px;");
+        form->addRow("", h);
+    }
     auto* htfMaxEdit   = mkEdit("日线%B拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
     auto* headroomEdit = mkEdit("净空比下限:",     prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
     auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
@@ -2184,7 +2229,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.mtf_k             = to_d(mtfKEdit,   0.5);
     cfg.mtf_min_gap_pct   = to_d(mtfGapEdit, 2.0);
     cfg.use_trend_filter  = trendBox->isChecked();
-    cfg.smart_gates         = smartBox->isChecked();
+    cfg.use_htf_filter      = htfBox->isChecked();
+    cfg.use_sr_support      = supBox->isChecked();
+    cfg.use_sr_headroom     = headBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
     cfg.sr_headroom_ratio   = to_d(headroomEdit, 3.0);
     cfg.use_sr_exit         = srExitBox->isChecked();
@@ -2192,7 +2239,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     // SR 雷达跟着依赖它的功能自动开关，用户不再单独控制：
     // 开了三层拦截却没有区域数据，结构层会静默地永久 fail-open（闸门形同虚设）；
     // 反过来三个都没开时雷达也没有存在意义，白占 K 线拉取额度
-    cfg.sr_radar = cfg.smart_gates || cfg.use_sr_exit || cfg.use_structural_stop;
+    // SR 雷达跟随任一需要区域数据的功能（高位层用日线带，不依赖雷达）
+    cfg.sr_radar = cfg.use_sr_support || cfg.use_sr_headroom ||
+                   cfg.use_sr_exit || cfg.use_structural_stop;
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -2205,9 +2254,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             c.trend_interval    = existing->cfg.trend_interval;
             c.trend_ema_period  = existing->cfg.trend_ema_period;
             c.sr_interval       = existing->cfg.sr_interval;
-            c.use_htf_filter    = existing->cfg.use_htf_filter;
             c.htf_interval      = existing->cfg.htf_interval;
-            c.use_sr_gate       = existing->cfg.use_sr_gate;
             c.sr_min_confluence = existing->cfg.sr_min_confluence;
             c.sr_independent_conf = existing->cfg.sr_independent_conf;
             c.sr_lower_half_only  = existing->cfg.sr_lower_half_only;

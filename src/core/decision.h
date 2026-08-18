@@ -100,8 +100,12 @@ struct Inputs {
     bool   htf_ok      = false;
     double htf_pct_b   = 0.5;
     double htf_pos_max = 0.80;
-    // 结构：支撑质量 + 净空（sr_ok=false → fail-open）
-    bool   use_sr        = true;
+    // 结构层拆成两个独立判据——它们问的是完全不同的问题：
+    //   支撑：脚下此刻有没有踩住够格区域（"这里该不该买"）
+    //   净空：头顶到最近够格阻力的空间够不够止盈（"买了跑不跑得掉"）
+    // 绑在一个开关里时无法知道拦截到底来自哪一条
+    bool   use_sr_support  = true;
+    bool   use_sr_headroom = true;
     bool   sr_ok         = false;
     bool   at_support    = false;
     double headroom      = 1e9;   // 已算好的净空比
@@ -132,13 +136,15 @@ inline Verdict evaluate(const Inputs& in) {
             v.htf_block = true;     // 做多拦高位；做空镜像拦低位
         }
     }
-    if (in.use_sr) {
+    if (in.use_sr_support || in.use_sr_headroom) {
         if (!in.sr_ok) {
+            // 两条判据都依赖区域数据：净空要知道头顶最近的够格阻力在哪，
+            // 没数据就没法判。strict 原则一致——数据没到不开仓
             v.sr_missing = true;
             if (in.strict) v.data_block = true;
         } else {
-            if (!in.at_support)              v.support_block  = true;
-            if (in.headroom < in.headroom_min) v.headroom_block = true;
+            if (in.use_sr_support  && !in.at_support)            v.support_block  = true;
+            if (in.use_sr_headroom && in.headroom < in.headroom_min) v.headroom_block = true;
         }
     }
     return v;
@@ -156,13 +162,14 @@ inline std::string summarize(const Inputs& in, const Verdict& v) {
     else if (!in.use_htf)   s += "关";
     else                    s += num(in.htf_pct_b) + (v.htf_block ? "✗高位" : "✓");
     s += " | 支撑";
-    if (v.sr_missing)       s += miss;
-    else if (!in.use_sr)    s += "关";
-    else                    s += v.support_block ? "✗无" : "✓在场";
+    if (!in.use_sr_support)      s += "关";
+    else if (v.sr_missing)       s += miss;
+    else                         s += v.support_block ? "✗无" : "✓在场";
     s += " | 净空";
-    if (v.sr_missing || !in.use_sr) s += "-";
-    else if (in.headroom >= 1e8)    s += "∞✓";
-    else                            s += num(in.headroom) + (v.headroom_block ? "✗不足" : "✓");
+    if (!in.use_sr_headroom)     s += "关";
+    else if (v.sr_missing)       s += miss;
+    else if (in.headroom >= 1e8) s += "∞✓";
+    else                         s += num(in.headroom) + (v.headroom_block ? "✗不足" : "✓");
     return s;
 }
 

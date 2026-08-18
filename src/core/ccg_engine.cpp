@@ -318,11 +318,11 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.trend_ema_period  = new_cfg.trend_ema_period;
     cfg.sr_radar          = new_cfg.sr_radar;
     cfg.sr_interval       = new_cfg.sr_interval;
-    cfg.smart_gates         = new_cfg.smart_gates;
     cfg.use_htf_filter      = new_cfg.use_htf_filter;
     cfg.htf_interval        = new_cfg.htf_interval;
     cfg.htf_pos_max         = new_cfg.htf_pos_max;
-    cfg.use_sr_gate         = new_cfg.use_sr_gate;
+    cfg.use_sr_support      = new_cfg.use_sr_support;
+    cfg.use_sr_headroom     = new_cfg.use_sr_headroom;
     cfg.sr_min_confluence   = new_cfg.sr_min_confluence;
     cfg.sr_res_min_conf     = new_cfg.sr_res_min_conf;
     cfg.sr_independent_conf = new_cfg.sr_independent_conf;
@@ -748,7 +748,22 @@ bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
     if (bot.tp_reached)    return false;  // 达到止盈时不加仓
 
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-    const double trail_entry = eff_params(bot).trail_entry;
+    double trail_entry = eff_params(bot).trail_entry;
+
+    // 多周期梯子：反弹比例必须跟着【当前槽位所属档位】的带宽走。
+    // 否则深层档位会失效——1d 档的带宽约是 1h 的 5 倍，用 1h 推出来的反弹比例
+    // 去等一个日线级别的反转，随便一个小反弹就把仓位打进去了，"追踪建仓"形同虚设
+    if (bot.cfg.mtf_ladder) {
+        const auto alloc = mtf_tier_alloc(bot.cfg);
+        const int  tier  = mtf_tier_of_slot(alloc, (int)bot.entries.size());
+        const auto& tb   = bot.mtf_band[tier];
+        const double mb  = (tb.ub + tb.lb) * 0.5;
+        if (mb > 0 && tb.ub > tb.lb) {
+            const double bandw = (tb.ub - tb.lb) / mb * 100.0;
+            trail_entry = dynparams::trail_entry_pct(bandw);
+        }
+    }
+
     double bounce_th = bot.dca_extreme *
         (is_long ? (1.0 + trail_entry / 100.0)
                  : (1.0 - trail_entry / 100.0));
@@ -935,11 +950,12 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 }
 
                 // v3.0 三层决策（宏观%B + 结构定位）。
-                // 影子模式（算了但不拦、只写快照日志）已移除：它属于"先验证程序的眼睛
-                // 准不准"的阶段，那个阶段已经结束。现在 smart_gates 关掉就是完全不参与，
-                // 不再空跑一遍判定去刷日志。
+                // 三个判据平级独立，任一开启才走判定；全关则完全不参与
+                // （不判定、不记录，也不空跑去刷日志）
+                const bool gates_on = bot.cfg.use_htf_filter ||
+                                      bot.cfg.use_sr_support || bot.cfg.use_sr_headroom;
                 std::string decision_snap;
-                if (can_enter && bot.cfg.smart_gates) {
+                if (can_enter && gates_on) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
                     auto snow = host_.now_steady();
 
@@ -951,7 +967,8 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     din.htf_ok      = bot.htf_ok && (snow - bot.htf_time) < std::chrono::minutes(30);
                     din.htf_pct_b   = bot.htf_pct_b;
                     din.htf_pos_max = bot.cfg.htf_pos_max;
-                    din.use_sr      = bot.cfg.use_sr_gate;
+                    din.use_sr_support  = bot.cfg.use_sr_support;
+                    din.use_sr_headroom = bot.cfg.use_sr_headroom;
                     din.sr_ok       = bot.sr_ok && (snow - bot.sr_time) < std::chrono::minutes(30);
                     din.at_support  = bot.sr_at_support;
                     // 预期止盈距离：动态模式=到上轨的距离（那就是利润目标）；静态=止盈%

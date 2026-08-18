@@ -144,7 +144,8 @@ static int cmd_run(int argc, char** argv) {
     }
     // 三层决策各开关同样显式复位，未指定 --gates 即全关
     c.use_htf_filter = arg_flag(argc, argv, "--gates");
-    c.use_sr_gate    = arg_flag(argc, argv, "--gates");
+    c.use_sr_support  = arg_flag(argc, argv, "--gates") && !arg_flag(argc, argv, "--no-support");
+    c.use_sr_headroom = arg_flag(argc, argv, "--gates") && !arg_flag(argc, argv, "--no-headroom");
     c.kline_interval  = arg_str(argc, argv, "--tf", "1h");
     c.rsi_threshold   = arg_num(argc, argv, "--rsi-th", 35);
     c.rsi_oversold_th = arg_num(argc, argv, "--rsi-os", 25);
@@ -160,7 +161,6 @@ static int cmd_run(int argc, char** argv) {
     c.min_profit_floor  = arg_num(argc, argv, "--floor", 0.3);
     c.use_trend_filter  = arg_flag(argc, argv, "--trend");
     c.sr_radar          = arg_flag(argc, argv, "--sr") || arg_flag(argc, argv, "--gates");
-    c.smart_gates       = arg_flag(argc, argv, "--gates");
     c.htf_pos_max       = arg_num(argc, argv, "--htf-max", 0.80);
     c.sr_headroom_ratio = arg_num(argc, argv, "--headroom", 1.5);
     // 快进快出方案（方案A）：盈利达标即激活追踪，不要求触上轨
@@ -177,7 +177,7 @@ static int cmd_run(int argc, char** argv) {
               << " 曲线" << curve
               << (c.dynamic_band_mode ? " 动态W" : "")
               << (c.use_trend_filter ? " 趋势" : "")
-              << (c.smart_gates ? " 三层拦截" : (c.sr_radar ? " SR" : ""))
+              << ((c.use_htf_filter || c.use_sr_support || c.use_sr_headroom) ? " 三层拦截" : (c.sr_radar ? " SR" : ""))
               << (c.entry_mode == CcgConfig::EntryMode::Indicator ? " 指标首单" : " 立即首单")
               << "\n\n";
 
@@ -372,7 +372,7 @@ static int cmd_sweep(int argc, char** argv) {
                 cf.dynamic_band_mode = true;                          // 动态W
                 cf.use_trend_filter  = true;
                 cf.sr_radar = true;
-                cf.smart_gates = c.gates;
+                cf.use_sr_support = c.gates; cf.use_sr_headroom = c.gates;
                 if (c.gates) { cf.htf_pos_max = c.htf; cf.sr_headroom_ratio = c.head; }
                 rows[i] = { c, d.sym, run_replay(d.s, o) };
             }
@@ -526,7 +526,7 @@ static int cmd_wf(int argc, char** argv) {
                 cf.dynamic_band_mode = true;
                 cf.use_trend_filter = true;
                 cf.sr_radar = true;
-                cf.smart_gates = combos[ci].gates;
+                cf.use_sr_support = combos[ci].gates; cf.use_sr_headroom = combos[ci].gates;
                 if (combos[ci].gates) {
                     cf.htf_pos_max = combos[ci].htf;
                     cf.sr_headroom_ratio = combos[ci].head;
@@ -692,7 +692,7 @@ static int cmd_rsi(int argc, char** argv) {
                 cf.dynamic_band_mode = true;
                 cf.use_trend_filter = true;
                 cf.sr_radar = true;
-                cf.smart_gates = true;
+                cf.use_sr_support = true; cf.use_sr_headroom = true;
                 cf.htf_pos_max = 0.60;
                 cf.sr_headroom_ratio = 3.0;
                 results[i] = run_replay(data[di].s, o);
@@ -885,7 +885,7 @@ static int cmd_portfolio(int argc, char** argv) {
     c.min_profit_floor  = arg_num(argc, argv, "--floor", 2.0);
     c.use_trend_filter  = true;
     c.sr_radar = true;
-    c.smart_gates = true;
+    c.use_sr_support = true; c.use_sr_headroom = true;
     c.htf_pos_max = arg_num(argc, argv, "--htf-max", 0.60);
     c.sr_headroom_ratio = arg_num(argc, argv, "--headroom", 3.0);
     c.use_sr_exit = true;
@@ -1084,7 +1084,7 @@ static int cmd_pgrid(int argc, char** argv) {
                 c.dynamic_band_mode = true;
                 c.min_profit_floor = arg_num(argc, argv, "--floor", 2.0);
                 c.use_trend_filter = true;
-                c.sr_radar = true; c.smart_gates = true;
+                c.sr_radar = true; c.use_sr_support = true; c.use_sr_headroom = true;
                 c.htf_pos_max = 0.60; c.sr_headroom_ratio = 3.0;
                 c.use_sr_exit = true;
                 results[i] = run_portfolio(all, o);
@@ -1357,7 +1357,7 @@ static int cmd_floor(int argc, char** argv) {
                 c.dynamic_band_mode = true;
                 c.min_profit_floor = grid[ci].floor;
                 c.use_trend_filter = true;
-                c.sr_radar = true; c.smart_gates = true;
+                c.sr_radar = true; c.use_sr_support = true; c.use_sr_headroom = true;
                 c.htf_pos_max = 0.60; c.sr_headroom_ratio = grid[ci].head;
                 c.tp_fixed_profit    = grid[ci].tp_fixed;
                 c.dyn_fixed_interval = sweep_intf ? grid[ci].int_fixed
