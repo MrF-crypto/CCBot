@@ -89,7 +89,9 @@ jobs:
       - name: Run all test suites
         run: |
           set -e
-          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests                    ccg_funding_tests ccg_rate_tests ccg_order_tests; do
+          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
+                   ccg_funding_tests ccg_rate_tests ccg_order_tests \
+                   ccg_stress_tests; do
             echo "── $t ──"
             ./build/$t
           done

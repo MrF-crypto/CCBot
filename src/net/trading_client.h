@@ -184,7 +184,11 @@ public:
             return (market_step_size > 0) ? market_step_size : step_size;
         }
     };
-    const SymbolInfo& get_symbol_info(const std::string& symbol);
+    // 按【值】返回，不是引用。返回引用的话指向的是 sym_cache_ 内部对象，而锁在
+    // 函数返回时就放掉了：两个线程同时首次查询同一品种，一个通过引用在读、另一个
+    // 在 `sym_cache_[sym] = info` 覆写同一个对象，是货真价实的数据竞争（UB）。
+    // 结构体只有 4 个 double + 1 个 bool，拷贝的代价可以忽略
+    SymbolInfo get_symbol_info(const std::string& symbol);
     // 只读缓存，不发网络请求；未命中返回 false —— 给 GUI 线程用，绝不能阻塞界面
     bool try_get_symbol_info(const std::string& symbol, SymbolInfo& out) const;
     double round_price(const std::string& symbol, double price);

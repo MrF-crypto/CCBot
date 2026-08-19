@@ -389,6 +389,13 @@ struct CcgBot {
     // 避免遗留一张触发价对不上新均价的孤儿单
     std::string disaster_stop_id;
     double      disaster_stop_price = 0;
+    // 同一个 bot 的挂单同步正在进行中。sync_disaster_stop 会被并发派发（每次成交
+    // 后一次、重启 resync 又一次），而它中间要放锁去发 HTTP：两个线程读到同一个
+    // 旧单号，都撤、都挂，第二张会被币安拒（同方向 closePosition 只允许一张），
+    // 失败分支随即把 disaster_stop_id 清空——于是交易所上明明有单，程序却认为
+    // 这个仓位没有进程外保护，并反复告警、反复重挂再被拒。
+    // 不落盘：它只是一次同步的进行中标记，重启后本就该重新同步
+    bool        ds_syncing = false;
 
     // 统计
     double realized_pnl = 0;

@@ -827,7 +827,7 @@ bool TradingClient::try_get_symbol_info(const std::string& sym, SymbolInfo& out)
     return true;
 }
 
-const TradingClient::SymbolInfo& TradingClient::get_symbol_info(const std::string& sym) {
+TradingClient::SymbolInfo TradingClient::get_symbol_info(const std::string& sym) {
     {
         std::lock_guard<std::mutex> lk(sym_mtx_);
         auto it = sym_cache_.find(sym);
@@ -892,12 +892,11 @@ const TradingClient::SymbolInfo& TradingClient::get_symbol_info(const std::strin
     std::lock_guard<std::mutex> lk(sym_mtx_);
     if (!info.valid) {
         // 拉取失败不写缓存（负缓存会把"首次网络抖动"固化成整个进程生命周期的
-        // 错误精度）——返回临时默认值，下次调用重试拉取
-        static const SymbolInfo fallback{};
-        return fallback;
+        // 错误精度）——返回默认值，下次调用重试拉取
+        return SymbolInfo{};
     }
     sym_cache_[sym] = info;
-    return sym_cache_[sym];
+    return info;
 }
 
 static double floor_to_step(double val, double step) {

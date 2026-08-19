@@ -822,7 +822,12 @@ bool CcgEngine::should_stop_loss(const CcgBot& bot, double price) const {
 
 // ── 主 tick（由 UI 定时器每 3 秒调用）────────────────────────────────────────
 void CcgEngine::tick(const std::string& symbol, double price) {
-    if (price <= 0) return;
+    // ⚠ 必须显式判 isfinite：NaN 与任何数比较都是 false，所以 `price <= 0` 这道
+    // 守卫【拦不住 NaN】。放进去之后 bot.current_price 变成 NaN，Immediate 模式
+    // 的空仓 bot 会照常派发首仓，submit_entry 里 usdt/NaN=NaN，而 `qty <= 0`
+    // 同样拦不住 NaN——最终会带着一个 NaN 数量去交易所下单。
+    // （压力测试 B11：单个 tick 就能复现）
+    if (!std::isfinite(price) || price <= 0) return;
 
     std::vector<std::string>                  do_entry;
     std::vector<std::pair<std::string,std::string>> do_close;  // {id, reason}
@@ -1109,9 +1114,14 @@ void CcgEngine::sync_disaster_stop(const std::string& bot_id) {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
         auto it = bots_.find(bot_id);
         if (it == bots_.end()) return;
-        const auto& b = it->second;
+        auto& b = it->second;
         if (!b.cfg.use_disaster_stop || b.cfg.disaster_stop_pct <= 0) return;
         if (b.total_qty <= 0 || b.avg_price <= 0) return;
+        // 同一 bot 的同步串行化：已有一次在途就直接跳过。跳过是安全的——真正需要
+        // 改单的时候（均价变了），下一次成交还会再派发一次；而并发跑两次的后果是
+        // 第二张挂单被币安拒、把第一张的单号误清掉（见 ds_syncing 的说明）
+        if (b.ds_syncing) return;
+        b.ds_syncing = true;
 
         const bool is_long = (b.cfg.direction == CcgConfig::Direction::Long);
         target = b.avg_price * (is_long ? (1.0 - b.cfg.disaster_stop_pct / 100.0)
@@ -1121,6 +1131,18 @@ void CcgEngine::sync_disaster_stop(const std::string& bot_id) {
         old_id = b.disaster_stop_id;
         old_price = b.disaster_stop_price;
     }
+
+    // 下面有 5 个提前返回点，标记必须每条路径都清掉——漏一条这个 bot 的灾难止损
+    // 就永久不再同步了（比并发挂两张更糟：静默失去保护）。交给析构函数，不靠人记
+    struct SyncFlagGuard {
+        CcgEngine* self; const std::string& id;
+        ~SyncFlagGuard() {
+            std::lock_guard<std::recursive_mutex> lk(self->mtx_);
+            auto it = self->bots_.find(id);
+            if (it != self->bots_.end()) it->second.ds_syncing = false;
+        }
+    } flag_guard{this, bot_id};
+
     if (target <= 0) return;
 
     // 触发价没有实质变化就不动它——每次补仓都撤了重挂会平白消耗限流额度，
@@ -1217,10 +1239,10 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
 
             const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                      ? "BUY" : "SELL";
-            // price 由 tick() 保证 >0 才会派发到这里，但一旦为0，usdt/price 得到的是
-            // inf，而下面的 qty<=0 检查【拦不住 inf】——会带着一个无穷大的数量去下单。
-            // 显式挡一道，代价是一行
-            if (price <= 0) {
+            // price 由 tick() 保证有限且 >0 才会派发到这里，但一旦为0，usdt/price
+            // 得到的是 inf，而下面的 qty<=0 检查【拦不住 inf 和 NaN】——会带着一个
+            // 无穷大/非数的数量去下单。纵深防御：tick() 是第一道，这里是第二道
+            if (!std::isfinite(price) || price <= 0) {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(bot_id);
                 if (it != bots_.end()) {
@@ -1232,7 +1254,7 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 return;
             }
             double qty = client_->round_qty(cfg.symbol, usdt / price);
-            if (qty <= 0) {
+            if (!std::isfinite(qty) || qty <= 0) {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(bot_id);
                 if (it != bots_.end()) {
@@ -1343,12 +1365,23 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
 
             bool   closed_ok      = false;
             bool   external_gone  = false;   // 交易所确认无此仓位（外部已平仓）
+            bool   unclosable     = false;   // 残量低于最小下单量，市价单发不出去
             double closed_qty = 0;   // 实际平掉的数量（可能是部分成交）
             if (total_qty > 0) {
                 const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                          ? "SELL" : "BUY";
                 double qty = client_->round_qty(cfg.symbol, total_qty);
-                auto r = client_->place_market_order(cfg.symbol, side, qty, true);
+                // 残量低于交易所最小下单量：取整后 qty=0，这张单必被拒。
+                // 此前没有这道检查，于是每个 tick 都会发一张数量为 0 的平仓单——
+                // 被拒→下个tick再发，无限空转，还白白消耗限流额度，仓位永远不结清。
+                // 注意这【不是】已有的"灰尘结算"能覆盖的情况：那段逻辑只在平仓
+                // 【成功】之后才跑，而这里单子根本发不出去。
+                // 触发路径：开仓部分成交到低于最小下单量（压力测试 B12 可确定性复现）
+                if (qty <= 0) {
+                    unclosable = true;
+                }
+                auto r = unclosable ? OrderOutcome{}
+                                    : client_->place_market_order(cfg.symbol, side, qty, true);
                 if (!r.ok && r.error.find("[-2022]") != std::string::npos) {
                     // reduceOnly被拒 = 交易所侧没有可平的仓位（用户在交易所手动平过/
                     // 强平过）。本地留着这个幽灵仓位会陷入无限重试（追踪止盈/硬止损
@@ -1387,6 +1420,21 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                 bot.pending = false;
                 cb_copy = trade_cb_;
 
+                // 残量低于最小下单量：停机 + 告警，而不是伪造一笔平仓。
+                // 为什么不当灰尘直接结清：最小下单量并不等于"金额可忽略"——
+                // BTCUSDT 的最小下单量是 0.001，按 10 万美元算就是 100 美元。
+                // 凭空记一笔没真正卖出的盈亏，是在账本上撒谎。
+                // 交易所网页端的「一键平仓」不受最小下单量限制，用户能自己处理
+                if (unclosable) {
+                    bot.state = CcgBot::State::Stopped;
+                    bot.last_action = "残量低于最小下单量，无法平仓，已停止";
+                    log("⚠ " + cfg.symbol + " 剩余持仓 " + std::to_string(total_qty) +
+                        " 低于交易所最小下单量，市价平仓单发不出去。已停止该bot"
+                        "（否则会每个tick空转重发）——请在交易所网页端用「一键平仓」"
+                        "处理这笔残仓，再点【继续】");
+                    return;
+                }
+
                 // 交易所确认无此仓位：清空本地跟踪并停止（同启动对账的外部平仓处理）
                 if (external_gone) {
                     bot.entries.clear();
@@ -1415,7 +1463,19 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                     double pnl = (is_long ? (close_price - avg_price)
                                            : (avg_price - close_price)) * closed_qty;
                     bot.realized_pnl += pnl;
-                    bot.total_qty  = total_qty - closed_qty;
+                    // ⚠ 必须从【当前】持仓量扣减，不能写 total_qty(旧快照) - closed_qty。
+                    // 发 HTTP 期间是不持锁的（否则整个引擎会卡在网络时长上），这段窗口里
+                    // 对账可能已经把仓位清空（交易所侧确认外部已平仓 → entries 清空、
+                    // total_qty 归零）。用旧快照做绝对赋值会把一个已经作废的数量重新写
+                    // 回去，得到"没有任何加仓记录、却有持仓量"的撕裂状态——那个幽灵仓位
+                    // 会占住保证金上限、反复发被拒的平仓单，盈亏还算在一个不存在的仓位上。
+                    // 增量扣减则天然幂等：清空过就是 0，没清空就正常减。
+                    // （压力测试 B13 可确定性复现；并发压测里约每 2 万轮出现一次）
+                    if (bot.total_qty + 1e-12 < total_qty) {
+                        log("⚠ " + cfg.symbol + " 平仓在途期间本地持仓被改动（对账?），"
+                            "按改动后的数量结算");
+                    }
+                    bot.total_qty  = std::max(0.0, bot.total_qty - closed_qty);
                     bot.total_cost = bot.avg_price * bot.total_qty;
                     // tp_reached/entries 保持不变——下个tick should_close 仍成立，继续平剩余
                     bot.last_action = reason + "(部分成交," + std::to_string(closed_qty) + ")";
