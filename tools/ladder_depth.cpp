@@ -53,13 +53,37 @@ struct Row {
     double deployed;    // 累计投入名义价值
     double avg_price;   // 该层成交后的持仓均价
     double unreal_pct;  // 该均价下、当前价即成交价时的浮盈亏%
+    double liq_price;   // 该层成交后的强平价（<=0 表示不可能被强平）
+    double liq_drop;    // 强平价距首仓价的跌幅%
 };
+
+// ── 全仓强平价 ────────────────────────────────────────────────────────────────
+// 强平条件：账户权益 = 维持保证金
+//     wallet + qty×(P − 均价) = qty × P × MMR
+//  ⇒  P_liq = (已投入名义 − wallet) / (qty × (1 − MMR))
+//
+// 注意其中的关键含义：**已投入名义价值 ≤ wallet 时 P_liq ≤ 0，即根本不可能被强平**
+// ——那部分仓位是被现金全额抵押的。这正是"子弹还没打出去"的价值所在，而且它是
+// 可以精确算出来的，不是感觉。
+//
+// wallet 默认取 预算÷杠杆（＝只按计划投入这么多保证金）。若账户里放了更多闲钱，
+// 用 --wallet 覆盖——多放的每一分都直接把强平价往下推。
+static void fill_liq(std::vector<Row>& rows, double wallet, double mmr, double p0) {
+    for (auto& r : rows) {
+        double qty = r.deployed / r.avg_price;      // 累计持仓量
+        double num = r.deployed - wallet;           // 已投入名义 − 现金
+        r.liq_price = (num <= 0) ? 0.0 : num / (qty * (1.0 - mmr));
+        r.liq_drop  = (r.liq_price <= 0) ? 100.0 : (p0 - r.liq_price) / p0 * 100.0;
+    }
+}
+
+static double g_p0 = 100.0;   // 首仓价（--price，纯为可读性，不影响任何比例）
 
 static std::vector<Row> walk(const CcgConfig& cfg, const std::vector<double>& gaps,
                              const std::vector<int>& tiers) {
     auto sizes = CcgEngine::entry_usdt(cfg);
     std::vector<Row> out;
-    double price = 100.0, qty = 0, cost = 0;
+    double price = g_p0, qty = 0, cost = 0;
     for (size_t i = 0; i < sizes.size(); ++i) {
         double gap = (i == 0) ? 0.0 : gaps[i];
         price *= (1.0 - gap / 100.0);
@@ -70,7 +94,7 @@ static std::vector<Row> walk(const CcgConfig& cfg, const std::vector<double>& ga
         r.slot      = (int)i;
         r.tier      = tiers.empty() ? -1 : tiers[i];
         r.gap_pct   = gap;
-        r.drop_pct  = 100.0 - price;
+        r.drop_pct  = (g_p0 - price) / g_p0 * 100.0;
         r.price     = price;
         r.deployed  = cost;
         r.avg_price = cost / qty;
@@ -81,22 +105,29 @@ static std::vector<Row> walk(const CcgConfig& cfg, const std::vector<double>& ga
 }
 
 static void print_table(const char* title, const std::vector<Row>& rows,
-                        double budget, int lev) {
+                        double budget, int lev, double wallet) {
     static const char* TN[4] = { "1h", "4h", "12h", "1d" };
     std::printf("\n%s\n", title);
-    std::printf("  层  档   本档间距   累计跌幅    成交价   累计投入   占预算    均价   该点浮亏\n");
-    std::printf("  ── ──── ────────── ────────── ───────── ────────── ────── ───────── ─────────\n");
+    std::printf("  层  档   本档间距  累计跌幅    成交价    累计投入 占预算     均价    该点浮亏     强平价  强平在跌\n");
+    std::printf("  ── ──── ───────── ───────── ────────── ──────── ────── ────────── ───────── ────────── ─────────\n");
     for (const auto& r : rows) {
-        std::printf("  %2d  %-4s %8.2f%% %9.2f%% %9.3f %9.0fU %5.0f%% %9.3f %8.2f%%\n",
+        char liq[32], liqd[24];
+        if (r.liq_price <= 0) { std::snprintf(liq, sizeof liq, "%9s", "不会强平");
+                                std::snprintf(liqd, sizeof liqd, "%8s", "—"); }
+        else { std::snprintf(liq, sizeof liq, "%10.2f", r.liq_price);
+               std::snprintf(liqd, sizeof liqd, "%8.1f%%", r.liq_drop); }
+        std::printf("  %2d  %-4s %7.2f%% %8.2f%% %10.2f %7.0fU %5.0f%% %10.2f %8.2f%% %s %s\n",
                     r.slot + 1,
                     r.tier < 0 ? "—" : TN[r.tier],
                     r.gap_pct, r.drop_pct, r.price,
                     r.deployed, r.deployed / budget * 100.0,
-                    r.avg_price, r.unreal_pct);
+                    r.avg_price, r.unreal_pct, liq, liqd);
     }
     const auto& last = rows.back();
-    std::printf("  满层：价格跌 %.2f%% 用光全部弹药，此时保证金占用 %.0fU（预算 %.0fU ÷ %dx）\n",
-                last.drop_pct, budget / lev, budget, lev);
+    std::printf("  满层：跌 %.2f%% 打光弹药 · 均价 %.2f · 浮亏 %.2f%% · 强平在跌 %.1f%%"
+                "（钱包 %.0fU，预算 %.0fU ÷ %dx）\n",
+                last.drop_pct, last.avg_price, last.unreal_pct, last.liq_drop,
+                wallet, budget, lev);
 }
 
 // 给定"当前跌幅"，反查两种梯子各自已投入多少、还剩多少没花
@@ -111,7 +142,7 @@ static void compare_at(double drop, const std::vector<Row>& base,
     };
     auto [nb, db, ab] = probe(base);
     auto [nm, dm, am] = probe(mtf);
-    double px = 100.0 * (1.0 - drop / 100.0);
+    double px = g_p0 * (1.0 - drop / 100.0);
     std::printf("  跌 %5.1f%%  基线: %d层 投入%5.0fU(%3.0f%%) 均价%7.3f 浮亏%7.2f%% 剩余保证金%5.0fU"
                 "  │  梯子: %d层 投入%5.0fU(%3.0f%%) 均价%7.3f 浮亏%7.2f%% 剩余保证金%5.0fU\n",
                 drop,
@@ -137,6 +168,7 @@ int main(int argc, char** argv) {
     else if (curve == "mart") cfg.strat_type = CcgConfig::StratType::Martingale;
     else                       cfg.strat_type = CcgConfig::StratType::Linear;
 
+    g_p0 = arg_num(argc, argv, "--price", 100.0);
     const double W1 = arg_num(argc, argv, "--w", 2.5);
     // √T 缩放：4h=×2, 12h=×3.464, 1d=×4.899。可被显式值覆盖
     const double Wt[4] = {
@@ -154,11 +186,18 @@ int main(int argc, char** argv) {
     std::printf("各档带宽: 1h=%.2f%%  4h=%.2f%%  12h=%.2f%%  1d=%.2f%%  (√T 缩放，可用 --w4h 等覆盖)\n",
                 Wt[0], Wt[1], Wt[2], Wt[3]);
 
+    const double mmr    = arg_num(argc, argv, "--mmr", 0.4) / 100.0;
+    const double wallet = arg_num(argc, argv, "--wallet", cfg.budget_usdt / cfg.leverage);
+    std::printf("维持保证金率 MMR=%.2f%%（BTCUSDT 小额档位；随名义价值分档变化，用 --mmr 覆盖）\n",
+                mmr * 100.0);
+    std::printf("钱包余额 %.0fU（默认=预算÷杠杆，即只按计划投入。多放闲钱用 --wallet）\n", wallet);
+
     // ── 基线：动态W，间隔 = clamp(W/3 × mult, 0.3, 1.5×mult) ──────────────
     const double base_gap = dynparams::interval_pct(W1, cfg.dyn_interval_mult);
     std::vector<double> gb(n, base_gap);
     auto base = walk(cfg, gb, {});
-    print_table("【基线】固定动态间隔（每一层都是同一个间距）", base, cfg.budget_usdt, cfg.leverage);
+    fill_liq(base, wallet, mmr, g_p0);
+    print_table("【基线】固定动态间隔（每一层都是同一个间距）", base, cfg.budget_usdt, cfg.leverage, wallet);
 
     // ── 多周期梯子：每档 gap = max(k × 该档带宽, 地板) ─────────────────────
     auto alloc = CcgEngine::mtf_tier_alloc(cfg);
@@ -172,7 +211,8 @@ int main(int argc, char** argv) {
         gm[i] = std::max(cfg.mtf_k * Wt[t], cfg.mtf_min_gap_pct);
     }
     auto mtf = walk(cfg, gm, tm);
-    print_table("【多周期梯子】每档间距由该档带宽决定", mtf, cfg.budget_usdt, cfg.leverage);
+    fill_liq(mtf, wallet, mmr, g_p0);
+    print_table("【多周期梯子】每档间距由该档带宽决定", mtf, cfg.budget_usdt, cfg.leverage, wallet);
 
     // ── 同一跌幅下的横向对比：这才是强平距离真正关心的东西 ─────────────────
     std::printf("\n【同一跌幅下的对比】—— 剩余保证金 = 还没花出去的子弹 = 强平缓冲\n");
