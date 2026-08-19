@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QFont>
+#include <QIcon>
 #include <QLockFile>
 #include <QStandardPaths>
 #include <QDir>
@@ -12,6 +13,17 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("CCG合约监控");
     app.setOrganizationName("CCGMonitor");
+
+    // 窗口左上角 / 任务栏 / Alt-Tab 的图标。Qt 不会去读 exe 内嵌的 ICON 资源，
+    // 得显式设一次。七个尺寸都塞进同一个 QIcon，让 Qt 按场景挑最合适的那张——
+    // 只给一张大图让它自己缩，小尺寸下会糊（图标集本来就是分尺寸出图的，
+    // ≤32px 用的是收到脸部的窄裁切，见 tools/make_icons.py）
+    {
+        QIcon ic;
+        for (int px : {16, 24, 32, 48, 64, 128, 256})
+            ic.addFile(QString(":/logo/logo_%1.png").arg(px));
+        app.setWindowIcon(ic);
+    }
 
     // 单实例锁：同一台机器双开会各自独立决策、对同一账户重复下单。
     // QLockFile 自带陈旧锁检测（崩溃残留的锁会被自动接管），正常运行的实例则拒绝二开。

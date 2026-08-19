@@ -1,0 +1,20 @@
+<!--
+  窗口/任务栏图标。编进 exe 而不是随包发文件，有两个理由：
+    ① 发布包的泄漏检查是白名单（只放行 exe/dll/dylib/so），多发一个 png 就得为它
+       开口子——为一张图标削弱那道门禁不划算
+    ② 用户解压后删掉或挪走图标文件，图标就没了；编进去不会
+
+  只放 PNG 不放 ico：PNG 解码器在 QtGui 里是内建的，而读 ico 要 imageformats/qico
+  插件，我们的发布包只带了 platforms/qwindows.dll，运行时会拿不到。
+-->
+<RCC>
+  <qresource prefix="/logo">
+    <file>logo_16.png</file>
+    <file>logo_24.png</file>
+    <file>logo_32.png</file>
+    <file>logo_48.png</file>
+    <file>logo_64.png</file>
+    <file>logo_128.png</file>
+    <file>logo_256.png</file>
+  </qresource>
+</RCC>

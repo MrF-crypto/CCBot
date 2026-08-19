@@ -13,7 +13,8 @@ CMakeUserPresets.json
 *credentials*
 *.dat
 
-# 参考截图（其它产品界面，跟本项目代码无关）
+# 参考截图（其它产品界面，跟本项目代码无关）。
+# 注意：logo 母图不在这里——它是要进版本控制的，放 assets/source-artwork.png
 图片/
 
 # headless 版配置文件/运行时落盘（含真实API Key，不应提交，只提交 config.example.json 模板）

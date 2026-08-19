@@ -1,0 +1,6 @@
+// Windows 可执行文件图标。
+// 资源 ID 用 1：Explorer / 任务栏 / Alt-Tab 取的是 ID 最小的那个 ICON 资源。
+//
+// 这一步只影响 exe 文件本身的图标。窗口左上角和任务栏运行时图标是另一回事，
+// Qt 不会去读 exe 的资源，得在 main.cpp 里 setWindowIcon（走 app.qrc）。
+1 ICON "icon.ico"

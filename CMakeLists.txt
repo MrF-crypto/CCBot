@@ -35,12 +35,20 @@ set(CORE_LIBS
 if(WIN32 OR APPLE)
     find_package(Qt6 COMPONENTS Widgets REQUIRED)
 
+    # 图标资源。app.qrc（窗口/任务栏图标，AUTORCC 编译）两个平台都要；
+    # app.rc（exe 文件本身的图标）是 Windows 资源脚本，只有 MSVC 认
+    set(APP_ICON_SOURCES assets/app.qrc)
+    if(WIN32)
+        list(APPEND APP_ICON_SOURCES assets/app.rc)
+    endif()
+
     # WIN32 关键字只在 Windows 生效（GUI 子系统，不带控制台窗口），macOS 上自动忽略
     add_executable(CCGMonitor WIN32
         src/main.cpp
         src/core/key_store.cpp
         src/gui/main_window.cpp
         ${CORE_SOURCES}
+        ${APP_ICON_SOURCES}
     )
     target_include_directories(CCGMonitor PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(CCGMonitor PRIVATE ${CORE_LIBS} Qt6::Widgets)

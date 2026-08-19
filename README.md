@@ -1,5 +1,7 @@
 # CCBOT合约监控
 
+<img src="assets/banner.jpg" alt="CCBOT 合约监控" width="360">
+
 Binance USDT-M 永续合约的网格 / 马丁格尔（DCA）自动交易程序，C++20。图形界面版（Qt6）支持
 Windows 和 macOS；核心引擎另有一个不依赖 Qt 的**无图形界面(headless)版**，配置文件驱动，
 可以在 Linux 服务器上完全后台运行，见 [docs/HEADLESS.md](docs/HEADLESS.md)。
