@@ -214,6 +214,18 @@ int main(int argc, char** argv) {
     fill_liq(mtf, wallet, mmr, g_p0);
     print_table("【多周期梯子】每档间距由该档带宽决定", mtf, cfg.budget_usdt, cfg.leverage, wallet);
 
+    // 追踪建仓：武装之后还要等反弹够比例才真正下单。深档用放宽上限的那条公式，
+    // 否则 4h/12h/1d 会被夹成同一个值（见 dynparams::mtf_trail_entry_pct）
+    static const char* TNAME[4] = { "1h", "4h", "12h", "1d" };
+    std::printf("\n各档追踪建仓（武装后需自最低点反弹多少才真正下单）：\n");
+    std::printf("  档   带宽     梯子专用    基线公式(对照)\n");
+    for (int t = 0; t < 4; ++t) {
+        double m = dynparams::mtf_trail_entry_pct(Wt[t]);
+        double b = dynparams::trail_entry_pct(Wt[t]);
+        std::printf("  %-4s %6.2f%%   %6.3f%%     %6.3f%%%s\n", TNAME[t], Wt[t], m, b,
+                    (b < m - 1e-9) ? "  ← 基线会夹住" : "");
+    }
+
     // ── 同一跌幅下的横向对比：这才是强平距离真正关心的东西 ─────────────────
     std::printf("\n【同一跌幅下的对比】—— 剩余保证金 = 还没花出去的子弹 = 强平缓冲\n");
     for (double d : {3.0, 6.0, 10.0, 15.0, 20.0, 30.0, 40.0})

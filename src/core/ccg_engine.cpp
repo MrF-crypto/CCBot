@@ -765,7 +765,10 @@ bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
         const double mb  = (tb.ub + tb.lb) * 0.5;
         if (mb > 0 && tb.ub > tb.lb) {
             const double bandw = (tb.ub - tb.lb) / mb * 100.0;
-            trail_entry = dynparams::trail_entry_pct(bandw);
+            // 用梯子专用的夹逼上限。共用 trail_entry_pct 的话，4h/12h/1d 三档会
+            // 全部撞在 0.4% 的上限上变成同一个值，本函数上面那段注释想避免的
+            // "小反弹就把深层打进去"照样发生——见 mtf_trail_entry_pct 的说明
+            trail_entry = dynparams::mtf_trail_entry_pct(bandw);
         }
     }
 
