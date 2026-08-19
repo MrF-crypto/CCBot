@@ -1149,9 +1149,16 @@ void MainWindow::onConnect() {
     run_async([this, cfg]() {
         auto client = std::make_shared<TradingClient>(cfg);
         client->sync_server_time();
+        // 探测账户的持仓模式（单向 / 双向）。此前这个查询【从未被调用】，
+        // dual_mode_ 从进程启动到结束一直是默认的 false，等于把"单向持仓"写死了：
+        //   · 账户是单向     → 恰好正确，一直没暴露问题
+        //   · 账户是双向     → 每笔单都缺 positionSide 参数，交易所一律拒单 -4061
+        // 同时 add_bot 那道"单向模式下不许同品种双向 bot"的检查也依赖它，
+        // 读到假的 false 会把一个合法配置拦掉
+        const bool dual = client->fetch_position_mode();
         auto info = client->fetch_account();
 
-        QMetaObject::invokeMethod(this, [this, client, info, cfg]() {
+        QMetaObject::invokeMethod(this, [this, client, info, cfg, dual]() {
             btnConnect_->setEnabled(true);
             if (!info.ok) {
                 connLabel_->setText("连接失败: " + QString::fromStdString(info.error));
@@ -1167,6 +1174,10 @@ void MainWindow::onConnect() {
             }
 
             client_ = client;
+            // 把探测结果打出来：持仓模式决定下单参数，配错了是【每笔单都被拒】，
+            // 而错误码 -4061 光看字面很难联想到是这里
+            log(dual ? "账户持仓模式: 双向持仓（下单将带 positionSide）"
+                     : "账户持仓模式: 单向持仓", "OK");
             engine_ = std::make_shared<CcgEngine>(client_, pool_);
             engine_->set_max_total_margin(maxTotalMargin_);
             engine_->set_log_cb([this](const std::string& msg) {

@@ -869,6 +869,11 @@ static int cmd_portfolio(int argc, char** argv) {
     o.per_symbol_budget = per_sym;
     o.max_positions = max_pos;
     o.max_total_margin = cap;
+    // 强平模型：默认开启。它【不改变任何本来就没爆仓的结果】——没触发就完全不介入，
+    // 历史数字原样可比；只有本来就该爆的那些组合会显示出来。--no-liq 可关掉以复现
+    // 加入强平模型之前的旧口径
+    o.liquidation = !arg_flag(argc, argv, "--no-liq");
+    o.mmr         = arg_num(argc, argv, "--mmr", 0.4) / 100.0;
     auto& c = o.base_cfg;
     c.direction = CcgConfig::Direction::Long;
     c.leverage = (int)arg_num(argc, argv, "--lev", 3);

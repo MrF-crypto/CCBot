@@ -144,6 +144,10 @@ int main(int argc, char** argv) {
 
     auto client = std::make_shared<TradingClient>(tc_cfg);
     client->sync_server_time();
+    // 探测持仓模式（单向/双向）。此前这个查询【从未被调用】，dual_mode_ 一直是
+    // 默认的 false，等于把"单向持仓"写死了：账户若是双向，每笔单都缺 positionSide
+    // 参数被交易所拒单 -4061，而那个错误码光看字面很难联想到是这里
+    const bool dual_mode = client->fetch_position_mode();
     auto info = client->fetch_account();
     if (!info.ok) {
         log_line("连接失败: " + info.error, "ERR");
@@ -156,7 +160,8 @@ int main(int argc, char** argv) {
     log_line("连接成功 | " + net_name +
              " | 权益 $" + std::to_string(info.total_equity) +
              " | 可用 $" + std::to_string(info.available) +
-             (info.uni_mmr > 0 ? " | uniMMR " + std::to_string(info.uni_mmr) : ""), "OK");
+             (info.uni_mmr > 0 ? " | uniMMR " + std::to_string(info.uni_mmr) : "") +
+             " | 持仓模式 " + (dual_mode ? "双向（带 positionSide）" : "单向"), "OK");
 
     auto pool   = std::make_shared<ThreadPool>(4);
     auto engine = std::make_shared<CcgEngine>(client, pool);

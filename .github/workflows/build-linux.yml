@@ -27,13 +27,34 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 兜底：GitHub 默认允许一个 job 跑 6 小时。首次编依赖（缓存未命中）约 30 分钟，
+    # 90 分钟足够宽松；卡住的任务不该白烧六小时才被发现
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
+      # apt 在 GitHub runner 上会偶发【挂死】（不是报错，是卡住不动）——v3.9.1 和
+      # v3.9.3 两次发版都撞上，每次都要人工取消重跑。
+      # 重试循环单独用不管用：挂死的进程不会退出，循环根本轮不到下一次。所以用
+      # timeout 主动砍掉，再由外层循环重试；job 级 timeout-minutes 是最后兜底，
+      # 免得卡住的任务白烧六小时
       - name: Install build tools
+        timeout-minutes: 15
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool
+          set -e
+          ok=0
+          for i in 1 2 3; do
+            if timeout 240 sudo apt-get update -qq && \
+               timeout 480 sudo apt-get install -y ninja-build pkg-config \
+                            autoconf autoconf-archive automake libtool; then
+              ok=1; break
+            fi
+            echo "── apt 第 $i 次超时或失败，15 秒后重试 ──"
+            sudo killall apt-get dpkg 2>/dev/null || true
+            sudo dpkg --configure -a || true
+            sleep 15
+          done
+          [ "$ok" = "1" ] || { echo "apt 三次均失败"; exit 1; }
 
       - name: Set up vcpkg
         run: |
@@ -79,7 +100,7 @@ jobs:
           set -e
           for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_stress_tests; do
+                   ccg_stress_tests ccg_liq_tests; do
             echo "── $t ──"
             ./build/$t
           done

@@ -115,6 +115,24 @@ public:
         return n;
     }
 
+    // ── 强平支持 ──────────────────────────────────────────────────────────────
+    // 维持保证金 = Σ(名义价值 × mmr)。币安按名义分档，这里用单一值近似——
+    // 取小额档位是【乐观】的一侧，真实分档只会更严
+    double maintenance_margin(double mmr) const { return total_notional() * mmr; }
+
+    // 强制平掉全部仓位（走正常撮合，滑点手续费照收）。
+    // 真实强平的成交条件比这更差（强平引擎吃穿盘口、还有强平手续费），
+    // 所以这个模型给出的损失是【下限】——现实只会更糟
+    int force_close_all() {
+        int closed = 0;
+        for (auto& [sym, p] : pos_) {
+            if (p.qty <= 0) continue;
+            place_market_order(sym, p.is_long ? "SELL" : "BUY", p.qty, true);
+            ++closed;
+        }
+        return closed;
+    }
+
 private:
     double fee_, extra_slip_;
     std::map<std::string, std::pair<double,double>> mkt_;   // sym → {price, spread}

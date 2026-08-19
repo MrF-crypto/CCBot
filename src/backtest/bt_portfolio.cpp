@@ -25,8 +25,52 @@ std::string PortfolioResult::to_text() const {
       << "   峰值保证金 " << peak_margin << " U   峰值名义 " << peak_notional << " U\n"
       << "  额度拦截  : " << margin_blocks << " 次（总保证金上限挡住的开仓）\n"
       << "  参与品种  : " << symbols_traded << " 个实际开过仓\n";
+
+    // 强平必须显示在最醒目的位置：一旦发生，上面那些收益/回撤数字【全部作废】——
+    // 账户在中途就没了，后面的行情它根本没参与。把它印在末尾而不是塞进某一行，
+    // 是为了让扫一眼结果的人不可能错过
+    if (liquidated) {
+        o << "\n"
+          << "  ╔══════════════════════════════════════════════════════════╗\n"
+          << "  ║  ⚠ 账户已被强平 —— 上面的收益与回撤数字全部作废          ║\n"
+          << "  ╚══════════════════════════════════════════════════════════╝\n"
+          << "  强平时刻权益 " << liq_equity << " U   当时持仓名义 " << liq_notional << " U\n"
+          << "  这组参数在这段行情里【死了】，不能与未爆仓的组合比收益\n";
+    } else if (min_margin_ratio < 1e17) {
+        o << "  保证金安全边际: 全程最低 权益÷维持保证金 = "
+          << min_margin_ratio << " 倍（=1 即强平）\n";
+    }
     return o.str();
 }
+
+namespace {
+// 强平检查：全仓口径，账户权益 ≤ 维持保证金即爆仓，全部仓位按市价强制平掉。
+// 返回 true 表示已强平，调用方应立即终止回放——账户没了，后面的行情与它无关。
+//
+// 顺带记录全程最低的"权益÷维持保证金"。这个比值比最大回撤更能说明危险程度：
+// 回撤 30% 在本金厚的时候毫发无伤，在杠杆拉满时已经爆了，而这个比值把两者
+// 归一化到同一把尺子上——它是"离死还有多远"的直接度量
+bool check_liquidation(ccbot::bt::MultiSimClient& sim,
+                       const ccbot::bt::PortfolioOptions& opt,
+                       ccbot::bt::PortfolioResult& res,
+                       double init_eq, int64_t t) {
+    if (!opt.liquidation) return false;
+    const double notion = sim.total_notional();
+    if (notion <= 0) return false;                      // 空仓不可能被强平
+
+    const double equity = init_eq + sim.realized() + sim.unrealized();
+    const double mm     = notion * opt.mmr;
+    if (mm > 0) res.min_margin_ratio = std::min(res.min_margin_ratio, equity / mm);
+    if (equity > mm) return false;
+
+    res.liquidated   = true;
+    res.liq_ts       = t;
+    res.liq_equity   = equity;
+    res.liq_notional = notion;
+    sim.force_close_all();
+    return true;
+}
+} // namespace
 
 namespace {
 // 高周期状态：closes 末尾恒为"当前未收盘bar"的实时收盘价——与实盘拉K线的
@@ -291,6 +335,10 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
 
         int64_t day = t / 86400000;
         if (day != last_day) { last_day = day; res.equity_curve.emplace_back(t, equity); }
+
+        // 强平检查放在每根bar的最后：本根的成交/资金费都已入账，此刻的权益
+        // 才是交易所看到的那个。爆了就立即终止——账户没了，后面的行情与它无关
+        if (check_liquidation(*sim, opt, res, init_eq, t)) break;
     }
 
     res.total_pnl    = sim->realized() + sim->unrealized();
@@ -480,6 +528,10 @@ PortfolioResult run_portfolio_stream(
 
         int64_t day = t / 86400000;
         if (day != last_day) { last_day = day; res.equity_curve.emplace_back(t, equity); }
+
+        // 强平检查放在每根bar的最后：本根的成交/资金费都已入账，此刻的权益
+        // 才是交易所看到的那个。爆了就立即终止——账户没了，后面的行情与它无关
+        if (check_liquidation(*sim, opt, res, init_eq, t)) break;
     }
 
     res.total_pnl    = sim->realized() + sim->unrealized();

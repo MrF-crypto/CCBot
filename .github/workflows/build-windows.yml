@@ -85,7 +85,7 @@ jobs:
           set -e
           for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_stress_tests; do
+                   ccg_stress_tests ccg_liq_tests; do
             echo "── $t ──"
             ./build/Release/$t.exe
           done

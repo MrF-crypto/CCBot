@@ -178,6 +178,17 @@ if(MSVC)
     target_compile_options(ccg_rate_tests PRIVATE /utf-8)
 endif()
 
+# ── 回测强平模型测试：该爆的要爆，不该爆的一个数字都不能动 ────────────────────
+add_executable(ccg_liq_tests tests/test_liquidation.cpp
+                             src/backtest/bt_portfolio.cpp
+                             src/backtest/bt_data.cpp      # aggregate / interval_ms / BarStream
+                             src/core/ccg_engine.cpp)
+target_include_directories(ccg_liq_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_liq_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_liq_tests PRIVATE /utf-8)
+endif()
+
 # ── 压力测试（并发撕裂 / 极端行情）：实盘前的最后一道自检 ────────────────────
 add_executable(ccg_stress_tests tests/test_stress.cpp src/core/ccg_engine.cpp)
 target_include_directories(ccg_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
