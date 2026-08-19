@@ -1234,8 +1234,18 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 usdt = sizes[level];
             }
 
-            // 首仓时设置杠杆
-            if (level == 0) client_->set_leverage(cfg.symbol, cfg.leverage);
+            // 首仓时设置杠杆。返回值不能丢：失败的话仓位会按【交易所上原有的杠杆】
+            // 开出去，而本地的保证金核算用的是 cfg.leverage（total_margin_used 里
+            // total_cost/leverage）。两者不一致时账户级保证金上限守的是一个假数字——
+            // 若交易所实际杠杆比配置的低，真实占用的保证金高于本地估算，那道闸就
+            // 形同虚设。对"保证金提前规划好"的用法来说这是直接踩在痛点上。
+            // 仍然放行而不是拦下：多数失败是网络抖动，而敞口（qty×价格）并不受
+            // 杠杆影响，错过建仓的代价更大。但必须让人看见
+            if (level == 0 && !client_->set_leverage(cfg.symbol, cfg.leverage)) {
+                log("⚠ " + cfg.symbol + " 杠杆设置失败（目标 " +
+                    std::to_string(cfg.leverage) + "x）——本次将按交易所上原有杠杆开仓，"
+                    "本地保证金核算可能与实际不符，请到交易所核对杠杆设置");
+            }
 
             const std::string side = (cfg.direction == CcgConfig::Direction::Long)
                                      ? "BUY" : "SELL";
