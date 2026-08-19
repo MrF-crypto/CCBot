@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
 #include <mutex>
 #include <memory>
 #include <functional>
@@ -259,8 +260,18 @@ private:
     TestHook    test_hook_;
     std::string base_;       // 签名端点的域名（统一账户 = papi.binance.com）
     std::string pub_base_;   // 公开行情端点的域名（永远是 fapi，papi 没有行情接口）
-    bool        dual_mode_       = false;
-    int64_t     time_offset_ms_  = 0;   // local_clock + offset = server_clock
+    // ⚠ 这两个都是【一处写、多处读，且跨线程】，必须是原子的。
+    //
+    // time_offset_ms_ 由 sync_server_time() 在线程池线程里写，而 ts_ms() 在【每一个
+    // 签名请求】里读——引擎池、GUI 线程都会读。做成普通 int64_t 是数据竞争：
+    // x86-64 上 64 位对齐读写不会撕裂，所以值不会变成垃圾，真正的风险是【可见性】——
+    // 编译器可以把它缓存在寄存器里不再重新加载，于是"看到 -1021 就立即重新对时"
+    // 这个自愈路径对那个线程【完全无效】，-1021 会一直反复出现而看不出原因。
+    //
+    // dual_mode_ 同理：由 set_dual_mode() 写（连接时探测持仓模式），而下单路径每次
+    // 都要读它来决定带不带 positionSide。读到陈旧值会让参数组合不对而被交易所拒单。
+    std::atomic<bool>    dual_mode_      {false};
+    std::atomic<int64_t> time_offset_ms_ {0};   // local_clock + offset = server_clock
 
     mutable std::mutex                                sym_mtx_;
     std::unordered_map<std::string, SymbolInfo>       sym_cache_;
