@@ -1470,8 +1470,22 @@ void MainWindow::refreshAccount() {
             ++netFailCount_;
             if (netFailCount_ >= 3 && connState_ == ConnState::Connected) {
                 connState_ = ConnState::NetworkError;
-                log(QString("检测到网络异常（账户接口连续 %1 次拉取失败）: %2")
-                    .arg(netFailCount_).arg(QString::fromStdString(info.error)), "ERR");
+                // -1021 一律报"网络异常"会误导：它有两种完全不同的成因，
+                // 处理方式相反（一个改系统时钟、一个查网络），必须让用户能分辨。
+                // 判据是币安返回的文案本身：ahead=本机时钟快了（网络物理上造不成
+                // 这个，延迟只会让时间戳显得更旧）；recvWindow=请求在路上太久，
+                // 或本机时钟慢了
+                const QString err = QString::fromStdString(info.error);
+                QString hint;
+                if (err.contains("-1021")) {
+                    hint = err.contains("ahead", Qt::CaseInsensitive)
+                        ? "  ← 本机时钟【快了】超过容忍范围，与网络无关。"
+                          "请同步系统时间（w32tm /resync）"
+                        : "  ← 请求在路上耗时超过 recvWindow(10秒)，或本机时钟慢了。"
+                          "多为瞬时网络抖动，程序会自动重新对时并重试";
+                }
+                log(QString("账户接口连续 %1 次拉取失败: %2%3")
+                    .arg(netFailCount_).arg(err).arg(hint), "ERR");
                 if (!alertedDisconnect_) {
                     alertedDisconnect_ = true;
                     sendAlert(QString("[CCGMonitor] 检测到网络异常，账户接口连续拉取失败: %1")
