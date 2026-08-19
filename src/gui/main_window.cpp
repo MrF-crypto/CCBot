@@ -1,4 +1,5 @@
 #include "gui/main_window.h"
+#include "version.h"
 #include "core/key_store.h"
 #include "net/alert.h"
 #include "core/decision.h"
@@ -103,7 +104,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle("CCG 合约监控  v3.9.0");
+    setWindowTitle(QString("CCG 合约监控  %1").arg(ccbot::kVersion));
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();

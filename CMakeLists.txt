@@ -1,8 +1,13 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.9.0 LANGUAGES CXX)
+project(CCGMonitor VERSION 3.9.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 版本号唯一来源：上面那行。窗口标题和 headless 启动横幅都从这里取（src/version.h），
+# 发版时只改一处。发布流水线的泄漏检查会核对 tag 版本号确实内嵌在可执行文件里，
+# 所以"改了 tag 忘了改源码"会被门禁拦住而不是发到用户手上
+set(CCBOT_VERSION_DEF CCBOT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -52,6 +57,7 @@ if(WIN32 OR APPLE)
     )
     target_include_directories(CCGMonitor PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(CCGMonitor PRIVATE ${CORE_LIBS} Qt6::Widgets)
+    target_compile_definitions(CCGMonitor PRIVATE ${CCBOT_VERSION_DEF})
 
     if(WIN32)
         target_link_libraries(CCGMonitor PRIVATE crypt32 ws2_32 wsock32)
@@ -89,6 +95,7 @@ add_executable(ccbot_headless
 )
 target_include_directories(ccbot_headless PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccbot_headless PRIVATE ${CORE_LIBS})
+target_compile_definitions(ccbot_headless PRIVATE ${CCBOT_VERSION_DEF})
 if(WIN32)
     target_link_libraries(ccbot_headless PRIVATE crypt32 ws2_32 wsock32)
     target_compile_definitions(ccbot_headless PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

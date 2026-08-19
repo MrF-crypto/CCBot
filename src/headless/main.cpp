@@ -1,5 +1,6 @@
 // ccbot_headless：无图形界面版本，配置文件驱动，Windows/Linux 都能编译运行。
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
+#include "version.h"
 #include "core/ccg_engine.h"
 #include "core/funding_ledger.h"
 #include "core/sr_zones.h"
@@ -124,8 +125,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    log_line("ccbot headless 启动，配置文件: " + config_path + "，共 " +
-             std::to_string(cfg.bots.size()) + " 个 bot");
+    // 版本号写进日志：VPS 上排查问题时，第一件要确认的事就是"跑的到底是哪一版"。
+    // 顺带让版本串真正进到二进制里——发布流水线的泄漏检查靠它核对
+    // "包里的可执行文件是不是这个 tag 编出来的"
+    log_line(std::string("ccbot headless ") + ccbot::kVersion + " 启动，配置文件: "
+             + config_path + "，共 " + std::to_string(cfg.bots.size()) + " 个 bot");
 
     TradingClient::Config tc_cfg;
     tc_cfg.api_key    = cfg.api_key;
