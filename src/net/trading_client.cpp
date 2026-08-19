@@ -162,28 +162,12 @@ std::string TradingClient::sign(const std::string& q) const {
     return hmac_sha256(cfg_.api_secret, q);
 }
 
-// ── recvWindow ────────────────────────────────────────────────────────────────
-// 币安只在 serverTime − timestamp ≤ recvWindow 时才受理签名请求。而 ts_ms() 又
-// 刻意回拨了 1 秒，所以真正留给【网络往返】的预算 = recvWindow − 1000。
-//
-// 原来是 5000，预算只有 4 秒：单次请求在路上超过 4 秒就会被判 -1021——注意这
-// 【不是超时】，请求确实到达了币安，只是到得太晚（curl 超时是 10 秒，够它到达）。
-// 实盘表现就是偶发的"[-1021] outside of recvWindow"，几秒后自己恢复。
-//
-// 调到 10000，网络预算变成 9 秒，覆盖绝大多数瞬时抖动。
-// 代价是抗重放窗口变长——对一个走 TLS 的自用程序，这个风险可以忽略；
-// 币安允许的上限是 60000，10000 仍属保守。
-//
-// ⚠ 这个值散落在本文件 15 处（有的带 & 前缀、有的拼在更大的字面量里，抽不成
-//   一个常量而不动下单参数的拼接方式）。改动时务必全文替换 —— 漏掉一处会以
-//   "偶发失败"的形式出现，是最难定位的那种
-
 int64_t TradingClient::ts_ms() const {
     using namespace std::chrono;
     auto local = duration_cast<milliseconds>(
         system_clock::now().time_since_epoch()).count();
     // 刻意回拨1秒：币安对"时间戳超前"零容忍（>1000ms直接-1021拒绝），对"滞后"
-    // 有 recvWindow=10000ms 的宽容——把时间戳往安全的一侧靠，本机时钟快1~2秒的
+    // 有 recvWindow=5000ms 的宽容——把时间戳往安全的一侧靠，本机时钟快1~2秒的
     // 常见漂移就不会再触发 -1021（时好时坏的"网络异常"多半是它）
     return local + time_offset_ms_ - 1000;
 }
@@ -356,7 +340,7 @@ TradingClient::AccountInfo TradingClient::fetch_account() {
 
 TradingClient::AccountInfo TradingClient::fetch_account_futures() {
     AccountInfo info;
-    auto resp = http_get(ep(Ep::Account), "recvWindow=10000");
+    auto resp = http_get(ep(Ep::Account), "recvWindow=5000");
     if (resp.empty()) { info.error = "无响应"; return info; }
 
     simdjson::dom::parser p;
@@ -385,7 +369,7 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
     simdjson::dom::parser p1, p2;
 
     // ① UM 子账户：未实现盈亏，以及 totalAvailableBalance 缺失时的兜底
-    auto um_resp = http_get(ep(Ep::Account), "recvWindow=10000");
+    auto um_resp = http_get(ep(Ep::Account), "recvWindow=5000");
     if (um_resp.empty()) { info.error = "统一账户无响应（papi）"; return info; }
 
     simdjson::dom::element um;
@@ -421,7 +405,7 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
     }
 
     // ② 全账户：uniMMR + 权益 + 可用
-    auto acc_resp = http_get(ep(Ep::PmAccount), "recvWindow=10000");
+    auto acc_resp = http_get(ep(Ep::PmAccount), "recvWindow=5000");
     double pm_equity = 0, pm_avail = 0;
     bool has_pm_eq = false, has_pm_av = false;
     if (!acc_resp.empty()) {
@@ -452,7 +436,7 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
 
 std::vector<TradingClient::Position> TradingClient::fetch_positions() {
     std::vector<Position> result;
-    auto resp = http_get(ep(Ep::PositionRisk), "recvWindow=10000");
+    auto resp = http_get(ep(Ep::PositionRisk), "recvWindow=5000");
     if (resp.empty()) return result;
 
     simdjson::dom::parser p;
@@ -492,7 +476,7 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions() {
 
 std::vector<TradingClient::OpenOrder> TradingClient::fetch_open_orders() {
     std::vector<OpenOrder> result;
-    auto resp = http_get(ep(Ep::OpenOrders), "recvWindow=10000");
+    auto resp = http_get(ep(Ep::OpenOrders), "recvWindow=5000");
     if (resp.empty()) return result;
 
     simdjson::dom::parser p;
@@ -559,7 +543,7 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     OrderResult r;
     auto resp = http_get(ep(Ep::Order),
                          "symbol=" + sym + "&origClientOrderId=" + client_order_id +
-                         "&recvWindow=10000");
+                         "&recvWindow=5000");
     if (resp.empty()) { r.error = "无响应"; r.uncertain = true; return r; }
 
     simdjson::dom::parser p;
@@ -606,7 +590,7 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
         std::string body = "symbol=" + sym + "&side=" + side
             + "&type=MARKET&quantity=" + fmt_qty(try_qty, try_step)
             + "&newClientOrderId=" + coid
-            + "&newOrderRespType=RESULT&recvWindow=10000" + extra;
+            + "&newOrderRespType=RESULT&recvWindow=5000" + extra;
 
         auto resp = http_post(ep(Ep::Order), body);
 
@@ -668,7 +652,7 @@ TradingClient::OrderResult TradingClient::place_limit(const std::string& sym,
         << "&type=LIMIT&timeInForce=GTC"
         << "&quantity=" << fmt_qty(qty, linfo.step_size)
         << "&price=" << std::fixed << std::setprecision(step_decimals(linfo.tick_size)) << price
-        << "&recvWindow=10000";
+        << "&recvWindow=5000";
 
     if (dual_mode_) {
         oss << pos_side_param(true, side, reduce_only);
@@ -691,7 +675,7 @@ TradingClient::OrderResult TradingClient::place_limit(const std::string& sym,
 }
 
 bool TradingClient::fetch_position_mode() {
-    auto resp = http_get(ep(Ep::PositionSideDual), "recvWindow=10000");
+    auto resp = http_get(ep(Ep::PositionSideDual), "recvWindow=5000");
     if (resp.empty()) return false;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -705,7 +689,7 @@ bool TradingClient::fetch_position_mode() {
 
 bool TradingClient::cancel_order(const std::string& sym, const std::string& order_id) {
     auto resp = http_del(ep(Ep::Order),
-        "symbol=" + sym + "&orderId=" + order_id + "&recvWindow=10000");
+        "symbol=" + sym + "&orderId=" + order_id + "&recvWindow=5000");
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
@@ -716,7 +700,7 @@ bool TradingClient::cancel_order(const std::string& sym, const std::string& orde
 
 bool TradingClient::cancel_all_orders(const std::string& sym) {
     auto resp = http_del(ep(Ep::AllOpenOrders),
-        "symbol=" + sym + "&recvWindow=10000");
+        "symbol=" + sym + "&recvWindow=5000");
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
@@ -969,7 +953,7 @@ TradingClient::place_cond_market(const std::string& sym, const char* order_type,
         << "&reduceOnly=true"
         << "&workingType=MARK_PRICE"
         << "&priceProtect=false"
-        << "&recvWindow=10000";
+        << "&recvWindow=5000";
     if (dual_mode_)
         oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
 
@@ -1006,7 +990,7 @@ std::string TradingClient::place_disaster_stop(const std::string& sym, double st
         << "&closePosition=true"
         << "&workingType=MARK_PRICE"   // 用标记价，避免插针成交价误触发
         << "&priceProtect=true"
-        << "&recvWindow=10000";
+        << "&recvWindow=5000";
     if (dual_mode_)
         oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
 
@@ -1030,7 +1014,7 @@ bool TradingClient::cancel_disaster_stop(const std::string& sym,
     // 统一账户的条件单不在普通撤单端点上，且用 strategyId 而不是 orderId
     auto resp = http_del(pm ? ep(Ep::CondOrder) : ep(Ep::Order),
         "symbol=" + sym + (pm ? "&strategyId=" : "&orderId=") + order_id +
-        "&recvWindow=10000");
+        "&recvWindow=5000");
     if (resp.empty()) return false;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -1202,7 +1186,7 @@ TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
     if (!sym.empty())   params += "&symbol=" + sym;
     if (start_ms > 0)   params += "&startTime=" + std::to_string(start_ms);
     if (end_ms   > 0)   params += "&endTime="   + std::to_string(end_ms);
-    params += "&recvWindow=10000";
+    params += "&recvWindow=5000";
 
     auto resp = http_get(ep(Ep::Income), params);
     if (resp.empty()) return out;
