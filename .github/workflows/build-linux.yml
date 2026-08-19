@@ -88,9 +88,9 @@ jobs:
         run: |
           set -e
           mkdir -p pkg
-          cp build/ccbot_headless pkg/
+          cp build/ccbot_headless build/ladder_depth pkg/
           cp config.example.json pkg/
-          chmod +x pkg/ccbot_headless
+          chmod +x pkg/ccbot_headless pkg/ladder_depth
 
       # 泄漏检查同样是硬门禁。config.example.json 是模板（不含真凭证），但白名单
       # 只放行可执行文件，所以要在检查【之后】再放进 zip

@@ -99,7 +99,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p pkg
-          cp build/CCGMonitor build/ccbot_headless pkg/
+          cp build/CCGMonitor build/ccbot_headless build/ladder_depth pkg/
 
       # 硬门禁：白名单校验 + 内嵌版本号核对。mac 包此前完全没有这一步
       - name: Leak check (hard gate)

@@ -96,7 +96,7 @@ jobs:
           set -e
           mkdir -p pkg/platforms
           cd build/Release
-          cp CCGMonitor.exe *.dll ../../pkg/
+          cp CCGMonitor.exe ladder_depth.exe *.dll ../../pkg/
           cp platforms/qwindows.dll ../../pkg/platforms/
           cd ../..
           ls -la pkg | head -30

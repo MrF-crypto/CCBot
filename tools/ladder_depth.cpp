@@ -19,6 +19,7 @@
 //   所以四个带宽都留了独立入口
 #include "core/ccg_engine.h"
 #include "core/dynamic_params.h"
+#include "version.h"
 
 #include <cmath>
 #include <cstdio>
@@ -179,7 +180,9 @@ int main(int argc, char** argv) {
     };
 
     const int n = cfg.max_entries;
-    std::printf("═══ 梯子深度分析 ═══\n");
+    // 打版本：这份表会被拿去做资金规划，必须能追溯是哪一版算的——
+    // 间距与追踪建仓的公式在版本之间是会变的
+    std::printf("═══ 梯子深度分析 · CCBOT %s ═══\n", ccbot::kVersion);
     std::printf("曲线=%s  层数=%d  预算=%.0fU  杠杆=%dx  1h带宽W=%.2f%%\n",
                 CcgEngine::strat_name(cfg.strat_type).c_str(), n, cfg.budget_usdt,
                 cfg.leverage, W1);
