@@ -658,8 +658,14 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             if (ok) {
                 const double mb = (tb.ub + tb.lb) * 0.5;
                 const double bandw = (mb > 0) ? (tb.ub - tb.lb) / mb * 100.0 : 0.0;
-                const double gap = std::max(bot.cfg.mtf_k * bandw,
-                                            bot.cfg.mtf_min_gap_pct);
+                double gap = std::max(bot.cfg.mtf_k * bandw,
+                                      bot.cfg.mtf_min_gap_pct);
+                // 趋势过滤的"空头态间隔×1.5"必须同样作用在梯子的间距上。
+                // 此前这里直接用 gap 覆盖了 triggered，而 ×1.5 是烘焙在 interval_th
+                // 里的——等于开了多周期梯子，趋势过滤的补仓那一半就【静默失效】了。
+                // 趋势过滤是个独立勾选项，用户会以为它还在工作；两个功能各自都对，
+                // 组合起来其中一个悄悄不算数，是最难发现的那类缺陷
+                gap = apply_trend_interval(bot, gap, host_.now_steady());
                 const double gap_th = bot.last_entry_price *
                     (is_long ? (1.0 - gap / 100.0) : (1.0 + gap / 100.0));
                 ok = is_long ? (price <= gap_th) : (price >= gap_th);

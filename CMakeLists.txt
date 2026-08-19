@@ -119,6 +119,14 @@ if(MSVC)
     target_compile_options(ccbot_backtest PRIVATE /utf-8)
 endif()
 
+# ── 梯子深度分析：满层能扛多深 / 剩多少保证金没花。不跑行情，纯确定性推演 ────
+add_executable(ladder_depth tools/ladder_depth.cpp src/core/ccg_engine.cpp)
+target_include_directories(ladder_depth PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ladder_depth PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ladder_depth PRIVATE /utf-8)
+endif()
+
 # ── 指标数学逻辑单元测试——纯 C++ 头文件，不依赖 Qt/curl/网络，独立小可执行文件 ──
 add_executable(ccg_indicator_tests tests/test_indicators.cpp)
 target_include_directories(ccg_indicator_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
