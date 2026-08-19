@@ -286,8 +286,77 @@ static void test_mtf_alloc() {
     std::printf("[ OK ]  1~50 层的权重分配求和恒等于层数\n");
 }
 
+// ── 用例：首仓后瞬间砸穿全部四档下轨再反弹，到底补几层？────────────────────
+// 这是实盘里最容易误解的一个场景。直觉上"跌破了日线下轨，深层该解锁了"，
+// 但梯子是【按槽位顺序】走的：下一层归哪一档只取决于当前有几层持仓，
+// 与"价格砸穿了多少条下轨"无关。而且每成交一层，间距基准就重置到新成交价。
+// 结论应当是：一次 V 形急跌急拉只补【一层】，且是下一个槽位那一层。
+static void test_v_crash_fills_one_layer() {
+    std::printf("\n── 用例：V形急跌砸穿四档下轨后反弹 ──\n");
+    int64_t vnow = 1'700'000'000'000LL;
+    auto fc  = std::make_shared<FakeClient>();
+    CcgEngine eng(fc, make_host(vnow));
+
+    CcgConfig c = base_cfg();
+    c.strat_type      = CcgConfig::StratType::Flat;   // 每层等额，便于核对
+    c.budget_usdt     = 8000.0;                       // 8 层 × 1000U
+    c.max_entries     = 8;
+    c.mtf_ladder      = true;
+    c.mtf_tier_layers = "5,1,1,1";
+    c.mtf_k           = 0.3333;
+    c.mtf_min_gap_pct = 0.3;
+    auto id = eng.add_bot(c);
+
+    // 四档带子（1h 带宽 2.5%，其余按 √T 缩放），中轨都在 100000
+    eng.update_mtf_band(id, 0,  98750.0, 101250.0);   // 1h   W=2.50%
+    eng.update_mtf_band(id, 1,  97500.0, 102500.0);   // 4h   W=5.00%
+    eng.update_mtf_band(id, 2,  95670.0, 104330.0);   // 12h  W=8.66%
+    eng.update_mtf_band(id, 3,  93875.0, 106125.0);   // 1d   W=12.25%
+
+    fc->next_fill_price = 100000.0;
+    eng.tick("BTCUSDT", 100000.0);                    // 首仓
+    check(eng.get_bots()[0].entries.size() == 1, "首仓已建立");
+
+    // 瞬间砸到 81500 —— 低于【全部四档】下轨（含日线 93875）
+    fc->next_fill_price = 81500.0;
+    vnow += 3000; eng.tick("BTCUSDT", 81500.0);
+    {
+        auto b = eng.get_bots()[0];
+        check(b.entries.size() == 1,
+              "砸穿四档下轨的那一刻【不下单】——只是武装并记录最低点");
+        check(std::fabs(b.dca_extreme - 81500.0) < 1e-6, "  最低点已记为 81500");
+    }
+
+    // 反弹到 83000（自最低点 +1.84%，超过 1h 档要求的 0.25%）
+    fc->next_fill_price = 83000.0;
+    vnow += 3000; eng.tick("BTCUSDT", 83000.0);
+    {
+        auto b = eng.get_bots()[0];
+        check(b.entries.size() == 2, "反弹达标 → 补【一】层");
+        check(b.entries.back().price > 82000.0,
+              "  成交价是【检测到反弹那一刻的价格】(83000)，不是最低点也不是最低点+0.25%");
+    }
+
+    // 继续反弹：不该再补。下一槽位仍归 1h 档，且间距基准已重置到 83000，
+    // 需要再跌破 83000×(1-0.833%)=82309 才可能武装——价格在往上走
+    for (double p : {85000.0, 88000.0, 92000.0, 95000.0}) {
+        fc->next_fill_price = p; vnow += 3000; eng.tick("BTCUSDT", p);
+    }
+    check(eng.get_bots()[0].entries.size() == 2,
+          "一路反弹回去不再补仓——V形只吃到一层，深层弹药原封不动");
+
+    // 再砸一次到 80000：这次相对 83000 跌够了，且仍在 1h 下轨外 → 可以武装
+    fc->next_fill_price = 80000.0; vnow += 3000; eng.tick("BTCUSDT", 80000.0);
+    fc->next_fill_price = 81000.0; vnow += 3000; eng.tick("BTCUSDT", 81000.0);
+    check(eng.get_bots()[0].entries.size() == 3,
+          "第二次下跌+反弹才补到第3层——每层都要各自的一轮「跌够+止跌」");
+
+    check(fc->market_orders == 3, "全程只发了 3 笔订单（首仓 + 2 次补仓）");
+}
+
 int main() {
     test_dca_margin_cap();
+    test_v_crash_fills_one_layer();
     test_disaster_stop_lifecycle();
     test_disabled_by_default();
     test_place_failure_is_loud();
