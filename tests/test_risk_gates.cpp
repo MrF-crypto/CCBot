@@ -354,9 +354,62 @@ static void test_v_crash_fills_one_layer() {
     check(fc->market_orders == 3, "全程只发了 3 笔订单（首仓 + 2 次补仓）");
 }
 
+// ── 用例：账户级并发持仓上限 ─────────────────────────────────────────────────
+// 全市场扫描场景的必需闸门。它与保证金上限管的是不同的事：保证金上限管
+// "总共投出去多少钱"，并发上限管"同时压在几个品种上"。只有前者的话，大跌那天
+// 几十个品种同时触发信号，钱会被最先触发的吃光，分散度完全失控。
+static void test_max_open_positions() {
+    std::printf("\n── 用例：账户级并发持仓上限 ──\n");
+    int64_t vnow = 1'700'000'000'000LL;
+    auto fc  = std::make_shared<FakeClient>();
+    CcgEngine eng(fc, make_host(vnow));
+    eng.set_max_open_positions(2);          // 最多同时持有 2 个品种
+
+    const char* syms[] = { "AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT" };
+    for (const char* s : syms) {
+        CcgConfig c = base_cfg();
+        c.symbol = s;
+        eng.add_bot(c);
+    }
+
+    fc->next_fill_price = 100.0;
+    for (const char* s : syms) { vnow += 3000; eng.tick(s, 100.0); }
+
+    int holding = 0;
+    for (const auto& b : eng.get_bots()) if (b.total_qty > 0) ++holding;
+    check(holding == 2, "4 个品种同时满足开仓条件，只开出 2 个（实际 " +
+                        std::to_string(holding) + "）");
+    check(eng.open_position_count() == 2, "open_position_count 报告 2");
+    check(fc->market_orders == 2, "只发了 2 笔订单，没有超发");
+
+    // 平掉一个，额度应当立刻释放给下一个品种
+    for (const auto& b : eng.get_bots()) {
+        if (b.total_qty > 0) { eng.close_bot(b.bot_id); break; }
+    }
+    check(eng.open_position_count() == 1, "手动平掉一个后并发数降到 1");
+
+    for (const char* s : syms) { vnow += 3000; eng.tick(s, 100.0); }
+    holding = 0;
+    for (const auto& b : eng.get_bots()) if (b.total_qty > 0) ++holding;
+    check(holding == 2, "空出的额度被后面排队的品种补上，仍不超过上限");
+
+    // 0 = 不限
+    CcgEngine eng2(fc, make_host(vnow));
+    eng2.set_max_open_positions(0);
+    for (const char* s : syms) {
+        CcgConfig c = base_cfg(); c.symbol = s;
+        eng2.add_bot(c);
+    }
+    for (const char* s : syms) { vnow += 3000; eng2.tick(s, 100.0); }
+    int h2 = 0;
+    for (const auto& b : eng2.get_bots()) if (b.total_qty > 0) ++h2;
+    check(h2 == 4, "上限设 0 = 不限制，4 个全部开出");
+}
+
 int main() {
     test_dca_margin_cap();
     test_v_crash_fills_one_layer();
+    test_max_open_positions();
     test_disaster_stop_lifecycle();
     test_disabled_by_default();
     test_place_failure_is_loud();

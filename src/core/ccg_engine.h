@@ -465,6 +465,20 @@ public:
     double max_total_margin() const;
     double total_margin_used() const;   // 当前所有 bot 已用保证金合计
 
+    // ── 账户级并发持仓上限（0=不限）───────────────────────────────────────────
+    // 与总保证金上限是【两道不同的闸】，全市场扫描下缺一不可：
+    //   保证金上限管的是"总共投出去多少钱"，撞到了才停；
+    //   并发上限管的是"同时压在几个品种上"。
+    // 全市场跑超卖策略时，大跌那天可能几十个品种同时满足信号——只有保证金上限
+    // 的话，钱会被最先触发的那几个吃光，而且分散度完全失控（几十个仓位同时
+    // 深套，与"分散"的初衷正好相反）。
+    //
+    // 计数包含【在途】的首仓：不然同一 tick 窗口里多个 bot 会一起过闸，
+    // 与 inflight_margin 防的是同一类竞争
+    void set_max_open_positions(int n);
+    int  max_open_positions() const;
+    int  open_position_count() const;   // 已持仓 + 在途首仓的 bot 数
+
     // 由 UI 定时器每 tick 调用（传入最新价格）
     void tick(const std::string& symbol, double price);
 
@@ -542,6 +556,7 @@ private:
     TradeCb                        trade_cb_;
     std::atomic<int>               id_seq_{0};
     std::atomic<double>            max_total_margin_{0.0};
+    std::atomic<int>               max_open_positions_{0};
     std::atomic<bool>   market_bearish_{false};
 };
 

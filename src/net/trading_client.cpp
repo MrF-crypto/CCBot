@@ -716,6 +716,38 @@ bool TradingClient::fetch_position_mode() {
     return dual;
 }
 
+std::vector<TradingClient::MarketTicker> TradingClient::fetch_all_tickers() {
+    std::vector<MarketTicker> out;
+    // 不带 symbol = 返回全部品种。走公开端点（统一账户下 papi 没有行情接口）
+    auto resp = http_get_public("/fapi/v1/ticker/24hr");
+    if (resp.empty()) return out;
+
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+
+    simdjson::dom::array arr;
+    if (doc.get(arr) != simdjson::SUCCESS) return out;
+
+    out.reserve(600);
+    for (auto e : arr) {
+        simdjson::dom::element el = e;
+        std::string_view sym;
+        if (el["symbol"].get(sym) != simdjson::SUCCESS) continue;
+        MarketTicker t;
+        t.symbol       = std::string(sym);
+        t.last_price   = parse_dbl_str(el, "lastPrice");
+        t.change_pct   = parse_dbl_str(el, "priceChangePercent");
+        t.quote_volume = parse_dbl_str(el, "quoteVolume");
+        // 停牌/无成交的品种价格会是 0，直接丢掉——它们进了候选池只会浪费
+        // 后续的 K 线请求，而那才是扫描的主要成本
+        if (t.last_price <= 0) continue;
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
 bool TradingClient::cancel_order(const std::string& sym, const std::string& order_id) {
     auto resp = http_del(ep(Ep::Order),
         "symbol=" + sym + "&orderId=" + order_id + "&recvWindow=5000");

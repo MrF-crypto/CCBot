@@ -86,7 +86,7 @@ jobs:
           for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
                    ccg_stress_tests ccg_liq_tests \
-                   ccg_persist_tests ccg_config_tests ccg_price_tests ccg_timesync_tests; do
+                   ccg_persist_tests ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_scanner_tests; do
             echo "── $t ──"
             ./build/Release/$t.exe
           done

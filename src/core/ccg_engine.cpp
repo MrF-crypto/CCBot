@@ -390,6 +390,26 @@ double CcgEngine::max_total_margin() const {
     return max_total_margin_.load();
 }
 
+void CcgEngine::set_max_open_positions(int n) {
+    max_open_positions_.store(std::max(0, n));
+}
+
+int CcgEngine::max_open_positions() const {
+    return max_open_positions_.load();
+}
+
+int CcgEngine::open_position_count() const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    int n = 0;
+    for (const auto& [id, b] : bots_) {
+        // 已有持仓，或首仓正在途中（inflight_margin>0 且还没成交）都要算进去。
+        // 只数 total_qty>0 的话，同一 tick 窗口里派发出去的那几笔在成交入账前
+        // 是"隐形"的，多个品种会一起过闸——与 inflight_margin 防的是同一类竞争
+        if (b.total_qty > 0 || b.inflight_margin > 0) ++n;
+    }
+    return n;
+}
+
 double CcgEngine::total_margin_used() const {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     double sum = 0;
@@ -1032,6 +1052,20 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                                 (verdict.data_block
                                  ? "（数据到齐后自动放行；新上市品种需等日线21根+4h线60根历史）"
                                  : ""));
+                        }
+                    }
+                }
+                // 账户级并发持仓上限：只挡"开新首仓"。放在保证金上限【之前】判——
+                // 它更便宜（数个数 vs 遍历求和），而且在全市场扫描场景下它才是
+                // 先撞到的那一道
+                if (can_enter) {
+                    const int cap_n = max_open_positions_.load();
+                    if (cap_n > 0 && open_position_count() >= cap_n) {
+                        can_enter = false;
+                        std::string why = "已达并发持仓上限(" + std::to_string(cap_n) + ")，暂缓开首仓";
+                        if (bot.last_action != why) {
+                            bot.last_action = why;
+                            log(bot.cfg.symbol + " " + why);
                         }
                     }
                 }

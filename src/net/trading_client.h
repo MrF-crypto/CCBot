@@ -172,6 +172,21 @@ public:
     // 持仓模式检测（连接时调用一次）
     bool fetch_position_mode();
 
+    // ── 全市场 24h 行情快照 ─────────────────────────────────────────────────
+    // 不带 symbol 参数时，币安一个请求返回【全部】品种，权重 40。
+    //
+    // 这个接口是全市场扫描能不能跑起来的关键：币安没有批量 K 线接口，逐个拉
+    // 500 个品种的 K 线要串行两分半、权重 500。而先用这一个请求把 500 个品种
+    // 按成交额和跌幅筛到几十个，再对候选拉 K 线，总成本降一个数量级。
+    // 便宜的粗筛 + 昂贵的精算，是扫描器的基本结构。
+    struct MarketTicker {
+        std::string symbol;
+        double      last_price   = 0;
+        double      change_pct   = 0;   // 24h 涨跌幅 %（负数=跌）
+        double      quote_volume = 0;   // 24h 成交额（USDT计价，跨品种可比）
+    };
+    std::vector<MarketTicker> fetch_all_tickers();
+
     // ── LOT_SIZE / 价格精度 ─────────────────────────────────────────────────
     struct SymbolInfo {
         double step_size        = 0.001;  // LOT_SIZE.stepSize（限价单精度）

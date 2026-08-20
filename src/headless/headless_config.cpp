@@ -65,6 +65,94 @@ CcgConfig::RsiConfirmMode parse_rsi_mode(const std::string& s) {
 
 } // namespace
 
+// 解析一个 bot 的策略参数。抽成函数是为了让【扫描器模板】复用同一套解析——
+// 否则那 60 行会被复制一遍，然后两份慢慢长歪（headless 默认值与引擎脱节那个
+// 缺陷就是这么来的）。
+// 返回 false 表示配置有致命错误，原因写进 err。
+static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
+                             HeadlessConfig& out, std::string& err) {
+    std::string dir_s = get_str(bo, "direction", "long");
+    if (dir_s == "both") {
+        // 引擎内部 Both 会走纯空头分支，headless 又没有 GUI 那样的拆分逻辑——
+        // 用户想要对冲、实际得到裸空单，必须拒绝启动
+        err = c.symbol + " 配置了 direction=both：headless 不支持双向，"
+              "请拆成两个 bot 分别配置 long 和 short（注意需要币安双向持仓模式）";
+        return false;
+    }
+
+    c.strat_type    = parse_strat(get_str(bo, "strat_type", "linear"));
+    c.direction     = parse_dir(dir_s);
+    c.budget_usdt   = get_num(bo, "budget_usdt", c.budget_usdt);
+    c.leverage      = (int)get_num(bo, "leverage", c.leverage);
+    c.max_entries   = (int)get_num(bo, "max_entries", c.max_entries);
+    c.interval_pct  = get_num(bo, "interval_pct", c.interval_pct);
+    c.trail_entry   = get_num(bo, "trail_entry", c.trail_entry);
+    c.tp_pct        = get_num(bo, "tp_pct", c.tp_pct);
+    c.trail_tp      = get_num(bo, "trail_tp", c.trail_tp);
+    c.auto_restart  = get_bool(bo, "auto_restart", c.auto_restart);
+    c.cooldown_secs = (int)get_num(bo, "cooldown_secs", c.cooldown_secs);
+    c.stop_loss_pct = get_num(bo, "stop_loss_pct", c.stop_loss_pct);
+    c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
+    c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
+    // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
+    // 而使用者以为仓位已经有进程外保护了
+    if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
+        out.warnings.push_back(c.symbol + " 配了 disaster_stop_pct 但 use_disaster_stop 不是 true，"
+                                          "交易所侧灾难止损单【未启用】");
+
+    c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "indicator"));
+    c.kline_interval  = get_str(bo, "kline_interval", c.kline_interval);
+    c.boll_period     = (int)get_num(bo, "boll_period", c.boll_period);
+    c.boll_mult       = get_num(bo, "boll_mult", c.boll_mult);
+    c.use_rsi_filter  = get_bool(bo, "use_rsi_filter", c.use_rsi_filter);
+    c.rsi_period      = (int)get_num(bo, "rsi_period", c.rsi_period);
+    c.rsi_threshold   = get_num(bo, "rsi_threshold", c.rsi_threshold);
+    c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "cross"));
+    c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", c.rsi_oversold_th);
+    c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", c.dynamic_band_mode);
+    c.min_profit_floor  = get_num(bo, "min_profit_floor", c.min_profit_floor);
+    // ── 快进快出三件套 ────────────────────────────────────────────────
+    // 引擎里早就有，但此前只有回测命令行能设——GUI 和 headless 都没暴露。
+    // 全市场超卖扫描要的正是这套：不等上轨、够本就跑、回调不随带宽放大
+    c.tp_floor_only     = get_bool(bo, "tp_floor_only",   c.tp_floor_only);
+    c.tp_fixed_profit   = get_num (bo, "tp_fixed_profit", c.tp_fixed_profit);
+    c.fixed_trail_tp    = get_num (bo, "fixed_trail_tp",  c.fixed_trail_tp);
+    c.mtf_ladder        = get_bool(bo, "mtf_ladder", c.mtf_ladder);
+    c.mtf_tier_layers   = get_str(bo, "mtf_tier_layers", c.mtf_tier_layers);
+    c.mtf_k             = get_num(bo, "mtf_k", c.mtf_k);
+    c.mtf_min_gap_pct   = get_num(bo, "mtf_min_gap_pct", c.mtf_min_gap_pct);
+    c.use_trend_filter  = get_bool(bo, "use_trend_filter", c.use_trend_filter);
+    c.trend_interval    = get_str(bo, "trend_interval", c.trend_interval);
+    c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", c.trend_ema_period);
+    c.sr_radar          = get_bool(bo, "sr_radar", c.sr_radar);
+    c.sr_interval       = get_str(bo, "sr_interval", c.sr_interval);
+    c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
+    c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
+    c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
+    // v3.8 迁移：老配置的 smart_gates 总开关为 false 时三层完全不参与，
+    // 升级后必须保持——否则老配置会突然开始拦截
+    {
+        const bool legacy_smart = get_bool(bo, "smart_gates", true);
+        const bool legacy_sr    = get_bool(bo, "use_sr_gate", true);
+        const bool has_new = (bo["use_sr_support"].error() == simdjson::SUCCESS);
+        if (has_new) {
+            c.use_sr_support  = get_bool(bo, "use_sr_support", c.use_sr_support);
+            c.use_sr_headroom = get_bool(bo, "use_sr_headroom", c.use_sr_headroom);
+        } else {
+            c.use_sr_support  = legacy_smart && legacy_sr;
+            c.use_sr_headroom = legacy_smart && legacy_sr;
+            if (!legacy_smart) c.use_htf_filter = false;
+        }
+    }
+    c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", c.sr_min_confluence);
+    c.sr_independent_conf = get_bool(bo, "sr_independent_conf", c.sr_independent_conf);
+    c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", c.sr_lower_half_only);
+    c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", c.sr_headroom_ratio);
+    c.use_sr_exit         = get_bool(bo, "use_sr_exit", c.use_sr_exit);
+    c.use_structural_stop = get_bool(bo, "use_structural_stop", c.use_structural_stop);
+    return true;
+}
+
 bool load_headless_config(const std::string& path, HeadlessConfig& out, std::string& err) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { err = "打不开配置文件: " + path; return false; }
@@ -91,6 +179,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     out.testnet           = get_bool(root, "testnet", false);
     out.account_mode      = get_str(root, "account_mode", "futures");
     out.max_total_margin  = get_num(root, "max_total_margin", 0.0);
+    out.max_open_positions = (int)get_num(root, "max_open_positions",
+                                          (double)out.max_open_positions);
 
     if (out.account_mode != "futures" && out.account_mode != "portfolio_margin") {
         err = "account_mode 只能是 \"futures\" 或 \"portfolio_margin\"，收到: " + out.account_mode;
@@ -126,6 +216,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "entry_mode", "kline_interval",
         "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
         "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",
+        "tp_floor_only", "tp_fixed_profit", "fixed_trail_tp",
         "mtf_ladder", "mtf_tier_layers", "mtf_k", "mtf_min_gap_pct",
         "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
         "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max", "use_sr_gate",
@@ -149,84 +240,65 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                                        "\"（拼写错误?），该项被忽略、对应参数使用默认值");
         }
 
-        std::string dir_s = get_str(bo, "direction", "long");
-        if (dir_s == "both") {
-            // 引擎内部 Both 会走纯空头分支，headless 又没有 GUI 那样的拆分逻辑——
-            // 用户想要对冲、实际得到裸空单，必须拒绝启动
-            err = c.symbol + " 配置了 direction=both：headless 不支持双向，"
-                  "请拆成两个 bot 分别配置 long 和 short（注意需要币安双向持仓模式）";
-            return false;
-        }
-
-        c.strat_type    = parse_strat(get_str(bo, "strat_type", "linear"));
-        c.direction     = parse_dir(dir_s);
-        c.budget_usdt   = get_num(bo, "budget_usdt", c.budget_usdt);
-        c.leverage      = (int)get_num(bo, "leverage", c.leverage);
-        c.max_entries   = (int)get_num(bo, "max_entries", c.max_entries);
-        c.interval_pct  = get_num(bo, "interval_pct", c.interval_pct);
-        c.trail_entry   = get_num(bo, "trail_entry", c.trail_entry);
-        c.tp_pct        = get_num(bo, "tp_pct", c.tp_pct);
-        c.trail_tp      = get_num(bo, "trail_tp", c.trail_tp);
-        c.auto_restart  = get_bool(bo, "auto_restart", c.auto_restart);
-        c.cooldown_secs = (int)get_num(bo, "cooldown_secs", c.cooldown_secs);
-        c.stop_loss_pct = get_num(bo, "stop_loss_pct", c.stop_loss_pct);
-        c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
-        c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
-        // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
-        // 而使用者以为仓位已经有进程外保护了
-        if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
-            out.warnings.push_back(c.symbol + " 配了 disaster_stop_pct 但 use_disaster_stop 不是 true，"
-                                              "交易所侧灾难止损单【未启用】");
-
-        c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "indicator"));
-        c.kline_interval  = get_str(bo, "kline_interval", c.kline_interval);
-        c.boll_period     = (int)get_num(bo, "boll_period", c.boll_period);
-        c.boll_mult       = get_num(bo, "boll_mult", c.boll_mult);
-        c.use_rsi_filter  = get_bool(bo, "use_rsi_filter", c.use_rsi_filter);
-        c.rsi_period      = (int)get_num(bo, "rsi_period", c.rsi_period);
-        c.rsi_threshold   = get_num(bo, "rsi_threshold", c.rsi_threshold);
-        c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "cross"));
-        c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", c.rsi_oversold_th);
-        c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", c.dynamic_band_mode);
-        c.min_profit_floor  = get_num(bo, "min_profit_floor", c.min_profit_floor);
-        c.mtf_ladder        = get_bool(bo, "mtf_ladder", c.mtf_ladder);
-        c.mtf_tier_layers   = get_str(bo, "mtf_tier_layers", c.mtf_tier_layers);
-        c.mtf_k             = get_num(bo, "mtf_k", c.mtf_k);
-        c.mtf_min_gap_pct   = get_num(bo, "mtf_min_gap_pct", c.mtf_min_gap_pct);
-        c.use_trend_filter  = get_bool(bo, "use_trend_filter", c.use_trend_filter);
-        c.trend_interval    = get_str(bo, "trend_interval", c.trend_interval);
-        c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", c.trend_ema_period);
-        c.sr_radar          = get_bool(bo, "sr_radar", c.sr_radar);
-        c.sr_interval       = get_str(bo, "sr_interval", c.sr_interval);
-        c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
-        c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
-        c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
-        // v3.8 迁移：老配置的 smart_gates 总开关为 false 时三层完全不参与，
-        // 升级后必须保持——否则老配置会突然开始拦截
-        {
-            const bool legacy_smart = get_bool(bo, "smart_gates", true);
-            const bool legacy_sr    = get_bool(bo, "use_sr_gate", true);
-            const bool has_new = (bo["use_sr_support"].error() == simdjson::SUCCESS);
-            if (has_new) {
-                c.use_sr_support  = get_bool(bo, "use_sr_support", c.use_sr_support);
-                c.use_sr_headroom = get_bool(bo, "use_sr_headroom", c.use_sr_headroom);
-            } else {
-                c.use_sr_support  = legacy_smart && legacy_sr;
-                c.use_sr_headroom = legacy_smart && legacy_sr;
-                if (!legacy_smart) c.use_htf_filter = false;
-            }
-        }
-        c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", c.sr_min_confluence);
-        c.sr_independent_conf = get_bool(bo, "sr_independent_conf", c.sr_independent_conf);
-        c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", c.sr_lower_half_only);
-        c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", c.sr_headroom_ratio);
-        c.use_sr_exit         = get_bool(bo, "use_sr_exit", c.use_sr_exit);
-        c.use_structural_stop = get_bool(bo, "use_structural_stop", c.use_structural_stop);
+        if (!parse_bot_fields(bo, c, out, err)) return false;
 
         out.bots.push_back(c);
     }
 
-    if (out.bots.empty()) {
+    // ── 全市场扫描器（可选段）───────────────────────────────────────────────
+    simdjson::dom::object sc;
+    if (root["scanner"].get(sc) == simdjson::SUCCESS) {
+        auto& S = out.scanner;
+        S.enabled       = get_bool(sc, "enabled", S.enabled);
+        S.interval_secs = (int)get_num(sc, "interval_secs", (double)S.interval_secs);
+        S.budget_per_position = get_num(sc, "budget_per_position", S.budget_per_position);
+
+        auto& C = S.cfg;
+        C.min_quote_vol_24h = get_num(sc, "min_quote_vol_24h", C.min_quote_vol_24h);
+        C.max_change_24h    = get_num(sc, "max_change_24h",    C.max_change_24h);
+        C.coarse_top_n      = (int)get_num(sc, "coarse_top_n", (double)C.coarse_top_n);
+        C.kline_interval    = get_str(sc, "kline_interval",    C.kline_interval);
+        C.boll_period       = (int)get_num(sc, "boll_period",  (double)C.boll_period);
+        C.boll_mult         = get_num(sc, "boll_mult",         C.boll_mult);
+        C.rsi_period        = (int)get_num(sc, "rsi_period",   (double)C.rsi_period);
+        C.max_pct_b         = get_num(sc, "max_pct_b",         C.max_pct_b);
+        C.max_rsi           = get_num(sc, "max_rsi",           C.max_rsi);
+        C.final_top_n       = (int)get_num(sc, "final_top_n",  (double)C.final_top_n);
+
+        simdjson::dom::array bl;
+        if (sc["blacklist"].get(bl) == simdjson::SUCCESS) {
+            for (auto e : bl) {
+                std::string_view v;
+                if (e.get(v) == simdjson::SUCCESS) C.blacklist.insert(std::string(v));
+            }
+        }
+
+        // 模板：扫描命中后用这套参数建 bot。走与普通 bot 完全相同的解析路径，
+        // 所以两边的默认值、迁移逻辑、告警一致，不会各长各的
+        simdjson::dom::object tpl;
+        if (sc["template"].get(tpl) == simdjson::SUCCESS) {
+            S.templ.symbol = "SCAN";   // 占位，建 bot 时会被真实品种覆盖
+            if (!parse_bot_fields(tpl, S.templ, out, err)) return false;
+        }
+        if (S.budget_per_position > 0) S.templ.budget_usdt = S.budget_per_position;
+
+        // 扫描器建的 bot 是【一次性】的：止盈后应当让位给新的候选，而不是
+        // 原地冷却等下一轮。auto_restart=true 会让它一直占着并发额度
+        if (S.enabled && S.templ.auto_restart) {
+            S.templ.auto_restart = false;
+            out.warnings.push_back("扫描器模板的 auto_restart 已强制为 false："
+                                   "扫描出的仓位止盈后应让位给新候选，"
+                                   "否则它会一直占着并发额度");
+        }
+        if (S.enabled && out.max_open_positions <= 0) {
+            err = "开启 scanner 时必须设置 max_open_positions（全市场扫描下，"
+                  "大跌那天可能几十个品种同时触发信号）";
+            return false;
+        }
+    }
+
+    // 扫描器模式下 bots 可以为空——品种完全由扫描器动态产生
+    if (out.bots.empty() && !out.scanner.enabled) {
         err = "配置文件 bots 数组为空或每一项都缺少 symbol";
         return false;
     }
