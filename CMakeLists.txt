@@ -178,6 +178,41 @@ if(MSVC)
     target_compile_options(ccg_rate_tests PRIVATE /utf-8)
 endif()
 
+# ── 价格源测试：报文解析 + 陈旧保护（WS 半开时的冻结价是最凶险的故障）──────────
+add_executable(ccg_price_tests tests/test_price_feed.cpp src/net/book_ticker_stream.cpp)
+target_include_directories(ccg_price_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_price_tests PRIVATE ixwebsocket::ixwebsocket simdjson::simdjson
+                                              Threads::Threads)
+if(WIN32)
+    # bcrypt：ixwebsocket 的 TLS 后端（mbedtls）要 BCryptGenRandom。
+    # 主程序通过别的目标间接带进来了，这个独立小目标必须自己声明
+    target_link_libraries(ccg_price_tests PRIVATE crypt32 bcrypt ws2_32 wsock32)
+    target_compile_definitions(ccg_price_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_options(ccg_price_tests PRIVATE /utf-8)
+endif()
+
+# ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
+add_executable(ccg_config_tests tests/test_config.cpp
+                                src/headless/headless_config.cpp
+                                src/core/ccg_engine.cpp)
+target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_config_tests PRIVATE /utf-8)
+endif()
+
+# ── 状态持久化往返测试：重启后仓位对不对，全看这一套 ──────────────────────────
+add_executable(ccg_persist_tests tests/test_persist.cpp
+                                 src/headless/headless_state.cpp
+                                 src/core/ccg_engine.cpp)
+target_include_directories(ccg_persist_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_persist_tests PRIVATE simdjson::simdjson Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_persist_tests PRIVATE /utf-8)
+endif()
+
 # ── 回测强平模型测试：该爆的要爆，不该爆的一个数字都不能动 ────────────────────
 add_executable(ccg_liq_tests tests/test_liquidation.cpp
                              src/backtest/bt_portfolio.cpp

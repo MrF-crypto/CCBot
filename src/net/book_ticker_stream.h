@@ -50,6 +50,20 @@ public:
 
     static int64_t now_ms();
 
+    // ── 测试注入点 ────────────────────────────────────────────────────────────
+    // 报文解析与陈旧判定是这个类里唯一会【静默出错】的部分：解析错了价格是垃圾，
+    // 陈旧判定错了引擎会拿着冻结价继续决策——两者都不会报错。而建连接/重连/订阅
+    // 出错是显性故障（完全没有价格），不需要单测。
+    // 所以只把这两处开出去，不为了可测性去动传输层结构（与订单路径测试同一取向）。
+    void on_message_for_test(const std::string& json) { on_message(json); }
+    // 把某个品种的收包时间往前推 age_ms 毫秒，用来构造"WebSocket 半开、
+    // 缓存里是冻结价"这个最凶险的场景——真等 10 秒会让测试慢得没人愿意跑
+    void age_cache_for_test(const std::string& symbol, int64_t age_ms) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = cache_.find(symbol);
+        if (it != cache_.end()) it->second.recv_ms = now_ms() - age_ms;
+    }
+
 private:
     void on_open   ();
     void on_message(const std::string& json);

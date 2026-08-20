@@ -139,7 +139,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         if (elem.get(bo) != simdjson::SUCCESS) continue;
 
         CcgConfig c;
-        c.symbol = get_str(bo, "symbol", "");
+        c.symbol = get_str(bo, "symbol", c.symbol);
         if (c.symbol.empty()) continue;
 
         for (auto field : bo) {
@@ -160,18 +160,18 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
 
         c.strat_type    = parse_strat(get_str(bo, "strat_type", "linear"));
         c.direction     = parse_dir(dir_s);
-        c.budget_usdt   = get_num(bo, "budget_usdt", 3000.0);
-        c.leverage      = (int)get_num(bo, "leverage", 3);
-        c.max_entries   = (int)get_num(bo, "max_entries", 7);
-        c.interval_pct  = get_num(bo, "interval_pct", 8.0);
-        c.trail_entry   = get_num(bo, "trail_entry", 1.0);
-        c.tp_pct        = get_num(bo, "tp_pct", 5.0);
-        c.trail_tp      = get_num(bo, "trail_tp", 2.0);
-        c.auto_restart  = get_bool(bo, "auto_restart", true);
-        c.cooldown_secs = (int)get_num(bo, "cooldown_secs", 300.0);
-        c.stop_loss_pct = get_num(bo, "stop_loss_pct", 0.0);
-        c.use_disaster_stop = get_bool(bo, "use_disaster_stop", false);
-        c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", 30.0);
+        c.budget_usdt   = get_num(bo, "budget_usdt", c.budget_usdt);
+        c.leverage      = (int)get_num(bo, "leverage", c.leverage);
+        c.max_entries   = (int)get_num(bo, "max_entries", c.max_entries);
+        c.interval_pct  = get_num(bo, "interval_pct", c.interval_pct);
+        c.trail_entry   = get_num(bo, "trail_entry", c.trail_entry);
+        c.tp_pct        = get_num(bo, "tp_pct", c.tp_pct);
+        c.trail_tp      = get_num(bo, "trail_tp", c.trail_tp);
+        c.auto_restart  = get_bool(bo, "auto_restart", c.auto_restart);
+        c.cooldown_secs = (int)get_num(bo, "cooldown_secs", c.cooldown_secs);
+        c.stop_loss_pct = get_num(bo, "stop_loss_pct", c.stop_loss_pct);
+        c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
+        c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
         // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
         // 而使用者以为仓位已经有进程外保护了
         if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
@@ -179,28 +179,28 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                                               "交易所侧灾难止损单【未启用】");
 
         c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "indicator"));
-        c.kline_interval  = get_str(bo, "kline_interval", "1h");
-        c.boll_period     = (int)get_num(bo, "boll_period", 20.0);
-        c.boll_mult       = get_num(bo, "boll_mult", 2.0);
-        c.use_rsi_filter  = get_bool(bo, "use_rsi_filter", true);
-        c.rsi_period      = (int)get_num(bo, "rsi_period", 14.0);
-        c.rsi_threshold   = get_num(bo, "rsi_threshold", 30.0);
+        c.kline_interval  = get_str(bo, "kline_interval", c.kline_interval);
+        c.boll_period     = (int)get_num(bo, "boll_period", c.boll_period);
+        c.boll_mult       = get_num(bo, "boll_mult", c.boll_mult);
+        c.use_rsi_filter  = get_bool(bo, "use_rsi_filter", c.use_rsi_filter);
+        c.rsi_period      = (int)get_num(bo, "rsi_period", c.rsi_period);
+        c.rsi_threshold   = get_num(bo, "rsi_threshold", c.rsi_threshold);
         c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "cross"));
-        c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", 25.0);
-        c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", true);
-        c.min_profit_floor  = get_num(bo, "min_profit_floor", 3.5);
-        c.mtf_ladder        = get_bool(bo, "mtf_ladder", false);
-        c.mtf_tier_layers   = get_str(bo, "mtf_tier_layers", "");
-        c.mtf_k             = get_num(bo, "mtf_k", 0.5);
-        c.mtf_min_gap_pct   = get_num(bo, "mtf_min_gap_pct", 2.0);
-        c.use_trend_filter  = get_bool(bo, "use_trend_filter", true);
-        c.trend_interval    = get_str(bo, "trend_interval", "4h");
-        c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", 200.0);
-        c.sr_radar          = get_bool(bo, "sr_radar", true);
-        c.sr_interval       = get_str(bo, "sr_interval", "4h");
-        c.use_htf_filter      = get_bool(bo, "use_htf_filter", true);
-        c.htf_interval        = get_str(bo, "htf_interval", "1d");
-        c.htf_pos_max         = get_num(bo, "htf_pos_max", 0.60);
+        c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", c.rsi_oversold_th);
+        c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", c.dynamic_band_mode);
+        c.min_profit_floor  = get_num(bo, "min_profit_floor", c.min_profit_floor);
+        c.mtf_ladder        = get_bool(bo, "mtf_ladder", c.mtf_ladder);
+        c.mtf_tier_layers   = get_str(bo, "mtf_tier_layers", c.mtf_tier_layers);
+        c.mtf_k             = get_num(bo, "mtf_k", c.mtf_k);
+        c.mtf_min_gap_pct   = get_num(bo, "mtf_min_gap_pct", c.mtf_min_gap_pct);
+        c.use_trend_filter  = get_bool(bo, "use_trend_filter", c.use_trend_filter);
+        c.trend_interval    = get_str(bo, "trend_interval", c.trend_interval);
+        c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", c.trend_ema_period);
+        c.sr_radar          = get_bool(bo, "sr_radar", c.sr_radar);
+        c.sr_interval       = get_str(bo, "sr_interval", c.sr_interval);
+        c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
+        c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
+        c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
         // v3.8 迁移：老配置的 smart_gates 总开关为 false 时三层完全不参与，
         // 升级后必须保持——否则老配置会突然开始拦截
         {
@@ -208,20 +208,20 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
             const bool legacy_sr    = get_bool(bo, "use_sr_gate", true);
             const bool has_new = (bo["use_sr_support"].error() == simdjson::SUCCESS);
             if (has_new) {
-                c.use_sr_support  = get_bool(bo, "use_sr_support", true);
-                c.use_sr_headroom = get_bool(bo, "use_sr_headroom", true);
+                c.use_sr_support  = get_bool(bo, "use_sr_support", c.use_sr_support);
+                c.use_sr_headroom = get_bool(bo, "use_sr_headroom", c.use_sr_headroom);
             } else {
                 c.use_sr_support  = legacy_smart && legacy_sr;
                 c.use_sr_headroom = legacy_smart && legacy_sr;
                 if (!legacy_smart) c.use_htf_filter = false;
             }
         }
-        c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", 2.0);
-        c.sr_independent_conf = get_bool(bo, "sr_independent_conf", true);
-        c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", false);
-        c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", 3.0);
-        c.use_sr_exit         = get_bool(bo, "use_sr_exit", false);
-        c.use_structural_stop = get_bool(bo, "use_structural_stop", false);
+        c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", c.sr_min_confluence);
+        c.sr_independent_conf = get_bool(bo, "sr_independent_conf", c.sr_independent_conf);
+        c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", c.sr_lower_half_only);
+        c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", c.sr_headroom_ratio);
+        c.use_sr_exit         = get_bool(bo, "use_sr_exit", c.use_sr_exit);
+        c.use_structural_stop = get_bool(bo, "use_structural_stop", c.use_structural_stop);
 
         out.bots.push_back(c);
     }

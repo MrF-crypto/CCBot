@@ -2,6 +2,8 @@
 #include <simdjson.h>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
+#include <limits>
 #include <chrono>
 #include <filesystem>
 
@@ -58,6 +60,23 @@ std::string get_str(simdjson::dom::object& o, const char* key, const std::string
 
 void save_headless_state(const std::string& path, const std::vector<CcgBot>& bots) {
     std::ostringstream ss;
+    // ⚠ ostringstream 默认精度是【6 位有效数字】，而这里存的是均价、持仓量、成本。
+    // 不设精度的话每次落盘都会静默截断：
+    //     94310.4912345678  →  94310.5
+    //     0.0318294715      →  0.0318295
+    //     3001.7654321098   →  3001.77
+    // 单个字段的相对误差只有 1e-6 量级，看着不大，但 avg_price / total_cost /
+    // total_qty 是【各自独立】存取的，各截各的之后三者互相矛盾——实测读回来
+    // 成本÷数量 与 均价 差了 2.7 个价格单位（BTC 量级）。而止盈线 = 均价×(1+保底)，
+    // 这个偏差会直接挪动出场价，且每次重启都发生一次。
+    //
+    // max_digits10 = 17，是"任意 double 都能无损往返"的最小位数。
+    // 不用 std::to_chars（更短更好看）：Apple Clang / libc++ 对浮点重载的支持
+    // 不齐，会挑平台编不过。
+    //
+    // GUI 侧走 QJsonDocument，Qt 本来就是全精度往返（实测落盘文件里是
+    // "avg_price": 489.1522131147541），不受影响——这个坑只在 headless。
+    ss << std::setprecision(std::numeric_limits<double>::max_digits10);
     ss << "[";
     bool first_bot = true;
     for (const auto& b : bots) {
