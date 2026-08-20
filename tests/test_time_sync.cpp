@@ -1,0 +1,160 @@
+// 与交易所对时的测试。
+//
+// 起因是实盘的 -1021：那台 macOS 的本机时钟慢 2.17 秒、网络往返只有 270ms，
+// 按 recvWindow 的预算算根本不该失败，实测却有 33% 的时间在报错。查了半天发现
+// 对时函数是个彻底的黑盒——成功没成功、往返多久、算出多少、有没有被限流压住，
+// 全都不对外说，只能靠猜。
+//
+// 这套测试钉住两件事：
+//   ① 往返过长的测量必须被【丢弃】而不是采纳
+//   ② 诊断信息必须如实反映发生了什么（那是排查的唯一依据）
+//
+// 为什么①是真缺陷而不是洁癖：中点估算 (t0+t1)/2 假设去回程等时。网络一慢
+// 往往就不对称，一次 8 秒往返最坏能算出 4 秒的偏移误差——而整个预算才 4 秒。
+// 更糟的是方向：回程慢会让偏移偏负、时间戳更旧，于是更容易 -1021，
+// 自愈越修越坏，形成自我强化。
+#include "net/trading_client.h"
+
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <thread>
+
+using namespace ccbot;
+
+static int g_fail = 0;
+static void check(bool ok, const std::string& what) {
+    std::printf("%s  %s\n", ok ? "[ OK ]" : "[FAIL]", what.c_str());
+    if (!ok) ++g_fail;
+}
+
+static int64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+static TradingClient make_client() {
+    TradingClient::Config c;
+    c.api_key = "k"; c.api_secret = "s"; c.testnet = true;
+    return TradingClient(c);
+}
+
+int main() {
+    // ── ① 正常往返：采纳，并算出正确的偏移 ──────────────────────────────────
+    // 造一个"本机比服务器慢 2170ms"的场景（正是实盘那台 iMac 的真实数值）
+    {
+        TradingClient cli = make_client();
+        cli.set_test_hook([](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 2170) + "}";
+            return true;
+        });
+        auto r = cli.sync_server_time();
+        check(r.accepted, "正常往返：测量被采纳");
+        // 允许几十毫秒的执行抖动
+        check(r.offset_ms > 2100 && r.offset_ms < 2240,
+              "  偏移约 +2170ms（本机慢 2.17 秒，与实盘那台一致）");
+        check(r.rtt_ms >= 0 && r.rtt_ms < 500, "  往返记录合理");
+        check(std::string(r.skip_reason).empty(), "  无丢弃原因");
+    }
+
+    // ── ② 往返过长：必须丢弃，且保留原偏移 ──────────────────────────────────
+    // 这是本次改动的核心。测试钩子里 sleep 制造一个慢往返
+    {
+        TradingClient cli = make_client();
+        // 先用一次正常同步把偏移建立起来
+        cli.set_test_hook([](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 1000) + "}";
+            return true;
+        });
+        auto good = cli.sync_server_time();
+        check(good.accepted, "先建立一个好的偏移");
+        const int64_t established = good.offset_ms;
+
+        // 再来一次"慢往返 + 偏移差很多"的测量，必须被拒
+        cli.set_test_hook([](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2300));  // > 2000ms 阈值
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 9999) + "}";
+            return true;
+        });
+        auto slow = cli.sync_server_time();
+        check(!slow.accepted, "往返 2.3 秒的测量被丢弃");
+        check(slow.rtt_ms >= 2000, "  往返时长如实记录（" + std::to_string(slow.rtt_ms) + "ms）");
+        check(slow.offset_ms == established,
+              "  偏移保持原值，没有被那次坏测量污染");
+        check(std::string(slow.skip_reason).find("往返") != std::string::npos,
+              "  丢弃原因说明是往返过长");
+        check(slow.prev_ms == established, "  prev_ms 记录了丢弃前的偏移");
+    }
+
+    // ── ③ 各类失败响应：一律不得改动偏移 ────────────────────────────────────
+    {
+        TradingClient cli = make_client();
+        cli.set_test_hook([](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 3000) + "}";
+            return true;
+        });
+        const int64_t base = cli.sync_server_time().offset_ms;
+
+        struct Case { const char* body; const char* tag; };
+        const Case cases[] = {
+            { "",                       "空响应" },
+            { "这不是json",              "非JSON" },
+            { "{\"code\":-1003}",       "无 serverTime 字段" },
+        };
+        for (const auto& c : cases) {
+            std::string b = c.body;
+            cli.set_test_hook([b](const std::string&, const std::string& path,
+                                  const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("/fapi/v1/time") == std::string::npos) return false;
+                out.code = 200; out.body = b;
+                return true;
+            });
+            auto r = cli.sync_server_time();
+            check(!r.accepted && r.offset_ms == base,
+                  std::string(c.tag) + " → 不采纳且偏移不变");
+        }
+    }
+
+    // ── ④ 诊断输出必须包含排查需要的信息 ────────────────────────────────────
+    // 这条不是形式主义：-1021 排查了整整一轮才发现"看不见对时发生了什么"是
+    // 最大的障碍。日志缺一项就得再等一轮实盘复现
+    {
+        TradingClient cli = make_client();
+        cli.set_test_hook([](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 5000) + "}";
+            return true;
+        });
+        cli.sync_server_time();                       // 建立 +5000 的偏移
+        cli.set_test_hook([](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 100) + "}";
+            return true;
+        });
+        auto r = cli.sync_server_time();              // 偏移骤降到 +100 = 跳变 -4900
+        const std::string s = r.to_log();
+        check(s.find("往返") != std::string::npos, "日志含往返时长");
+        check(s.find("偏移") != std::string::npos, "日志含偏移量");
+        check(s.find("跳变") != std::string::npos,
+              "偏移大幅跳变时日志明确标出（时钟被系统步进的直接证据）");
+    }
+
+    std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
+    return g_fail ? 1 : 0;
+}

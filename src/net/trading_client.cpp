@@ -200,24 +200,53 @@ std::string TradingClient::http_get_public(const std::string& path) {
     return resp;
 }
 
-void TradingClient::sync_server_time() {
+// 往返超过这个时长就丢弃本次测量。
+//
+// 中点估算 local_mid=(t0+t1)/2 隐含了一个假设：去程与回程耗时相同。网络正常时
+// 这没问题（实测往返 250~290ms，最大误差 ~145ms）；但网络一慢，去回程往往是
+// 不对称的，一次 8 秒的往返最坏能算出 4 秒的偏移误差——而整个 recvWindow 预算
+// 才 4 秒。更糟的是方向：回程慢会让偏移偏负，时间戳更旧，于是更容易 -1021，
+// 自愈越修越坏，形成自我强化。
+//
+// 阈值取 2000ms（正常值的 7 倍以上）：最坏误差 1 秒，仍在预算内；同时足够宽松，
+// 不会把偶尔的抖动也拒掉。丢弃后保留原偏移——宁可用一个略旧的好值，
+// 也不要一个当场测出来的坏值。
+static constexpr int64_t kMaxSyncRttMs = 2000;
+
+TradingClient::TimeSyncResult TradingClient::sync_server_time() {
     using namespace std::chrono;
+    TimeSyncResult r;
+    r.prev_ms = time_offset_ms_.load();
+    r.offset_ms = r.prev_ms;
+
     auto t0   = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    // 注意：http_get_public 内部会先过限流闸门，闸门在权重逼近上限时会阻塞——
+    // 所以下面这个 rtt 是【含闸门等待】的总耗时。这是刻意的：如果对时被闸门
+    // 压了几十秒，日志里会直接看到一个几万毫秒的 rtt，一眼就能定位
     auto resp = http_get_public("/fapi/v1/time");
     auto t1   = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    if (resp.empty()) return;
+    r.rtt_ms  = t1 - t0;
+
+    if (resp.empty())               { r.skip_reason = "无响应";     return r; }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return;
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS)
+                                    { r.skip_reason = "JSON解析失败"; return r; }
 
     int64_t server_time = 0;
-    if (doc["serverTime"].get(server_time) != simdjson::SUCCESS) return;
+    if (doc["serverTime"].get(server_time) != simdjson::SUCCESS)
+                                    { r.skip_reason = "无serverTime"; return r; }
+
+    if (r.rtt_ms > kMaxSyncRttMs)   { r.skip_reason = "往返过长，中点估算不可信"; return r; }
 
     // 用请求往返的中点估算本机与服务器的时差
-    int64_t local_mid   = (t0 + t1) / 2;
-    time_offset_ms_     = server_time - local_mid;
+    int64_t local_mid = (t0 + t1) / 2;
+    time_offset_ms_.store(server_time - local_mid);
+    r.offset_ms = server_time - local_mid;
+    r.accepted  = true;
+    return r;
 }
 
 std::string TradingClient::http_get(const std::string& path, std::string params) {

@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
     for (const auto& w : cfg.warnings) log_line("⚠ 配置警告: " + w, "WARN");
 
     auto client = std::make_shared<TradingClient>(tc_cfg);
-    client->sync_server_time();
+    const auto first_sync = client->sync_server_time();
     // 探测持仓模式（单向/双向）。此前这个查询【从未被调用】，dual_mode_ 一直是
     // 默认的 false，等于把"单向持仓"写死了：账户若是双向，每笔单都缺 positionSide
     // 参数被交易所拒单 -4061，而那个错误码光看字面很难联想到是这里
@@ -162,6 +162,8 @@ int main(int argc, char** argv) {
              " | 可用 $" + std::to_string(info.available) +
              (info.uni_mmr > 0 ? " | uniMMR " + std::to_string(info.uni_mmr) : "") +
              " | 持仓模式 " + (dual_mode ? "双向（带 positionSide）" : "单向"), "OK");
+    // 首次对时结果：偏移量是 -1021 的直接成因，启动时就该让人看见
+    log_line(first_sync.to_log(), first_sync.accepted ? "OK" : "WARN");
 
     auto pool   = std::make_shared<ThreadPool>(4);
     auto engine = std::make_shared<CcgEngine>(client, pool);
@@ -506,7 +508,7 @@ int main(int argc, char** argv) {
                     log_line("心跳失败（网络异常?): " + acc.error, "ERR");
                     // -1021 = 时钟漂移超窗，立即重新对时自愈
                     if (acc.error.find("-1021") != std::string::npos)
-                        client->sync_server_time();
+                        log_line(client->sync_server_time().to_log(), "WARN");
                     // 连续3次（约3分钟）失败才告警：偶发抖动不值得半夜叫醒人
                     if (hb_fail_streak.fetch_add(1) + 1 >= 3 && !hb_alerted.exchange(true) && !w.empty())
                         send_webhook(w, "[ccbot] ⚠ 账户接口连续3次拉取失败：" + acc.error);
@@ -592,7 +594,12 @@ int main(int argc, char** argv) {
         // ── 7) 服务器时间重对时（约1小时一次）：时钟漂移超 recvWindow 会让所有
         //     签名请求集体失败 ────────────────────────────────────────────────
         if (tick_n % 1200 == 0) {
-            fetch_pool->submit([client]() { client->sync_server_time(); });
+            fetch_pool->submit([client]() {
+                const auto ts = client->sync_server_time();
+                // 每小时一条。偏移随时间的变化曲线，是判断"时钟在漂还是被步进"
+                // 的直接依据——漂是缓慢累积，步进是一次跳好几秒
+                log_line(ts.to_log(), ts.accepted ? "INFO" : "WARN");
+            });
         }
     }
 

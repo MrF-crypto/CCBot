@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.9.5 LANGUAGES CXX)
+project(CCGMonitor VERSION 3.9.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -176,6 +176,19 @@ target_include_directories(ccg_rate_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_rate_tests PRIVATE Threads::Threads)
 if(MSVC)
     target_compile_options(ccg_rate_tests PRIVATE /utf-8)
+endif()
+
+# ── 对时测试：往返过长的测量必须丢弃，诊断信息必须如实 ────────────────────────
+add_executable(ccg_timesync_tests tests/test_time_sync.cpp
+                                  src/net/trading_client.cpp src/net/rate_gate.cpp)
+target_include_directories(ccg_timesync_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_timesync_tests PRIVATE ${CORE_LIBS})
+if(WIN32)
+    target_link_libraries(ccg_timesync_tests PRIVATE crypt32 ws2_32 wsock32)
+    target_compile_definitions(ccg_timesync_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_options(ccg_timesync_tests PRIVATE /utf-8)
 endif()
 
 # ── 价格源测试：报文解析 + 陈旧保护（WS 半开时的冻结价是最凶险的故障）──────────

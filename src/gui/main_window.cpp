@@ -1148,7 +1148,7 @@ void MainWindow::onConnect() {
 
     run_async([this, cfg]() {
         auto client = std::make_shared<TradingClient>(cfg);
-        client->sync_server_time();
+        const auto tsync = client->sync_server_time();
         // 探测账户的持仓模式（单向 / 双向）。此前这个查询【从未被调用】，
         // dual_mode_ 从进程启动到结束一直是默认的 false，等于把"单向持仓"写死了：
         //   · 账户是单向     → 恰好正确，一直没暴露问题
@@ -1158,7 +1158,7 @@ void MainWindow::onConnect() {
         const bool dual = client->fetch_position_mode();
         auto info = client->fetch_account();
 
-        QMetaObject::invokeMethod(this, [this, client, info, cfg, dual]() {
+        QMetaObject::invokeMethod(this, [this, client, info, cfg, dual, tsync]() {
             btnConnect_->setEnabled(true);
             if (!info.ok) {
                 connLabel_->setText("连接失败: " + QString::fromStdString(info.error));
@@ -1178,6 +1178,8 @@ void MainWindow::onConnect() {
             // 而错误码 -4061 光看字面很难联想到是这里
             log(dual ? "账户持仓模式: 双向持仓（下单将带 positionSide）"
                      : "账户持仓模式: 单向持仓", "OK");
+            // 首次对时的结果：偏移量是 -1021 的直接成因，连接时就该让人看见
+            log(QString::fromStdString(tsync.to_log()), tsync.accepted ? "OK" : "WARN");
             engine_ = std::make_shared<CcgEngine>(client_, pool_);
             engine_->set_max_total_margin(maxTotalMargin_);
             engine_->set_log_cb([this](const std::string& msg) {
@@ -1474,7 +1476,16 @@ void MainWindow::refreshAccount() {
             }
             // -1021 = 本机时钟漂移超窗，不是网络问题——立即重新对时自愈，不等每小时定时
             if (info.error.find("-1021") != std::string::npos) {
-                run_async([this]() { if (client_) client_->sync_server_time(); });
+                run_async([this]() {
+                    if (!client_) return;
+                    const auto ts = client_->sync_server_time();
+                    // 每次 -1021 都会走到这里，所以这条日志的密度正好等于故障密度。
+                    // 排查 -1021 时它是最关键的一行：能看出对时到底成功没有、
+                    // 往返多久（含限流闸门的等待）、偏移有没有大幅跳变
+                    QMetaObject::invokeMethod(this, [this, ts]() {
+                        log(QString::fromStdString(ts.to_log()), ts.accepted ? "INFO" : "WARN");
+                    }, Qt::QueuedConnection);
+                });
             }
             // 单次失败不覆盖上一次的有效账户数据，但要计数——连续失败才判定为网络异常，
             // 避免偶尔一次超时就报警
@@ -2502,7 +2513,15 @@ void MainWindow::onTick() {
 
     // 每小时重新对时一次：时钟漂移超过 recvWindow(5s) 会让所有签名请求集体失败
     if (srTickCount_ % 1200 == 0) {
-        run_async([this]() { if (client_) client_->sync_server_time(); });
+        run_async([this]() {
+            if (!client_) return;
+            const auto ts = client_->sync_server_time();
+            // 每小时一条。偏移量随时间的变化曲线，是判断"本机时钟在漂还是被步进"
+            // 的直接依据——漂是缓慢累积，步进是一次跳好几秒
+            QMetaObject::invokeMethod(this, [this, ts]() {
+                log(QString::fromStdString(ts.to_log()), ts.accepted ? "INFO" : "WARN");
+            }, Qt::QueuedConnection);
+        });
     }
 
     // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；

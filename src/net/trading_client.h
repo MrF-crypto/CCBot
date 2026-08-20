@@ -200,7 +200,41 @@ public:
     void        delete_listen_key(const std::string& key);
 
     // 拉取 Binance 服务器时间，计算本机与服务器的时钟偏移（一次即可）
-    void sync_server_time();
+    // ── 与交易所对时 ──────────────────────────────────────────────────────────
+    // 返回诊断信息而不是 void：这个函数此前是个彻底的黑盒——成功没成功、往返多久、
+    // 算出的偏移是多少、有没有被限流闸门压住，全都不对外说。而 -1021 排查恰恰
+    // 需要这些：本机时钟慢 2.17 秒、网络往返 270ms，按预算算根本不该失败，
+    // 实盘却有 33% 的时间在报错，靠猜是定位不了的。
+    struct TimeSyncResult {
+        bool        accepted   = false;  // 本次测量是否被采纳
+        int64_t     rtt_ms     = 0;      // 整个调用的耗时【含限流闸门的等待】——
+                                         // 若闸门把请求压了 30 秒，这里就会显示 30000
+        int64_t     offset_ms  = 0;      // 调用结束后生效的偏移
+        int64_t     prev_ms    = 0;      // 调用前的偏移（跳变幅度＝时钟被步进的证据）
+        const char* skip_reason = "";    // 未采纳的原因
+
+        // 排成一行人读的日志。放在这里而不是各调用点各写一份——GUI 和 headless
+        // 都要打，格式必须一致，否则两边日志没法对照着看
+        std::string to_log() const {
+            std::string s = "[对时] 往返 " + std::to_string(rtt_ms) + "ms | ";
+            if (accepted) {
+                s += "偏移 " + std::to_string(offset_ms) + "ms";
+                const int64_t d = offset_ms - prev_ms;
+                // 跳变幅度是关键证据：偏移本该只随时钟漂移缓慢变化，一次同步就
+                // 跳好几秒，说明本机时钟被系统步进了（macOS 的 timed 会干这事）
+                if (d > 500 || d < -500)
+                    s += "（较上次跳变 " + std::string(d > 0 ? "+" : "") +
+                         std::to_string(d) + "ms ⚠）";
+                else
+                    s += "（原 " + std::to_string(prev_ms) + "ms）";
+            } else {
+                s += std::string("未采纳：") + skip_reason +
+                     "，保留原偏移 " + std::to_string(prev_ms) + "ms";
+            }
+            return s;
+        }
+    };
+    TimeSyncResult sync_server_time();
 
     // ── 测试注入点 ──────────────────────────────────────────────────────────
     // 订单路径（超时→查单恢复、部分成交、零成交、-1111重试）平时【永远不执行】，
