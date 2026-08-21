@@ -508,6 +508,19 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
             adopter->dca_extreme = ex.entry_price;
             adopter->tp_extreme  = ex.entry_price;
             adopter->interval_hit = adopter->tp_reached = false;
+            // ⚠ 必须退出冷却态：持仓与冷却是【互斥】的。
+            //
+            // 冷却态的语义是"上一轮已平完，在等下一轮"，所以 tick 里冷却期满时会
+            // 无条件执行 entries.clear() + total_qty=0 来清理上一轮的残留状态。
+            // 如果认领之后还留在冷却态，那笔刚认回来的仓位会在冷却期满时被【静默
+            // 清零】，然后同一个 tick 继续往下走、发现"空仓"又开一笔新首仓——
+            // 交易所实际持有 认领的 + 新开的，本地只记新开的，也就是【双倍仓位】。
+            // 比单纯丢记录更糟，而且前面刚打过一条"已认领"的日志让人放心。
+            //
+            // Stopped 不动：那是用户意愿或程序自我保护，而 Stopped 不会走冷却清理
+            // 那条路径，所以仓位是安全的、只是不自动交易——本地记录仍然正确。
+            if (adopter->state == CcgBot::State::Cooldown)
+                adopter->state = CcgBot::State::Running;
             adopter->last_action  = "对账:认领孤儿仓位";
             issues.push_back(ex.symbol + " 交易所存在本地未跟踪的仓位（qty=" +
                              std::to_string(ex.qty) + " 均价=" + std::to_string(ex.entry_price) +

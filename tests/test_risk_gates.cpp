@@ -406,8 +406,77 @@ static void test_max_open_positions() {
     check(h2 == 4, "上限设 0 = 不限制，4 个全部开出");
 }
 
+// ── 用例：对账认领的仓位不能被冷却逻辑清掉 ───────────────────────────────────
+// 这是压力测试的状态机不变量（"冷却态却仍持有仓位"）抓出来的一条完整 bug 链：
+//
+//   ① bot 止盈完成 → 进入 Cooldown（仓位已清零）
+//   ② 对账发现交易所有个孤儿仓位（典型是崩溃期间成交、还没落盘的那笔）
+//   ③ adopter 的选择【只看 !pending，完全不看 state】→ 选中这个 Cooldown 的 bot
+//   ④ 认领代码写入 total_qty/avg_price/entries，但【不改 state】
+//   ⑤ 冷却结束 → tick 里执行 "entries.clear(); total_qty = 0"
+//      → 刚认领回来的仓位被【静默清零】
+//   ⑥ 那笔仓位变成交易所有、本地无人管的真孤儿，没有任何止盈止损保护
+//
+// 最恶劣的是它会先打一条"已认领孤儿仓位"的日志让人放心，几分钟后再悄悄清掉。
+static void test_adopted_position_survives_cooldown() {
+    std::printf("\n── 用例：对账认领的仓位不能被冷却清掉 ──\n");
+    int64_t vnow = 1'700'000'000'000LL;
+    auto fc  = std::make_shared<FakeClient>();
+    CcgEngine eng(fc, make_host(vnow));
+
+    CcgConfig c = base_cfg();
+    c.auto_restart  = true;
+    c.cooldown_secs = 60;
+    auto id = eng.add_bot(c);
+
+    // 建仓 → 止盈 → 进入冷却
+    fc->next_fill_price = 100.0;
+    eng.tick("BTCUSDT", 100.0);
+    // tp_pct=5 → 止盈线 105；trail_tp=2 → 自最高点 106 回落到 103.88 才触发
+    fc->next_fill_price = 106.0;
+    vnow += 3000; eng.tick("BTCUSDT", 106.0);   // 激活止盈追踪
+    fc->next_fill_price = 102.0;
+    vnow += 3000; eng.tick("BTCUSDT", 102.0);   // 跌破 103.88 → 追踪平仓
+    {
+        auto b = eng.get_bots()[0];
+        check(b.state == CcgBot::State::Cooldown, "止盈后进入冷却态");
+        check(b.total_qty <= 0, "  冷却时仓位已清零");
+    }
+
+    // 对账：交易所冒出一个本地没跟踪的仓位（崩溃期间成交的那种）
+    CcgEngine::ExchangePos orphan;
+    orphan.symbol = "BTCUSDT"; orphan.direction = 1;
+    orphan.qty = 0.5; orphan.entry_price = 98.0;
+    eng.reconcile_positions({ orphan });
+
+    {
+        auto b = eng.get_bots()[0];
+        check(b.total_qty > 0.49, "对账认领了孤儿仓位");
+        check(b.state != CcgBot::State::Cooldown,
+              "  认领之后必须退出冷却态——冷却与持仓是互斥的");
+    }
+
+    // 推进到冷却本该结束的时刻：认领的仓位必须【原样】还在。
+    // 注意要比对【具体数量】而不是 ">0"——修复前这里也是 >0，但那是"认领的 0.5
+    // 被清零后又开了一笔新首仓"的结果。交易所实际持有 0.5+新仓，本地只记新仓，
+    // 也就是【双倍仓位】：比单纯丢记录更糟
+    const int orders_before = fc->market_orders;
+    vnow += 120'000;
+    eng.tick("BTCUSDT", 97.0);
+    {
+        auto b = eng.get_bots()[0];
+        check(std::fabs(b.total_qty - 0.5) < 1e-6,
+              "冷却期满后仓位仍是认领的那 0.5（实际 " + std::to_string(b.total_qty) + "）");
+        check(!b.entries.empty(), "  加仓记录也还在，没被清空");
+        check(b.avg_price > 90.0, "  均价保留，止盈线才有基准");
+        check(fc->market_orders == orders_before,
+              "  没有因为误判空仓而重新开首仓（那会变成双倍仓位）");
+    }
+}
+
 int main() {
     test_dca_margin_cap();
+    test_adopted_position_survives_cooldown();
     test_v_crash_fills_one_layer();
     test_max_open_positions();
     test_disaster_stop_lifecycle();

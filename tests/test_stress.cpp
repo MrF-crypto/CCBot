@@ -74,6 +74,37 @@ static std::string violated_invariant(const CcgBot& b) {
         if (std::fabs(implied - b.avg_price) > std::max(1e-6, b.avg_price * 1e-6))
             return "均价与成本/数量不自洽";
     }
+
+    // ── 状态机不变量 ────────────────────────────────────────────────────────
+    // 上面全是【数值】不变量：它们能抓住"数字变成垃圾"，抓不住"标志位组合非法"。
+    // 而后者同样致命，且更隐蔽——数字全对，引擎却基于一个不可能的状态做决策。
+    //
+    // 例：entries 空了（刚平完仓）而 tp_reached 还留着 true，下一轮建仓后
+    // should_close 会立刻用上一轮的 tp_extreme 判定，可能开仓即平仓。
+    if (b.entries.empty()) {
+        if (b.tp_reached)
+            return "无持仓却仍处于止盈追踪态（tp_reached=true）";
+        if (b.interval_hit)
+            return "无持仓却仍处于补仓武装态（interval_hit=true）";
+        if (b.avg_price > 1e-12)
+            return "无持仓却残留均价 " + std::to_string(b.avg_price);
+        if (b.total_cost > 1e-9)
+            return "无持仓却残留成本 " + std::to_string(b.total_cost);
+    } else {
+        // 有加仓记录就必须有均价——止盈线、保底线、灾难止损价全建立在它之上
+        if (b.total_qty > 1e-12 && b.avg_price <= 0)
+            return "有持仓却没有均价";
+    }
+
+    // 冷却态是"平仓之后等下一轮"，此时不该还握着仓位。
+    // 若两者并存，说明平仓路径把状态改了却没清仓位，那笔仓位会失去止盈止损照管
+    if (b.state == CcgBot::State::Cooldown && b.total_qty > 1e-12)
+        return "冷却态却仍持有仓位 " + std::to_string(b.total_qty);
+
+    // 止盈追踪激活时必须有极值锚点，否则 should_close 的回落判定没有基准
+    if (b.tp_reached && b.tp_extreme <= 0)
+        return "止盈追踪已激活但极值锚点为 0";
+
     return "";
 }
 
