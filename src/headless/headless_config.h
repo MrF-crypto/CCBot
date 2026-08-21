@@ -1,6 +1,5 @@
 #pragma once
 #include "core/ccg_engine.h"
-#include "core/scanner.h"
 #include <string>
 #include <vector>
 
@@ -25,18 +24,6 @@ struct HeadlessConfig {
     std::vector<CcgConfig> bots;
     std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 
-    // ── 全市场扫描模式（默认关）────────────────────────────────────────────
-    // 与 bots 列表【可以共存】：bots 里的是常驻品种（比如你长期持有的 BTC），
-    // 扫描器额外动态开仓。两者共享同一套账户级闸门（保证金上限、并发上限），
-    // 所以常驻仓位会自动占用扫描器的额度——这是对的，账户只有一个。
-    struct ScannerSection {
-        bool   enabled       = false;
-        int    interval_secs = 60;     // 扫描周期。1h K线一小时才变一次，60秒足够
-        double budget_per_position = 0; // 每个扫描仓位的预算（0=用 template 里的）
-        ScannerConfig cfg;
-        // 扫描命中后用这套参数建 bot。symbol 会被逐个覆盖
-        CcgConfig     templ;
-    } scanner;
 };
 
 // 从 JSON 文件加载配置；失败返回 false 并把原因写进 err

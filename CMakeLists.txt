@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 3.9.7 LANGUAGES CXX)
+project(CCGMonitor VERSION 4.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,6 @@ find_package(Threads REQUIRED)
 set(CORE_SOURCES
     src/core/ccg_engine.cpp
     src/core/funding_ledger.cpp
-    src/core/scanner.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
     src/net/book_ticker_stream.cpp
@@ -179,13 +178,6 @@ if(MSVC)
     target_compile_options(ccg_rate_tests PRIVATE /utf-8)
 endif()
 
-# ── 全市场扫描器测试：重点是【成本】——粗筛必须把 K 线请求限制住 ──────────────
-add_executable(ccg_scanner_tests tests/test_scanner.cpp src/core/scanner.cpp)
-target_include_directories(ccg_scanner_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-if(MSVC)
-    target_compile_options(ccg_scanner_tests PRIVATE /utf-8)
-endif()
-
 # ── 对时测试：往返过长的测量必须丢弃，诊断信息必须如实 ────────────────────────
 add_executable(ccg_timesync_tests tests/test_time_sync.cpp
                                   src/net/trading_client.cpp src/net/rate_gate.cpp)
@@ -217,8 +209,7 @@ endif()
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
-                                src/core/scanner.cpp
-                                src/core/ccg_engine.cpp)
+                                                            src/core/ccg_engine.cpp)
 target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)

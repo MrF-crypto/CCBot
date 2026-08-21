@@ -1479,11 +1479,11 @@ void MainWindow::refreshAccount() {
                 run_async([this]() {
                     if (!client_) return;
                     const auto ts = client_->sync_server_time();
-                    // 每次 -1021 都会走到这里，所以这条日志的密度正好等于故障密度。
-                    // 排查 -1021 时它是最关键的一行：能看出对时到底成功没有、
-                    // 往返多久（含限流闸门的等待）、偏移有没有大幅跳变
+                    // 只有异常才吭声。这条路径每次 -1021 都会走到，v3.9.6 里它一天
+                    // 打了近百条，把交易信息全淹了——而正常对时本来就是常态
+                    if (!ts.noteworthy()) return;
                     QMetaObject::invokeMethod(this, [this, ts]() {
-                        log(QString::fromStdString(ts.to_log()), ts.accepted ? "INFO" : "WARN");
+                        log(QString::fromStdString(ts.to_log()), "WARN");
                     }, Qt::QueuedConnection);
                 });
             }
@@ -2516,10 +2516,11 @@ void MainWindow::onTick() {
         run_async([this]() {
             if (!client_) return;
             const auto ts = client_->sync_server_time();
-            // 每小时一条。偏移量随时间的变化曲线，是判断"本机时钟在漂还是被步进"
-            // 的直接依据——漂是缓慢累积，步进是一次跳好几秒
+            // 常规对时静默；只有测量被丢弃、或偏移大幅跳变（本机时钟被系统步进）
+            // 才值得占用一行——那两种情况都意味着有东西不对劲
+            if (!ts.noteworthy()) return;
             QMetaObject::invokeMethod(this, [this, ts]() {
-                log(QString::fromStdString(ts.to_log()), ts.accepted ? "INFO" : "WARN");
+                log(QString::fromStdString(ts.to_log()), "WARN");
             }, Qt::QueuedConnection);
         });
     }

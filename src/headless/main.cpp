@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
              " | 可用 $" + std::to_string(info.available) +
              (info.uni_mmr > 0 ? " | uniMMR " + std::to_string(info.uni_mmr) : "") +
              " | 持仓模式 " + (dual_mode ? "双向（带 positionSide）" : "单向"), "OK");
-    // 首次对时结果：偏移量是 -1021 的直接成因，启动时就该让人看见
+    // 启动这一条保留：一次性的，而且本机与交易所的时差是排查任何时间戳问题的起点
     log_line(first_sync.to_log(), first_sync.accepted ? "OK" : "WARN");
 
     auto pool   = std::make_shared<ThreadPool>(4);
@@ -284,28 +284,6 @@ int main(int argc, char** argv) {
     std::set<std::string> stall_alerted;       // 已告警的品种，恢复后清除
     std::atomic<int> hb_fail_streak{0};
     std::atomic<bool> hb_alerted{false};
-
-    // ── 全市场扫描器 ────────────────────────────────────────────────────────
-    // 扫描在拉取线程池里跑（一轮要十几秒，绝不能挡住 3 秒的主循环），结果放进
-    // 一个互斥保护的队列，由主循环消费后动态建 bot。
-    // 扫描器本身不碰引擎——它只产出候选，"要不要开仓"的决定权留在主循环，
-    // 因为并发上限、保证金上限这些账户级约束只有主循环这边看得全
-    MarketScanner scanner(cfg.scanner.cfg);
-    std::atomic<bool> scan_busy{false};
-    std::vector<ScanCandidate> scan_queue;
-    std::mutex scan_mtx;
-    const int scan_ticks = std::max(1, cfg.scanner.interval_secs / 3);
-    if (cfg.scanner.enabled) {
-        log_line("全市场扫描已启用：每 " + std::to_string(cfg.scanner.interval_secs) +
-                 " 秒一轮 | 成交额≥" +
-                 std::to_string((int64_t)(cfg.scanner.cfg.min_quote_vol_24h / 1e6)) + "M" +
-                 " | 粗筛 top" + std::to_string(cfg.scanner.cfg.coarse_top_n) +
-                 " → 入选 top" + std::to_string(cfg.scanner.cfg.final_top_n) +
-                 " | %B≤" + std::to_string(cfg.scanner.cfg.max_pct_b) +
-                 " RSI≤" + std::to_string((int)cfg.scanner.cfg.max_rsi) +
-                 " | 并发上限 " + std::to_string(cfg.max_open_positions) +
-                 " | 每仓 $" + std::to_string((int)cfg.scanner.templ.budget_usdt), "OK");
-    }
 
     int tick_n = 0;
     while (g_running.load()) {
@@ -531,87 +509,17 @@ int main(int argc, char** argv) {
                     log_line("心跳失败（网络异常?): " + acc.error, "ERR");
                     // -1021 = 时钟漂移超窗，立即重新对时自愈
                     if (acc.error.find("-1021") != std::string::npos)
-                        log_line(client->sync_server_time().to_log(), "WARN");
+                    {
+                        // 只有异常才吭声——这条路径每次 -1021 都会走到
+                        const auto ts = client->sync_server_time();
+                        if (ts.noteworthy()) log_line(ts.to_log(), "WARN");
+                    }
                     // 连续3次（约3分钟）失败才告警：偶发抖动不值得半夜叫醒人
                     if (hb_fail_streak.fetch_add(1) + 1 >= 3 && !hb_alerted.exchange(true) && !w.empty())
                         send_webhook(w, "[ccbot] ⚠ 账户接口连续3次拉取失败：" + acc.error);
                 }
                 hb_busy.store(false);
             });
-        }
-
-        // ── 6c) 全市场扫描：派发 + 消费 + 回收 ──────────────────────────────
-        if (cfg.scanner.enabled) {
-            // ① 派发扫描（异步）。已持仓的品种排除掉——它们已经在管了，
-            //    重复选中只会浪费一次 K 线请求
-            if (tick_n % scan_ticks == 0 && !scan_busy.load()) {
-                scan_busy.store(true);
-                fetch_pool->submit([&]() {
-                    std::set<std::string> exclude;
-                    for (const auto& b : engine->get_bots()) exclude.insert(b.cfg.symbol);
-
-                    ScanFeed feed;
-                    feed.all_tickers = [&]() {
-                        std::vector<ScanFeed::Ticker> v;
-                        for (const auto& t : client->fetch_all_tickers())
-                            v.push_back({ t.symbol, t.last_price, t.change_pct, t.quote_volume });
-                        return v;
-                    };
-                    feed.indicators = [&](const std::string& sym) {
-                        ScanFeed::Indicators d;
-                        auto s = client->fetch_indicators(sym, cfg.scanner.cfg.kline_interval,
-                                                          cfg.scanner.cfg.boll_period,
-                                                          cfg.scanner.cfg.boll_mult,
-                                                          cfg.scanner.cfg.rsi_period);
-                        d.ok = s.ok; d.price = s.price;
-                        d.boll_lb = s.boll_lb; d.boll_ub = s.boll_ub; d.rsi = s.rsi;
-                        return d;
-                    };
-
-                    auto found = scanner.scan(feed, exclude);
-                    { std::lock_guard<std::mutex> lk(scan_mtx); scan_queue = found; }
-                    log_line("[扫描] " + scanner.last_stats().to_text() +
-                             " | 入选 " + std::to_string(found.size()));
-                    for (const auto& c : found) log_line("[扫描]   " + c.to_text());
-                    scan_busy.store(false);
-                });
-            }
-
-            // ② 消费候选：动态建 bot。并发上限在这里【和引擎那道闸重复检查】——
-            //    引擎那道是最终防线，这里提前判是为了不制造一堆立刻被拦下的空 bot
-            std::vector<ScanCandidate> cands;
-            { std::lock_guard<std::mutex> lk(scan_mtx); cands.swap(scan_queue); }
-            for (const auto& c : cands) {
-                if (engine->open_position_count() >= cfg.max_open_positions) break;
-                CcgConfig bc = cfg.scanner.templ;
-                bc.symbol = c.symbol;
-                auto id = engine->add_bot(bc);
-                if (id.empty()) continue;      // 同品种已有 bot
-                symbols.insert(c.symbol);
-                ticker.subscribe(c.symbol);
-                log_line("[扫描] 建仓监控 " + c.to_text(), "OK");
-                state_dirty.store(true);
-            }
-
-            // ③ 回收：扫描出的 bot 是一次性的（auto_restart=false），止盈后会变
-            //    Stopped。及时移除，把并发额度和 WS 订阅让给新候选——否则跑一天
-            //    就攒下几百个僵尸 bot，状态文件和订阅数一起膨胀
-            for (const auto& b : engine->get_bots()) {
-                if (b.state != CcgBot::State::Stopped) continue;
-                if (b.total_qty > 0 || b.pending)      continue;
-                // 只回收扫描器建的，不碰配置文件里的常驻 bot
-                bool from_cfg = false;
-                for (const auto& cb : cfg.bots)
-                    if (cb.symbol == b.cfg.symbol) { from_cfg = true; break; }
-                if (from_cfg) continue;
-
-                engine->remove_bot(b.bot_id);
-                symbols.erase(b.cfg.symbol);
-                ticker.unsubscribe(b.cfg.symbol);
-                log_line("[扫描] 回收 " + b.cfg.symbol + "（本轮已了结，累计盈亏 " +
-                         std::to_string(b.realized_pnl) + "U）");
-                state_dirty.store(true);
-            }
         }
 
         // ── 6b) 资金费：费率约5分钟一刷，历史流水约1小时一同步 ──────────────
@@ -693,9 +601,8 @@ int main(int argc, char** argv) {
         if (tick_n % 1200 == 0) {
             fetch_pool->submit([client]() {
                 const auto ts = client->sync_server_time();
-                // 每小时一条。偏移随时间的变化曲线，是判断"时钟在漂还是被步进"
-                // 的直接依据——漂是缓慢累积，步进是一次跳好几秒
-                log_line(ts.to_log(), ts.accepted ? "INFO" : "WARN");
+                // 常规对时静默；只有测量被丢弃或偏移大幅跳变才值得占一行
+                if (ts.noteworthy()) log_line(ts.to_log(), "WARN");
             });
         }
     }

@@ -250,6 +250,24 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
 }
 
 std::string TradingClient::http_get(const std::string& path, std::string params) {
+    std::string resp, rhdr;
+    struct curl_slist* hdrs = nullptr;
+    // ⚠ 顺序至关重要：先过闸门，【放行之后】才算时间戳并签名。
+    //
+    // 反过来（先签名再等闸门）会制造一个隐蔽的 -1021 工厂：闸门在权重逼近上限时
+    // 会阻塞，实测最长压过 44 秒（对时诊断日志里往返 P99=20.6s、max=44.2s，而
+    // 中位数只有 596ms——那条长尾只可能来自闸门）。请求带着 44 秒前的时间戳抵达
+    // 币安，而 recvWindow 只有 5 秒，必然被判 "Timestamp outside of recvWindow"。
+    //
+    // 这正是那台 macOS 实盘 33% 时间在报 -1021 的真正原因：与本机时钟无关
+    // （诊断显示偏移中位数只有 300ms），纯粹是"签名早、发送晚"。
+    gate_->acquire(false);
+    if (!params.empty()) {
+        params += "&timestamp=" + std::to_string(ts_ms());
+        params += "&signature=" + sign(params);
+    }
+    // 测试钩子放在签名【之后】：它拦截的应当是"即将发出的那个请求"，
+    // 而不是刚进函数、还没加时间戳的半成品。用例⑤靠这一点验证时间戳的新鲜度
     if (test_hook_) {
         FakeReply fr;
         if (test_hook_("GET", path, params, fr)) {
@@ -257,14 +275,7 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
             return fr.body;
         }
     }
-    if (!params.empty()) {
-        params += "&timestamp=" + std::to_string(ts_ms());
-        params += "&signature=" + sign(params);
-    }
     std::string url = base_ + path + (params.empty() ? "" : "?" + params);
-    std::string resp, rhdr;
-    struct curl_slist* hdrs = nullptr;
-    gate_->acquire(false);
     CURL* c = make_curl(cfg_.api_key, resp, hdrs);
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
@@ -278,15 +289,6 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
 }
 
 std::string TradingClient::http_post(const std::string& path, std::string params) {
-    if (test_hook_) {
-        FakeReply fr;
-        if (test_hook_("POST", path, params, fr)) {
-            gate_->observe(fr.code, fr.headers, fr.body);
-            return fr.body;
-        }
-    }
-    params += "&timestamp=" + std::to_string(ts_ms());
-    params += "&signature=" + sign(params);
     std::string url  = base_ + path;
     std::string resp;
 
@@ -302,6 +304,21 @@ std::string TradingClient::http_post(const std::string& path, std::string params
     // 订单请求享有优先权：只在真正被封禁时才等，不参与权重软限速。
     // 平仓/止损延迟直接对应资金损失，而拉一次指标晚几秒无所谓
     gate_->acquire(true);
+
+    // ⚠ 时间戳必须在【闸门放行之后】才算——顺序反了就是个 -1021 工厂，
+    //   详见 http_get 里的说明。订单路径虽然享有优先权、极少被压，
+    //   但被封禁时同样会等，所以这里同样不能提前签名
+    params += "&timestamp=" + std::to_string(ts_ms());
+    params += "&signature=" + sign(params);
+
+    // 测试钩子放在签名之后：拦截的应当是"即将发出的那个请求"，而不是半成品
+    if (test_hook_) {
+        FakeReply fr;
+        if (test_hook_("POST", path, params, fr)) {
+            gate_->observe(fr.code, fr.headers, fr.body);
+            return fr.body;
+        }
+    }
 
     std::string rhdr;
     CURL* c = static_cast<CURL*>(slot->handle);
@@ -319,6 +336,12 @@ std::string TradingClient::http_post(const std::string& path, std::string params
 }
 
 std::string TradingClient::http_del(const std::string& path, std::string params) {
+    std::string resp, rhdr;
+    struct curl_slist* hdrs = nullptr;
+    gate_->acquire(true);          // 撤单同属订单类，优先
+    // ⚠ 闸门放行之后才算时间戳，详见 http_get 里的说明
+    params += "&timestamp=" + std::to_string(ts_ms());
+    params += "&signature=" + sign(params);
     if (test_hook_) {
         FakeReply fr;
         if (test_hook_("DELETE", path, params, fr)) {
@@ -326,12 +349,7 @@ std::string TradingClient::http_del(const std::string& path, std::string params)
             return fr.body;
         }
     }
-    params += "&timestamp=" + std::to_string(ts_ms());
-    params += "&signature=" + sign(params);
     std::string url  = base_ + path + "?" + params;
-    std::string resp, rhdr;
-    struct curl_slist* hdrs = nullptr;
-    gate_->acquire(true);          // 撤单同属订单类，优先
     CURL* c = make_curl(cfg_.api_key, resp, hdrs);
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
@@ -714,38 +732,6 @@ bool TradingClient::fetch_position_mode() {
     doc["dualSidePosition"].get(dual);
     dual_mode_ = dual;
     return dual;
-}
-
-std::vector<TradingClient::MarketTicker> TradingClient::fetch_all_tickers() {
-    std::vector<MarketTicker> out;
-    // 不带 symbol = 返回全部品种。走公开端点（统一账户下 papi 没有行情接口）
-    auto resp = http_get_public("/fapi/v1/ticker/24hr");
-    if (resp.empty()) return out;
-
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
-
-    simdjson::dom::array arr;
-    if (doc.get(arr) != simdjson::SUCCESS) return out;
-
-    out.reserve(600);
-    for (auto e : arr) {
-        simdjson::dom::element el = e;
-        std::string_view sym;
-        if (el["symbol"].get(sym) != simdjson::SUCCESS) continue;
-        MarketTicker t;
-        t.symbol       = std::string(sym);
-        t.last_price   = parse_dbl_str(el, "lastPrice");
-        t.change_pct   = parse_dbl_str(el, "priceChangePercent");
-        t.quote_volume = parse_dbl_str(el, "quoteVolume");
-        // 停牌/无成交的品种价格会是 0，直接丢掉——它们进了候选池只会浪费
-        // 后续的 K 线请求，而那才是扫描的主要成本
-        if (t.last_price <= 0) continue;
-        out.push_back(std::move(t));
-    }
-    return out;
 }
 
 bool TradingClient::cancel_order(const std::string& sym, const std::string& order_id) {

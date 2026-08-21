@@ -245,60 +245,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         out.bots.push_back(c);
     }
 
-    // ── 全市场扫描器（可选段）───────────────────────────────────────────────
-    simdjson::dom::object sc;
-    if (root["scanner"].get(sc) == simdjson::SUCCESS) {
-        auto& S = out.scanner;
-        S.enabled       = get_bool(sc, "enabled", S.enabled);
-        S.interval_secs = (int)get_num(sc, "interval_secs", (double)S.interval_secs);
-        S.budget_per_position = get_num(sc, "budget_per_position", S.budget_per_position);
-
-        auto& C = S.cfg;
-        C.min_quote_vol_24h = get_num(sc, "min_quote_vol_24h", C.min_quote_vol_24h);
-        C.max_change_24h    = get_num(sc, "max_change_24h",    C.max_change_24h);
-        C.coarse_top_n      = (int)get_num(sc, "coarse_top_n", (double)C.coarse_top_n);
-        C.kline_interval    = get_str(sc, "kline_interval",    C.kline_interval);
-        C.boll_period       = (int)get_num(sc, "boll_period",  (double)C.boll_period);
-        C.boll_mult         = get_num(sc, "boll_mult",         C.boll_mult);
-        C.rsi_period        = (int)get_num(sc, "rsi_period",   (double)C.rsi_period);
-        C.max_pct_b         = get_num(sc, "max_pct_b",         C.max_pct_b);
-        C.max_rsi           = get_num(sc, "max_rsi",           C.max_rsi);
-        C.final_top_n       = (int)get_num(sc, "final_top_n",  (double)C.final_top_n);
-
-        simdjson::dom::array bl;
-        if (sc["blacklist"].get(bl) == simdjson::SUCCESS) {
-            for (auto e : bl) {
-                std::string_view v;
-                if (e.get(v) == simdjson::SUCCESS) C.blacklist.insert(std::string(v));
-            }
-        }
-
-        // 模板：扫描命中后用这套参数建 bot。走与普通 bot 完全相同的解析路径，
-        // 所以两边的默认值、迁移逻辑、告警一致，不会各长各的
-        simdjson::dom::object tpl;
-        if (sc["template"].get(tpl) == simdjson::SUCCESS) {
-            S.templ.symbol = "SCAN";   // 占位，建 bot 时会被真实品种覆盖
-            if (!parse_bot_fields(tpl, S.templ, out, err)) return false;
-        }
-        if (S.budget_per_position > 0) S.templ.budget_usdt = S.budget_per_position;
-
-        // 扫描器建的 bot 是【一次性】的：止盈后应当让位给新的候选，而不是
-        // 原地冷却等下一轮。auto_restart=true 会让它一直占着并发额度
-        if (S.enabled && S.templ.auto_restart) {
-            S.templ.auto_restart = false;
-            out.warnings.push_back("扫描器模板的 auto_restart 已强制为 false："
-                                   "扫描出的仓位止盈后应让位给新候选，"
-                                   "否则它会一直占着并发额度");
-        }
-        if (S.enabled && out.max_open_positions <= 0) {
-            err = "开启 scanner 时必须设置 max_open_positions（全市场扫描下，"
-                  "大跌那天可能几十个品种同时触发信号）";
-            return false;
-        }
-    }
-
-    // 扫描器模式下 bots 可以为空——品种完全由扫描器动态产生
-    if (out.bots.empty() && !out.scanner.enabled) {
+    if (out.bots.empty()) {
         err = "配置文件 bots 数组为空或每一项都缺少 symbol";
         return false;
     }

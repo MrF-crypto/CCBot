@@ -101,7 +101,7 @@ jobs:
           for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
                    ccg_stress_tests ccg_liq_tests \
-                   ccg_persist_tests ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_scanner_tests; do
+                   ccg_persist_tests ccg_config_tests ccg_price_tests ccg_timesync_tests; do
             echo "── $t ──"
             ./build/$t
           done
@@ -111,14 +111,14 @@ jobs:
           set -e
           mkdir -p pkg
           cp build/ccbot_headless build/ladder_depth pkg/
-          cp config.example.json config.scanner.example.json pkg/
+          cp config.example.json pkg/
           chmod +x pkg/ccbot_headless pkg/ladder_depth
 
       # 泄漏检查同样是硬门禁。config.example.json 是模板（不含真凭证），但白名单
       # 只放行可执行文件，所以要在检查【之后】再放进 zip
       - name: Leak check (hard gate)
         run: |
-          rm -f pkg/config.example.json pkg/config.scanner.example.json
+          rm -f pkg/config.example.json
           VER=""
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
           if [ -n "$VER" ]; then
@@ -126,7 +126,7 @@ jobs:
           else
             python3 tools/leak_check.py pkg
           fi
-          cp config.example.json config.scanner.example.json pkg/
+          cp config.example.json pkg/
 
       - name: Zip
         run: |

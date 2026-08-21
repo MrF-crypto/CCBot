@@ -155,6 +155,40 @@ int main() {
               "偏移大幅跳变时日志明确标出（时钟被系统步进的直接证据）");
     }
 
+    // ── ⑤ 时间戳必须在限流闸门【放行之后】才算 ──────────────────────────────
+    // 这是 v4.0 的核心修复，也是那台 macOS 实盘 33% 时间在报 -1021 的真正原因。
+    //
+    // 顺序反了（先签名 → 再等闸门 → 才发送）时，闸门一旦阻塞，请求就带着一个
+    // 陈旧的时间戳抵达币安。实测闸门最长压过 44 秒，而 recvWindow 只有 5 秒。
+    //
+    // 怎么测：让测试钩子在被调用时读取 params 里的时间戳，与"钩子被调用那一刻"
+    // 的真实时间比对。钩子是在闸门之后才触发的，所以两者的差值就等于
+    // 「签名时刻 → 发送时刻」的间隔。修复前这个差值等于闸门的阻塞时长，
+    // 修复后它恒等于 0（外加 ts_ms 刻意回拨的 1 秒）。
+    {
+        TradingClient cli = make_client();
+        int64_t ts_in_params = 0, hook_called_at = 0;
+        cli.set_test_hook([&](const std::string&, const std::string&,
+                              const std::string& params, TradingClient::FakeReply& out) {
+            auto pos = params.find("timestamp=");
+            if (pos != std::string::npos)
+                ts_in_params = std::atoll(params.c_str() + pos + 10);
+            hook_called_at = now_ms();
+            out.code = 200; out.body = "{}";
+            return true;
+        });
+
+        // 走一个签名请求（fetch_account 内部是 http_get + 非空 params）
+        cli.fetch_account();
+
+        check(ts_in_params > 0, "签名请求确实带了 timestamp");
+        // ts_ms() 会刻意回拨 1 秒，所以期望差值约 1000ms；给 500ms 余量容纳执行抖动
+        const int64_t lag = hook_called_at - ts_in_params;
+        check(lag >= 900 && lag < 1500,
+              "时间戳与发送时刻的间隔约等于 1 秒的刻意回拨（实际 " +
+              std::to_string(lag) + "ms）—— 说明它是在闸门放行【之后】才算的");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }
