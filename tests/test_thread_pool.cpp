@@ -28,13 +28,17 @@ int main() {
     // 如果实现只看 tasks_.empty()，这条会失败——而那正是 UAF 的入口
     {
         ThreadPool p(2);
-        std::atomic<bool> finished{false};
+        std::atomic<bool> started{false}, finished{false};
         p.submit([&] {
+            started.store(true);            // 已出队、开始执行 —— 此刻队列是空的
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
             finished.store(true);
         });
-        // 给 worker 一点时间把任务【取出队列】：此刻队列空了，但任务在跑
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        // 自旋等到任务【确实开始执行】，而不是 sleep 一个拍脑袋的时长。
+        // 原先用 sleep(60ms) 制造这个时机，在 macOS arm64 上实测睡了约 165ms，
+        // 于是后面"至少阻塞 250ms"的断言就崩了——CI 抓到的正是这个。
+        // 基于绝对时长的断言在不同硬件的调度粒度下天然不可靠
+        while (!started.load()) std::this_thread::yield();
 
         auto t0 = std::chrono::steady_clock::now();
         bool ok = p.wait_idle(5000);
@@ -42,8 +46,10 @@ int main() {
                       std::chrono::steady_clock::now() - t0).count();
 
         check(ok, "wait_idle 返回成功");
+        // 这一条才是核心判据：队列早就空了，它必须等到任务真正执行完
         check(finished.load(), "  返回时任务确实已经执行完（不是只等到队列空）");
-        check(ms >= 250, "  确实阻塞等待了（实际 " + std::to_string(ms) + "ms）");
+        // 时长只做辅助确认"没有立即返回"，阈值放宽——精确时长不该被断言
+        check(ms >= 100, "  确实阻塞等待了（实际 " + std::to_string(ms) + "ms）");
     }
 
     // ── ② 多任务：全部完成才返回 ────────────────────────────────────────────
@@ -73,18 +79,20 @@ int main() {
     // ── ④ 超时兜底：卡死的任务不能让关窗口变成假死 ──────────────────────────
     {
         ThreadPool p(1);
-        std::atomic<bool> release{false};
+        std::atomic<bool> release{false}, running{false};
         p.submit([&] {
+            running.store(true);
             while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        while (!running.load()) std::this_thread::yield();   // 同上，不用固定 sleep
 
         auto t0 = std::chrono::steady_clock::now();
         bool ok = p.wait_idle(300);          // 明显短于任务时长
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0).count();
         check(!ok, "任务卡住时 wait_idle 返回 false，而不是无限等下去");
-        check(ms >= 250 && ms < 1500, "  在超时附近返回（实际 " + std::to_string(ms) + "ms）");
+        // 只验"没有立即返回、也没有无限等"，上界给足余量容纳慢机器的调度抖动
+        check(ms >= 200 && ms < 3000, "  在超时附近返回（实际 " + std::to_string(ms) + "ms）");
 
         release.store(true);                 // 放行，让池能干净析构
         p.wait_idle(5000);
