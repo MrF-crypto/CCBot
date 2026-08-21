@@ -607,7 +607,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    log_line("收到退出信号，保存状态后退出");
+    log_line("收到退出信号，等待在途订单落地后保存状态…");
+    // 与 GUI 同一处理：等在途任务跑完【再落盘】。
+    //   · 消除 use-after-free —— 任务捕获 engine 裸指针，而 CcgEngine 里 pool_ 的
+    //     声明位置在 mtx_/bots_ 之前，线程池 join 时那两个成员已经析构
+    //   · 让在途订单的结果进得了状态文件 —— 否则 SIGTERM 瞬间正在成交的那笔
+    //     本地无记录，重启只能靠对账认领，而认领会丢掉层数信息
+    if (!pool->wait_idle(20000))
+        log_line("仍有下单任务未完成，状态可能不完整——重启后由对账兜底", "WARN");
+    fetch_pool->wait_idle(5000);
+
     save_headless_state(cfg.state_path, engine->get_bots());
     funding.save(funding_path);
     // 退出也要通知：进程停了就等于所有本地风控停了，只剩交易所侧的灾难止损单。

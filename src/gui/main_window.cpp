@@ -121,17 +121,30 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 MainWindow::~MainWindow() {
-    if (ticker_) ticker_->stop();
+    // ① 先切断新任务的来源，否则下面等排空时还在源源不断地进新任务
+    if (ticker_)     ticker_->stop();
     if (tick_timer_) tick_timer_->stop();
     if (ob_timer_)   ob_timer_->stop();
-    // 落盘去抖可能还压着最后几笔没写，退出前强制刷一次，否则关程序会丢
+    if (header_timer_) header_timer_->stop();
+
+    // ② 等在途任务跑完【再落盘】。这一步同时解决两个问题：
+    //
+    //   a) use-after-free：任务的 lambda 捕获的是 this 和 engine_ 的裸指针，而
+    //      CcgEngine 里 pool_ 的声明位置在 mtx_/bots_ 之前 —— 意味着线程池 join
+    //      的时候那两个成员已经析构，在途任务一访问就是 UAF。等排空之后再让
+    //      成员开始销毁，这条路径就不存在了。
+    //
+    //   b) 在途订单的结果能被落盘：原先是先 save_bots() 再让成员销毁，所以
+    //      关窗口瞬间正在成交的那笔本地没有记录，只能靠下次启动对账去认领——
+    //      而认领会丢掉层数信息（按交易所均价重建成单层）。现在等它落地再存。
+    //
+    // 超时兜底：单笔 HTTP 最长 15 秒，卡死的任务不该把关窗口变成假死
+    if (pool_      && !pool_->wait_idle(20000))
+        log("退出时仍有下单任务未完成，状态可能不完整——下次启动会由对账兜底", "WARN");
+    if (fetchPool_) fetchPool_->wait_idle(5000);   // 数据拉取不影响资金，等短一点
+
+    // ③ 此刻状态最完整，落盘
     if (tradesDirty_) save_trades(true);
-    // 仓位状态同样要在退出时刷一次（headless 版一直是这么做的，GUI 这边漏了）。
-    // 平时 save_bots 挂在引擎的日志回调上，而那个回调是 QueuedConnection：
-    // 成交刚发生、日志事件还排在队列里时用户关掉窗口，这笔成交就永远不会落盘——
-    // 重启后本地不知道有这个仓位，只能靠对账去认领（认领会丢掉层数信息）。
-    // save_bots 读的是 engine_->get_bots() 的实时状态，不受队列积压影响。
-    // 残留窗口：线程池里正在途的订单若在此之后才成交，仍然要靠启动对账兜底
     save_bots();
 }
 

@@ -170,6 +170,14 @@ if(MSVC)
     target_compile_options(ccg_order_tests PRIVATE /utf-8)
 endif()
 
+# ── 线程池关停语义测试：wait_idle 必须等【在途任务】而不只是队列空 ───────────
+add_executable(ccg_pool_tests tests/test_thread_pool.cpp)
+target_include_directories(ccg_pool_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_pool_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_pool_tests PRIVATE /utf-8)
+endif()
+
 # ── 限流闸门测试（时间相关逻辑，且坐在每一个 HTTP 出口上）────────────────────
 add_executable(ccg_rate_tests tests/test_rate_gate.cpp src/net/rate_gate.cpp)
 target_include_directories(ccg_rate_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
