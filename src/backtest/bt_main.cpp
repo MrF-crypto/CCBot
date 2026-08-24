@@ -139,6 +139,9 @@ static int cmd_run(int argc, char** argv) {
     if (arg_flag(argc, argv, "--indicator")) {
         c.entry_mode = CcgConfig::EntryMode::Indicator;
         c.rsi_confirm_mode = CcgConfig::RsiConfirmMode::CrossFromOversold;
+        // --no-rsi：只保留「跌破布林下轨」这一个首单条件，剥掉 RSI 那一层。
+        // 用来单独归因——指标首单的价值到底来自"位置在带外"还是"动能已反转"
+        c.use_rsi_filter = !arg_flag(argc, argv, "--no-rsi");
     } else {
         c.entry_mode     = CcgConfig::EntryMode::Immediate;   // 首单即开
         c.use_rsi_filter = false;
@@ -168,6 +171,7 @@ static int cmd_run(int argc, char** argv) {
     c.tp_floor_only        = arg_flag(argc, argv, "--floor-only");
     c.tp_fixed_profit      = arg_num(argc, argv, "--tp-fixed", 0.0);
     c.fixed_trail_tp       = arg_num(argc, argv, "--fixed-trail", 0);
+    c.fixed_trail_entry    = arg_num(argc, argv, "--fixed-entry", 0);
     c.first_entry_bounce_pct = arg_num(argc, argv, "--bounce", 0);
     c.use_sr_exit          = arg_flag(argc, argv, "--sr-exit");
     c.use_structural_stop  = arg_flag(argc, argv, "--struct-stop");

@@ -311,6 +311,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.tp_floor_only     = new_cfg.tp_floor_only;
     cfg.tp_fixed_profit   = new_cfg.tp_fixed_profit;
     cfg.fixed_trail_tp    = new_cfg.fixed_trail_tp;
+    cfg.fixed_trail_entry = new_cfg.fixed_trail_entry;
     cfg.first_entry_bounce_pct = new_cfg.first_entry_bounce_pct;
     cfg.use_trend_filter  = new_cfg.use_trend_filter;
     cfg.trend_interval    = new_cfg.trend_interval;
@@ -644,7 +645,8 @@ CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
                      : dynparams::interval_pct(W, bot.cfg.dyn_interval_mult);
     p.trail_entry  = dynparams::trail_entry_pct(W);
     p.trail_tp     = dynparams::trail_tp_pct(W);
-    if (bot.cfg.fixed_trail_tp > 0) p.trail_tp = bot.cfg.fixed_trail_tp;
+    if (bot.cfg.fixed_trail_tp > 0)    p.trail_tp    = bot.cfg.fixed_trail_tp;
+    if (bot.cfg.fixed_trail_entry > 0) p.trail_entry = bot.cfg.fixed_trail_entry;
     return p;
 }
 
