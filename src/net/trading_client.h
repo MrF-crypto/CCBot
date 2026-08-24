@@ -336,6 +336,15 @@ private:
         CurlSlot& operator=(const CurlSlot&) = delete;
     };
     CurlSlot curl_pool_[kCurlPoolSize];
+    // 公开行情单独一个池，不与签名池共用，两个理由：
+    //   ① 主机不同——统一账户下签名走 papi，公开行情永远走 fapi，
+    //      共用句柄等于让连接缓存在两个 host 之间来回切，复用率反而下降
+    //   ② 公开端点按 IP 计权重，不需要身份，不该携带 X-MBX-APIKEY
+    // 补这个池的实测依据：实盘环境下每次新建连接要付完整的 DNS+TCP+TLS 握手，
+    // 干净测量的纯网络往返只有 83ms，而框架自己测到 538~693ms，差额就在握手上。
+    // 更糟的是它会污染对时——中点估算把握手时间当成对称网络延迟平摊，
+    // 于是偏移被系统性抬高约 H/2（实测约 +200ms，与日志基线和干净测量的差值吻合）
+    CurlSlot pub_pool_[kCurlPoolSize];
 
     std::string sign(const std::string& q) const;
     int64_t     ts_ms() const;

@@ -149,12 +149,30 @@ TradingClient::TradingClient(const Config& cfg) : cfg_(cfg) {
         curl_pool_[i].handle = c;
         curl_pool_[i].hdrs   = h;
     }
+
+    // 公开行情池：同样预热，但【不挂 API Key header】——这类端点按 IP 计权重
+    for (int i = 0; i < kCurlPoolSize; ++i) {
+        CURL* c = curl_easy_init();
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write);
+        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE, 30L);
+        curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 15L);
+        pub_pool_[i].handle = c;
+        pub_pool_[i].hdrs   = nullptr;
+    }
 }
 
 TradingClient::~TradingClient() {
     for (auto& slot : curl_pool_) {
         if (slot.handle) curl_easy_cleanup(static_cast<CURL*>(slot.handle));
         if (slot.hdrs)   curl_slist_free_all(static_cast<struct curl_slist*>(slot.hdrs));
+    }
+    for (auto& slot : pub_pool_) {
+        if (slot.handle) curl_easy_cleanup(static_cast<CURL*>(slot.handle));
     }
 }
 
@@ -182,21 +200,27 @@ std::string TradingClient::http_get_public(const std::string& path) {
     }
     std::string url  = pub_base_ + path;
     std::string resp, rhdr;
+
+    // 从公开池取一个空闲槽：先非阻塞轮询，全忙则阻塞等 0 号槽（与订单池同一策略）
+    std::unique_lock<std::mutex> lk;
+    CurlSlot* slot = nullptr;
+    for (auto& s : pub_pool_) {
+        std::unique_lock<std::mutex> try_lk(s.mtx, std::try_to_lock);
+        if (try_lk.owns_lock()) { slot = &s; lk = std::move(try_lk); break; }
+    }
+    if (!slot) { lk = std::unique_lock<std::mutex>(pub_pool_[0].mtx); slot = &pub_pool_[0]; }
+
     // 公开行情按 IP 计权重，和签名请求共用同一个配额——这里是请求量最大的一类
     // （31品种×每5分钟的指标+趋势批次），突发风险主要来自它
     gate_->acquire(false);
-    CURL* c = curl_easy_init();
+    CURL* c = static_cast<CURL*>(slot->handle);
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write);
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);      // 槽只用于 GET，显式复位以防将来被复用
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_perform(c);
     long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     gate_->observe(code, rhdr, resp);
-    curl_easy_cleanup(c);
     return resp;
 }
 
