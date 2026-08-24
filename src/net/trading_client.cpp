@@ -638,6 +638,30 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     return r;
 }
 
+// 下单遇到 -1021 时就地重发的次数。
+// 取 2 而不是更多：这类停顿是离散的秒级事件，两次重发（间隔 250ms）足以跨过去；
+// 再多只会在真正的持续性故障里拖长每一次下单的耗时，而那种情况本就该让上层看见
+static constexpr int kTimestampRetries = 2;
+
+// 响应是否为【可确认的】-1021（时间戳超出 recvWindow）。
+//
+// 判定必须严格：只有合法 JSON 且 code 明确等于 -1021 才算。空响应、非 JSON、
+// 网关错误页一律不算——那些是"订单状态未知"，必须走查单恢复，绝不能重发。
+//
+// 为什么 -1021 可以安全重发：recvWindow 校验发生在订单进撮合引擎【之前】，
+// 校验没过订单根本不会被创建。所以它是"确定没成交"的证据，
+// 与超时/空响应那种"可能已经成交"是性质完全不同的两类失败。
+static bool is_timestamp_reject(const std::string& resp) {
+    if (resp.empty()) return false;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    simdjson::padded_string ps(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
+    int64_t code = 0;
+    if (doc["code"].get(code) != simdjson::SUCCESS) return false;
+    return code == -1021;
+}
+
 TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
                                                         const std::string& side,
                                                         double qty, bool reduce_only) {
@@ -664,6 +688,20 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
             + "&newOrderRespType=RESULT&recvWindow=5000" + extra;
 
         auto resp = http_post(ep(Ep::Order), body);
+
+        // -1021 就地重发：网络（尤其 TCP 隧道）的秒级停顿会让时间戳抵达时已超窗，
+        // 而这类停顿是离散的、过去就好。时间戳在 http_post 内部每次重算，
+        // 所以重发一次通常就落回窗口内了。
+        // 【复用同一个 clientOrderId】——不像 -1111 那样换新的。-1111 是精度被拒、
+        // 重试是真正的新订单；-1021 则是同一笔订单的重发，复用 ID 等于多一层保险：
+        // 万一"确定没成交"这个判断有误、原单真进去了，重复 ID 会被币安拒掉，
+        // 而不是开出第二个仓位
+        for (int ts_retry = 0;
+             ts_retry < kTimestampRetries && is_timestamp_reject(resp);
+             ++ts_retry) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            resp = http_post(ep(Ep::Order), body);
+        }
 
         // 可疑响应统一走查单恢复：空响应（超时/断网）和"非空但不是JSON"（网关5xx
         // HTML页、Cloudflare拦截页、被截断的响应）都意味着【订单状态未知】——

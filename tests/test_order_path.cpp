@@ -227,6 +227,89 @@ int main() {
         check(r.error.find("-2019") != std::string::npos, "错误码透传: " + r.error);
     }
 
+    // ── -1021 重发 ────────────────────────────────────────────────────────────
+    // 网络（尤其 TCP 隧道）的秒级停顿会让时间戳抵达时已超出 recvWindow。
+    // 这类失败与超时是【性质不同】的：recvWindow 校验在订单进撮合之前，
+    // 校验没过订单根本没被创建，所以重发不存在双倍仓位风险。
+    std::printf("\n── 用例8：首次 -1021、重发后成功 ──\n");
+    {
+        TradingClient tc(test_cfg());
+        int posts = 0, queries = 0;
+        std::string first_coid, second_coid;
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string& params, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
+            if (m == "GET" && path.find("/order") != std::string::npos) { ++queries; }
+            if (m == "POST") {
+                ++posts;
+                // 记录两次用的 clientOrderId，验证是否复用（与用例6 恰好相反的要求）
+                (posts == 1 ? first_coid : second_coid) = coid_of(params);
+                if (posts == 1) {
+                    out.body = R"({"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."})";
+                    return true;
+                }
+                out.body = R"({"orderId":7001,"status":"FILLED","avgPrice":"63210.0",)"
+                           R"("executedQty":"0.015","origQty":"0.015"})";
+                return true;
+            }
+            return false;
+        });
+        auto r = tc.place_market("BTCUSDT", "BUY", 0.015, false);
+        check(r.ok, "重发后返回成功");
+        check(posts == 2, "只重发了一次（实际下单 " + std::to_string(posts) + " 次）");
+        check(queries == 0, "不走查单恢复——-1021 是确定没成交，不是状态未知");
+        check(r.executed_qty > 0.0149 && r.executed_qty < 0.0151, "拿到真实成交数量，仓位只有一份");
+        check(!first_coid.empty() && first_coid == second_coid,
+              "重发复用同一个 clientOrderId（万一原单真进去了，重复ID会被拒而不是开第二个仓位）");
+    }
+
+    std::printf("\n── 用例9：持续 -1021，重发耗尽后如实失败 ──\n");
+    {
+        TradingClient tc(test_cfg());
+        int posts = 0, queries = 0;
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
+            if (m == "GET" && path.find("/order") != std::string::npos) ++queries;
+            if (m == "POST") {
+                ++posts;
+                out.body = R"({"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."})";
+                return true;
+            }
+            return false;
+        });
+        auto r = tc.place_market("BTCUSDT", "BUY", 0.015, false);
+        check(!r.ok, "持续失败时如实返回失败，不假装成功");
+        check(!r.uncertain, "状态是确定的（交易所明确拒绝），不该标记 uncertain");
+        check(posts == 3, "首次 + 2 次重发 = 3（实际 " + std::to_string(posts) + "）");
+        check(queries == 0, "始终不触发查单恢复");
+        check(r.error.find("-1021") != std::string::npos, "错误码透传: " + r.error);
+    }
+
+    std::printf("\n── 用例10：空响应仍走查单，不被 -1021 重发路径吞掉 ──\n");
+    {
+        // 回归防护：重发判定必须严格。空响应是"状态未知"，如果被误判成可重发，
+        // 就会在订单可能已成交的情况下再下一单 —— 双倍仓位
+        TradingClient tc(test_cfg());
+        int posts = 0, queries = 0;
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
+            if (m == "POST") { ++posts; out.body = ""; return true; }
+            if (m == "GET" && path.find("/order") != std::string::npos) {
+                ++queries;
+                out.body = R"({"orderId":7002,"status":"FILLED","avgPrice":"63000.0",)"
+                           R"("executedQty":"0.015","origQty":"0.015"})";
+                return true;
+            }
+            return false;
+        });
+        auto r = tc.place_market("BTCUSDT", "BUY", 0.015, false);
+        check(posts == 1, "空响应【不】重发下单（实际下单 " + std::to_string(posts) + " 次）");
+        check(queries >= 1, "走的是查单恢复");
+        check(r.ok, "查单确认已成交");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }
