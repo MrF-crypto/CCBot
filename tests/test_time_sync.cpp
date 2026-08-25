@@ -189,6 +189,57 @@ int main() {
               std::to_string(lag) + "ms）—— 说明它是在闸门放行【之后】才算的");
     }
 
+    // ── ⑥ 择优采样：慢样本必须被后续的快样本取代 ────────────────────────────
+    // 复现实盘抓到的形态：冷连接那一次往返 747ms、偏移 293ms，紧接着热连接
+    // 往返 86ms、偏移 −14ms —— 差的 307ms 正好是握手时长的一半。
+    // 单次采样时，那个 293ms 会被当成真实时差写进去，一直用到下次对时。
+    {
+        TradingClient cli = make_client();
+        int calls = 0;
+        cli.set_test_hook([&calls](const std::string&, const std::string& path,
+                                   const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            ++calls;
+            out.code = 200;
+            if (calls == 1) {
+                // 第一枪：慢，但仍在 2000ms 阈值内 —— 所以【不会】被原有的
+                // 丢弃逻辑挡住，只能靠择优采样把它比下去
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                out.body = "{\"serverTime\":" + std::to_string(now_ms() + 5000) + "}";
+            } else {
+                out.body = "{\"serverTime\":" + std::to_string(now_ms() + 100) + "}";
+            }
+            return true;
+        });
+        auto r = cli.sync_server_time();
+        check(r.accepted, "择优采样：仍然采纳");
+        check(calls >= 2, "  第一枪慢(400ms)会补枪（实际请求 " + std::to_string(calls) + " 次）");
+        check(r.rtt_ms < 150, "  记录的是最快那次的往返（" + std::to_string(r.rtt_ms) + "ms）");
+        check(r.offset_ms > 0 && r.offset_ms < 500,
+              "  【关键】采用快样本的 ~100ms，没被慢样本的 +5000 污染（实际 " +
+              std::to_string(r.offset_ms) + "）");
+    }
+
+    // ── ⑦ 常态零开销：第一枪就够快时不得再发请求 ────────────────────────────
+    // 择优采样若在正常情况下也多打两枪，等于把权重和延迟凭空翻三倍。
+    // 实盘热连接往返中位 84ms、P95 101ms，都在 150ms 的收工阈值之内
+    {
+        TradingClient cli = make_client();
+        int calls = 0;
+        cli.set_test_hook([&calls](const std::string&, const std::string& path,
+                                   const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") == std::string::npos) return false;
+            ++calls;
+            out.code = 200;
+            out.body = "{\"serverTime\":" + std::to_string(now_ms() + 200) + "}";
+            return true;
+        });
+        auto r = cli.sync_server_time();
+        check(r.accepted, "热连接常态：采纳");
+        check(calls == 1, "  【关键】只发一次请求，择优采样不给常态增加任何开销（实际 " +
+              std::to_string(calls) + " 次）");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

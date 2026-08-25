@@ -237,38 +237,85 @@ std::string TradingClient::http_get_public(const std::string& path) {
 // 也不要一个当场测出来的坏值。
 static constexpr int64_t kMaxSyncRttMs = 2000;
 
+// 择优采样的三个参数（见 sync_server_time 的说明）：
+//   最多采几次；快到什么程度就不必再采；总耗时预算
+// kSyncGoodRttMs 取 150ms：实盘热连接实测中位 84ms、P95 101ms，所以常态下
+// 第一枪就达标、直接收工——不给正常情况增加任何请求。冷连接（747ms）和
+// 隧道卡顿（991ms）都远在阈值之上，正是需要补枪的那些场合。
+// kSyncBudgetMs 取 2000ms 与 kMaxSyncRttMs 对齐：已经花掉这么久说明网络此刻
+// 不健康，再采也救不回精度，只会把调用线程堵得更久。
+static constexpr int     kSyncSamples   = 3;
+static constexpr int64_t kSyncGoodRttMs = 150;
+static constexpr int64_t kSyncBudgetMs  = 2000;
+
 TradingClient::TimeSyncResult TradingClient::sync_server_time() {
     using namespace std::chrono;
     TimeSyncResult r;
     r.prev_ms = time_offset_ms_.load();
     r.offset_ms = r.prev_ms;
 
-    auto t0   = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    // 注意：http_get_public 内部会先过限流闸门，闸门在权重逼近上限时会阻塞——
-    // 所以下面这个 rtt 是【含闸门等待】的总耗时。这是刻意的：如果对时被闸门
-    // 压了几十秒，日志里会直接看到一个几万毫秒的 rtt，一眼就能定位
-    auto resp = http_get_public("/fapi/v1/time");
-    auto t1   = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    r.rtt_ms  = t1 - t0;
+    // ── 择优采样：最多采 kSyncSamples 次，取【往返最短】的那一次 ──────────────
+    // NTP 的标准做法。理由是中点估算的误差上界恰好是 ±RTT/2 —— 往返越短，
+    // 去回程不对称能造成的偏差就越小，所以最快的样本必然是最可信的样本。
+    //
+    // 为什么需要它：单次采样时，一次慢样本（连接重建、隧道卡顿）就会把偏移
+    // 写偏几百毫秒，而那个坏值要一直用到下次对时。实盘实测过这个形态——
+    // 冷连接那一次往返 747ms、偏移 293ms，紧接着热连接往返 86ms、偏移 −14ms，
+    // 差的 307ms 正好是握手时长的一半。
+    //
+    // 代价被压到几乎为零：第一个样本只要够快就直接收工，所以常态（热连接
+    // 80ms 左右）根本不会有第二次请求。只有第一枪打偏时才补枪，
+    // 而那正是需要冗余的时候。
+    int64_t best_rtt = INT64_MAX;
+    int64_t best_offset = 0;
+    bool    got = false;
+    const auto began = steady_clock::now();
 
-    if (resp.empty())               { r.skip_reason = "无响应";     return r; }
+    for (int i = 0; i < kSyncSamples; ++i) {
+        auto t0 = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        // 注意：http_get_public 内部会先过限流闸门，闸门在权重逼近上限时会阻塞——
+        // 所以下面这个 rtt 是【含闸门等待】的总耗时。这是刻意的：如果对时被闸门
+        // 压了几十秒，日志里会直接看到一个几万毫秒的 rtt，一眼就能定位
+        auto resp = http_get_public("/fapi/v1/time");
+        auto t1 = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        const int64_t rtt = t1 - t0;
+        // rtt 始终反映"最近一次实际测量"，除非后面有更优样本把它替换掉
+        if (!got) r.rtt_ms = rtt;
 
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS)
-                                    { r.skip_reason = "JSON解析失败"; return r; }
+        do {
+            if (resp.empty())           { r.skip_reason = "无响应";        break; }
+            simdjson::dom::parser p;
+            simdjson::dom::element doc;
+            auto ps = simdjson::padded_string(resp);
+            if (p.parse(ps).get(doc) != simdjson::SUCCESS)
+                                        { r.skip_reason = "JSON解析失败";  break; }
+            int64_t server_time = 0;
+            if (doc["serverTime"].get(server_time) != simdjson::SUCCESS)
+                                        { r.skip_reason = "无serverTime";  break; }
+            if (rtt > kMaxSyncRttMs)    { r.skip_reason = "往返过长，中点估算不可信"; break; }
 
-    int64_t server_time = 0;
-    if (doc["serverTime"].get(server_time) != simdjson::SUCCESS)
-                                    { r.skip_reason = "无serverTime"; return r; }
+            if (rtt < best_rtt) {
+                best_rtt = rtt;
+                // 用请求往返的中点估算本机与服务器的时差
+                best_offset = server_time - (t0 + t1) / 2;
+                got = true;
+                r.rtt_ms = rtt;
+                r.skip_reason = "";     // 已有可用样本，之前的失败不再是结论
+            }
+        } while (false);
 
-    if (r.rtt_ms > kMaxSyncRttMs)   { r.skip_reason = "往返过长，中点估算不可信"; return r; }
+        // 够快就收工——常态下这里第一轮就返回，不产生任何额外请求
+        if (got && best_rtt <= kSyncGoodRttMs) break;
+        // 已经花掉的时间超过预算就别再补枪了：网络此刻明显不健康，
+        // 多采几次既救不回精度，还会把调用线程堵得更久
+        if (duration_cast<milliseconds>(steady_clock::now() - began).count() >= kSyncBudgetMs)
+            break;
+    }
 
-    // 用请求往返的中点估算本机与服务器的时差
-    int64_t local_mid = (t0 + t1) / 2;
-    time_offset_ms_.store(server_time - local_mid);
-    r.offset_ms = server_time - local_mid;
+    if (!got) return r;                  // 一个可用样本都没有：保留原偏移
+
+    time_offset_ms_.store(best_offset);
+    r.offset_ms = best_offset;
     r.accepted  = true;
     return r;
 }
