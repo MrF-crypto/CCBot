@@ -180,14 +180,39 @@ std::string TradingClient::sign(const std::string& q) const {
     return hmac_sha256(cfg_.api_secret, q);
 }
 
-int64_t TradingClient::ts_ms() const {
+// 墙上时钟（会被 SetSystemTime 改动）与单调时钟（不会）各取一个毫秒读数
+static int64_t wall_ms() {
     using namespace std::chrono;
-    auto local = duration_cast<milliseconds>(
-        system_clock::now().time_since_epoch()).count();
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+static int64_t mono_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+int64_t TradingClient::ts_ms() const {
     // 刻意回拨1秒：币安对"时间戳超前"零容忍（>1000ms直接-1021拒绝），对"滞后"
-    // 有 recvWindow=5000ms 的宽容——把时间戳往安全的一侧靠，本机时钟快1~2秒的
-    // 常见漂移就不会再触发 -1021（时好时坏的"网络异常"多半是它）
-    return local + time_offset_ms_ - 1000;
+    // 有 recvWindow=5000ms 的宽容——把时间戳往安全的一侧靠。
+    //
+    // ⚠ 锚点是【单调时钟】而不是墙上时钟。起因是实盘抓到的一个真实故障：
+    // 同一台机器上另一个程序（第三方交易机器人）每 5 分钟调一次 SetSystemTime
+    // 把系统时钟拨到整秒，而它算出来的那个整秒偶尔会差一秒——安全日志实录：
+    //     旧 15:24:19.0738746Z → 新 15:24:18.0000000Z   （往回 1074ms）
+    // 若锚在墙上时钟上，这一拨会直接平移我们发出的每一个时间戳，而超前侧的
+    // 预算只有 2000ms，一次就吃掉一半。
+    //
+    // steady_clock 是单调的，SetSystemTime 对它没有任何影响，所以别的程序
+    // 怎么拨系统时钟都与我们无关。代价只有晶振漂移（典型 10~50ppm，
+    // 15 分钟对时间隔内累计 0.04~0.18ms），可以忽略。
+    if (has_anchor_.load(std::memory_order_acquire))
+        return mono_ms() + steady_offset_ms_.load(std::memory_order_relaxed) - 1000;
+
+    // 还没成功对过时：退回墙上时钟。此刻本来也没有可用偏移，两者等价
+    return wall_now_ms() - 1000;
+}
+
+int64_t TradingClient::wall_now_ms() const {
+    return wall_hook_ ? wall_hook_() : wall_ms();
 }
 
 std::string TradingClient::http_get_public(const std::string& path) {
@@ -251,7 +276,9 @@ static constexpr int64_t kSyncBudgetMs  = 2000;
 TradingClient::TimeSyncResult TradingClient::sync_server_time() {
     using namespace std::chrono;
     TimeSyncResult r;
-    r.prev_ms = time_offset_ms_.load();
+    // 跳变检测比的是【墙上时钟偏移】——它正是"系统时钟被谁动了"的度量。
+    // 现在 ts_ms() 已经对此免疫，所以这条日志的定位从"告警"变成了"取证"
+    r.prev_ms = wall_offset_ms_.load();
     r.offset_ms = r.prev_ms;
 
     // ── 择优采样：最多采 kSyncSamples 次，取【往返最短】的那一次 ──────────────
@@ -267,18 +294,25 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
     // 80ms 左右）根本不会有第二次请求。只有第一枪打偏时才补枪，
     // 而那正是需要冗余的时候。
     int64_t best_rtt = INT64_MAX;
-    int64_t best_offset = 0;
+    int64_t best_steady_off = 0;    // 喂给 ts_ms() 的那个（锚在单调时钟上）
+    int64_t best_wall_off   = 0;    // 只用于日志与跳变检测
     bool    got = false;
     const auto began = steady_clock::now();
 
     for (int i = 0; i < kSyncSamples; ++i) {
-        auto t0 = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        // 两个时钟在同一时刻各取一次读数：单调的那个用来做锚点，
+        // 墙上的那个只为算出"系统时钟偏了多少"给人看
+        auto m0 = mono_ms();
+        auto w0 = wall_now_ms();
         // 注意：http_get_public 内部会先过限流闸门，闸门在权重逼近上限时会阻塞——
         // 所以下面这个 rtt 是【含闸门等待】的总耗时。这是刻意的：如果对时被闸门
         // 压了几十秒，日志里会直接看到一个几万毫秒的 rtt，一眼就能定位
         auto resp = http_get_public("/fapi/v1/time");
-        auto t1 = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-        const int64_t rtt = t1 - t0;
+        auto m1 = mono_ms();
+        auto w1 = wall_now_ms();
+        // 往返用单调时钟量：墙上时钟若在这中间被别的程序拨了，量出来的往返会是
+        // 负数或荒谬的大数，进而把中点估算和阈值判断一起带偏
+        const int64_t rtt = m1 - m0;
         // rtt 始终反映"最近一次实际测量"，除非后面有更优样本把它替换掉
         if (!got) r.rtt_ms = rtt;
 
@@ -296,8 +330,11 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
 
             if (rtt < best_rtt) {
                 best_rtt = rtt;
-                // 用请求往返的中点估算本机与服务器的时差
-                best_offset = server_time - (t0 + t1) / 2;
+                // 用请求往返的中点估算时差。两个锚点各算一份：
+                //   单调 —— 之后 ts_ms() 就靠它，不受任何人改系统时钟的影响
+                //   墙上 —— 只进日志，用来暴露"系统时钟被谁动了"
+                best_steady_off = server_time - (m0 + m1) / 2;
+                best_wall_off   = server_time - (w0 + w1) / 2;
                 got = true;
                 r.rtt_ms = rtt;
                 r.skip_reason = "";     // 已有可用样本，之前的失败不再是结论
@@ -314,8 +351,13 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
 
     if (!got) return r;                  // 一个可用样本都没有：保留原偏移
 
-    time_offset_ms_.store(best_offset);
-    r.offset_ms = best_offset;
+    // 先写偏移、再置 has_anchor_（release），保证读侧一旦看到锚点有效，
+    // 读到的偏移一定是配套的那个
+    steady_offset_ms_.store(best_steady_off, std::memory_order_relaxed);
+    has_anchor_.store(true, std::memory_order_release);
+    wall_offset_ms_.store(best_wall_off);
+
+    r.offset_ms = best_wall_off;         // 对外汇报的是【人能看懂的那个】：系统时钟差多少
     r.accepted  = true;
     return r;
 }

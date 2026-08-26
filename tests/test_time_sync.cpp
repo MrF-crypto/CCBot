@@ -240,6 +240,58 @@ int main() {
               std::to_string(calls) + " 次）");
     }
 
+    // ── ⑧ 系统时钟被外部程序拨动时，我们发出的时间戳必须纹丝不动 ──────────────
+    // 这是 v4.0.2 那次改动的核心，也是唯一无法用真实环境复现的分支。
+    //
+    // 实盘实录：同一台机器上另一个程序（第三方交易机器人）每 5 分钟调一次
+    // SetSystemTime 把系统时钟拨到整秒，而它算的整秒偶尔差一秒——
+    //     旧 15:24:19.0738746Z → 新 15:24:18.0000000Z   （往回 1074ms）
+    // 若时间戳锚在墙上时钟上，这一拨会平移我们发出的每一个时间戳，
+    // 而超前侧预算只有 2000ms，一次就吃掉一半。
+    {
+        TradingClient cli = make_client();
+        int64_t fake_wall_shift = 0;
+        cli.set_wall_clock_for_test([&fake_wall_shift]() {
+            return now_ms() + fake_wall_shift;      // 模拟系统时钟被外部拨动
+        });
+        // 取出【实际发出去的那个 timestamp】，走真实签名路径，不新开测试后门
+        int64_t sent = 0;
+        cli.set_test_hook([&sent](const std::string&, const std::string& path,
+                                  const std::string& params, TradingClient::FakeReply& out) {
+            if (path.find("/fapi/v1/time") != std::string::npos) {
+                out.code = 200;
+                out.body = "{\"serverTime\":" + std::to_string(now_ms() + 300) + "}";
+                return true;
+            }
+            auto pos = params.find("timestamp=");
+            if (pos != std::string::npos) sent = std::atoll(params.c_str() + pos + 10);
+            out.code = 200; out.body = "{}";
+            return true;
+        });
+        auto s = cli.sync_server_time();
+        check(s.accepted, "外部拨钟场景：先正常对时一次");
+
+        cli.fetch_account();
+        const int64_t before = sent;
+        // 外部程序把系统时钟往回拨 1074ms —— 与实盘安全日志里那一条完全同幅
+        fake_wall_shift = -1074;
+        cli.fetch_account();
+        const int64_t after = sent;
+
+        const int64_t moved = std::llabs(after - before);
+        check(moved < 60,
+              "  【核心】系统时钟被拨走 1074ms，时间戳只按真实流逝推进（实际动了 " +
+              std::to_string(moved) + "ms）");
+
+        // 同时验证：日志侧仍然要能看见这次拨动，否则就成了"免疫但也失明"
+        auto s2 = cli.sync_server_time();
+        const int64_t seen = s2.offset_ms - s.offset_ms;
+        check(seen > 900 && seen < 1250,
+              "  拨动仍如实反映在【上报的偏移】里，供取证（实际 " +
+              std::to_string(seen) + "ms）");
+        check(s2.noteworthy(), "  且会被判定为值得记一行日志");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

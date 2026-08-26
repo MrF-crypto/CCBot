@@ -261,6 +261,12 @@ public:
                                         const std::string& params, FakeReply& out)>;
     void set_test_hook(TestHook h) { test_hook_ = std::move(h); }
 
+    // 仅测试用：替换掉"墙上时钟"的读数，用来构造【系统时钟被外部程序拨动】
+    // 这个场景。它是本类里唯一无法用真实环境复现的分支——总不能让单测去改
+    // 机器的系统时间。有了它才能验证 ts_ms() 确实对此免疫（见 test_time_sync ⑧）。
+    // 传空还原为真实时钟。生产环境永不调用，代码路径与未引入前一致
+    void set_wall_clock_for_test(std::function<int64_t()> f) { wall_hook_ = std::move(f); }
+
     // 限流状态（界面/日志展示用）
     struct RateStatus { int used_weight, limit, throttled, rejected; bool banned; int64_t ban_left_ms; };
     RateStatus rate_status() const;
@@ -320,7 +326,17 @@ private:
     // dual_mode_ 同理：由 set_dual_mode() 写（连接时探测持仓模式），而下单路径每次
     // 都要读它来决定带不带 positionSide。读到陈旧值会让参数组合不对而被交易所拒单。
     std::atomic<bool>    dual_mode_      {false};
-    std::atomic<int64_t> time_offset_ms_ {0};   // local_clock + offset = server_clock
+
+    // ── 时间戳锚点 ────────────────────────────────────────────────────────────
+    // 锚在【单调时钟】上，不是墙上时钟：steady_ms() + steady_offset = 服务器时间。
+    // 完整理由见 ts_ms() 的注释——一句话是同机器上别的程序调 SetSystemTime 时，
+    // 我们发出的时间戳不能跟着一起被平移。
+    std::atomic<int64_t> steady_offset_ms_ {0};
+    std::atomic<bool>    has_anchor_       {false};   // 首次对时前为 false
+    // 只用于日志与跳变检测：本机【墙上时钟】相对服务器差多少毫秒。
+    // 不参与任何时间戳计算——它存在的意义恰恰是把"系统时钟被谁动了"显示出来，
+    // 而 ts_ms() 对此免疫
+    std::atomic<int64_t> wall_offset_ms_   {0};
 
     mutable std::mutex                                sym_mtx_;
     std::unordered_map<std::string, SymbolInfo>       sym_cache_;
@@ -348,6 +364,9 @@ private:
 
     std::string sign(const std::string& q) const;
     int64_t     ts_ms() const;
+    // 墙上时钟读数；测试可经 set_wall_clock_for_test 替换
+    int64_t     wall_now_ms() const;
+    std::function<int64_t()> wall_hook_;
 
     AccountInfo fetch_account_futures();
     AccountInfo fetch_account_pm();
