@@ -406,6 +406,78 @@ static void test_max_open_positions() {
     check(h2 == 4, "上限设 0 = 不限制，4 个全部开出");
 }
 
+// ── 用例：认领必须按成本反推层数，否则满仓之上还能再补 ───────────────────────
+//
+// 补仓闸门看的是 entries.size() >= max_entries。认领若把整个仓位塞进一笔 entry，
+// 一个【已经满仓】的 bot 就会以为自己还在第 1 层，于是还能再补满剩下的层——
+// 总名义可以到预算的两倍，直接打破"名义仓位 ≤ 权益 ⇒ 强平价 ≤ 0"这个不变式。
+//
+// 账户级总保证金上限确实也会挡，但它默认是 0（=不限），所以默认配置下
+// 没有任何东西拦这件事。
+static void test_adopt_reconstructs_levels() {
+    std::printf("\n── 用例：对账认领按成本反推层数 ──\n");
+    int64_t vnow = 1'700'000'000'000LL;
+    auto fc = std::make_shared<FakeClient>();
+    CcgEngine eng(fc, make_host(vnow));
+
+    CcgConfig c = base_cfg();       // 平推 4 层 / 每层 250U / 预算 1000U
+    c.entry_mode = CcgConfig::EntryMode::Indicator;   // 不自己开首仓，只等认领
+    eng.add_bot(c);
+
+    // 交易所上是一笔【已经满仓】的仓位：10 × 100 = 1000U = 全部预算
+    CcgEngine::ExchangePos full;
+    full.symbol = "BTCUSDT"; full.direction = 1;
+    full.qty = 10.0; full.entry_price = 100.0;
+    eng.reconcile_positions({ full });
+
+    {
+        auto b = eng.get_bots()[0];
+        check((int)b.entries.size() == c.max_entries,
+              "认领后按成本反推为满层（实际 " + std::to_string(b.entries.size()) +
+              "/" + std::to_string(c.max_entries) + "）");
+        check(std::fabs(b.total_qty - 10.0) < 1e-9, "  总量与交易所完全一致");
+        check(std::fabs(b.avg_price - 100.0) < 1e-9, "  均价与交易所完全一致");
+        double sum = 0;
+        for (const auto& e : b.entries) sum += e.qty;
+        check(std::fabs(sum - 10.0) < 1e-9, "  各层数量之和精确等于总量（末层吃掉舍入残差）");
+    }
+
+    // 【核心】满仓之后，再怎么"跌够间隔+反弹确认"都不该继续补。
+    // 每轮先跌破 10% 间隔、再反弹 1% 完成建仓确认——这正是 DCA 会真正触发的形态。
+    // 修复前 entries.size()==1，闸门放行，会在 1000U 之上再补三层共 750U
+    fc->next_fill_price = 80.0;
+    const double seq[][2] = { {85, 87}, {70, 72}, {60, 62} };
+    for (const auto& r : seq) {
+        vnow += 3000; eng.tick("BTCUSDT", r[0]);
+        vnow += 3000; eng.tick("BTCUSDT", r[1]);
+    }
+    {
+        auto b = eng.get_bots()[0];
+        check((int)b.entries.size() == c.max_entries,
+              "  三轮「跌够+反弹」之后仍是满层，没有在满仓之上继续补（实际 " +
+              std::to_string(b.entries.size()) + " 层）");
+        check(std::fabs(b.total_qty - 10.0) < 1e-9,
+              "  总量未增加（实际 " + std::to_string(b.total_qty) + "）");
+    }
+
+    // 反面：只认领了一层的量，层数也要算对，且后续补仓照常可用
+    {
+        auto fc2 = std::make_shared<FakeClient>();
+        CcgEngine eng2(fc2, make_host(vnow));
+        CcgConfig c2 = base_cfg();
+        c2.entry_mode = CcgConfig::EntryMode::Indicator;
+        eng2.add_bot(c2);
+        CcgEngine::ExchangePos one;
+        one.symbol = "BTCUSDT"; one.direction = 1;
+        one.qty = 2.0; one.entry_price = 100.0;      // 200U < 第一层的 250U
+        eng2.reconcile_positions({ one });
+        auto b = eng2.get_bots()[0];
+        check((int)b.entries.size() == 1,
+              "  只认领一层的量时反推为 1 层（实际 " +
+              std::to_string(b.entries.size()) + "）");
+    }
+}
+
 // ── 用例：对账认领的仓位不能被冷却逻辑清掉 ───────────────────────────────────
 // 这是压力测试的状态机不变量（"冷却态却仍持有仓位"）抓出来的一条完整 bug 链：
 //
@@ -483,6 +555,7 @@ int main() {
     test_disabled_by_default();
     test_place_failure_is_loud();
     test_mtf_alloc();
+    test_adopt_reconstructs_levels();
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -494,14 +494,49 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
 
         if (adopter && ex.entry_price > 0) {
             adopter->entries.clear();
-            CcgEntry e;
-            e.level     = 0;
-            e.price     = ex.entry_price;
-            e.qty       = ex.qty;
-            e.cost_usdt = ex.qty * ex.entry_price;
-            e.order_id  = "adopted";
-            e.time      = host_.now_wall();
-            adopter->entries.push_back(e);
+
+            // ⚠ 必须按成本【反推层数】，不能一律记成单层。
+            //
+            // 补仓闸门看的是 entries.size() >= max_entries。若把整个仓位塞进一笔
+            // entry，一个【已经满仓】的 bot 认领后会以为自己还在第 1 层，于是
+            // 还能再补第 2~8 层——按预算 18000/递增8层算，认领 18000 之上再补
+            // 17500，总名义约等于预算的两倍。
+            // 那会直接打破"名义仓位 ≤ 权益 ⇒ 强平价 ≤ 0"这个不变式，
+            // 也就是整套资金安全性的地基。
+            //
+            // 账户级总保证金上限确实也会挡，但它默认是 0（=不限），
+            // 所以默认配置下没有任何东西拦这件事。
+            const double adopted_cost = ex.qty * ex.entry_price;
+            const auto   sizes        = entry_usdt(adopter->cfg);
+            const int    max_lv       = std::max(1, adopter->cfg.max_entries);
+            int    n_levels = 1;
+            double cum      = 0;
+            for (int i = 0; i < (int)sizes.size() && i < max_lv; ++i) {
+                cum += sizes[i];
+                n_levels = i + 1;
+                // 容差 2%：交易所均价与本地记账总有零头差异，不该因此少算一层
+                if (cum >= adopted_cost * 0.98) break;
+            }
+
+            // 各层价格无从得知（只有交易所给的均价），全部按均价合成——
+            // entries[].price 不参与任何决策，只用于展示与落盘，所以这样安全。
+            // 数量按梯子权重切分，保证 总量 与 均价 与交易所完全一致
+            double w_sum = 0;
+            for (int i = 0; i < n_levels; ++i) w_sum += sizes[i];
+            double placed = 0;
+            for (int i = 0; i < n_levels; ++i) {
+                CcgEntry e;
+                e.level = i;
+                e.price = ex.entry_price;
+                // 最后一层吃掉舍入残差，确保各层之和精确等于 ex.qty
+                e.qty = (i == n_levels - 1) ? (ex.qty - placed)
+                                            : (w_sum > 0 ? ex.qty * sizes[i] / w_sum : 0);
+                placed += e.qty;
+                e.cost_usdt = e.qty * ex.entry_price;
+                e.order_id  = "adopted";
+                e.time      = host_.now_wall();
+                adopter->entries.push_back(e);
+            }
             adopter->total_qty  = ex.qty;
             adopter->avg_price  = ex.entry_price;
             adopter->total_cost = ex.qty * ex.entry_price;
@@ -525,7 +560,10 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
             adopter->last_action  = "对账:认领孤儿仓位";
             issues.push_back(ex.symbol + " 交易所存在本地未跟踪的仓位（qty=" +
                              std::to_string(ex.qty) + " 均价=" + std::to_string(ex.entry_price) +
-                             "），已认领到同方向bot恢复管理（可能是上次崩溃期间成交的）");
+                             "），已认领到同方向bot恢复管理，按成本反推为第 " +
+                             std::to_string(n_levels) + "/" +
+                             std::to_string(adopter->cfg.max_entries) +
+                             " 层（可能是上次崩溃期间成交的）");
         } else {
             issues.push_back(ex.symbol + " 交易所存在无人管理的孤儿仓位（qty=" +
                              std::to_string(ex.qty) + "），且没有可认领的同方向bot，"

@@ -616,12 +616,26 @@ int main(int argc, char** argv) {
     //     声明位置在 mtx_/bots_ 之前，线程池 join 时那两个成员已经析构
     //   · 让在途订单的结果进得了状态文件 —— 否则 SIGTERM 瞬间正在成交的那笔
     //     本地无记录，重启只能靠对账认领，而认领会丢掉层数信息
-    if (!pool->wait_idle(20000))
-        log_line("仍有下单任务未完成，状态可能不完整——重启后由对账兜底", "WARN");
+    // 预算按【单个下单任务的最坏耗时】定，不是按单次 HTTP：一次 place_market
+    // 会串起 POST 超时 10s → 空响应 → 查单恢复 3×(600ms+10s) ≈ 42s，
+    // 坏网络下很平常。原先取 20 秒远远不够。完整推导见 GUI 侧同一处注释
+    const bool drained = pool->wait_idle(60000);
     fetch_pool->wait_idle(5000);
 
     save_headless_state(cfg.state_path, engine->get_bots());
     funding.save(funding_path);
+
+    // 没排空就直接结束进程，不跑析构。在途任务捏着 engine 的裸指针，而
+    // CcgEngine 里 pool_ 的声明位置在 mtx_/bots_ 之前 —— 正常析构会先销毁那两个
+    // 成员，任务一访问就是 use-after-free。状态此刻已经落盘，剩下唯一该做的
+    // 就是别再碰内存
+    if (!drained) {
+        log_line("仍有下单任务未完成，跳过清理直接结束进程（避免访问已释放内存）；"
+                 "在途成交由重启后的对账兜底", "WARN");
+        { std::error_code ec; std::filesystem::remove(alive_path, ec); }
+        { std::error_code ec; std::filesystem::remove(lock_path,  ec); }
+        std::_Exit(0);
+    }
     // 退出也要通知：进程停了就等于所有本地风控停了，只剩交易所侧的灾难止损单。
     // 这条消息本身就是"从现在起没人在管"的信号
     {
