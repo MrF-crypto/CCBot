@@ -271,17 +271,28 @@ int main() {
         auto s = cli.sync_server_time();
         check(s.accepted, "外部拨钟场景：先正常对时一次");
 
+        const int64_t w0 = now_ms();
         cli.fetch_account();
         const int64_t before = sent;
         // 外部程序把系统时钟往回拨 1074ms —— 与实盘安全日志里那一条完全同幅
         fake_wall_shift = -1074;
         cli.fetch_account();
         const int64_t after = sent;
+        const int64_t real_elapsed = now_ms() - w0;   // 两次调用之间真实流逝了多久
 
-        const int64_t moved = std::llabs(after - before);
-        check(moved < 60,
-              "  【核心】系统时钟被拨走 1074ms，时间戳只按真实流逝推进（实际动了 " +
-              std::to_string(moved) + "ms）");
+        // ⚠ 这里【不能】断言"移动量小于某个毫秒数"——那是机器速度的函数，
+        // 慢机器上两次 fetch_account 之间本来就会流逝一两百毫秒。
+        // 真正要区分的是两种情形：
+        //     锚在单调时钟（正确）→ 时间戳只会前进，移动量 ≈ 真实流逝
+        //     锚在墙上时钟（错误）→ 跟着倒退，移动量 ≈ 真实流逝 − 1074
+        // 所以判据取"没有倒退"，它是单调锚点的定义性质，与机器快慢无关
+        const int64_t moved = after - before;
+        check(moved >= 0,
+              "  【核心】系统时钟被往回拨 1074ms，时间戳没有倒退（实际 " +
+              std::to_string(moved) + "ms，同期真实流逝 " +
+              std::to_string(real_elapsed) + "ms）");
+        check(moved <= real_elapsed + 200,
+              "  也没有凭空跳前——推进量与真实流逝相称");
 
         // 同时验证：日志侧仍然要能看见这次拨动，否则就成了"免疫但也失明"
         auto s2 = cli.sync_server_time();
