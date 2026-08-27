@@ -303,6 +303,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
     cfg.dyn_interval_mult = new_cfg.dyn_interval_mult;
     cfg.dyn_fixed_interval = new_cfg.dyn_fixed_interval;
+    cfg.dyn_interval_growth = new_cfg.dyn_interval_growth;
     cfg.mtf_ladder         = new_cfg.mtf_ladder;
     cfg.mtf_tier_layers    = new_cfg.mtf_tier_layers;
     cfg.mtf_k              = new_cfg.mtf_k;
@@ -764,6 +765,13 @@ static double apply_trend_interval(const CcgBot& bot, double interval_pct,
     return trend_active_bearish(bot, now) ? interval_pct * kBearIntervalMult : interval_pct;
 }
 
+// 梯度间隔：越深的层要求跌得越多。见 dyn_interval_growth 的说明。
+// entries.size() 是【已有】层数，所以下一笔是第 size()+1 层，倍数用 size()
+static double apply_layer_growth(const CcgBot& bot, double interval_pct) {
+    if (bot.cfg.dyn_interval_growth <= 0) return interval_pct;
+    return interval_pct * (1.0 + bot.cfg.dyn_interval_growth * (double)bot.entries.size());
+}
+
 // ── 追踪变量更新（在 tick 持锁中调用）────────────────────────────────────────
 void CcgEngine::update_tracking(CcgBot& bot, double price) {
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -771,7 +779,8 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
     if (bot.entries.empty()) return;  // 尚未建仓，不用追踪
 
     const EffParams eff = eff_params(bot);
-    const double eff_interval = apply_trend_interval(bot, eff.interval_pct, host_.now_steady());
+    const double eff_interval = apply_layer_growth(
+        bot, apply_trend_interval(bot, eff.interval_pct, host_.now_steady()));
 
     // ── DCA 间隔追踪 ──────────────────────────────────────────────────────────
     double interval_th = bot.last_entry_price *

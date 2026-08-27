@@ -157,6 +157,7 @@ static int cmd_run(int argc, char** argv) {
     c.dynamic_band_mode = arg_flag(argc, argv, "--dynamic");
     c.dyn_interval_mult = arg_num(argc, argv, "--int-mult", 1.0);
     c.dyn_fixed_interval = arg_num(argc, argv, "--int-fixed", 0.0);
+    c.dyn_interval_growth = arg_num(argc, argv, "--int-growth", 0.0);
     // 多周期梯子：槽位按档位归属，第 i 槽必须跌破该档周期的下轨才武装
     c.mtf_ladder      = arg_flag(argc, argv, "--mtf");
     c.mtf_tier_layers = arg_str(argc, argv, "--mtf-tiers", "");
