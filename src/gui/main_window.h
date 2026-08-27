@@ -163,6 +163,11 @@ private:
 
     // symbol + "_L"/"_S" → 交易所真实持仓（强平价来源，随 tick_timer_ 每 3s 刷新一次）
     std::unordered_map<std::string, TradingClient::Position> pos_cache_;
+    // pos_cache_ 最后一次【成功拉取】的时刻（0=从未成功）。
+    // 周期对账必须靠它区分"交易所确实没有持仓"和"我还没拿到数据"——
+    // 两者的 pos_cache_ 都是空的，但前者该清本地仓位、后者绝不能动。
+    // 拿不到数据就当成"这一轮不对账"，宁可晚一分钟发现，也不能凭空清掉真实持仓
+    qint64 posCacheMs_ = 0;
 
     // 正在后台预取品种精度信息的品种集合，避免同一品种被重复发起请求（仅 GUI 线程访问）
     std::set<std::string> pendingSymbolFetch_;

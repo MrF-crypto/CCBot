@@ -608,6 +608,38 @@ int main(int argc, char** argv) {
                 if (ts.noteworthy()) log_line(ts.to_log(), "WARN");
             });
         }
+
+        // ── 8) 周期对账（每 20 tick ≈ 1 分钟）───────────────────────────────
+        // 此前只在启动时对一次账，所以运行中被外部（手机 App / 网页 / 强平）
+        // 平掉的仓位要等到重启才会发现，期间 bot 拿着一个不存在的仓位继续算
+        // 止盈止损、继续补仓。
+        //
+        // 用 Periodic 模式：它会跳过在途和刚成交的 bot，否则正在止盈平仓的
+        // 那笔会被当成"外部平仓"清掉。
+        // 拉取失败【绝不对账】——空的持仓列表既可能是"确实没仓"也可能是请求
+        // 失败，把后者当成前者会凭空清掉真实持仓
+        if (tick_n % 20 == 0) {
+            bool pos_ok = false;
+            auto ex_pos = client->fetch_positions(&pos_ok);
+            if (pos_ok) {
+                std::vector<CcgEngine::ExchangePos> ex;
+                ex.reserve(ex_pos.size());
+                for (const auto& p : ex_pos)
+                    ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+                auto issues = engine->reconcile_positions(
+                    ex, CcgEngine::ReconcileMode::Periodic);
+                if (!issues.empty()) {
+                    for (const auto& s : issues) log_line("[对账] " + s, "WARN");
+                    save_headless_state(cfg.state_path, engine->get_bots());
+                    if (!cfg.alert_webhook.empty()) {
+                        std::string msg = "[ccbot] 运行中对账发现 " +
+                                          std::to_string(issues.size()) + " 处不一致:";
+                        for (const auto& s : issues) msg += "\n" + s;
+                        send_webhook(cfg.alert_webhook, msg);
+                    }
+                }
+            }
+        }
     }
 
     log_line("收到退出信号，等待在途订单落地后保存状态…");

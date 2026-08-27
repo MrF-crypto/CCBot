@@ -421,7 +421,13 @@ double CcgEngine::total_margin_used() const {
     return sum;
 }
 
-std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<ExchangePos>& exchange) {
+// 周期对账里"刚成交"的静置期。持仓快照来自 REST，可能拍摄于成交之前——
+// GUI 每 3 秒拉一次，加上网络延迟，30 秒有足够余量。
+// 代价只是外部平仓要多等最多 30 秒才被发现，而此前是"不重启就永远发现不了"
+static constexpr int kReconcileSettleSecs = 30;
+
+std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<ExchangePos>& exchange,
+                                                        ReconcileMode mode) {
     std::vector<std::string> issues;
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
@@ -440,6 +446,20 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
             issues.push_back(bot.cfg.symbol + " 有多个同向持仓bot，无法自动对账，请人工核对");
             continue;
         }
+        // 周期模式下的两道防误判闸门（启动模式不需要：那时没有在途任务，
+        // 而且崩溃重启时 entries 的时间戳可能就在几秒前，按"刚成交"跳过会让
+        // 最需要对账的场景失效）
+        if (mode == ReconcileMode::Periodic) {
+            // ① 在途：订单已在交易所生效但本地还没入账。此刻比对必然对不上，
+            //    而且方向恰好是最坏的——正在止盈平仓的 bot 会被判成"外部平仓"，
+            //    状态被清空、bot 被停掉，而那本来是一次完全正常的止盈
+            if (bot.pending) continue;
+            // ② 刚成交：持仓快照可能拍摄于这笔成交【之前】，同样会误判成外部平仓
+            if (!bot.entries.empty()) {
+                const auto age = host_.now_wall() - bot.entries.back().time;
+                if (age < std::chrono::seconds(kReconcileSettleSecs)) continue;
+            }
+        }
 
         const int want_dir = (bot.cfg.direction == CcgConfig::Direction::Long) ? 1 : -1;
         const ExchangePos* ex = nullptr;
@@ -450,15 +470,53 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
         const double tol   = std::max(local * 1e-4, 1e-9);
 
         if (!ex || ex->qty <= tol) {
-            // 交易所已无此仓位：外部（手动/强平）已平仓——本地状态作废，停下来等人工确认
-            issues.push_back(bot.cfg.symbol + " 本地记录持仓 " + std::to_string(local) +
-                             " 但交易所已无仓位（外部平仓?），已清空本地状态并停止该bot");
+            // 交易所已无此仓位：外部（手动/强平）已平仓——本地状态作废。
+            //
+            // ⚠ 这笔平仓的盈亏【进不了交易明细】：本地不知道成交价，也无从推断
+            // 是止盈走的还是被强平的。统计里会缺这一笔，这是外部干预的固有代价
+            //
+            // 仓位已空，撤掉交易所侧的灾难止损单——与止盈平仓同一处理。
+            // closePosition 单在无仓可平时币安会自动失效，但不撤会留在挂单列表里，
+            // 下一轮开仓时同方向再挂一张会被拒
+            if (!bot.disaster_stop_id.empty()) {
+                const std::string bid = id;
+                host_.submit([this, bid]() { cancel_disaster_stop(bid); });
+            }
+
             bot.entries.clear();
             bot.total_qty = bot.total_cost = bot.avg_price = 0;
             bot.interval_hit = bot.tp_reached = false;
+            bot.ind_dipped = false;    // 若要重新等信号，探底状态清零重新累积
             bot.last_entry_price = 0;
-            bot.state = CcgBot::State::Stopped;
-            bot.last_action = "对账:交易所无仓位，已停止";
+
+            // 后续行为跟随 auto_restart，与止盈平仓走同一条路径：
+            // 用户开了自动循环，语义就是"这一轮结束了就开下一轮"，而手动平仓
+            // 正是"这一轮结束了"。走冷却而不是直接 Running，是为了留出缓冲——
+            // 也让指标首单闸门在下一轮正常生效（冷却期满会落入 entries.empty()
+            // 的正常首仓判定，不会无视信号立刻市价买入）。
+            //
+            // Stopped 保持不动：那是用户意愿或程序自我保护，不能被这里悄悄复活
+            if (bot.state == CcgBot::State::Stopped) {
+                bot.last_action = "对账:交易所无仓位，本地已清空";
+                issues.push_back(bot.cfg.symbol + " 本地记录持仓 " + std::to_string(local) +
+                                 " 但交易所已无仓位（外部平仓?），已清空本地状态"
+                                 "（该bot本就处于停止态，保持不变）");
+            } else if (bot.cfg.auto_restart) {
+                bot.cooldown_until = host_.now_wall() +
+                                     std::chrono::seconds(bot.cfg.cooldown_secs);
+                bot.state = CcgBot::State::Cooldown;
+                bot.last_action = "对账:外部已平仓，冷却后重新开始";
+                issues.push_back(bot.cfg.symbol + " 本地记录持仓 " + std::to_string(local) +
+                                 " 但交易所已无仓位（外部平仓?），已清空本地状态，"
+                                 "冷却 " + std::to_string(bot.cfg.cooldown_secs) +
+                                 "s 后按策略重新开始（该笔平仓盈亏不计入统计）");
+            } else {
+                bot.state = CcgBot::State::Stopped;
+                bot.last_action = "对账:交易所无仓位，已停止";
+                issues.push_back(bot.cfg.symbol + " 本地记录持仓 " + std::to_string(local) +
+                                 " 但交易所已无仓位（外部平仓?），已清空本地状态并停止该bot"
+                                 "（未开启自动循环）");
+            }
         } else if (ex->qty < local - tol) {
             // 交易所比本地少：外部部分平仓——数量收敛到交易所值，均价保留
             issues.push_back(bot.cfg.symbol + " 本地持仓 " + std::to_string(local) +

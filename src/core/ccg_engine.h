@@ -495,12 +495,37 @@ public:
         double      qty         = 0;   // 绝对值
         double      entry_price = 0;   // 交易所侧开仓均价（孤儿仓认领时用）
     };
-    // 连接成功/重启恢复后调用一次，把本地跟踪的仓位和交易所实际持仓核对：
-    //   本地有仓、交易所没有   → 外部已平仓：清空本地仓位并停止该bot（等人工确认，不自动重开）
+    // 对账模式。区别只在【要不要防在途竞态】，判定规则本身完全相同。
+    enum class ReconcileMode {
+        // 连接成功/重启恢复后调用。此刻没有任何在途任务，落盘状态就是全部真相，
+        // 所以不做任何跳过——尤其不能按"刚成交"跳过：崩溃重启时 entries 里的
+        // 时间戳可能就在几秒前，而那正是最需要对账的场景
+        Startup,
+        // 运行中周期调用。必须比启动模式保守：
+        //   · 跳过 pending 的 bot —— 下单/平仓已在交易所生效、本地还没入账，
+        //     此刻比对必然误判（正在止盈的会被当成"外部平仓"清空并停掉）
+        //   · 跳过刚成交的 bot —— 持仓快照可能拍摄于成交【之前】，同样误判
+        Periodic
+    };
+    // 把本地跟踪的仓位和交易所实际持仓核对：
+    //   本地有仓、交易所没有   → 外部已平仓：清空本地仓位；auto_restart 开则进冷却
+    //                            等下一轮（与止盈后同一条路径），否则停止等人工确认
     //   本地qty > 交易所qty    → 外部部分平仓：本地数量收敛到交易所值（均价保留）
     //   本地qty < 交易所qty    → 交易所多出（外部手动加仓）：仅告警不动本地状态
     // 同一品种有多个持仓bot时无法归属，跳过并告警。返回每条不一致的可读描述（空=完全一致）
-    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange);
+    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange,
+                                                 ReconcileMode mode = ReconcileMode::Startup);
+
+    // 仅测试用：直接摆布 pending 标志。
+    // 存在的理由是"订单已在交易所生效、本地还没入账"这个【瞬间】无法在测试里
+    // 自然复现——测试用的 host_.submit 是同步执行的，派发完 pending 立刻就被清掉了。
+    // 而周期对账最凶险的误判恰恰发生在那个瞬间（正在止盈的会被当成外部平仓），
+    // 所以必须能把它构造出来。生产代码永不调用
+    void set_pending_for_test(const std::string& bot_id, bool v) {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        auto it = bots_.find(bot_id);
+        if (it != bots_.end()) it->second.pending = v;
+    }
 
     // 写入指标信号快照（UI 异步拉取 BOLL/RSI 后回调，仅用于 entry_mode==Indicator 的首单判定）
     void update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi);

@@ -594,8 +594,9 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
     return info;
 }
 
-std::vector<TradingClient::Position> TradingClient::fetch_positions() {
+std::vector<TradingClient::Position> TradingClient::fetch_positions(bool* ok) {
     std::vector<Position> result;
+    if (ok) *ok = false;
     auto resp = http_get(ep(Ep::PositionRisk), "recvWindow=5000");
     if (resp.empty()) return result;
 
@@ -603,6 +604,8 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions() {
     simdjson::dom::array arr;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return result;
+    // 解析出数组即认定成功：币安无持仓时返回的是合法的 []，与请求失败区分开
+    if (ok) *ok = true;
 
     for (auto item : arr) {
         std::string_view sym, amt_s, ep_s, mp_s, pnl_s, liq_s;

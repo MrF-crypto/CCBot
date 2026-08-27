@@ -2576,6 +2576,38 @@ void MainWindow::onTick() {
         });
     }
 
+    // 周期对账：每 20 个 tick（约1分钟）拿最新持仓和本地跟踪核对一次。
+    //
+    // 起因是一个实际反馈：在手机上手动平掉仓位后，程序界面仍然显示着持仓，
+    // 要关掉重开才会发现——因为对账此前【只在连接成功时跑一次】。
+    // 期间 bot 拿着一个不存在的仓位继续算止盈止损，还会继续补仓。
+    //
+    // 不额外请求：refreshPositions() 每个 tick 都在拉持仓填 pos_cache_，
+    // 此前那份数据只喂给了界面显示，这里直接复用，权重成本为零。
+    //
+    // 用 Periodic 模式——它会跳过在途和刚成交的 bot，否则正在止盈的那笔
+    // 会被当成"外部平仓"清掉（详见 reconcile_positions 的说明）
+    // ⚠ 判据用【快照新鲜度】，不能用 pos_cache_ 非空：所有仓位都被外部平掉时
+    // 缓存本来就是空的，而那恰恰是最需要对账的时刻。反过来，拉取失败时缓存
+    // 同样是空的（或陈旧的），此时若当成"交易所无持仓"就会凭空清掉真实仓位。
+    // refreshPositions 只在【真正成功】时才更新 posCacheMs_，所以这里
+    // 只要求它足够新；拿不到新数据就这一轮不对账，宁可晚一分钟发现
+    const qint64 posAge = QDateTime::currentMSecsSinceEpoch() - posCacheMs_;
+    if (srTickCount_ % 20 == 0 && engine_ && posCacheMs_ > 0 && posAge < 30000) {
+        std::vector<CcgEngine::ExchangePos> ex;
+        ex.reserve(pos_cache_.size());
+        for (const auto& [k, p] : pos_cache_)
+            ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+        auto issues = engine_->reconcile_positions(ex, CcgEngine::ReconcileMode::Periodic);
+        if (!issues.empty()) {
+            for (const auto& s : issues) log(QString::fromStdString("[对账] " + s), "WARN");
+            save_bots();          // 收敛后的状态立刻落盘
+            refreshBotTable();
+            sendAlert(QString("[CCGMonitor] 运行中对账发现 %1 处不一致，详见日志")
+                      .arg(issues.size()));
+        }
+    }
+
     // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；
     // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转。
     // v3.0：日线%B（宏观层）搭同一班车——等首仓的 bot 每5分钟拉一次日线布林
@@ -2715,13 +2747,19 @@ void MainWindow::refreshPositions() {
     if (!client_ || posFetchBusy_.load()) return;
     posFetchBusy_.store(true);
     run_async([this]() {
-        auto positions = client_->fetch_positions();
+        bool ok = false;
+        auto positions = client_->fetch_positions(&ok);
         posFetchBusy_.store(false);
-        QMetaObject::invokeMethod(this, [this, positions = std::move(positions)]() {
+        QMetaObject::invokeMethod(this, [this, ok, positions = std::move(positions)]() {
+            // 拉取失败时【保留上一份缓存、不更新时间戳】：空的返回值有歧义——
+            // 既可能是"账户确实没有持仓"，也可能是这次请求失败了。
+            // 周期对账靠 posCacheMs_ 的新鲜度来区分，误判的代价是凭空清掉真实持仓
+            if (!ok) return;
             pos_cache_.clear();
             for (const auto& p : positions) {
                 pos_cache_[p.symbol + (p.direction > 0 ? "_L" : "_S")] = p;
             }
+            posCacheMs_ = QDateTime::currentMSecsSinceEpoch();
         }, Qt::QueuedConnection);
     });
 }

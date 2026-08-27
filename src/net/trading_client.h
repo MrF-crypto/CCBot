@@ -79,7 +79,10 @@ public:
     ~TradingClient();
 
     AccountInfo            fetch_account();
-    std::vector<Position>  fetch_positions();
+    // ok（可选输出）：本次请求是否【真的成功】。返回空 vector 有歧义——
+    // 既可能是账户确实没有持仓，也可能是请求失败/响应无法解析。
+    // 周期对账靠它区分两者：把失败当成"没有持仓"会凭空清掉真实仓位
+    std::vector<Position>  fetch_positions(bool* ok = nullptr);
     std::vector<OpenOrder> fetch_open_orders();
 
     OrderResult place_market(const std::string& symbol, const std::string& side,

@@ -406,6 +406,86 @@ static void test_max_open_positions() {
     check(h2 == 4, "上限设 0 = 不限制，4 个全部开出");
 }
 
+// ── 用例：运行中外部平仓要被发现，且不能误伤正常止盈 ─────────────────────────
+//
+// 实际反馈：在手机 App 上手动平掉仓位后，程序界面仍显示着持仓，要关掉重开才
+// 会发现——因为对账此前【只在连接成功时跑一次】。期间 bot 拿着一个不存在的
+// 仓位继续算止盈止损、继续补仓。
+//
+// 周期对账的难点不在"发现"，而在【不误判】：正在平仓的 bot，订单已在交易所
+// 生效、本地还没入账，此刻比对必然对不上——若当成"外部平仓"，一次完全正常的
+// 止盈会被清空状态并停掉。所以这里三条一起测。
+static void test_periodic_reconcile() {
+    std::printf("\n── 用例：周期对账（外部平仓检测 + 防误判）──\n");
+    using RM = CcgEngine::ReconcileMode;
+    int64_t vnow = 1'700'000'000'000LL;
+    auto fc = std::make_shared<FakeClient>();
+    CcgEngine eng(fc, make_host(vnow));
+
+    CcgConfig c = base_cfg();
+    c.auto_restart  = true;
+    c.cooldown_secs = 60;
+    eng.add_bot(c);
+
+    fc->next_fill_price = 100.0;
+    eng.tick("BTCUSDT", 100.0);
+    check(eng.get_bots()[0].total_qty > 0, "先建仓");
+
+    // ① 刚成交就对账：持仓快照可能拍摄于成交【之前】，必须跳过不判
+    eng.reconcile_positions({}, RM::Periodic);
+    check(eng.get_bots()[0].total_qty > 0,
+          "  刚成交时的空快照【不】清仓位（快照可能早于成交）");
+
+    // ② 静置期过后，交易所确实已无该仓位 → 认定外部平仓
+    vnow += 40'000;     // 越过 30 秒静置期
+    eng.reconcile_positions({}, RM::Periodic);
+    {
+        auto b = eng.get_bots()[0];
+        check(b.total_qty <= 0, "静置期后检测到外部平仓，本地仓位已清空");
+        check(b.entries.empty(), "  加仓记录也清空了");
+        check(b.state == CcgBot::State::Cooldown,
+              "  auto_restart 开着 → 进冷却等下一轮，而不是停掉");
+    }
+
+    // ③ 冷却期满后能重新开仓——"检测到无持仓并重启策略"的完整闭环
+    vnow += 61'000;
+    fc->next_fill_price = 90.0;
+    eng.tick("BTCUSDT", 90.0);
+    {
+        auto b = eng.get_bots()[0];
+        check(b.state == CcgBot::State::Running, "冷却期满回到运行态");
+        check(b.total_qty > 0, "  并按策略重新开了首仓");
+    }
+
+    // ④ 【核心防误判】正在平仓中（pending）的 bot 绝不能被判成外部平仓。
+    //    构造：手工把 pending 置起来，模拟"平仓单已发出、本地还没入账"
+    vnow += 40'000;
+    eng.set_pending_for_test(eng.get_bots()[0].bot_id, true);
+    eng.reconcile_positions({}, RM::Periodic);
+    {
+        auto b = eng.get_bots()[0];
+        check(b.total_qty > 0,
+              "  在途(pending)时的空快照【不】清仓位——否则正常止盈会被误判成外部平仓");
+    }
+    eng.set_pending_for_test(eng.get_bots()[0].bot_id, false);
+
+    // ⑤ 关掉 auto_restart 时保持原有的保守行为：停止，等人工确认
+    {
+        auto fc2 = std::make_shared<FakeClient>();
+        CcgEngine eng2(fc2, make_host(vnow));
+        CcgConfig c2 = base_cfg();
+        c2.auto_restart = false;
+        eng2.add_bot(c2);
+        fc2->next_fill_price = 100.0;
+        eng2.tick("BTCUSDT", 100.0);
+        vnow += 40'000;
+        eng2.reconcile_positions({}, RM::Periodic);
+        auto b = eng2.get_bots()[0];
+        check(b.total_qty <= 0, "未开自动循环：同样清空仓位");
+        check(b.state == CcgBot::State::Stopped, "  但停止该bot而不是重启（原有的保守行为）");
+    }
+}
+
 // ── 用例：认领必须按成本反推层数，否则满仓之上还能再补 ───────────────────────
 //
 // 补仓闸门看的是 entries.size() >= max_entries。认领若把整个仓位塞进一笔 entry，
@@ -556,6 +636,7 @@ int main() {
     test_place_failure_is_loud();
     test_mtf_alloc();
     test_adopt_reconstructs_levels();
+    test_periodic_reconcile();
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }
