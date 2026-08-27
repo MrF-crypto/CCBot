@@ -2600,7 +2600,8 @@ void MainWindow::onTick() {
             ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
         auto issues = engine_->reconcile_positions(ex, CcgEngine::ReconcileMode::Periodic);
         if (!issues.empty()) {
-            for (const auto& s : issues) log(QString::fromStdString("[对账] " + s), "WARN");
+            // 明细不在这里打——引擎内部已经逐条 log 过（"⚠ 对账: ..."），
+            // 再打一遍就是双份。这里只做落盘、刷新和外部告警
             save_bots();          // 收敛后的状态立刻落盘
             refreshBotTable();
             sendAlert(QString("[CCGMonitor] 运行中对账发现 %1 处不一致，详见日志")

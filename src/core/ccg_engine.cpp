@@ -638,7 +638,11 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
     }
 
     for (const auto& msg : issues) log("⚠ 对账: " + msg);
-    if (issues.empty()) log("对账完成：本地仓位与交易所一致");
+    // "一致"只在启动时报一次——那是有信息量的（确认恢复出来的状态可信）。
+    // 周期对账每分钟一次，一致是常态，打出来只会把交易日志淹掉：
+    // 一天 1440 条噪音，而真正要看见的那条不一致反而被埋在里面
+    if (issues.empty() && mode == ReconcileMode::Startup)
+        log("对账完成：本地仓位与交易所一致");
     return issues;
 }
 

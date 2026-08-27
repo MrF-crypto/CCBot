@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
     // 止损/止盈判定饿死几十秒——现在价格喂入永远最先、拉取全部异步。
     // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
-    std::atomic<bool> ind_busy{false}, sr_busy{false}, trend_busy{false}, hb_busy{false};
+    std::atomic<bool> ind_busy{false}, sr_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
     std::mutex sr_mtx;   // sr_zones_map/sr_atr_map 由拉取线程写、主循环读
     std::map<std::string, std::vector<srzones::Zone>> sr_zones_map;
     std::map<std::string, double> sr_atr_map;   // 区域计算时的ATR（结构止损位推导）
@@ -618,27 +618,37 @@ int main(int argc, char** argv) {
         // 那笔会被当成"外部平仓"清掉。
         // 拉取失败【绝不对账】——空的持仓列表既可能是"确实没仓"也可能是请求
         // 失败，把后者当成前者会凭空清掉真实持仓
-        if (tick_n % 20 == 0) {
-            bool pos_ok = false;
-            auto ex_pos = client->fetch_positions(&pos_ok);
-            if (pos_ok) {
-                std::vector<CcgEngine::ExchangePos> ex;
-                ex.reserve(ex_pos.size());
-                for (const auto& p : ex_pos)
-                    ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                auto issues = engine->reconcile_positions(
-                    ex, CcgEngine::ReconcileMode::Periodic);
-                if (!issues.empty()) {
-                    for (const auto& s : issues) log_line("[对账] " + s, "WARN");
-                    save_headless_state(cfg.state_path, engine->get_bots());
-                    if (!cfg.alert_webhook.empty()) {
-                        std::string msg = "[ccbot] 运行中对账发现 " +
-                                          std::to_string(issues.size()) + " 处不一致:";
-                        for (const auto& s : issues) msg += "\n" + s;
-                        send_webhook(cfg.alert_webhook, msg);
+        // 必须【异步】：同步调用会把主循环阻塞在这次 HTTP 上（超时最长 10 秒），
+        // 期间所有 bot 的 tick 全停——行情不再推进，止盈止损判定跟着停摆。
+        // 主循环里除了价格兜底之外的每一个 HTTP 都走 fetch_pool，这里同理
+        if (tick_n % 20 == 0 && !rec_busy.load()) {
+            rec_busy.store(true);
+            fetch_pool->submit([client, engine, &rec_busy,
+                                sp = cfg.state_path, w = cfg.alert_webhook]() {
+                bool pos_ok = false;
+                auto ex_pos = client->fetch_positions(&pos_ok);
+                // 拉取失败绝不对账：空的持仓列表既可能是"确实没仓"也可能是请求
+                // 失败，把后者当成前者会凭空清掉真实持仓
+                if (pos_ok) {
+                    std::vector<CcgEngine::ExchangePos> ex;
+                    ex.reserve(ex_pos.size());
+                    for (const auto& p : ex_pos)
+                        ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+                    auto issues = engine->reconcile_positions(
+                        ex, CcgEngine::ReconcileMode::Periodic);
+                    // 明细不在这里打——引擎内部已经逐条 log 过（"⚠ 对账: ..."）
+                    if (!issues.empty()) {
+                        save_headless_state(sp, engine->get_bots());
+                        if (!w.empty()) {
+                            std::string msg = "[ccbot] 运行中对账发现 " +
+                                              std::to_string(issues.size()) + " 处不一致:";
+                            for (const auto& s : issues) msg += "\n" + s;
+                            send_webhook(w, msg);
+                        }
                     }
                 }
-            }
+                rec_busy.store(false);
+            });
         }
     }
 
