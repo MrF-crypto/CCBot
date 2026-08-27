@@ -446,19 +446,27 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
             issues.push_back(bot.cfg.symbol + " 有多个同向持仓bot，无法自动对账，请人工核对");
             continue;
         }
-        // 周期模式下的两道防误判闸门（启动模式不需要：那时没有在途任务，
-        // 而且崩溃重启时 entries 的时间戳可能就在几秒前，按"刚成交"跳过会让
-        // 最需要对账的场景失效）
-        if (mode == ReconcileMode::Periodic) {
-            // ① 在途：订单已在交易所生效但本地还没入账。此刻比对必然对不上，
-            //    而且方向恰好是最坏的——正在止盈平仓的 bot 会被判成"外部平仓"，
-            //    状态被清空、bot 被停掉，而那本来是一次完全正常的止盈
-            if (bot.pending) continue;
-            // ② 刚成交：持仓快照可能拍摄于这笔成交【之前】，同样会误判成外部平仓
-            if (!bot.entries.empty()) {
-                const auto age = host_.now_wall() - bot.entries.back().time;
-                if (age < std::chrono::seconds(kReconcileSettleSecs)) continue;
-            }
+        // ① 在途的 bot 一律跳过，【不分模式】。
+        //
+        // pending 的含义就是"状态不确定"：订单已经派发、可能已在交易所成交，
+        // 而本地还没入账。此刻拿本地数量和交易所快照比对必然对不上，而且方向
+        // 恰好最坏——正在止盈平仓的会被判成"外部平仓"，状态被清空、bot 被停掉。
+        //
+        // 更糟的是它能制造一个非法状态：清零并置为冷却之后，那笔在途成交的回调
+        // 才写回仓位 → 冷却态却持有仓位。而冷却期满时引擎会无条件清理"上一轮
+        // 残留"，那笔仓位会被静默抹掉，交易所上却真实存在。
+        // 并发压力测试（seed=1/7）正是抓到这条。
+        //
+        // 启动模式同样跳过：那时本来就没有 pending 的 bot，跳过是 no-op；
+        // 而万一真有（例如运行中手动触发对账），跳过才是对的
+        if (bot.pending) continue;
+
+        // ② 刚成交的只在周期模式跳过：持仓快照可能拍摄于这笔成交【之前】。
+        //    启动模式不能这么做——崩溃重启时 entries 的时间戳可能就在几秒前，
+        //    按"刚成交"跳过会让最需要对账的那个场景整个失效
+        if (mode == ReconcileMode::Periodic && !bot.entries.empty()) {
+            const auto age = host_.now_wall() - bot.entries.back().time;
+            if (age < std::chrono::seconds(kReconcileSettleSecs)) continue;
         }
 
         const int want_dir = (bot.cfg.direction == CcgConfig::Direction::Long) ? 1 : -1;
