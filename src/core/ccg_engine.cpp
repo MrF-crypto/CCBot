@@ -1006,6 +1006,28 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
         for (auto& [id, bot] : bots_) {
             if (bot.cfg.symbol != symbol) continue;
+
+            // ── 满层健康度计时 ────────────────────────────────────────────────
+            // 放在 pending 检查【之前】：在途下单期间仓位照样存在，该计时。
+            // 每个 bot 只属于一个 symbol，所以这里不会重复累加。
+            {
+                const auto ns = host_.now_steady();
+                if (bot.last_health_tick.time_since_epoch().count() != 0 &&
+                    bot.state != CcgBot::State::Stopped) {
+                    const auto dt = std::chrono::duration_cast<std::chrono::seconds>(
+                                        ns - bot.last_health_tick).count();
+                    // 上限 60 秒：程序休眠、断连恢复、行情长时间中断都会产生一个
+                    // 巨大的间隔，把它算进去会凭空制造"满层很久"或"存活很久"。
+                    // 正常 tick 是 3 秒一次，60 秒已经很宽松
+                    if (dt > 0 && dt <= 60) {
+                        bot.alive_secs += dt;
+                        if ((int)bot.entries.size() >= bot.cfg.max_entries)
+                            bot.full_layer_secs += dt;
+                    }
+                }
+                bot.last_health_tick = ns;
+            }
+
             if (bot.pending) continue;
 
             bot.current_price = price;

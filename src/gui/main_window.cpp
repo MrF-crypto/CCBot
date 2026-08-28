@@ -388,6 +388,9 @@ void MainWindow::save_bots() {
         o["tp_extreme"]        = b.tp_extreme;
         o["realized_pnl"]      = b.realized_pnl;
         o["cycle_count"]       = b.cycle_count;
+        // 满层健康度：随 bot 落盘，重启后继续累加（口径=自创建以来）
+        o["full_layer_secs"]   = (double)b.full_layer_secs;
+        o["alive_secs"]        = (double)b.alive_secs;
         o["cooldown_until_ms"] = tp_to_ms(b.cooldown_until);
         // 交易所侧灾难止损单号：重启后据此撤掉旧单再按当前均价重挂
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
@@ -503,6 +506,8 @@ void MainWindow::load_and_restore_bots() {
         bot.tp_extreme        = o["tp_extreme"].toDouble();
         bot.realized_pnl      = o["realized_pnl"].toDouble();
         bot.cycle_count       = o["cycle_count"].toInt();
+        bot.full_layer_secs   = (int64_t)o["full_layer_secs"].toDouble();
+        bot.alive_secs        = (int64_t)o["alive_secs"].toDouble();
         bot.cooldown_until    = ms_to_tp((qint64)o["cooldown_until_ms"].toDouble());
         bot.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
         bot.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
@@ -2963,7 +2968,37 @@ void MainWindow::refreshBotTable() {
         botTable_->setItem(i, 2,  mkc(QString::fromStdString(CcgEngine::dir_name(b.cfg.direction)), dir_c));
         botTable_->setItem(i, 3,  mkc(QString::fromStdString(CcgEngine::strat_name(b.cfg.strat_type)),
                                        QColor("#8b949e")));
-        botTable_->setItem(i, 4,  mkc(layers,                     QColor("#58a6ff")));
+        // 层进度 + 满层健康度。颜色即判据，不用去读数字：
+        //   实测（60品种）满层<10% 时 22/22 盈利；>75% 时 0/6 盈利、中位亏 16854
+        // 分母不足 1 天时不着色——样本太少，颜色会误导
+        {
+            const double fp   = b.full_layer_pct();
+            const bool   ripe = b.alive_secs >= 86400;
+            QColor lc = QColor("#58a6ff");
+            if (ripe) {
+                if      (fp >= 50.0) lc = QColor("#f85149");   // 危险：已进入失败模式区间
+                else if (fp >= 25.0) lc = QColor("#d29922");   // 警告：盈利概率开始下滑
+            }
+            auto* it = mkc(layers, lc);
+            QString tip = QString("满层时间占比 %1%（统计时长 %2）")
+                          .arg(fp, 0, 'f', 1)
+                          .arg(b.alive_secs >= 86400
+                               ? QString("%1 天").arg(b.alive_secs / 86400.0, 0, 'f', 1)
+                               : QString("%1 小时").arg(b.alive_secs / 3600.0, 0, 'f', 1));
+            if (!ripe) {
+                tip += "\n统计不足 1 天，暂不判读";
+            } else if (fp >= 50.0) {
+                tip += "\n\n⚠ 危险区：回测中满层>75% 的品种 0/6 盈利（中位亏 16854U）。\n"
+                       "满 8 层且持续一个月以上，应停掉该 bot，不要补钱摊平。";
+            } else if (fp >= 25.0) {
+                tip += "\n\n注意：回测中满层 25~50% 的品种 8/11 盈利，已明显低于\n"
+                       "满层<10% 那档的 22/22。观察即可，别加预算。";
+            } else {
+                tip += "\n\n健康：回测中满层<10% 的品种 22/22 盈利。";
+            }
+            it->setToolTip(tip);
+            botTable_->setItem(i, 4, it);
+        }
         // 均价 + 资金费修正后的回本价（悬停）。放在均价上是有道理的：回本价本质
         // 就是被资金费修正过的均价——对长期持有的用法，那才是真正要盯的数
         auto* avg_item = mkc(fmt_price(disp_avg), QColor("#8b949e"));

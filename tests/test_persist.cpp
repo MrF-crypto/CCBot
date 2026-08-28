@@ -66,6 +66,9 @@ int main() {
     b.ind_dipped       = true;
     b.realized_pnl     = 1234.56789012;
     b.cycle_count      = 17;
+    // 满层健康度：漏存的话重启后统计静默归零，而它是品种健康的唯一判据
+    b.full_layer_secs  = 123456;
+    b.alive_secs       = 987654;
     b.cooldown_until   = std::chrono::system_clock::time_point(
                              std::chrono::milliseconds(1787156044876LL));
     b.disaster_stop_id    = "9876543210";
@@ -110,6 +113,11 @@ int main() {
     check(r.tp_reached   == true,  "tp_reached 往返");
     check(r.ind_dipped   == true,  "ind_dipped 往返");
     check(r.cycle_count  == 17,    "cycle_count 往返");
+    check(r.full_layer_secs == 123456, "full_layer_secs 往返");
+    check(r.alive_secs      == 987654, "alive_secs 往返");
+    // 比值也要对：两个字段各自往返对但配错了同样是错的
+    check(std::fabs(r.full_layer_pct() - 100.0*123456/987654) < 1e-9,
+          "  满层占比据此算出的值一致");
     check(r.disaster_stop_id == "9876543210", "disaster_stop_id 往返");
     check(r.cooldown_until == b.cooldown_until, "cooldown_until 往返（毫秒级精确）");
 

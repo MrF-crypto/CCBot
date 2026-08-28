@@ -507,6 +507,29 @@ struct CcgBot {
     double realized_pnl = 0;
     int    cycle_count  = 0;
 
+    // ── 满层时长累计（品种健康度）────────────────────────────────────────────
+    // 回测里满层时间占比是【贯穿全部实验的枢纽变量】，但此前只存在于回测报告，
+    // 实盘界面上看不到。60 品种实测（6% 档）：
+    //   满层  0~10%  →  22/22 盈利，净利中位 +19432
+    //   满层 10~25%  →  16/17 盈利
+    //   满层 25~50%  →   8/11 盈利
+    //   满层 75%+    →   0/6  盈利，净利中位 −16854
+    // 而所有有效改进（宽间隔、趋势过滤、选币）都是通过压低它起作用的，
+    // 所有失败尝试（梯度间隔、动态W、补仓闸门）都把它推高了。
+    //
+    // 让它在运行时可见，就有了【提前退出的依据】——而不是等亏了才发现。
+    // 两个累计量都随 bot 落盘，重启后继续累加；口径是"自该 bot 创建以来"。
+    int64_t full_layer_secs = 0;   // 处于满层状态的累计秒数
+    int64_t alive_secs      = 0;   // 有效计时的累计秒数（分母；跳过 Stopped）
+    // 上一次计时的时刻，用于算增量。不落盘：重启后从当前时刻重新起算，
+    // 否则会把关机时间也算成"满层"或"存活"
+    std::chrono::steady_clock::time_point last_health_tick{};
+
+    // 满层时间占比 %（分母为 0 时返回 0）
+    double full_layer_pct() const {
+        return alive_secs > 0 ? 100.0 * (double)full_layer_secs / (double)alive_secs : 0.0;
+    }
+
     std::chrono::system_clock::time_point start_time;
     std::chrono::system_clock::time_point cooldown_until;
     // last_action 同时是【日志去重键】：只有它变了才打新日志。所以它必须是稳定的
