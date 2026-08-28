@@ -112,6 +112,8 @@ static int cmd_run(int argc, char** argv) {
     ReplayOptions opt;
     opt.initial_equity = arg_num(argc, argv, "--equity", 10000);
     opt.verbose        = arg_flag(argc, argv, "--verbose");
+    // --stats-from：数据从 --from 加载（预热），但统计从这里才开始
+    opt.stats_from_ms  = parse_day_ms(arg_str(argc, argv, "--stats-from", ""));
 
     auto& c = opt.cfg;
     c.symbol       = s.symbol;

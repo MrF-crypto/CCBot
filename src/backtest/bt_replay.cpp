@@ -134,12 +134,33 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
     int64_t last_day = 0, in_pos_min = 0, total_min = 0;
     int64_t full_min = 0;   // 处于满层状态的分钟数
     int64_t last_sr_calc = 0, last_slow_calc = 0;
+    // 预热期基线：跨过 stats_from_ms 时拍一次快照，最终统计全部减去它。
+    // 预热期内引擎照常运行（指标才能预热），只是不计分
+    const int64_t stats_from = opt.stats_from_ms ? opt.stats_from_ms : opt.start_ms;
+    bool   scoring   = (stats_from == 0);
+    double base_real = 0, base_fees = 0, base_fund = 0;
+    int    base_cyc  = 0, base_win = 0, base_ord = 0, base_layer = 0;
     std::vector<srzones::Zone> sr_zones;
     double sr_atr = 0;
 
     for (const auto& b : series.bars) {
         if (opt.start_ms && b.ts_ms < opt.start_ms) continue;
         if (opt.end_ms   && b.ts_ms > opt.end_ms)   break;
+
+        if (!scoring && stats_from && b.ts_ms >= stats_from) {
+            scoring    = true;
+            base_real  = sim->realized();
+            base_fees  = sim->fees();
+            base_fund  = sim->funding_paid();
+            base_ord   = sim->order_count();
+            base_cyc   = res.cycles;  base_win = res.wins;  base_layer = layer_sum;
+            // 权益与回撤从统计起点重新起算，否则预热期的波动会污染测试段回撤
+            equity = peak_eq = init_eq + sim->realized() + sim->unrealized();
+            res.max_drawdown = 0; res.max_dd_pct = 0;
+            res.max_layers = 0; res.max_notional = 0;
+            res.gate_pass = res.gate_block_htf = res.gate_block_sr = 0;
+            res.equity_curve.clear(); res.equity_days.clear();
+        }
 
         vnow_ms = b.ts_ms;
         tf_ind.feed(b); tf_trend.feed(b); tf_htf.feed(b); tf_sr.feed(b);
@@ -224,7 +245,8 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
         // ④ 资金费结算
         if (b.funding != 0) sim->settle_funding(b.funding);
 
-        // ⑤ 权益与回撤跟踪
+        // ⑤ 权益与回撤跟踪（预热期不计分）
+        if (!scoring) continue;
         equity = init_eq + sim->realized() + sim->unrealized();
         peak_eq = std::max(peak_eq, equity);
         double dd = peak_eq - equity;
@@ -247,11 +269,14 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
         }
     }
 
-    res.total_pnl  = sim->realized() + sim->unrealized();
+    res.total_pnl  = (sim->realized() - base_real) + sim->unrealized();
     res.return_pct = init_eq > 0 ? res.total_pnl / init_eq * 100.0 : 0;
-    res.fees       = sim->fees();
-    res.funding    = sim->funding_paid();
-    res.orders     = sim->order_count();
+    res.fees       = sim->fees()         - base_fees;
+    res.funding    = sim->funding_paid() - base_fund;
+    res.orders     = sim->order_count()  - base_ord;
+    res.cycles    -= base_cyc;
+    res.wins      -= base_win;
+    layer_sum     -= base_layer;
     res.avg_layers = res.cycles ? (double)layer_sum / res.cycles : 0;
     res.time_in_pos_pct = total_min ? 100.0 * in_pos_min / total_min : 0;
     res.full_layer_pct  = total_min ? 100.0 * full_min   / total_min : 0;

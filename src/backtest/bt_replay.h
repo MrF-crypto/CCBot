@@ -48,6 +48,12 @@ struct ReplayOptions {
     double    initial_equity = 10000;
     int64_t   start_ms = 0;        // 0=全段
     int64_t   end_ms   = 0;
+    // 统计起点（0=同 start_ms）。[start_ms, stats_from_ms) 这段【正常跑引擎但不计分】，
+    // 用于给指标预热——4h EMA200 需要 34 天、SR 需要 400 根 4h ≈ 67 天。
+    // 没有它的话，分段回测每段开头那一个多月里趋势过滤是瞎的，而梯子恰恰
+    // 在那时被打光：曾据此得出"深熊需要宽间隔"，带预热重测后结论完全反转。
+    // walk-forward 必须用它，否则测试段要么缺预热、要么与训练段重叠。
+    int64_t   stats_from_ms = 0;
     bool      verbose  = false;    // 打印每笔成交
 };
 
