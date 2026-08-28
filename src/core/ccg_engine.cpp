@@ -309,6 +309,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.mtf_k              = new_cfg.mtf_k;
     cfg.mtf_min_gap_pct    = new_cfg.mtf_min_gap_pct;
     cfg.min_profit_floor  = new_cfg.min_profit_floor;
+    cfg.floor_decay       = new_cfg.floor_decay;
     cfg.tp_floor_only     = new_cfg.tp_floor_only;
     cfg.tp_fixed_profit   = new_cfg.tp_fixed_profit;
     cfg.fixed_trail_tp    = new_cfg.fixed_trail_tp;
@@ -848,9 +849,16 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             // 动态W模式：止盈锚定上轨（多）/下轨（空）+ 保底利润双条件。
             // 保底条款必须有：下跌趋势里上轨可能低于均价（高位库存拖的），
             // 只看"触上轨"会亏着平仓；保底保证每轮至少覆盖手续费+微利
+            // 保底利润可随层数递减：满层时首要目标是脱身而非赚够（见 floor_decay）
+            double eff_floor = bot.cfg.min_profit_floor;
+            if (bot.cfg.floor_decay > 0 && bot.cfg.max_entries > 1) {
+                const double prog = (double)(std::max<size_t>(1, bot.entries.size()) - 1)
+                                    / (double)(bot.cfg.max_entries - 1);
+                eff_floor *= std::max(0.0, 1.0 - bot.cfg.floor_decay * std::min(1.0, prog));
+            }
             double floor_th = bot.avg_price *
-                (is_long ? (1.0 + bot.cfg.min_profit_floor / 100.0)
-                         : (1.0 - bot.cfg.min_profit_floor / 100.0));
+                (is_long ? (1.0 + eff_floor / 100.0)
+                         : (1.0 - eff_floor / 100.0));
             // v3.0 止盈锚定：够格阻力比上轨更近且仍在保底线之上时，在阻力前落袋
             // （不指望价格穿墙）。激活是一次性的，锚点天然锁定在激活时刻
             double target = is_long ? bot.ind_boll_ub : bot.ind_boll_lb;

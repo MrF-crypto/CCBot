@@ -168,6 +168,7 @@ static int cmd_run(int argc, char** argv) {
     c.mtf_k           = arg_num(argc, argv, "--mtf-k", 0.5);
     c.mtf_min_gap_pct = arg_num(argc, argv, "--mtf-gap", 2.0);
     c.min_profit_floor  = arg_num(argc, argv, "--floor", 0.3);
+    c.floor_decay       = arg_num(argc, argv, "--floor-decay", 0.0);
     c.use_trend_filter  = arg_flag(argc, argv, "--trend");
     c.sr_radar          = arg_flag(argc, argv, "--sr") || arg_flag(argc, argv, "--gates");
     c.htf_pos_max       = arg_num(argc, argv, "--htf-max", 0.80);
