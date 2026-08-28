@@ -158,6 +158,10 @@ static int cmd_run(int argc, char** argv) {
     c.dyn_interval_mult = arg_num(argc, argv, "--int-mult", 1.0);
     c.dyn_fixed_interval = arg_num(argc, argv, "--int-fixed", 0.0);
     c.dyn_interval_growth = arg_num(argc, argv, "--int-growth", 0.0);
+    // 补仓侧闸门（此前只有 grid 扫描能设，run 命令够不着）
+    c.dca_gate_from_layer = (int)arg_num(argc, argv, "--dca-from", 0);
+    c.dca_gate_trend      = arg_flag(argc, argv, "--dca-trend");
+    c.dca_gate_htf_min    = arg_num(argc, argv, "--dca-pctb", 0.0);
     // 多周期梯子：槽位按档位归属，第 i 槽必须跌破该档周期的下轨才武装
     c.mtf_ladder      = arg_flag(argc, argv, "--mtf");
     c.mtf_tier_layers = arg_str(argc, argv, "--mtf-tiers", "");
