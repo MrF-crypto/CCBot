@@ -122,7 +122,13 @@ jobs:
           cd pkg && zip -r "../ccbot-$VER-macos-${{ matrix.arch }}.zip" . && cd ..
           ls -la ccbot-*.zip
 
+      # macOS 这条与 linux/windows 不同：下一步直接把包挂到 Release，
+      # 不经过 artifact 中转，所以这个上传【没有任何消费者】。
+      # 仍保留是为了能手工下载调试构建，但只在 tag 时上传——
+      # 每次推送都存一份的话会累积撞上 artifact 配额，
+      # 表现为构建与测试全绿、唯独上传步骤失败
       - name: Upload artifact
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ccbot-macos-${{ matrix.arch }}

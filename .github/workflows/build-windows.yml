@@ -124,7 +124,14 @@ jobs:
           cd pkg && 7z a "../ccbot-$VER-win64.zip" . >/dev/null
           cd .. && ls -la ccbot-*.zip
 
+      # 只在 tag 构建时上传：release job 靠它拿包，而 main 上的普通提交
+      # 只需要验证"能编译、测试通过"，产物没人取用。
+      # 不加这个条件的话每次推送都存一份三平台的包（约 79MB），
+      # 累积到 296 个 / 6.29GB 时会撞上 GitHub 的 artifact 配额，
+      # 表现为构建与测试全绿、唯独 Upload artifact 步骤失败——
+      # 一个与代码完全无关却会挡住发版的故障
       - name: Upload artifact
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ccbot-win64
