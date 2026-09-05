@@ -351,6 +351,7 @@ void MainWindow::save_bots() {
         o["rsi_oversold_th"]  = c.rsi_oversold_th;
         o["dynamic_band_mode"] = c.dynamic_band_mode;
         o["min_profit_floor"]  = c.min_profit_floor;
+        o["dyn_fixed_interval"] = c.dyn_fixed_interval;
         o["mtf_ladder"]        = c.mtf_ladder;
         o["mtf_tier_layers"]   = QString::fromStdString(c.mtf_tier_layers);
         o["mtf_k"]             = c.mtf_k;
@@ -457,6 +458,9 @@ void MainWindow::load_and_restore_bots() {
         c.rsi_oversold_th  = o["rsi_oversold_th"].toDouble(25.0);
         c.dynamic_band_mode = o["dynamic_band_mode"].toBool(true);
         c.min_profit_floor  = o["min_profit_floor"].toDouble(3.5);
+        // 兜底 0（自适应）而不是建议值 6：老版本存的配置里没有这个字段，
+        // 兜底成 6 等于在用户不知情时把正在跑的策略换掉（间距 0.9%→6%）
+        c.dyn_fixed_interval = o["dyn_fixed_interval"].toDouble(0.0);
         c.mtf_ladder        = o["mtf_ladder"].toBool(false);
         c.mtf_tier_layers   = o["mtf_tier_layers"].toString().toStdString();
         c.mtf_k             = o["mtf_k"].toDouble(0.5);
@@ -1813,6 +1817,25 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* floorEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.min_profit_floor : 3.5));
     addSub(dcaForm, "保底利润%（动态模式）", floorEdit);
 
+    // 固定补仓间隔：此前只有回测命令行能设，实盘够不着——而 walk-forward 证明
+    // 它全面优于 W/3 自适应推导。不通到界面等于把最好的配置锁在回测里
+    auto* fixIvEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.dyn_fixed_interval : 0.0));
+    fixIvEdit->setPlaceholderText("0 = 用 W/3 自适应；建议填 6");
+    fixIvEdit->setToolTip(
+        "只替换动态W的【间距推导】，结构锚定完全保留——\n"
+        "补仓仍要求价格在下轨外，止盈仍要求触及上轨且盈利≥保底利润。\n\n"
+        "⚠ 实证建议填 6。8品种 × 8个滚动窗口 = 64 个纯样本外测试段：\n"
+        "  固定 6%   总净利  70620   盈利 56/64   满层中位  0.0%   ← 最优\n"
+        "  固定 5%   总净利  67289   盈利 52/64   满层中位  0.7%\n"
+        "  固定 4%   总净利  53826   盈利 49/64   满层中位  1.2%\n"
+        "  固定 3%   总净利 −35616   盈利 38/64   满层中位 22.4%   ← 样本外净亏\n"
+        "而 W/3 推导出的间隔中位仅 0.90%，满层中位高达 84.5%，\n"
+        "5 个品种里 0 个能打平其最优固定间隔。\n\n"
+        "满层＝弹药耗尽、失去摊薄能力，是驱动回撤与资金费的枢纽变量：\n"
+        "满层<10% 的品种 22/22 盈利，>75% 的 0/6 盈利（中位亏 16854U）。\n"
+        "填 6 之后实测平均只用 1.5 层、满层率 0.0%——子弹根本用不完。");
+    addSub(dcaForm, "固定补仓间隔%（0=自适应，建议 6）", fixIvEdit);
+
     // ── 多周期梯子（v3.7 实验，默认关）────────────────────────────────────────
     auto* mtfBox = new QCheckBox("多周期梯子（补仓档位锚定 1h/4h/12h/1d 下轨，越深的层要求越极端）");
     mtfBox->setChecked(prefill ? prefill->cfg.mtf_ladder : false);
@@ -2349,6 +2372,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.rsi_oversold_th  = to_d(rsiOversoldEdit, 25.0);
     cfg.dynamic_band_mode = dynBandBox->isChecked();
     cfg.min_profit_floor  = to_d(floorEdit, 3.5);
+    cfg.dyn_fixed_interval = to_d(fixIvEdit, 0.0);
     cfg.mtf_ladder        = mtfBox->isChecked();
     cfg.mtf_tier_layers   = mtfTiersEdit->text().trimmed().toStdString();
     cfg.mtf_k             = to_d(mtfKEdit,   0.5);

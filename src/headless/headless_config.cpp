@@ -111,6 +111,9 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", c.rsi_oversold_th);
     c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", c.dynamic_band_mode);
     c.min_profit_floor  = get_num(bo, "min_profit_floor", c.min_profit_floor);
+    // 固定补仓间隔（0=用 W/3 自适应）。walk-forward 证明固定值全面更优，
+    // 而此前它只有回测命令行能设
+    c.dyn_fixed_interval = get_num(bo, "dyn_fixed_interval", c.dyn_fixed_interval);
     // ── 快进快出三件套 ────────────────────────────────────────────────
     // 引擎里早就有，但此前只有回测命令行能设——GUI 和 headless 都没暴露。
     // 全市场超卖扫描要的正是这套：不等上轨、够本就跑、回调不随带宽放大
@@ -216,6 +219,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "entry_mode", "kline_interval",
         "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
         "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",
+        "dyn_fixed_interval",
         "tp_floor_only", "tp_fixed_profit", "fixed_trail_tp",
         "mtf_ladder", "mtf_tier_layers", "mtf_k", "mtf_min_gap_pct",
         "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",

@@ -153,11 +153,18 @@ static int cmd_run(int argc, char** argv) {
     c.use_sr_support  = arg_flag(argc, argv, "--gates") && !arg_flag(argc, argv, "--no-support");
     c.use_sr_headroom = arg_flag(argc, argv, "--gates") && !arg_flag(argc, argv, "--no-headroom");
     c.kline_interval  = arg_str(argc, argv, "--tf", "1h");
+    // 布林参数此前在 run 里是硬编码 20/2.0，从未被验证过。
+    // 而上轨位置直接决定止盈难度，是这套策略最敏感的维度：
+    // 去掉上轨条件 −48.5%；保底 2%↔3% 之间回撤 3733→13526。
+    c.boll_period     = (int)arg_num(argc, argv, "--boll-p", 20);
+    c.boll_mult       = arg_num(argc, argv, "--boll-m", 2.0);
     c.rsi_threshold   = arg_num(argc, argv, "--rsi-th", 35);
     c.rsi_oversold_th = arg_num(argc, argv, "--rsi-os", 25);
 
     c.dynamic_band_mode = arg_flag(argc, argv, "--dynamic");
     c.dyn_interval_mult = arg_num(argc, argv, "--int-mult", 1.0);
+    // --no-band-dca：关掉"补仓必须在带外"，验证下轨锚定是保护还是限制
+    c.dca_require_band  = !arg_flag(argc, argv, "--no-band-dca");
     c.dyn_fixed_interval = arg_num(argc, argv, "--int-fixed", 0.0);
     c.dyn_interval_growth = arg_num(argc, argv, "--int-growth", 0.0);
     // 补仓侧闸门（此前只有 grid 扫描能设，run 命令够不着）

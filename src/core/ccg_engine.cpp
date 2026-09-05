@@ -303,6 +303,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
     cfg.dyn_interval_mult = new_cfg.dyn_interval_mult;
     cfg.dyn_fixed_interval = new_cfg.dyn_fixed_interval;
+    cfg.dca_require_band   = new_cfg.dca_require_band;
     cfg.dyn_interval_growth = new_cfg.dyn_interval_growth;
     cfg.mtf_ladder         = new_cfg.mtf_ladder;
     cfg.mtf_tier_layers    = new_cfg.mtf_tier_layers;
@@ -828,9 +829,11 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             // 动态W模式：补仓锚定布林带——除了跌够动态间隔，价格还必须在带外
             // （多：≤下轨；空：≥上轨），即"当前统计意义上的超卖/超买位"才武装补仓。
             // 指标数据过期时冻结武装（fresh=false），宁可错过不可乱买
-            bool band_cond = eff.fresh &&
-                (is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub));
-            triggered = triggered && band_cond;
+            if (bot.cfg.dca_require_band) {
+                bool band_cond = eff.fresh &&
+                    (is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub));
+                triggered = triggered && band_cond;
+            }
         }
         if (triggered) {
             bot.interval_hit = true;

@@ -90,6 +90,7 @@ int main() {
         eqd(g.rsi_oversold_th, d.rsi_oversold_th, "rsi_oversold_th");
         eq(g.dynamic_band_mode, d.dynamic_band_mode, "dynamic_band_mode");
         eqd(g.min_profit_floor, d.min_profit_floor, "min_profit_floor（与层数强耦合，必须成对）");
+        eqd(g.dyn_fixed_interval, d.dyn_fixed_interval, "dyn_fixed_interval 缺字段时继承默认");
         eq(g.mtf_ladder,    d.mtf_ladder,    "mtf_ladder");
         eq(g.mtf_tier_layers, d.mtf_tier_layers, "mtf_tier_layers");
         eqd(g.mtf_k,        d.mtf_k,        "mtf_k");
@@ -117,7 +118,8 @@ int main() {
             "{\"api_key\":\"k\",\"api_secret\":\"s\",\"bots\":[{"
             "\"symbol\":\"ETHUSDT\",\"direction\":\"short\",\"strat_type\":\"flat\","
             "\"max_entries\":3,\"leverage\":10,\"budget_usdt\":777.5,"
-            "\"min_profit_floor\":4.25,\"mtf_ladder\":true,\"mtf_tier_layers\":\"5,1,1,1\","
+            "\"min_profit_floor\":4.25,\"dyn_fixed_interval\":6.0,"
+            "\"mtf_ladder\":true,\"mtf_tier_layers\":\"5,1,1,1\","
             "\"entry_mode\":\"immediate\",\"use_trend_filter\":false}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "带显式值的配置能解析: " + err);
@@ -130,6 +132,7 @@ int main() {
             eq((int)g.leverage, 10, "leverage=10");
             eqd(g.budget_usdt, 777.5, "budget_usdt=777.5");
             eqd(g.min_profit_floor, 4.25, "min_profit_floor=4.25");
+            eqd(g.dyn_fixed_interval, 6.0, "dyn_fixed_interval=6.0（显式值生效）");
             eq(g.mtf_ladder, true, "mtf_ladder=true");
             eq(g.mtf_tier_layers, std::string("5,1,1,1"), "mtf_tier_layers");
             eq(g.entry_mode, CcgConfig::EntryMode::Immediate, "entry_mode=immediate");

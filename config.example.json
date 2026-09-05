@@ -38,6 +38,7 @@
 
       "dynamic_band_mode": true,
       "min_profit_floor": 2.0,
+      "dyn_fixed_interval": 6.0,
 
       "use_trend_filter": true,
       "trend_interval": "4h",
