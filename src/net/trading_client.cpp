@@ -1322,6 +1322,22 @@ TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
     out.boll_lb = boll.lb;
     out.rsi     = indicators::rsi(closes, rsi_period);
 
+    // 涨幅：closes.back() 是【未收盘】的当前K线，往回数才是已收盘的基准。
+    // need 至少 39 根（boll/rsi 的需求），7 根回看永远够，不必额外拉数据
+    const size_t n = closes.size();
+    auto pct_from = [&](size_t back) -> double {
+        const double base = closes[n - 1 - back];
+        return base > 0 ? (closes.back() - base) / base * 100.0 : 0.0;
+    };
+    // chg_ok 以【两条都算得出】为准（8 根）。不足时保持 0 且 chg_ok=false，
+    // 免得新上市品种因"历史不够"被当成"涨幅为 0"而放行。
+    // 实践中这条兜底不会触发：out.ok 取自 boll.ok，20 根不够就整个快照作废
+    if (n >= 8) {
+        out.chg_1  = pct_from(1);
+        out.chg_7  = pct_from(7);
+        out.chg_ok = true;
+    }
+
     out.ok = boll.ok;
     return out;
 }

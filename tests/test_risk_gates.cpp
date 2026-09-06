@@ -4,6 +4,7 @@
 // ITradingClient 把引擎单独拎出来跑。EngineHost 用内联执行器 + 虚拟时钟，
 // 和回测同一套注入方式，结果完全确定可复现。
 #include "core/ccg_engine.h"
+#include "core/decision.h"
 #include <cstdio>
 #include <cmath>
 #include <string>
@@ -626,7 +627,72 @@ static void test_adopted_position_survives_cooldown() {
     }
 }
 
+// ── 宏观涨幅拦截（v4.0.7）────────────────────────────────────────────────────
+// decision::evaluate 是纯函数，直接喂值验证，不用起引擎。
+// 覆盖四件事：阈值方向、做空镜像、0=关、以及"算不出涨幅"在 strict 下不被
+// 当成"涨幅为0"放行——最后这条是最容易写错的（新上市品种正是最该拦的一类）
+static void test_htf_change_gates() {
+    auto base = []() {
+        decision::Inputs in;
+        in.is_long = true;  in.strict = true;
+        in.use_htf = false;                 // 只测涨幅，把 %B 关掉
+        in.htf_ok  = true;
+        in.use_sr_support = false; in.use_sr_headroom = false;
+        return in;
+    };
+
+    // 阈值方向：超过拦，没超过放行
+    { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 6.2;
+      auto v = decision::evaluate(in);
+      check(v.day_chg_block && !v.pass(), "日涨6.2% > 阈值5% → 拦截"); }
+    { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 4.9;
+      auto v = decision::evaluate(in);
+      check(!v.day_chg_block && v.pass(), "日涨4.9% < 阈值5% → 放行"); }
+
+    // 边界：恰好等于阈值不拦（用 > 而非 >=）
+    { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 5.0;
+      check(decision::evaluate(in).pass(), "日涨恰好等于阈值 → 放行"); }
+
+    // 7日与日线互不干扰
+    { auto in = base(); in.week_chg_max = 20.0; in.week_chg_pct = 25.0;
+      in.day_chg_max = 5.0; in.day_chg_pct = 1.0;
+      auto v = decision::evaluate(in);
+      check(v.week_chg_block && !v.day_chg_block, "7日过热但日线正常 → 只有7日那条拦"); }
+
+    // 做空镜像：拦的是跌幅
+    { auto in = base(); in.is_long = false; in.day_chg_max = 5.0; in.day_chg_pct = -6.2;
+      check(decision::evaluate(in).day_chg_block, "做空：日跌6.2% → 拦截"); }
+    { auto in = base(); in.is_long = false; in.day_chg_max = 5.0; in.day_chg_pct = 6.2;
+      check(decision::evaluate(in).pass(), "做空：日涨6.2% 不该拦（镜像方向）"); }
+
+    // 0 = 关：涨幅再离谱也放行
+    { auto in = base(); in.day_chg_max = 0; in.day_chg_pct = 99.0;
+      in.week_chg_max = 0; in.week_chg_pct = 300.0;
+      check(decision::evaluate(in).pass(), "阈值 0 = 关闭，涨幅99%/300% 也放行"); }
+
+    // 数据缺失：strict 下必须拦，且不能被当成"涨幅为0"
+    { auto in = base(); in.htf_ok = false; in.day_chg_max = 5.0; in.day_chg_pct = 0;
+      auto v = decision::evaluate(in);
+      check(v.data_block && !v.pass(), "涨幅算不出 + strict → 拦截（不当成涨幅0放行）"); }
+    // 非 strict（影子）下只标注不拦
+    { auto in = base(); in.strict = false; in.htf_ok = false; in.day_chg_max = 5.0;
+      auto v = decision::evaluate(in);
+      check(v.htf_missing && v.pass(), "涨幅算不出 + 非strict → 只标注不拦"); }
+
+    // 全部闸门都关时不该因为数据缺失而拦（use_chg=false 走不进那个分支）
+    { auto in = base(); in.htf_ok = false;   // 三个阈值全 0
+      check(decision::evaluate(in).pass(), "涨幅与%B全关 → 数据缺失也放行"); }
+
+    // %B 与涨幅正交：%B 正常但涨幅过热，仍要拦
+    { auto in = base(); in.use_htf = true; in.htf_pct_b = 0.30; in.htf_pos_max = 0.60;
+      in.day_chg_max = 5.0; in.day_chg_pct = 8.0;
+      auto v = decision::evaluate(in);
+      check(!v.htf_block && v.day_chg_block && !v.pass(),
+            "%B=0.30 未越界但日涨8% → 涨幅那条独立拦住"); }
+}
+
 int main() {
+    test_htf_change_gates();
     test_dca_margin_cap();
     test_adopted_position_survives_cooldown();
     test_v_crash_fills_one_layer();

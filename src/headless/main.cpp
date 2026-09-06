@@ -420,7 +420,10 @@ int main(int argc, char** argv) {
                 if (b.state == CcgBot::State::Stopped) continue;
                 if (b.cfg.use_trend_filter) need.push_back(b);
                 // %B 对所有非停止 bot 持续保鲜（立即开仓/冷却重进的首仓才赶得上数据）
-                if (b.cfg.use_htf_filter) htf_need.push_back(b);
+                // 涨幅拦截与 %B 同源，任一开启都要拉这份高周期数据
+                if (b.cfg.use_htf_filter ||
+                    b.cfg.htf_day_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
+                    htf_need.push_back(b);
                 if (b.cfg.mtf_ladder)     mtf_need.push_back(b);
             }
             if (!need.empty() || !htf_need.empty() || !mtf_need.empty()) {
@@ -436,7 +439,7 @@ int main(int argc, char** argv) {
                                                               20, 2.0, 14);
                         if (!snap.ok) continue;
                         double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
-                        engine->update_htf(b.bot_id, pb);
+                        engine->update_htf(b.bot_id, pb, snap.chg_ok, snap.chg_1, snap.chg_7);
                         // 复用：宏观层拉的就是日线带，正好是第3档
                         if (b.cfg.mtf_ladder && b.cfg.htf_interval == "1d")
                             engine->update_mtf_band(b.bot_id, 3, snap.boll_lb, snap.boll_ub);

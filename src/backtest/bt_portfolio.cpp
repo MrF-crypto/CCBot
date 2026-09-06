@@ -161,6 +161,9 @@ PortfolioResult run_portfolio(const std::vector<Series>& all, const PortfolioOpt
         auto cfg = opt.base_cfg;
         cfg.symbol = s.symbol;
         cfg.budget_usdt = opt.per_symbol_budget;
+        // 同 bt_replay：回测不跟踪宏观涨幅，非零阈值会在 strict 下静默拦死一切
+        cfg.htf_day_chg_max  = 0;
+        cfg.htf_week_chg_max = 0;
         st.bot_id = eng->add_bot(cfg);
         if (st.bot_id.empty()) continue;
         st.tf_ind.period   = interval_ms(cfg.kline_interval);

@@ -364,6 +364,8 @@ void MainWindow::save_bots() {
         o["use_htf_filter"]      = c.use_htf_filter;
         o["htf_interval"]        = QString::fromStdString(c.htf_interval);
         o["htf_pos_max"]         = c.htf_pos_max;
+        o["htf_day_chg_max"]     = c.htf_day_chg_max;
+        o["htf_week_chg_max"]    = c.htf_week_chg_max;
         o["use_sr_support"]      = c.use_sr_support;
         o["use_sr_headroom"]     = c.use_sr_headroom;
         o["sr_min_confluence"]   = c.sr_min_confluence;
@@ -473,6 +475,10 @@ void MainWindow::load_and_restore_bots() {
         c.use_htf_filter      = o["use_htf_filter"].toBool(true);
         c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
+        // 兜底 0 而非某个"建议值"：老 bots.json 里没有这两个键，兜成非零
+        // 等于在用户不知情时给正在跑的策略加了两道闸门（同 v4.0.6 固定间隔的处理）
+        c.htf_day_chg_max     = o["htf_day_chg_max"].toDouble(0.0);
+        c.htf_week_chg_max    = o["htf_week_chg_max"].toDouble(0.0);
         // v3.8 迁移：老配置只有 smart_gates 总开关 + use_sr_gate。
         // 总开关为 false 时三层完全不参与，升级后必须保持这个行为——否则
         // 老 bot 会突然开始拦截
@@ -1919,6 +1925,18 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     addHint(gateForm, "三条平级独立，全不勾 = 三层决策完全不参与。"
                       "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
     auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
+    auto* dayChgEdit   = mkEditIn(gateForm, "日涨幅拦截%（0=关）:",
+                                  prefill ? prefill->cfg.htf_day_chg_max : 0.0);
+    auto* weekChgEdit  = mkEditIn(gateForm, "近7日涨幅拦截%（0=关）:",
+                                  prefill ? prefill->cfg.htf_week_chg_max : 0.0);
+    addHint(gateForm,
+            "两条涨幅与 %B 同源（共用那次日线拉取，不增加请求），但口径不同：\n"
+            "%B 问「价格在波动区间的什么位置」，涨幅问「最近涨得多急」。\n"
+            "窄幅横盘时 %B 可以贴着上轨而涨幅极小；急涨突破时涨幅很大而 %B 未必越界。\n"
+            "「近7日」是滚动口径（相对7根日线前的收盘），不是本周K线——\n"
+            "后者每周一归零，闸门会在行情最容易延续的时点失效大半天。\n"
+            "做空时镜像：拦的是跌幅。两条独立于上面的①开关，可以只用涨幅不用 %B。\n"
+            "⚠ 这两个阈值没有回测依据（回测侧未实现涨幅跟踪），填多少靠手判。");
     auto* headroomEdit = mkEditIn(gateForm, "净空比下限:", prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
     auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
     srExitBox->setChecked(prefill ? prefill->cfg.use_sr_exit : false);
@@ -2382,6 +2400,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.use_sr_support      = supBox->isChecked();
     cfg.use_sr_headroom     = headBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
+    cfg.htf_day_chg_max     = to_d(dayChgEdit,   0.0);
+    cfg.htf_week_chg_max    = to_d(weekChgEdit,  0.0);
     cfg.sr_headroom_ratio   = to_d(headroomEdit, 3.0);
     cfg.use_sr_exit         = srExitBox->isChecked();
     cfg.use_structural_stop = structStopBox->isChecked();
@@ -2649,7 +2669,10 @@ void MainWindow::onTick() {
             // %B 对所有非停止 bot 持续保鲜（不限"等首仓中"）：立即开仓模式点继续
             // 3秒内就下单、冷却结束当tick就重进——只给等待中的bot拉的话，这些
             // 首仓永远赶不上数据，%B恒为"缺失(放行)"
-            if (b.cfg.use_htf_filter) htf_bots.push_back(b);
+            // 涨幅拦截与 %B 同源，任一开启都要拉这份高周期数据
+            if (b.cfg.use_htf_filter ||
+                b.cfg.htf_day_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
+                htf_bots.push_back(b);
         }
         if ((!trend_bots.empty() || !htf_bots.empty()) && !trendFetchBusy_.load()) {
             trendFetchBusy_.store(true);
@@ -2670,7 +2693,7 @@ void MainWindow::onTick() {
                     const bool tier3 = b.cfg.mtf_ladder && b.cfg.htf_interval == "1d";
                     QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb, snap, tier3]() {
                         if (!engine_) return;
-                        engine_->update_htf(bid, pb);
+                        engine_->update_htf(bid, pb, snap.chg_ok, snap.chg_1, snap.chg_7);
                         // 复用：宏观层拉的就是日线带，正好是第3档
                         if (tier3) engine_->update_mtf_band(bid, 3, snap.boll_lb, snap.boll_ub);
                     }, Qt::QueuedConnection);

@@ -100,6 +100,16 @@ struct Inputs {
     bool   htf_ok      = false;
     double htf_pct_b   = 0.5;
     double htf_pos_max = 0.80;
+    // 宏观涨幅：与 %B 同源（同一次高周期K线拉取），但口径正交——
+    //   %B  问的是"价格在波动区间的什么位置"
+    //   涨幅问的是"最近涨得多急"
+    // 窄幅横盘时 %B 可以贴着上轨而涨幅微乎其微；急涨突破时涨幅巨大而 %B 未必越界。
+    // 两者会给出相反的答案，所以是独立判据而不是 %B 的替代。
+    // 各自 0=关，且不受 use_htf 开关约束（可以只用涨幅、不用 %B）
+    double day_chg_pct  = 0;   // 近 1 根高周期K线涨幅%
+    double week_chg_pct = 0;   // 近 7 根高周期K线涨幅%（htf_interval=1d 时即近7日）
+    double day_chg_max  = 0;   // 0=关；做多时涨幅高于此值拦截，做空镜像
+    double week_chg_max = 0;   // 0=关
     // 结构层拆成两个独立判据——它们问的是完全不同的问题：
     //   支撑：脚下此刻有没有踩住够格区域（"这里该不该买"）
     //   净空：头顶到最近够格阻力的空间够不够止盈（"买了跑不跑得掉"）
@@ -114,6 +124,8 @@ struct Inputs {
 
 struct Verdict {
     bool htf_block      = false;   // 宏观：日线高位（做多）/低位（做空）
+    bool day_chg_block  = false;   // 宏观：日涨幅过热
+    bool week_chg_block = false;   // 宏观：7日涨幅过热
     bool support_block  = false;   // 结构：脚下无够格支撑
     bool headroom_block = false;   // 结构：头顶净空不足
     bool htf_missing    = false;   // 数据缺失标注
@@ -121,19 +133,30 @@ struct Verdict {
     bool data_block     = false;   // strict 模式下因数据缺失而拦截
 
     bool pass() const {
-        return !htf_block && !support_block && !headroom_block && !data_block;
+        return !htf_block && !day_chg_block && !week_chg_block
+            && !support_block && !headroom_block && !data_block;
     }
 };
 
 inline Verdict evaluate(const Inputs& in) {
     Verdict v;
-    if (in.use_htf) {
+    // %B 与两条涨幅共用同一份高周期K线，所以数据缺失只判一次
+    const bool use_chg = in.day_chg_max > 0 || in.week_chg_max > 0;
+    if (in.use_htf || use_chg) {
         if (!in.htf_ok) {
             v.htf_missing = true;
             if (in.strict) v.data_block = true;   // 严格模式：数据没到不开仓
-        } else if (in.is_long ? (in.htf_pct_b > in.htf_pos_max)
-                              : (in.htf_pct_b < 1.0 - in.htf_pos_max)) {
-            v.htf_block = true;     // 做多拦高位；做空镜像拦低位
+        } else {
+            if (in.use_htf && (in.is_long ? (in.htf_pct_b > in.htf_pos_max)
+                                          : (in.htf_pct_b < 1.0 - in.htf_pos_max)))
+                v.htf_block = true;     // 做多拦高位；做空镜像拦低位
+            // 做多拦"涨太急"，做空镜像拦"跌太急"
+            if (in.day_chg_max > 0 && (in.is_long ? in.day_chg_pct >  in.day_chg_max
+                                                  : in.day_chg_pct < -in.day_chg_max))
+                v.day_chg_block = true;
+            if (in.week_chg_max > 0 && (in.is_long ? in.week_chg_pct >  in.week_chg_max
+                                                   : in.week_chg_pct < -in.week_chg_max))
+                v.week_chg_block = true;
         }
     }
     if (in.use_sr_support || in.use_sr_headroom) {
@@ -161,6 +184,17 @@ inline std::string summarize(const Inputs& in, const Verdict& v) {
     if (v.htf_missing)      s += miss;
     else if (!in.use_htf)   s += "关";
     else                    s += num(in.htf_pct_b) + (v.htf_block ? "✗高位" : "✓");
+    // 两条涨幅只在启用时才占位，免得默认关闭的用户每行日志都看到两段"关"
+    if (in.day_chg_max > 0) {
+        s += " | 日涨";
+        if (v.htf_missing) s += miss;
+        else               s += num(in.day_chg_pct) + "%" + (v.day_chg_block ? "✗过热" : "✓");
+    }
+    if (in.week_chg_max > 0) {
+        s += " | 7日涨";
+        if (v.htf_missing) s += miss;
+        else               s += num(in.week_chg_pct) + "%" + (v.week_chg_block ? "✗过热" : "✓");
+    }
     s += " | 支撑";
     if (!in.use_sr_support)      s += "关";
     else if (v.sr_missing)       s += miss;

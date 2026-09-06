@@ -110,7 +110,14 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
         if (opt.verbose) std::printf("    %s\n", msg.c_str());
     });
 
-    auto bot_id = engine->add_bot(opt.cfg);
+    // 宏观涨幅拦截在回测里【未实现】：这里喂 update_htf 时不带涨幅（chg_ok=false），
+    // 而引擎在 strict 模式下把"算不出涨幅"等同于"数据没到不开仓"。若配置里带了
+    // 非零阈值（从实盘 bots.json 复制过来的场景），回测会一单不开却毫无提示。
+    // 强制归零并让它保持静默失效，比静默拦死一切要诚实
+    auto bt_cfg = opt.cfg;
+    bt_cfg.htf_day_chg_max  = 0;
+    bt_cfg.htf_week_chg_max = 0;
+    auto bot_id = engine->add_bot(bt_cfg);
     if (bot_id.empty()) return res;
 
     // ── 高周期序列 ──────────────────────────────────────────────────────────

@@ -120,6 +120,14 @@ public:
         double boll_mb = 0;
         double boll_lb = 0;
         double rsi     = 50.0;
+        // 高位涨幅拦截用。相对【前 N 根已收盘K线的收盘价】，不是"本周期开盘至今"——
+        // 后者在每根新K线开出时归零（周线口径下等于每周一闸门失效半天），
+        // 滚动口径任何时刻都是"过去 N 个周期涨了多少"，没有归零窗口。
+        // 币安合约连续交易，本根开盘 == 上根收盘，所以 chg_1 与"今日涨幅"是同一个数。
+        // 历史不足 N 根时保持 0（=不拦），由 chg_ok 区分"真的没涨"和"算不出来"
+        bool   chg_ok  = false;
+        double chg_1   = 0;      // 近 1 根涨幅%
+        double chg_7   = 0;      // 近 7 根涨幅%
     };
     IndicatorSnapshot fetch_indicators(const std::string& symbol, const std::string& interval,
                                         int boll_period, double boll_mult, int rsi_period);
