@@ -438,7 +438,7 @@ void MainWindow::load_and_restore_bots() {
         c.direction    = (CcgConfig::Direction)o["direction"].toInt(0);
         c.budget_usdt  = o["budget_usdt"].toDouble(3000.0);
         c.leverage     = o["leverage"].toInt(3);
-        c.max_entries  = o["max_entries"].toInt(7);
+        c.max_entries  = o["max_entries"].toInt(10);
         c.interval_pct = o["interval_pct"].toDouble(8.0);
         c.trail_entry  = o["trail_entry"].toDouble(1.0);
         c.tp_pct       = o["tp_pct"].toDouble(5.0);
@@ -1772,7 +1772,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     auto* budgetEdit   = mkEdit ("预算USDT:",      prefill ? prefill->cfg.budget_usdt  : 3000.0);
     auto* levEdit      = mkEditI("杠杆:",          prefill ? prefill->cfg.leverage     : 3);
-    auto* maxEntEdit   = mkEditI("最大层:",        prefill ? prefill->cfg.max_entries  : 7);
+    auto* maxEntEdit   = mkEditI("最大层:",        prefill ? prefill->cfg.max_entries  : 10);
     auto* intervalEdit = mkEdit ("间隔%:",         prefill ? prefill->cfg.interval_pct : 8.0);
     auto* trailEntEdit = mkEdit ("追踪建仓%:",     prefill ? prefill->cfg.trail_entry  : 1.0);
     auto* tpEdit       = mkEdit ("止盈%:",         prefill ? prefill->cfg.tp_pct       : 5.0);
@@ -2365,7 +2365,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.direction     = static_cast<CcgConfig::Direction>(dirBox->currentIndex());
     cfg.budget_usdt   = to_d(budgetEdit,   3000.0);
     cfg.leverage      = to_i(levEdit,       3);
-    cfg.max_entries   = to_i(maxEntEdit,    7);
+    cfg.max_entries   = to_i(maxEntEdit,    10);
     cfg.interval_pct  = to_d(intervalEdit,  8.0);
     cfg.trail_entry   = to_d(trailEntEdit,  1.0);
     cfg.tp_pct        = to_d(tpEdit,        5.0);
