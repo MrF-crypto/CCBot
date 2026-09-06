@@ -20,3 +20,10 @@ CMakeUserPresets.json
 # headless 版配置文件/运行时落盘（含真实API Key，不应提交，只提交 config.example.json 模板）
 config.json
 ccbot_state.json
+
+# GUI 版运行时目录：加密凭证、bot配置、成交明细、日志全在这里。
+# 它生成在可执行文件【旁边】，开发时恰好落在 build/ 底下所以一直被忽略——
+# 但那是巧合不是规则：把 Release 包解压到仓库根目录跑一次，data/ 就出现在根目录，
+# 一个 git add -A 就把实盘配置和全部成交推上去。仓库已公开，历史删不掉
+data/
+
