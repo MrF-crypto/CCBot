@@ -2709,6 +2709,29 @@ void MainWindow::onTick() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 最新成交价的小数位数。
+//
+// 首选交易所给的 tick_size（最小价格步长），它是精确答案。但 tick_size 是异步
+// 预取的（见 ensureSymbolInfoAsync），拿不到时传进来是 0。
+// 此处原先写死兜底 2 位小数，后果是：价格低于 $0.01 的币一律显示成 "0.00"，
+// 看起来像行情挂了，其实只是品种精度还没到位——而这个格子 100ms 刷新一次，
+// 若该品种的 symbol_info 始终取不回来，就会永远显示 0。
+// 兜底改成按数量级推，口径与本文件的 fmt_price 一致。
+// tick_size ≥ 1 的情形保持原样（2 位），不在本次修复范围内。
+// ─────────────────────────────────────────────────────────────────────────────
+static QString fmt_tick_px(double p, double tick) {
+    if (p <= 0) return "--";
+    int dp = 2;
+    if (tick > 0 && tick < 1.0) {
+        double t = tick; dp = 0;
+        while (t < 1.0 - 1e-9 && dp < 8) { t *= 10; ++dp; }
+    } else if (tick <= 0) {
+        dp = p >= 100 ? 2 : p >= 1 ? 4 : p >= 0.01 ? 5 : p >= 0.0001 ? 6 : 8;
+    }
+    return QString::number(p, 'f', dp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 100ms 高频刷新：只更新"最新成交价"与"延迟"两列的文本，不touch行/按钮
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshLiveQuotes() {
@@ -2723,15 +2746,6 @@ void MainWindow::refreshLiveQuotes() {
         it->setForeground(c);
         return it;
     };
-    auto fmt_tick = [](double p, double tick) -> QString {
-        if (p <= 0) return "--";
-        int dp = 2;
-        if (tick > 0 && tick < 1.0) {
-            double t = tick; dp = 0;
-            while (t < 1.0 - 1e-9 && dp < 8) { t *= 10; ++dp; }
-        }
-        return QString::number(p, 'f', dp);
-    };
 
     int64_t now_ms = BookTickerStream::now_ms();
 
@@ -2744,7 +2758,7 @@ void MainWindow::refreshLiveQuotes() {
             if (client_->try_get_symbol_info(b.cfg.symbol, info) && info.valid) tick_size = info.tick_size;
             else ensureSymbolInfoAsync(b.cfg.symbol);
         }
-        QString lastPx = (tick.last_price > 0) ? fmt_tick(tick.last_price, tick_size) : "--";
+        QString lastPx = (tick.last_price > 0) ? fmt_tick_px(tick.last_price, tick_size) : "--";
         botTable_->setItem(i, 6, mkc(lastPx, QColor("#e6edf3")));
 
         int64_t latency = (tick.last_price > 0 || tick.valid) ? (now_ms - tick.recv_ms) : -1;
@@ -2837,15 +2851,6 @@ void MainWindow::refreshBotTable() {
                          : QString("$%1").arg(p, 0, 'f', 6);
     };
 
-    auto fmt_tick = [](double p, double tick) -> QString {
-        if (p <= 0) return "--";
-        int dp = 2;
-        if (tick > 0 && tick < 1.0) {
-            double t = tick; dp = 0;
-            while (t < 1.0 - 1e-9 && dp < 8) { t *= 10; ++dp; }
-        }
-        return QString::number(p, 'f', dp);
-    };
 
     int64_t now_ms = BookTickerStream::now_ms();
 
@@ -3053,7 +3058,7 @@ void MainWindow::refreshBotTable() {
             if (client_->try_get_symbol_info(b.cfg.symbol, info) && info.valid) tick_size = info.tick_size;
             else ensureSymbolInfoAsync(b.cfg.symbol);
         }
-        QString lastPx = (tick.last_price > 0) ? fmt_tick(tick.last_price, tick_size) : "--";
+        QString lastPx = (tick.last_price > 0) ? fmt_tick_px(tick.last_price, tick_size) : "--";
         botTable_->setItem(i, 6,  mkc(lastPx, QColor("#e6edf3")));
 
         int64_t latency = (tick.last_price > 0 || tick.valid) ? (now_ms - tick.recv_ms) : -1;
