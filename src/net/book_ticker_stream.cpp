@@ -4,6 +4,7 @@
 #include <chrono>
 #include <algorithm>
 #include <sstream>
+#include <thread>
 
 namespace ccbot {
 
@@ -110,7 +111,7 @@ void BookTickerStream::resubscribe_all() {
     if (to_sub.empty()) return;
 
     // 币安合约 WS 单连接最多 200 条流（1024 是【现货】的数字，别搞混）。
-    // 每品种 3 条流 ⇒ 约 66 个品种到顶。超了要么整条 SUBSCRIBE 被拒、
+    // 每品种 2 条流 ⇒ 100 个品种到顶。超了要么整条 SUBSCRIBE 被拒、
     // 要么连接被断，而两种情况此前都是静默的——所以在这里就说清楚
     if (to_sub.size() > 200) {
         LogCb cb;
@@ -128,8 +129,9 @@ void BookTickerStream::resubscribe_all() {
 // （反过来，将来做全市场扫描时那两条合并流才是对的——总数与品种数无关。）
 std::vector<std::string> BookTickerStream::streams_of(const std::string& symbol) {
     const std::string s = to_lower(symbol);
-    return { s + "@markPrice@1s",   // 标记价：引擎决策、强平距离、界面显示
-             s + "@ticker" };        // 24h 滚动涨幅：高位拦截
+    return { s + "@markPrice@1s",   // 标记价：引擎首选价、强平距离、界面显示
+             s + "@ticker",          // 24h 滚动涨幅：高位拦截
+             s + "@bookTicker" };    // 中间价：markPrice 收不到时的降级价格源
 }
 
 void BookTickerStream::subscribe(const std::string& symbol) {
@@ -157,17 +159,40 @@ void BookTickerStream::unsubscribe(const std::string& symbol) {
 
 void BookTickerStream::send_subs(const std::vector<std::string>& streams, bool sub) {
     if (streams.empty()) return;
-    std::ostringstream params;
-    bool first = true;
-    for (const auto& s : streams) {
-        if (!first) params << ',';
-        params << '"' << s << '"';
-        first = false;
+    // 分批发送。47 个品种 × 2 条流 = 94 个流名塞进一条 SUBSCRIBE，实盘表现为
+    // 【连接成功、服务端不报错、数据永远不来】——而同一套机制在 47 条流
+    // （v4.0.8 只订 bookTicker）时是正常收数据的。唯一的变量就是数量，
+    // 所以按批发，一批 kSubBatch 条。
+    //
+    // 批之间必须留间隔：币安合约 WS 限【每秒 10 条入站消息】，超了直接断连。
+    // 这里跑在 WS 回调线程上，短暂 sleep 不影响下单路径（那在另一个线程池）。
+    const size_t kSubBatch = 20;
+    const char* method = sub ? "SUBSCRIBE" : "UNSUBSCRIBE";
+    size_t sent_batches = 0;
+    for (size_t i = 0; i < streams.size(); i += kSubBatch) {
+        const size_t end = std::min(i + kSubBatch, streams.size());
+        std::ostringstream params;
+        for (size_t k = i; k < end; ++k) {
+            if (k > i) params << ',';
+            params << '"' << streams[k] << '"';
+        }
+        std::string msg = std::string("{\"method\":\"") + method
+                        + "\",\"params\":[" + params.str()
+                        + "],\"id\":" + std::to_string(req_id_++) + "}";
+        auto info = ws_->send(msg);
+        // send 的返回值此前【被丢弃】：发送失败时既没有日志也没有重试，
+        // 表现为"订阅了但没数据"，与订阅被拒完全无法区分
+        if (!info.success) {
+            LogCb cb;
+            { std::lock_guard<std::mutex> lk(mtx_); cb = srv_cb_; }
+            if (cb) cb("行情WS订阅消息发送失败（第 " + std::to_string(sent_batches + 1)
+                       + " 批，" + std::to_string(end - i) + " 条流）");
+        }
+        ++sent_batches;
+        // 每批之间隔 150ms：10 条/秒的限制下，20 条一批也远远够用
+        if (end < streams.size())
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
-    std::string msg = std::string("{\"method\":\"") + (sub ? "SUBSCRIBE" : "UNSUBSCRIBE")
-                    + "\",\"params\":[" + params.str()
-                    + "],\"id\":" + std::to_string(req_id_++) + "}";
-    ws_->send(msg);
 }
 
 // ── 消息解析 ──────────────────────────────────────────────────────────────────
@@ -194,6 +219,7 @@ void BookTickerStream::on_message(const std::string& json) {
         { std::lock_guard<std::mutex> lk(mtx_); cb = srv_cb_; }
         if (cb) cb("行情WS收到首个数据包，订阅生效");
     }
+    last_data_ms_.store(now_ms(), std::memory_order_relaxed);
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -224,6 +250,21 @@ void BookTickerStream::on_message(const std::string& json) {
         c.symbol     = symbol;
         c.mark_price = mp;
         c.mark_ms    = now_ms();
+    } else if (ev == "bookTicker") {
+        // {"e":"bookTicker","s":"BTCUSDT","b":"买一","B":"量","a":"卖一","A":"量"}
+        std::string_view b_sv, a_sv;
+        data["b"].get(b_sv);
+        data["a"].get(a_sv);
+        const double b = safe_stod(b_sv), a = safe_stod(a_sv);
+        // 只有一边有效时中间价会是真实价格的一半——那会让引擎以为价格瞬间腰斩，
+        // 直接触发深层补仓。两边都必须有效才写
+        if (b <= 0 || a <= 0) return;
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& c = cache_[symbol];
+        c.symbol = symbol;
+        c.bid = b; c.ask = a;
+        c.mid = (b + a) / 2.0;
+        c.mid_ms = now_ms();
     } else if (ev == "24hrTicker") {
         // {"e":"24hrTicker","s":"BTCUSDT","P":"<24h涨幅%>","c":"<最新成交价>",...}
         // 只取 P。这条流的其它字段（最新成交价、成交量）目前无人使用——
@@ -259,6 +300,56 @@ double BookTickerStream::mark_price(const std::string& symbol) const {
     // markPrice@1s 每秒一包，10 秒没来就是这条流断了，调用方会转 REST 兜底
     if (now_ms() - t.mark_ms > kStaleMs) return 0.0;
     return t.mark_price;
+}
+
+double BookTickerStream::mid_price(const std::string& symbol) const {
+    auto t = get(symbol);
+    if (t.mid <= 0) return 0.0;
+    // 与标记价同一把尺子。bookTicker 是逐笔推送，10 秒没来就是这条流也断了
+    if (now_ms() - t.mid_ms > kStaleMs) return 0.0;
+    return t.mid;
+}
+
+double BookTickerStream::live_price(const std::string& symbol, PxSrc& out_src) const {
+    // 先标记价：它与强平价、未实现盈亏同体系，是"正确"的那个。
+    // 拿不到才退到中间价——某些链路只放行 bookTicker，那时中间价是
+    // 唯一的实时行情，比退到 REST（47 品种串行、每个约 10 秒一次）好两个数量级
+    if (double p = mark_price(symbol); p > 0) { out_src = PxSrc::Mark; return p; }
+    if (double p = mid_price(symbol);  p > 0) { out_src = PxSrc::Mid;  return p; }
+    out_src = PxSrc::None;
+    return 0.0;
+}
+
+const char* BookTickerStream::px_src_name(PxSrc s) {
+    switch (s) {
+    case PxSrc::Mark: return "标记价(WS)";
+    case PxSrc::Mid:  return "中间价(WS bookTicker)";
+    default:          return "REST兜底";
+    }
+}
+
+std::string BookTickerStream::silence_check(int64_t quiet_ms) {
+    if (!running_.load()) return {};
+    if (!connected_.load()) return {};           // 没连上是另一回事，Close/Error 已有日志
+    const int64_t last = last_data_ms_.load(std::memory_order_relaxed);
+    size_t n = 0;
+    { std::lock_guard<std::mutex> lk(mtx_); n = streams_.size(); }
+    if (n == 0) return {};                        // 没订阅任何流，静默是正常的
+
+    if (last == 0) {
+        // 连上之后一个包都没来过——最凶险的一种：三个"正常"信号加起来仍是完全静默
+        if (silence_warned_.exchange(true)) return {};
+        return "⚠ 行情WS已连接且已发出 " + std::to_string(n) +
+               " 条流的订阅，但至今【一个数据包都没收到】。"
+               "策略会退化到 REST 兜底（更慢、更耗权重），24h 涨幅等推送专属数据可能缺失。";
+    }
+    const int64_t age = now_ms() - last;
+    if (age > quiet_ms) {
+        if (silence_warned_.exchange(true)) return {};
+        return "⚠ 行情WS已 " + std::to_string(age / 1000) + " 秒没有收到任何数据包（连接仍显示已建立）";
+    }
+    silence_warned_.store(false);                 // 恢复了就重新武装，下次静默还会报
+    return {};
 }
 
 void BookTickerStream::set_mark_price(const std::string& symbol, double price) {
