@@ -11,6 +11,7 @@
 // ─── Windows: DPAPI ───────────────────────────────────────────────────────────
 #include <windows.h>
 #include <wincrypt.h>   // CryptProtectData / CryptUnprotectData (crypt32.lib)
+#include <filesystem>
 #include <fstream>
 #include <vector>
 
@@ -52,10 +53,33 @@ static std::string dpapi_dec(const std::vector<uint8_t>& data) {
     return s;
 }
 
+// 凭证落盘。两条都不是可有可无的：
+//
+// ① 原子写。原先直接 trunc 目标文件再写——中途崩溃/断电会留下一个空的或
+//    半截的凭证文件，而它是【已经加密的二进制】，损坏后无法人工修复，
+//    用户只能重新录入 API Key。GUI 的三处落盘早就用 QSaveFile 做了原子保存，
+//    headless 状态用 tmp+rename，唯独最不该丢的这个文件没做。
+//
+// ② 检查写是否真的成功。原先 f.write() 之后无条件 return true：磁盘满、
+//    权限不足、路径被占用，一律报告"保存成功"而实际什么都没写进去。
+//    对凭证来说这意味着用户以为存好了，下次启动却要重新录入——
+//    更糟的是若此时旧文件已被 trunc 清空，连回退都没有
 static bool write_blob(const std::string& path, const std::vector<uint8_t>& enc) {
-    std::ofstream f(utf8_to_wide(path), std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    f.write((char*)enc.data(), (std::streamsize)enc.size());
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(utf8_to_wide(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f.write((const char*)enc.data(), (std::streamsize)enc.size());
+        f.flush();
+        if (!f) {                       // 写失败/磁盘满，此时目标文件还没被动过
+            f.close();
+            std::error_code ec; std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }                                    // 析构 → 关闭，确保数据落到文件系统再改名
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);   // 两平台都是覆盖式改名
+    if (ec) { std::filesystem::remove(tmp, ec); return false; }
     return true;
 }
 
@@ -143,13 +167,29 @@ static bool backend_load(std::string& plain, const std::string& /*path*/) {
 #else
 // ─── 其他平台：明文文件兜底（仅为编译完整性，GUI 不在这些平台发布）────────────
 #include <fstream>
+#include <filesystem>
 
 namespace ccbot {
 
+// 同 Windows 分支：原子写 + 检查写是否成功。
+// 这个分支只为编译完整性存在（GUI 不在这些平台发布），但错误的成功返回值
+// 会误导任何将来在这里排查问题的人，不能因为"用不到"就留个坑
 static bool backend_save(const std::string& plain, const std::string& path) {
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    f.write(plain.data(), (std::streamsize)plain.size());
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f.write(plain.data(), (std::streamsize)plain.size());
+        f.flush();
+        if (!f) {
+            f.close();
+            std::error_code ec; std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) { std::filesystem::remove(tmp, ec); return false; }
     return true;
 }
 
