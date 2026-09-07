@@ -101,6 +101,9 @@ void save_headless_state(const std::string& path, const std::vector<CcgBot>& bot
            << "\"full_layer_secs\":" << b.full_layer_secs << ","
            << "\"alive_secs\":"    << b.alive_secs << ","
            << "\"cooldown_until_ms\":" << tp_to_ms(b.cooldown_until) << ","
+           // 出场价记忆要跨进程重启存活，否则 VPS 上每次重启都会忘掉"刚在山顶卖过"
+           << "\"last_tp_price\":"  << b.last_tp_price << ","
+           << "\"last_tp_time_ms\":" << tp_to_ms(b.last_tp_time) << ","
            << "\"disaster_stop_id\":\"" << b.disaster_stop_id << "\","
            << "\"disaster_stop_price\":" << b.disaster_stop_price << ","
            << "\"entries\":[";
@@ -191,6 +194,8 @@ std::vector<CcgBot> load_headless_state(const std::string& path, const std::vect
         bot.full_layer_secs   = (int64_t)get_num(o, "full_layer_secs", 0.0);
         bot.alive_secs        = (int64_t)get_num(o, "alive_secs", 0.0);
         bot.cooldown_until    = ms_to_tp((int64_t)get_num(o, "cooldown_until_ms", 0.0));
+        bot.last_tp_price     = get_num(o, "last_tp_price", 0.0);
+        bot.last_tp_time      = ms_to_tp((int64_t)get_num(o, "last_tp_time_ms", 0.0));
         bot.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
         bot.disaster_stop_price = get_num(o, "disaster_stop_price", 0.0);
 

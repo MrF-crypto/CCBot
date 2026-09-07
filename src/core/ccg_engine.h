@@ -79,6 +79,24 @@ struct CcgConfig {
     double      trail_entry  = 1.0;      // 追踪建仓 %（动态W模式下不生效）
     double      tp_pct       = 5.0;      // 整体止盈 %（动态W模式下不生效）
     double      trail_tp     = 2.0;      // 追踪止盈 %（动态W模式下不生效）
+    // ── 出场价记忆：止盈后不在原地把仓位买回来（v4.0.8）──────────────────────
+    // 其余所有高位闸门都是【无记忆的相对指标】，会随时间衰减到失效：
+    //   日涨幅  1 根日线后归零
+    //   7日涨幅 7 根日线后归零
+    //   日线%B  约 18 根日线后回落到 0.60 以下（均线爬上来了）
+    // 币爆拉一波、止盈出场、然后横在高位——上面三条最终【全部放行】，机器人
+    // 会在山顶重新开首仓。它们只认价格序列的形状，不认价位本身。
+    //
+    // 这一条是唯一的绝对参照：记住上次止盈的出场价，要求现价比它低够了才准重开。
+    // 做空镜像（要求现价比出场价【高】够了）。
+    //
+    // 只记【追踪止盈】。硬止损/结构止损/手动平仓都不记：
+    //   止损出场说明判断错了，此时锁死重入等于把亏损凝固；
+    //   手动平仓是用户的主动决定，不该反过来约束用户下一步
+    double      reentry_drawdown_pct = 0;    // 0=关；现价须 ≤ 出场价×(1−此值%)
+    // 过期：一个再也回不去的价位会把 bot 永久锁死（埋伏型策略尤其致命——
+    // 蹲了几个月就为这一波，结果永远等不到回撤）。0=永不过期
+    int         reentry_memory_days  = 30;
     bool        auto_restart  = true;
     int         cooldown_secs = 300;     // 回测用值；60秒在高位区会立刻回补
     double      stop_loss_pct = 0.0;   // 均价跌幅超过此值强制平仓（0=禁用）
@@ -585,6 +603,11 @@ struct CcgBot {
 
     std::chrono::system_clock::time_point start_time;
     std::chrono::system_clock::time_point cooldown_until;
+    // 出场价记忆（只在【追踪止盈】全量平仓时写入）。0=无记忆。
+    // 用 wall clock 而不是 steady：它要跨进程重启存进 bots.json，
+    // steady_clock 的原点每次启动都变，存下来毫无意义
+    double last_tp_price = 0;
+    std::chrono::system_clock::time_point last_tp_time{};
     // last_action 同时是【日志去重键】：只有它变了才打新日志。所以它必须是稳定的
     // 短字符串，不能塞进带实时数字的详情——否则每个 tick 都不相等，日志会 3 秒刷一条
     std::string last_action;

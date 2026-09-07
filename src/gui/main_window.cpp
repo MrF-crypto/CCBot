@@ -336,6 +336,8 @@ void MainWindow::save_bots() {
         o["trail_tp"]     = c.trail_tp;
         o["auto_restart"] = c.auto_restart;
         o["cooldown_secs"]= c.cooldown_secs;
+        o["reentry_drawdown_pct"] = c.reentry_drawdown_pct;
+        o["reentry_memory_days"]  = c.reentry_memory_days;
         o["stop_loss_pct"]= c.stop_loss_pct;
         o["use_disaster_stop"] = c.use_disaster_stop;
         o["disaster_stop_pct"] = c.disaster_stop_pct;
@@ -395,6 +397,10 @@ void MainWindow::save_bots() {
         o["full_layer_secs"]   = (double)b.full_layer_secs;
         o["alive_secs"]        = (double)b.alive_secs;
         o["cooldown_until_ms"] = tp_to_ms(b.cooldown_until);
+        // 出场价记忆随 bot 落盘：不存的话程序一重启记忆就没了，
+        // 而"止盈后别在山顶重开"恰恰是要跨重启生效的
+        o["last_tp_price"]     = b.last_tp_price;
+        o["last_tp_time_ms"]   = tp_to_ms(b.last_tp_time);
         // 交易所侧灾难止损单号：重启后据此撤掉旧单再按当前均价重挂
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
         o["disaster_stop_price"] = b.disaster_stop_price;
@@ -445,6 +451,10 @@ void MainWindow::load_and_restore_bots() {
         c.trail_tp     = o["trail_tp"].toDouble(2.0);
         c.auto_restart = o["auto_restart"].toBool(true);
         c.cooldown_secs= o["cooldown_secs"].toInt(300);
+        // 兜底 0=关：老 bots.json 没有这个键，兜成非零等于给正在跑的策略
+        // 悄悄加了一道闸门（同 v4.0.6 固定间隔、v4.0.7 涨幅拦截的处理）
+        c.reentry_drawdown_pct = o["reentry_drawdown_pct"].toDouble(0.0);
+        c.reentry_memory_days  = o["reentry_memory_days"].toInt(30);
         c.stop_loss_pct= o["stop_loss_pct"].toDouble(0.0);
         c.use_disaster_stop = o["use_disaster_stop"].toBool(false);
         c.disaster_stop_pct = o["disaster_stop_pct"].toDouble(30.0);
@@ -519,6 +529,8 @@ void MainWindow::load_and_restore_bots() {
         bot.full_layer_secs   = (int64_t)o["full_layer_secs"].toDouble();
         bot.alive_secs        = (int64_t)o["alive_secs"].toDouble();
         bot.cooldown_until    = ms_to_tp((qint64)o["cooldown_until_ms"].toDouble());
+        bot.last_tp_price     = o["last_tp_price"].toDouble(0.0);
+        bot.last_tp_time      = ms_to_tp((qint64)o["last_tp_time_ms"].toDouble());
         bot.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
         bot.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         for (const auto& ev : o["entries"].toArray()) {
@@ -1804,6 +1816,23 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
     addCheck(form, autoRestartBox);
 
+    auto* reentryDdEdit = mkEdit ("止盈后重开需回撤%（0=关）:",
+                                  prefill ? prefill->cfg.reentry_drawdown_pct : 0.0);
+    auto* reentryDayEdit = mkEditI("上述记忆过期天数（0=永不）:",
+                                  prefill ? prefill->cfg.reentry_memory_days : 30);
+    addHint(form,
+            "解决的是：币爆拉一波、止盈出场，然后机器人在山顶重新开首仓。\n"
+            "填 15 = 现价必须回到上次止盈价的 85% 以下才准重开（做空镜像）。\n\n"
+            "为什么别的闸门挡不住——它们都是无记忆的相对指标，会衰减到失效：\n"
+            "  日涨幅   1 根日线后归零\n"
+            "  7日涨幅  7 根日线后归零\n"
+            "  日线%B   约 18 根日线后回落到 0.60 以下（均线爬上来了）\n"
+            "币横在高位不动，上面三条最终全部放行。这一条是唯一的绝对参照。\n\n"
+            "只记【追踪止盈】：止损出场说明判断错了，锁死重入等于把亏损凝固；\n"
+            "手动平仓是你的主动决定，不该反过来约束你下一步。\n"
+            "过期天数是必要的——一个再也回不去的价位会把 bot 永久锁死。\n"
+            "记忆随 bot 存盘，程序重启后仍然生效。");
+
     auto* entryModeBox = new QComboBox();
     entryModeBox->addItem("立即开仓（一开监控就开首仓）");
     entryModeBox->addItem("指标信号（BOLL+RSI 满足才开首仓）");
@@ -2372,6 +2401,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.trail_tp      = to_d(trailTpEdit,   2.0);
     cfg.auto_restart  = autoRestartBox->isChecked();
     cfg.cooldown_secs = to_i(cooldownEdit,  300);
+    cfg.reentry_drawdown_pct = to_d(reentryDdEdit,  0.0);
+    cfg.reentry_memory_days  = to_i(reentryDayEdit, 30);
     cfg.stop_loss_pct = to_d(stopLossEdit,  0.0);
     cfg.use_disaster_stop = disStopBox->isChecked();
     cfg.disaster_stop_pct = to_d(disStopEdit, 30.0);

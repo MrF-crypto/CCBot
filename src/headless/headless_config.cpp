@@ -91,6 +91,8 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.trail_tp      = get_num(bo, "trail_tp", c.trail_tp);
     c.auto_restart  = get_bool(bo, "auto_restart", c.auto_restart);
     c.cooldown_secs = (int)get_num(bo, "cooldown_secs", c.cooldown_secs);
+    c.reentry_drawdown_pct = get_num(bo, "reentry_drawdown_pct", c.reentry_drawdown_pct);
+    c.reentry_memory_days  = (int)get_num(bo, "reentry_memory_days", c.reentry_memory_days);
     c.stop_loss_pct = get_num(bo, "stop_loss_pct", c.stop_loss_pct);
     c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
     c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
@@ -217,7 +219,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     static const std::set<std::string> known_keys = {
         "symbol", "direction", "strat_type", "budget_usdt", "leverage", "max_entries",
         "interval_pct", "trail_entry", "tp_pct", "trail_tp", "auto_restart",
-        "cooldown_secs", "stop_loss_pct", "use_disaster_stop", "disaster_stop_pct",
+        "cooldown_secs", "reentry_drawdown_pct", "reentry_memory_days",
+        "stop_loss_pct", "use_disaster_stop", "disaster_stop_pct",
         "entry_mode", "kline_interval",
         "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
         "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",

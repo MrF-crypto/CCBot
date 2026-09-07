@@ -627,6 +627,118 @@ static void test_adopted_position_survives_cooldown() {
     }
 }
 
+// ── 出场价记忆（v4.0.8）──────────────────────────────────────────────────────
+// 场景：币爆拉、止盈出场、横在高位。其余高位闸门全是无记忆的相对指标，最终
+// 都会放行让 bot 在山顶重新开首仓。这条是唯一不衰减的绝对参照。
+// 把 bot 驱动到止盈：建仓100 → 冲106（激活追踪）→ 回落102（跌破103.88触发）
+static void drive_to_tp(CcgEngine& eng, FakeClient& fc, int64_t& vnow) {
+    fc.next_fill_price = 100.0;
+    eng.tick("BTCUSDT", 100.0);
+    fc.next_fill_price = 106.0;
+    vnow += 3000; eng.tick("BTCUSDT", 106.0);
+    fc.next_fill_price = 102.0;
+    vnow += 3000; eng.tick("BTCUSDT", 102.0);
+}
+
+static void test_reentry_price_memory() {
+    std::printf("\n── 用例：止盈后的出场价记忆 ──\n");
+    // ① 止盈记价，高位不准重开，跌够了才放行
+    {
+        int64_t vnow = 1'700'000'000'000LL;
+        auto fc = std::make_shared<FakeClient>();
+        CcgEngine eng(fc, make_host(vnow));
+        CcgConfig c = base_cfg();
+        c.auto_restart = true; c.cooldown_secs = 60;
+        c.reentry_drawdown_pct = 15.0;      // 需回撤到出场价 85% 以下
+        c.reentry_memory_days  = 30;
+        eng.add_bot(c);
+
+        drive_to_tp(eng, *fc, vnow);
+        const double tp_px = eng.get_bots()[0].last_tp_price;
+        check(std::fabs(tp_px - 102.0) < 1e-6,
+              "止盈出场价被记住（期望102，实际 " + std::to_string(tp_px) + "）");
+
+        // 冷却结束后在高位反复 tick：一单都不该开
+        vnow += 120'000;
+        const int orders_before = fc->market_orders;
+        for (double p : {101.0, 99.0, 95.0, 88.0}) {   // 88 仍高于 102×0.85=86.7
+            fc->next_fill_price = p;
+            vnow += 3000; eng.tick("BTCUSDT", p);
+        }
+        check(fc->market_orders == orders_before,
+              "  回撤不足（最低88 > 86.7）期间一单未开");
+        check(eng.get_bots()[0].last_action == "距上次止盈价回撤不足，暂不重开",
+              "  拦截原因写进了 last_action");
+
+        // 跌破 86.7 → 放行
+        fc->next_fill_price = 86.0;
+        vnow += 3000; eng.tick("BTCUSDT", 86.0);
+        check(fc->market_orders > orders_before, "  跌到86（< 86.7）后重新开首仓");
+    }
+
+    // ② 记忆过期：一个再也回不去的价位不能把 bot 永久锁死
+    {
+        int64_t vnow = 1'700'000'000'000LL;
+        auto fc = std::make_shared<FakeClient>();
+        CcgEngine eng(fc, make_host(vnow));
+        CcgConfig c = base_cfg();
+        c.auto_restart = true; c.cooldown_secs = 60;
+        c.reentry_drawdown_pct = 15.0;
+        c.reentry_memory_days  = 30;
+        eng.add_bot(c);
+
+        drive_to_tp(eng, *fc, vnow);
+        vnow += 120'000;
+        const int orders_before = fc->market_orders;
+        fc->next_fill_price = 101.0;
+        vnow += 3000; eng.tick("BTCUSDT", 101.0);
+        check(fc->market_orders == orders_before, "过期前：101 被拦住");
+
+        vnow += 31LL * 24 * 3600 * 1000;   // 推进 31 天
+        fc->next_fill_price = 101.0;
+        eng.tick("BTCUSDT", 101.0);
+        check(fc->market_orders > orders_before, "  31天后记忆过期，同样的101放行");
+        check(eng.get_bots()[0].last_tp_price == 0.0, "  过期后记忆被清零");
+    }
+
+    // ③ 只记追踪止盈：硬止损出场不该锁死重入（那等于把亏损凝固）
+    {
+        int64_t vnow = 1'700'000'000'000LL;
+        auto fc = std::make_shared<FakeClient>();
+        CcgEngine eng(fc, make_host(vnow));
+        CcgConfig c = base_cfg();
+        c.auto_restart = true; c.cooldown_secs = 60;
+        c.reentry_drawdown_pct = 15.0;
+        c.stop_loss_pct = 10.0;             // 跌 10% 硬止损
+        eng.add_bot(c);
+
+        fc->next_fill_price = 100.0;
+        eng.tick("BTCUSDT", 100.0);
+        fc->next_fill_price = 88.0;
+        vnow += 3000; eng.tick("BTCUSDT", 88.0);   // 跌破 90 → 硬止损
+        check(eng.get_bots()[0].last_tp_price == 0.0,
+              "硬止损出场【不】记价（记了等于把亏损凝固）");
+    }
+
+    // ④ 0 = 关：记忆照记，但不拦
+    {
+        int64_t vnow = 1'700'000'000'000LL;
+        auto fc = std::make_shared<FakeClient>();
+        CcgEngine eng(fc, make_host(vnow));
+        CcgConfig c = base_cfg();
+        c.auto_restart = true; c.cooldown_secs = 60;
+        c.reentry_drawdown_pct = 0.0;       // 关
+        eng.add_bot(c);
+
+        drive_to_tp(eng, *fc, vnow);
+        vnow += 120'000;
+        const int orders_before = fc->market_orders;
+        fc->next_fill_price = 101.0;
+        vnow += 3000; eng.tick("BTCUSDT", 101.0);
+        check(fc->market_orders > orders_before, "阈值0=关：高位照样重开（保持旧行为）");
+    }
+}
+
 // ── 宏观涨幅拦截（v4.0.7）────────────────────────────────────────────────────
 // decision::evaluate 是纯函数，直接喂值验证，不用起引擎。
 // 覆盖四件事：阈值方向、做空镜像、0=关、以及"算不出涨幅"在 strict 下不被
@@ -692,6 +804,7 @@ static void test_htf_change_gates() {
 }
 
 int main() {
+    test_reentry_price_memory();
     test_htf_change_gates();
     test_dca_margin_cap();
     test_adopted_position_survives_cooldown();
