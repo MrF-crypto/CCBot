@@ -179,8 +179,14 @@ int main() {
         check(got.size() == 1 && got[0].find("Invalid request") != std::string::npos,
               "订阅被拒会上报（v4.0.9 查不出根因的直接原因）");
 
+        // 首包会发一条"订阅生效"，这是有意的：它把"没连上/订阅没生效/数据在流"
+        // 三种情况区分开——此前三者在日志里长得一模一样（都是什么都没有）
         ts3.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "100.0"));
-        check(got.size() == 1, "  数据包不触发服务端消息回调");
+        check(got.size() == 2 && got[1].find("首个数据包") != std::string::npos,
+              "  首个数据包提示订阅生效");
+        ts3.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "101.0"));
+        ts3.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "102.0"));
+        check(got.size() == 2, "  后续数据包不再重复提示（只报一次）");
     }
 
     // ── ⑫ 订阅生命周期：退订必须真的收缩 ────────────────────────────────────

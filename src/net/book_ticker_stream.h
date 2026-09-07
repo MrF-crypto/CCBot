@@ -116,6 +116,7 @@ private:
     std::atomic<bool> running_  {false};
     std::atomic<bool> connected_{false};
     std::atomic<int>  req_id_   {1};
+    std::atomic<bool> first_data_seen_{false};   // 首包只提示一次
 
     mutable std::mutex                    mtx_;
     std::set<std::string>                 streams_;   // lowercase "btcusdt@markPrice@1s"

@@ -170,6 +170,16 @@ public:
     };
     PremiumInfo fetch_premium(const std::string& symbol);
 
+    // 全市场 24 小时滚动涨幅（symbol → priceChangePercent）。
+    // 不带 symbol 参数的 /fapi/v1/ticker/24hr 一次返回【全部】合约，权重 40——
+    // 逐品种查是权重 1×N，47 个品种就是 47，而且要 47 次往返；一次全取反而更省。
+    //
+    // 存在的理由：24h 涨幅原本只有 @ticker 推送流一个来源，是全系统唯一【没有
+    // REST 兜底】的数据。WebSocket 一旦不推（连不上/订阅没生效/网络中断），
+    // 高位拦截在 strict 下就永久拦死，一单也开不出来。其余数据都有兜底，
+    // 所以这条恰恰是唯一会把 WS 故障暴露出来的——也是唯一会被它拖死的
+    std::unordered_map<std::string, double> fetch_all_24h_changes();
+
     // 历史资金费流水。income 带符号，负数=你付出去的。
     // 币安不带时间范围时只返回最近7天，所以补历史要按7天窗口分页（见 funding_ledger）
     struct FundingRecord {

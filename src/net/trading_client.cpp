@@ -1370,6 +1370,32 @@ std::vector<TradingClient::Bar> TradingClient::fetch_bars(
     return fetch_klines(sym, interval, limit);
 }
 
+std::unordered_map<std::string, double> TradingClient::fetch_all_24h_changes() {
+    std::unordered_map<std::string, double> out;
+    // 不带 symbol = 全市场一次取回（权重 40）。逐品种是 1×N 权重 + N 次往返，
+    // 品种一多反而更贵
+    auto resp = http_get_public("/fapi/v1/ticker/24hr");
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    if (doc.get(arr) != simdjson::SUCCESS) return out;
+    for (auto e : arr) {
+        std::string_view sym, pct;
+        if (e["symbol"].get(sym) != simdjson::SUCCESS) continue;
+        if (e["priceChangePercent"].get(pct) != simdjson::SUCCESS) continue;
+        // 涨幅可以合法地为 0 或负数，不能像价格那样用 >0 判合法，
+        // 所以只要字段在就收下
+        if (pct.empty()) continue;
+        double v = 0;
+        try { v = std::stod(std::string(pct)); } catch (...) { continue; }
+        out.emplace(std::string(sym), v);
+    }
+    return out;
+}
+
 TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) {
     PremiumInfo info;
     auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + sym);

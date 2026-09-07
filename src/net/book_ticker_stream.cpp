@@ -48,15 +48,36 @@ void BookTickerStream::start() {
     ws_->enableAutomaticReconnection();
     ws_->setMaxWaitBetweenReconnectionRetries(3000);
 
-    ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+    // 连接状态此前【完全不可见】：既没日志也没界面展示。
+    // 后果是行情不来时无从判断是"没连上/订阅没生效/数据没来"三者中的哪一种，
+    // 而三者的修法完全不同。更糟的是标记价有 REST 兜底、日线走 REST，
+    // WS 死了也照常有价——唯独 24h 涨幅没有兜底，于是只有它会暴露问题，
+    // 却又被误读成"这一条数据有问题"
+    auto say = [this](const std::string& m) {
+        LogCb cb;
+        { std::lock_guard<std::mutex> lk(mtx_); cb = srv_cb_; }
+        if (cb) cb(m);
+    };
+
+    ws_->setOnMessageCallback([this, say](const ix::WebSocketMessagePtr& msg) {
         switch (msg->type) {
-        case ix::WebSocketMessageType::Open:
+        case ix::WebSocketMessageType::Open: {
             connected_.store(true);
+            size_t n = 0;
+            { std::lock_guard<std::mutex> lk(mtx_); n = streams_.size(); }
+            say("行情WS已连接，正在订阅 " + std::to_string(n) + " 条流（"
+                + std::to_string(n / 2) + " 个品种 × 2）");
             on_open();
             break;
+        }
         case ix::WebSocketMessageType::Close:
+            connected_.store(false);
+            say("行情WS连接已断开（会自动重连）");
+            break;
         case ix::WebSocketMessageType::Error:
             connected_.store(false);
+            say("行情WS连接错误: " + msg->errorInfo.reason
+                + "（HTTP " + std::to_string(msg->errorInfo.http_status) + "）");
             break;
         case ix::WebSocketMessageType::Message:
             on_message(msg->str);
@@ -163,6 +184,16 @@ void BookTickerStream::on_message(const std::string& json) {
         return;
     }
     if (json.size() < 20) return;
+
+    // 首包提示（只发一次）。有了它，"WS已连接"之后到底有没有数据就一目了然：
+    //   有"已连接"没"首包"  → 订阅没生效
+    //   连"已连接"都没有     → 压根没连上
+    //   两条都有             → 数据在流，问题在别处
+    if (!first_data_seen_.exchange(true)) {
+        LogCb cb;
+        { std::lock_guard<std::mutex> lk(mtx_); cb = srv_cb_; }
+        if (cb) cb("行情WS收到首个数据包，订阅生效");
+    }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;

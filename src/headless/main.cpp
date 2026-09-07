@@ -24,6 +24,7 @@
 #include <ctime>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <cmath>
 #include <filesystem>
 
@@ -246,6 +247,10 @@ int main(int argc, char** argv) {
         engine->resync_disaster_stops();
     }
 
+    // 24h 涨幅的 REST 兜底缓存（全市场一次取回，90 秒有效期）
+    std::unordered_map<std::string, double> chg24_rest;
+    int64_t chg24_rest_ms = 0;
+
     BookTickerStream ticker(cfg.testnet);
     // 订阅被拒等服务端消息此前静默丢弃：VPS 上没有界面，这类问题只能靠日志发现
     ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
@@ -333,14 +338,33 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ── 1b) 24h 滚动涨幅：读 @ticker 推送缓存，零请求，所以每 tick 都喂
+        // ── 1b) 24h 滚动涨幅：优先读 @ticker 推送缓存（零请求），
+        //     推送流不可用时回落到全市场 REST 快照。
+        //     这条数据原本是全系统【唯一没有兜底】的：WS 一断，高位拦截在
+        //     strict 下永久拦死，一单也开不出来
         {
+            bool need_rest_chg = false;
             for (const auto& b : engine->get_bots()) {
                 if (b.state == CcgBot::State::Stopped) continue;
                 if (b.cfg.htf_24h_chg_max <= 0) continue;
                 double pct = 0;
-                const bool ok = ticker.change_24h(b.cfg.symbol, pct);
+                bool ok = ticker.change_24h(b.cfg.symbol, pct);
+                if (!ok) {
+                    auto it = chg24_rest.find(b.cfg.symbol);
+                    if (it != chg24_rest.end() &&
+                        BookTickerStream::now_ms() - chg24_rest_ms < 90000) {
+                        pct = it->second; ok = true;
+                    } else {
+                        need_rest_chg = true;
+                    }
+                }
                 engine->update_24h_change(b.bot_id, ok, pct);
+            }
+            // 全市场一次取回（权重 40），不是逐品种——品种一多逐个查
+            // 既费往返又费权重。同步调用即可：90 秒才会真正触发一次
+            if (need_rest_chg) {
+                auto m = client->fetch_all_24h_changes();
+                if (!m.empty()) { chg24_rest = std::move(m); chg24_rest_ms = BookTickerStream::now_ms(); }
             }
         }
 

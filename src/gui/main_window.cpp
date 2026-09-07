@@ -2714,12 +2714,42 @@ void MainWindow::onTick() {
     // 所以每个 tick 都喂，不必搭 5 分钟那班车。@ticker 每秒推一次，
     // 让引擎拿到的始终是最新值
     if (ticker_) {
+        bool need_rest_chg = false;
         for (const auto& b : bots) {
             if (b.state == CcgBot::State::Stopped) continue;
             if (b.cfg.htf_24h_chg_max <= 0) continue;
             double pct = 0;
-            const bool ok = ticker_->change_24h(b.cfg.symbol, pct);
+            bool ok = ticker_->change_24h(b.cfg.symbol, pct);
+            if (!ok) {
+                // 推送流没到 → 用 REST 兜底的那份缓存。
+                // 24h 涨幅原本是全系统【唯一没有兜底】的数据：WS 一断，
+                // 高位拦截在 strict 下永久拦死，一单也开不出来。而其余数据
+                // （标记价、日线指标）都有 REST 兜底，所以 WS 故障只会从这一条
+                // 冒出来，还容易被误读成"这条数据本身有问题"
+                std::lock_guard<std::mutex> lk(chg24Mtx_);
+                auto it = chg24Rest_.find(b.cfg.symbol);
+                // 全市场快照 90 秒内有效：24h 涨幅是慢变量，这个新鲜度足够
+                if (it != chg24Rest_.end() &&
+                    BookTickerStream::now_ms() - chg24RestMs_ < 90000) {
+                    pct = it->second; ok = true;
+                } else {
+                    need_rest_chg = true;
+                }
+            }
             engine_->update_24h_change(b.bot_id, ok, pct);
+        }
+        // 一次 REST 拿回全市场（权重 40），不是逐品种——47 个品种逐个查是
+        // 47 次往返，而全取只要 1 次，权重也更省
+        if (need_rest_chg && client_ && !chg24FetchBusy_.exchange(true)) {
+            run_async([this]() {
+                auto m = client_->fetch_all_24h_changes();
+                if (!m.empty()) {
+                    std::lock_guard<std::mutex> lk(chg24Mtx_);
+                    chg24Rest_   = std::move(m);
+                    chg24RestMs_ = BookTickerStream::now_ms();
+                }
+                chg24FetchBusy_.store(false);
+            });
         }
     }
 
@@ -2786,6 +2816,14 @@ void MainWindow::onTick() {
 
     if (need_rest.empty()) { refreshBotTable(); return; }
 
+    // 防重入：这一批是【串行】遍历所有缺价的品种，47 个品种要跑几十秒，
+    // 而引擎 tick 是 3 秒一次。没有这道闸的话每 3 秒就再投递一批，
+    // 任务在只有 4 个线程的 fetchPool_ 里无限堆积——而高周期指标拉取用的是
+    // 同一个池，会被直接饿死，表现为"%B 永远缺失、一单开不出来"。
+    // WS 正常时 need_rest 基本为空，这条路径根本走不到；一旦 WS 断了，
+    // 品种数越多雪崩得越快，恰恰是最需要它撑住的时候
+    if (restFetchBusy_.exchange(true)) { refreshBotTable(); return; }
+
     run_async([this, need_rest = std::move(need_rest)]() {
         for (const auto& sym : need_rest) {
             double price = client_->fetch_mark_price(sym);
@@ -2796,6 +2834,7 @@ void MainWindow::onTick() {
                 if (ticker_) ticker_->set_mark_price(sym, price);
             }
         }
+        restFetchBusy_.store(false);
         QMetaObject::invokeMethod(this, [this]() { refreshBotTable(); },
                                   Qt::QueuedConnection);
     });

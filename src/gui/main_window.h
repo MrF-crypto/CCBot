@@ -200,6 +200,14 @@ private:
     // 拉取队列无限增长——弹窗预览等一次性任务被排到队尾永远轮不到
     std::atomic<bool> indFetchBusy_{false};
     std::atomic<bool> trendFetchBusy_{false};
+    // REST 价格兜底的防重入。串行遍历全部缺价品种，品种一多远超 3 秒的 tick 周期，
+    // 没有这道闸会在 fetchPool_ 里无限堆积并饿死高周期指标拉取
+    std::atomic<bool> restFetchBusy_{false};
+    // 24h 涨幅的 REST 兜底：全市场一次取回，缓存到下一轮
+    std::atomic<bool> chg24FetchBusy_{false};
+    std::unordered_map<std::string, double> chg24Rest_;
+    std::mutex        chg24Mtx_;
+    int64_t           chg24RestMs_ = 0;
     std::atomic<bool> srFetchBusy_{false};
     std::atomic<bool> accFetchBusy_{false};
     std::atomic<bool> posFetchBusy_{false};
