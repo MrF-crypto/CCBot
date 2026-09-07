@@ -2763,26 +2763,38 @@ void MainWindow::onTick() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 最新成交价的小数位数。
+// 价格的小数位数。取【tick_size 推的位数】与【价格数量级需要的位数】的较大者。
 //
-// 首选交易所给的 tick_size（最小价格步长），它是精确答案。但 tick_size 是异步
-// 预取的（见 ensureSymbolInfoAsync），拿不到时传进来是 0。
-// 此处原先写死兜底 2 位小数，后果是：价格低于 $0.01 的币一律显示成 "0.00"，
-// 看起来像行情挂了，其实只是品种精度还没到位——而这个格子 100ms 刷新一次，
-// 若该品种的 symbol_info 始终取不回来，就会永远显示 0。
-// 兜底改成按数量级推，口径与本文件的 fmt_price 一致。
-// tick_size ≥ 1 的情形保持原样（2 位），不在本次修复范围内。
+// 为什么不能只信 tick_size：它是精确答案，但有两种拿不到正确值的情况，而且
+// 第二种是【静默】的——
+//   ① 异步预取还没回来（见 ensureSymbolInfoAsync），传进来是 0
+//   ② SymbolInfo::tick_size 的默认值是 0.01，而 info.valid 只取决于 LOT_SIZE
+//      （trading_client.cpp: info.valid = lot_found）。PRICE_FILTER 没解析到时
+//      valid 照样为真，tick_size 就静默停在 0.01 —— 推出 dp=2
+// 两种情况下 0.001 都会显示成 "0.00"，看着像行情挂了。v4.0.7 只修了 ①。
+//
+// 取 max 之后无论 tick_size 是缺失、正确还是错误，显示都不会丢掉有效数字：
+//   ETH  3000  tick 0.01     → max(2, 2) = 2  "3000.00"    尊重 tick
+//   某币 0.001 tick 0.0000001→ max(7, 6) = 7  "0.0010000"  尊重 tick
+//   某币 0.001 tick 0.01(错) → max(2, 5) = 5  "0.00100"    数量级兜住
 // ─────────────────────────────────────────────────────────────────────────────
+static int price_decimals(double p, double tick) {
+    int dp_tick = 2;
+    if (tick > 0 && tick < 1.0) {
+        double t = tick; dp_tick = 0;
+        while (t < 1.0 - 1e-9 && dp_tick < 8) { t *= 10; ++dp_tick; }
+    } else if (tick >= 1.0) {
+        dp_tick = 0;
+    }
+    // 数量级下限：保证至少留住约 4 位有效数字
+    const int dp_mag = p >= 100 ? 2 : p >= 1 ? 4 : p >= 0.01 ? 5
+                     : p >= 0.0001 ? 6 : p >= 0.000001 ? 8 : 10;
+    return std::max(dp_tick, dp_mag);
+}
+
 static QString fmt_tick_px(double p, double tick) {
     if (p <= 0) return "--";
-    int dp = 2;
-    if (tick > 0 && tick < 1.0) {
-        double t = tick; dp = 0;
-        while (t < 1.0 - 1e-9 && dp < 8) { t *= 10; ++dp; }
-    } else if (tick <= 0) {
-        dp = p >= 100 ? 2 : p >= 1 ? 4 : p >= 0.01 ? 5 : p >= 0.0001 ? 6 : 8;
-    }
-    return QString::number(p, 'f', dp);
+    return QString::number(p, 'f', price_decimals(p, tick));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2898,11 +2910,12 @@ void MainWindow::refreshBotTable() {
         return it;
     };
 
+    // 均价/强平价/保证金等。同样的截断问题：原先最细只有 6 位，
+    // 价格低于 0.000001 的品种（1000 系列之外的极便宜币）会显示成 "$0.000000"。
+    // 复用 price_decimals 的数量级阶梯，这里没有 tick_size 可用故传 0
     auto fmt_price = [](double p) -> QString {
         if (p <= 0) return "--";
-        return p >= 100  ? QString("$%1").arg(p, 0, 'f', 2)
-             : p >= 0.01 ? QString("$%1").arg(p, 0, 'f', 4)
-                         : QString("$%1").arg(p, 0, 'f', 6);
+        return QString("$%1").arg(p, 0, 'f', price_decimals(p, 0));
     };
 
 
