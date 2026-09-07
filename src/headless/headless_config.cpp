@@ -134,7 +134,9 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
     c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
     c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
-    c.htf_day_chg_max     = get_num(bo, "htf_day_chg_max", c.htf_day_chg_max);
+    // 老键 htf_day_chg_max 兜底（v4.0.9 改名 + 从今日涨幅改为 24h 滚动涨幅）
+    c.htf_24h_chg_max     = get_num(bo, "htf_day_chg_max", c.htf_24h_chg_max);
+    c.htf_24h_chg_max     = get_num(bo, "htf_24h_chg_max", c.htf_24h_chg_max);
     c.htf_week_chg_max    = get_num(bo, "htf_week_chg_max", c.htf_week_chg_max);
     // v3.8 迁移：老配置的 smart_gates 总开关为 false 时三层完全不参与，
     // 升级后必须保持——否则老配置会突然开始拦截
@@ -229,7 +231,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "mtf_ladder", "mtf_tier_layers", "mtf_k", "mtf_min_gap_pct",
         "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
         "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max",
-        "htf_day_chg_max", "htf_week_chg_max", "use_sr_gate",
+        "htf_day_chg_max", "htf_24h_chg_max", "htf_week_chg_max", "use_sr_gate",
         "use_sr_support", "use_sr_headroom",
         "sr_min_confluence", "sr_headroom_ratio", "use_sr_exit", "use_structural_stop",
         "sr_independent_conf", "sr_lower_half_only",

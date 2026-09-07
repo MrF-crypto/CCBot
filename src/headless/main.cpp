@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
 
         // ── 1) 价格喂入 + 策略判定：永远最先执行，不被任何数据拉取阻塞 ────────
         for (const auto& sym : symbols) {
-            double price = ticker.mid_price(sym);   // 内置10秒陈旧保护，冻结价返回0
+            double price = ticker.mark_price(sym);   // 内置10秒陈旧保护，冻结价返回0
             if (price <= 0) price = client->fetch_mark_price(sym);
             if (price > 0) {
                 engine->tick(sym, price);
@@ -327,6 +327,17 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ── 1b) 24h 滚动涨幅：读 @ticker 推送缓存，零请求，所以每 tick 都喂
+        {
+            for (const auto& b : engine->get_bots()) {
+                if (b.state == CcgBot::State::Stopped) continue;
+                if (b.cfg.htf_24h_chg_max <= 0) continue;
+                double pct = 0;
+                const bool ok = ticker.change_24h(b.cfg.symbol, pct);
+                engine->update_24h_change(b.bot_id, ok, pct);
+            }
+        }
+
         // ── 1c) 心跳文件（dead-man's switch）：每 tick 写入当前时间戳。
         //     外部看门狗（systemd WatchdogSec / cron）检查这个文件的年龄就能发现
         //     "进程还在但循环卡住"——这是日志和进程存活检查都发现不了的故障
@@ -346,7 +357,7 @@ int main(int argc, char** argv) {
                 for (const auto& b : bots) {
                     auto zit = sr_zones_map.find(b.cfg.symbol);
                     if (zit == sr_zones_map.end() || zit->second.empty()) continue;
-                    double price = ticker.mid_price(b.cfg.symbol);
+                    double price = ticker.mark_price(b.cfg.symbol);
                     if (price <= 0) continue;
                     auto dg = decision::digest_zones(zit->second, price, b.cfg.sr_min_confluence);
                     double atr = sr_atr_map.count(b.cfg.symbol) ? sr_atr_map[b.cfg.symbol] : 0;
@@ -422,7 +433,7 @@ int main(int argc, char** argv) {
                 // %B 对所有非停止 bot 持续保鲜（立即开仓/冷却重进的首仓才赶得上数据）
                 // 涨幅拦截与 %B 同源，任一开启都要拉这份高周期数据
                 if (b.cfg.use_htf_filter ||
-                    b.cfg.htf_day_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
+                    b.cfg.htf_24h_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
                     htf_need.push_back(b);
                 if (b.cfg.mtf_ladder)     mtf_need.push_back(b);
             }
@@ -439,7 +450,7 @@ int main(int argc, char** argv) {
                                                               20, 2.0, 14);
                         if (!snap.ok) continue;
                         double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
-                        engine->update_htf(b.bot_id, pb, snap.chg_ok, snap.chg_1, snap.chg_7);
+                        engine->update_htf(b.bot_id, pb, snap.chg_ok, snap.chg_7);
                         // 复用：宏观层拉的就是日线带，正好是第3档
                         if (b.cfg.mtf_ladder && b.cfg.htf_interval == "1d")
                             engine->update_mtf_band(b.bot_id, 3, snap.boll_lb, snap.boll_ub);

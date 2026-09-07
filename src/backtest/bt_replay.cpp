@@ -115,7 +115,7 @@ BacktestResult run_replay(const Series& series, const ReplayOptions& opt) {
     // 非零阈值（从实盘 bots.json 复制过来的场景），回测会一单不开却毫无提示。
     // 强制归零并让它保持静默失效，比静默拦死一切要诚实
     auto bt_cfg = opt.cfg;
-    bt_cfg.htf_day_chg_max  = 0;
+    bt_cfg.htf_24h_chg_max  = 0;
     bt_cfg.htf_week_chg_max = 0;
     auto bot_id = engine->add_bot(bt_cfg);
     if (bot_id.empty()) return res;

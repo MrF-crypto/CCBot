@@ -326,7 +326,7 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.use_htf_filter      = new_cfg.use_htf_filter;
     cfg.htf_interval        = new_cfg.htf_interval;
     cfg.htf_pos_max         = new_cfg.htf_pos_max;
-    cfg.htf_day_chg_max     = new_cfg.htf_day_chg_max;
+    cfg.htf_24h_chg_max     = new_cfg.htf_24h_chg_max;
     cfg.htf_week_chg_max    = new_cfg.htf_week_chg_max;
     cfg.use_sr_support      = new_cfg.use_sr_support;
     cfg.use_sr_headroom     = new_cfg.use_sr_headroom;
@@ -341,19 +341,27 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
 }
 
 void CcgEngine::update_htf(const std::string& bot_id, double pct_b,
-                           bool chg_ok, double day_chg, double week_chg) {
+                           bool chg_ok, double week_chg) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
     if (it == bots_.end()) return;
     it->second.htf_ok    = (pct_b >= -0.5);   // decision::pct_b 非法时返回 -1
     it->second.htf_pct_b = pct_b;
-    // 涨幅与 %B 同源同一次拉取，但历史不足 8 根时算不出来，单独一个 ok 标志。
+    // 7日涨幅与 %B 同源同一次拉取，但历史不足 8 根时算不出来，单独一个 ok 标志。
     // 回测的三个调用点走的是 2 参数默认形式（chg_ok=false）——回测侧不跟踪涨幅，
     // 所以那两个阈值在回测里被强制归零，见 bt_replay.cpp / bt_portfolio.cpp
     it->second.htf_chg_ok   = chg_ok;
-    it->second.htf_day_chg  = day_chg;
     it->second.htf_week_chg = week_chg;
     it->second.htf_time  = host_.now_steady();
+}
+
+void CcgEngine::update_24h_change(const std::string& bot_id, bool ok, double pct) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    it->second.h24_ok   = ok;
+    it->second.h24_chg  = pct;
+    it->second.h24_time = host_.now_steady();
 }
 
 void CcgEngine::update_sr_structure(const std::string& bot_id, bool at_support,
@@ -1203,7 +1211,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 // （不判定、不记录，也不空跑去刷日志）
                 // 两条涨幅不受 use_htf_filter 约束：可以只用涨幅、不用 %B
                 const bool gates_on = bot.cfg.use_htf_filter ||
-                                      bot.cfg.htf_day_chg_max  > 0 ||
+                                      bot.cfg.htf_24h_chg_max  > 0 ||
                                       bot.cfg.htf_week_chg_max > 0 ||
                                       bot.cfg.use_sr_support || bot.cfg.use_sr_headroom;
                 std::string decision_snap;
@@ -1221,15 +1229,22 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     din.htf_ok      = bot.htf_ok && htf_fresh_30m;
                     din.htf_pct_b   = bot.htf_pct_b;
                     din.htf_pos_max = bot.cfg.htf_pos_max;
-                    // 涨幅同源同鲜度，但多一个"历史够不够 8 根"的条件。
+                    // 7日涨幅与 %B 同源同鲜度，但多一个"历史够不够 8 根"的条件。
                     // 算不出来时把 htf_ok 一并压掉——strict 模式下等价于"数据没到不开仓"，
                     // 而不是当成"涨幅 0"放行（新上市品种正是最该拦的那一类）
-                    if (bot.cfg.htf_day_chg_max > 0 || bot.cfg.htf_week_chg_max > 0) {
+                    if (bot.cfg.htf_week_chg_max > 0) {
                         din.htf_ok = din.htf_ok && bot.htf_chg_ok;
-                        din.day_chg_pct  = bot.htf_day_chg;
                         din.week_chg_pct = bot.htf_week_chg;
-                        din.day_chg_max  = bot.cfg.htf_day_chg_max;
                         din.week_chg_max = bot.cfg.htf_week_chg_max;
+                    }
+                    // 24h 涨幅来自 @ticker 推送流，与日线K线不同源，鲜度单独判。
+                    // 同样遵循 strict：拿不到就不开仓，不当成"涨幅 0"放行
+                    if (bot.cfg.htf_24h_chg_max > 0) {
+                        const bool h24_fresh = bot.h24_ok &&
+                            (snow - bot.h24_time) < std::chrono::minutes(5);
+                        din.htf_ok = din.htf_ok && h24_fresh;
+                        din.day_chg_pct = bot.h24_chg;
+                        din.day_chg_max = bot.cfg.htf_24h_chg_max;
                     }
                     din.use_sr_support  = bot.cfg.use_sr_support;
                     din.use_sr_headroom = bot.cfg.use_sr_headroom;

@@ -41,6 +41,15 @@ static std::string msg(const char* sym_lower, const char* SYM,
          + "\"T\":1787156044876,\"E\":1787156044880}}";
 }
 
+// 24h 行情流报文（<symbol>@ticker）。P=24h滚动涨幅%，c=最新成交价
+static std::string tick24_msg(const char* sym_lower, const char* SYM, const char* P) {
+    return std::string("{\"stream\":\"") + sym_lower + "@ticker\",\"data\":{"
+         + "\"e\":\"24hrTicker\",\"E\":1787156044880,\"s\":\"" + SYM + "\","
+         + "\"p\":\"120.5\",\"P\":\"" + P + "\",\"c\":\"95000.00\","
+         + "\"o\":\"94000.00\",\"h\":\"96000.00\",\"l\":\"93000.00\","
+         + "\"v\":\"12345.6\",\"q\":\"1170000000\"}}";
+}
+
 // 标记价流报文（<symbol>@markPrice@1s）。p=标记价，i=指数价，r=资金费率
 static std::string mark_msg(const char* sym_lower, const char* SYM, const char* p) {
     return std::string("{\"stream\":\"") + sym_lower + "@markPrice@1s\",\"data\":{"
@@ -167,6 +176,50 @@ int main() {
         ts.on_message_for_test(mark_msg("pepeusdt", "PEPEUSDT", "0.00000123499"));
         check_near(ts.get("PEPEUSDT").mark_price, 0.00000123499, 1e-15,
                    "微价标记价保留精度");
+    }
+
+    // ── ⑨ 标记价的陈旧保护走【自己的】时间戳 ────────────────────────────────
+    // 引擎现在按标记价决策，所以冻结的标记价和当年冻结的中间价一样危险。
+    // 关键点：不能复用 recv_ms（那是 bookTicker 的）——markPrice 断流而
+    // bookTicker 还活着时，recv_ms 是新鲜的，冻结的标记价会照常流进引擎
+    {
+        ts.on_message_for_test(msg("btcusdt", "BTCUSDT", "95100.00", "1.0", "95101.00", "1.0"));
+        ts.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "95050.00"));
+        check_near(ts.mark_price("BTCUSDT"), 95050.00, 1e-6, "标记价新鲜时正常返回");
+
+        // 只把 bookTicker 的包龄推老：标记价自己是新的，必须仍然可用
+        ts.age_cache_for_test("BTCUSDT", 11000);
+        // age_cache_for_test 动的是 recv_ms，mark_ms 不受影响
+        check(ts.mark_price("BTCUSDT") > 0,
+              "  bookTicker 陈旧不影响标记价（两条流各判各的）");
+    }
+    {
+        // 未订阅品种：标记价返回 0，不返回垃圾
+        check_near(ts.mark_price("NOSUCHUSDT"), 0.0, 1e-12, "未知品种标记价返回 0");
+    }
+
+    // ── ⑩ 24h 滚动涨幅 ──────────────────────────────────────────────────────
+    // 换掉"今日涨幅"就是为了消掉 UTC 0 点归零那个盲区，所以这里要确认
+    // 负值和 0 都能被正确接收——涨幅不像价格能用 ">0" 判合法
+    {
+        double pct = 0;
+        check(!ts.change_24h("NOSUCHUSDT", pct), "未收到 @ticker 时 change_24h 返回 false");
+
+        ts.on_message_for_test(tick24_msg("btcusdt", "BTCUSDT", "12.345"));
+        check(ts.change_24h("BTCUSDT", pct) && std::fabs(pct - 12.345) < 1e-9,
+              "24h 涨幅解析");
+        check_near(ts.get("BTCUSDT").mark_price, 95050.00, 1e-6,
+                   "  没有污染标记价");
+        check_near(ts.get("BTCUSDT").last_price, 95100.50, 1e-6,
+                   "  没有污染中间价");
+
+        ts.on_message_for_test(tick24_msg("btcusdt", "BTCUSDT", "-8.75"));
+        check(ts.change_24h("BTCUSDT", pct) && std::fabs(pct + 8.75) < 1e-9,
+              "负涨幅（跌幅）正确接收——做空镜像要用");
+
+        ts.on_message_for_test(tick24_msg("btcusdt", "BTCUSDT", "0"));
+        check(ts.change_24h("BTCUSDT", pct) && std::fabs(pct) < 1e-12,
+              "涨幅恰好为 0 仍算有效（不能用 >0 判合法）");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

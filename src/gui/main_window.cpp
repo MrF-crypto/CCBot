@@ -366,7 +366,7 @@ void MainWindow::save_bots() {
         o["use_htf_filter"]      = c.use_htf_filter;
         o["htf_interval"]        = QString::fromStdString(c.htf_interval);
         o["htf_pos_max"]         = c.htf_pos_max;
-        o["htf_day_chg_max"]     = c.htf_day_chg_max;
+        o["htf_24h_chg_max"]     = c.htf_24h_chg_max;
         o["htf_week_chg_max"]    = c.htf_week_chg_max;
         o["use_sr_support"]      = c.use_sr_support;
         o["use_sr_headroom"]     = c.use_sr_headroom;
@@ -487,7 +487,11 @@ void MainWindow::load_and_restore_bots() {
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
         // 兜底 0 而非某个"建议值"：老 bots.json 里没有这两个键，兜成非零
         // 等于在用户不知情时给正在跑的策略加了两道闸门（同 v4.0.6 固定间隔的处理）
-        c.htf_day_chg_max     = o["htf_day_chg_max"].toDouble(0.0);
+        // v4.0.9 改名 + 改口径（今日涨幅 → 24h滚动涨幅）。老键兜底读回来：
+        // 两者都是"拦涨太急"，阈值量级相当，丢掉用户填过的值比口径微调更糟
+        c.htf_24h_chg_max     = o.contains("htf_24h_chg_max")
+                              ? o["htf_24h_chg_max"].toDouble(0.0)
+                              : o["htf_day_chg_max"].toDouble(0.0);
         c.htf_week_chg_max    = o["htf_week_chg_max"].toDouble(0.0);
         // v3.8 迁移：老配置只有 smart_gates 总开关 + use_sr_gate。
         // 总开关为 false 时三层完全不参与，升级后必须保持这个行为——否则
@@ -1456,7 +1460,7 @@ void MainWindow::refreshSrZones() {
 // 本身并不需要人做任何事——该拦的闸门已经拦了。
 void MainWindow::openSrZonesDialog(const std::string& symbol) {
     auto it = srStates_.find(symbol);
-    double price = ticker_ ? ticker_->mid_price(symbol) : 0;
+    double price = ticker_ ? ticker_->mark_price(symbol) : 0;
 
     QDialog dlg(this);
     dlg.setWindowTitle(QString("支撑/阻力区 - %1").arg(QString::fromStdString(symbol)));
@@ -1954,18 +1958,21 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     addHint(gateForm, "三条平级独立，全不勾 = 三层决策完全不参与。"
                       "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
     auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
-    auto* dayChgEdit   = mkEditIn(gateForm, "日涨幅拦截%（0=关）:",
-                                  prefill ? prefill->cfg.htf_day_chg_max : 0.0);
+    auto* dayChgEdit   = mkEditIn(gateForm, "24h涨幅拦截%（0=关）:",
+                                  prefill ? prefill->cfg.htf_24h_chg_max : 0.0);
     auto* weekChgEdit  = mkEditIn(gateForm, "近7日涨幅拦截%（0=关）:",
                                   prefill ? prefill->cfg.htf_week_chg_max : 0.0);
     addHint(gateForm,
-            "两条涨幅与 %B 同源（共用那次日线拉取，不增加请求），但口径不同：\n"
+            "涨幅与 %B 的口径不同：\n"
             "%B 问「价格在波动区间的什么位置」，涨幅问「最近涨得多急」。\n"
-            "窄幅横盘时 %B 可以贴着上轨而涨幅极小；急涨突破时涨幅很大而 %B 未必越界。\n"
-            "「近7日」是滚动口径（相对7根日线前的收盘），不是本周K线——\n"
-            "后者每周一归零，闸门会在行情最容易延续的时点失效大半天。\n"
+            "窄幅横盘时 %B 可以贴着上轨而涨幅极小；急涨突破时涨幅很大而 %B 未必越界。\n\n"
+            "「24h」是币安界面上那个 24 小时滚动涨幅（@ticker 推送，无额外请求）。\n"
+            "v4.0.9 之前这里是「今日涨幅」——它每天 UTC 0 点归零，而 UTC 0 点是\n"
+            "北京时间早 8 点：某币 20:00-23:00 拉了 50%，23:30 拦得住，00:30 就放行，\n"
+            "币还在一天前的 1.5 倍位置上。滚动 24h 没有这个盲区。\n\n"
+            "「近7日」同样是滚动口径（相对 7 根日线前的收盘），不是本周 K 线。\n"
             "做空时镜像：拦的是跌幅。两条独立于上面的①开关，可以只用涨幅不用 %B。\n"
-            "⚠ 这两个阈值没有回测依据（回测侧未实现涨幅跟踪），填多少靠手判。");
+            "⚠ 这两个阈值没有回测依据，填多少靠手判。");
     auto* headroomEdit = mkEditIn(gateForm, "净空比下限:", prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
     auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
     srExitBox->setChecked(prefill ? prefill->cfg.use_sr_exit : false);
@@ -2206,7 +2213,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
         // 预计建仓价：跟引擎实际触发逻辑一致——每层相对上一层跌(涨)interval%触发，
         // 再反弹(回落)trail%才真正下单（should_enter() 的镜像）
-        double livePrice = ticker_ ? ticker_->mid_price(symbol) : 0.0;
+        double livePrice = ticker_ ? ticker_->mark_price(symbol) : 0.0;
         std::vector<double> predPrice(n, 0.0);
         if (livePrice > 0) {
             predPrice[0] = livePrice;
@@ -2431,7 +2438,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.use_sr_support      = supBox->isChecked();
     cfg.use_sr_headroom     = headBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
-    cfg.htf_day_chg_max     = to_d(dayChgEdit,   0.0);
+    cfg.htf_24h_chg_max     = to_d(dayChgEdit,   0.0);
     cfg.htf_week_chg_max    = to_d(weekChgEdit,  0.0);
     cfg.sr_headroom_ratio   = to_d(headroomEdit, 3.0);
     cfg.use_sr_exit         = srExitBox->isChecked();
@@ -2616,7 +2623,7 @@ void MainWindow::onTick() {
         for (const auto& b : engine_->get_bots()) {
             auto sit = srStates_.find(b.cfg.symbol);
             if (sit == srStates_.end() || sit->second.zones.empty()) continue;
-            double price = ticker_->mid_price(b.cfg.symbol);
+            double price = ticker_->mark_price(b.cfg.symbol);
             if (price <= 0) continue;
             decision::DigestOpts dop; dop.min_conf = b.cfg.sr_min_confluence;
             dop.independent_conf = b.cfg.sr_independent_conf;
@@ -2689,6 +2696,19 @@ void MainWindow::onTick() {
         }
     }
 
+    // 24h 滚动涨幅：来自 @ticker 推送流，读一次缓存就行，不发任何请求——
+    // 所以每个 tick 都喂，不必搭 5 分钟那班车。@ticker 每秒推一次，
+    // 让引擎拿到的始终是最新值
+    if (ticker_) {
+        for (const auto& b : bots) {
+            if (b.state == CcgBot::State::Stopped) continue;
+            if (b.cfg.htf_24h_chg_max <= 0) continue;
+            double pct = 0;
+            const bool ok = ticker_->change_24h(b.cfg.symbol, pct);
+            engine_->update_24h_change(b.bot_id, ok, pct);
+        }
+    }
+
     // 趋势状态机：4h 级别数据变化慢，每 100 个 tick（约5分钟）拉一次就够；
     // 首个 tick 立刻拉一次，避免刚启动的半小时里趋势过滤空转。
     // v3.0：日线%B（宏观层）搭同一班车——等首仓的 bot 每5分钟拉一次日线布林
@@ -2702,7 +2722,7 @@ void MainWindow::onTick() {
             // 首仓永远赶不上数据，%B恒为"缺失(放行)"
             // 涨幅拦截与 %B 同源，任一开启都要拉这份高周期数据
             if (b.cfg.use_htf_filter ||
-                b.cfg.htf_day_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
+                b.cfg.htf_24h_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
                 htf_bots.push_back(b);
         }
         if ((!trend_bots.empty() || !htf_bots.empty()) && !trendFetchBusy_.load()) {
@@ -2724,7 +2744,7 @@ void MainWindow::onTick() {
                     const bool tier3 = b.cfg.mtf_ladder && b.cfg.htf_interval == "1d";
                     QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb, snap, tier3]() {
                         if (!engine_) return;
-                        engine_->update_htf(bid, pb, snap.chg_ok, snap.chg_1, snap.chg_7);
+                        engine_->update_htf(bid, pb, snap.chg_ok, snap.chg_7);
                         // 复用：宏观层拉的就是日线带，正好是第3档
                         if (tier3) engine_->update_mtf_band(bid, 3, snap.boll_lb, snap.boll_ub);
                     }, Qt::QueuedConnection);
@@ -2742,7 +2762,7 @@ void MainWindow::onTick() {
 
     std::set<std::string> need_rest;
     for (const auto& sym : syms) {
-        double ws_price = ticker_ ? ticker_->mid_price(sym) : 0.0;
+        double ws_price = ticker_ ? ticker_->mark_price(sym) : 0.0;
         if (ws_price > 0) {
             engine_->tick(sym, ws_price);
         } else {
@@ -2798,39 +2818,32 @@ static QString fmt_tick_px(double p, double tick) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 「标记价」单元格。优先标记价，拿不到时回退中间价并在提示里说明。
+// 「标记价」单元格。
 //
-// 为什么这一列是标记价而不是中间价：强平价、未实现盈亏、强平触发，币安全部按
-// 标记价算。用中间价去比强平价是两套体系相减，平时差几个基点无所谓，但便宜的
-// 山寨币剧烈波动时会明显分叉——恰恰是最需要看准的时候。
+// v4.0.9 起标记价是【唯一】的价格口径：显示是它，引擎决策也是它。
+// 此前显示中间价、决策也用中间价，而强平价那一列是币安按标记价给的——
+// 两套体系并排放着，剧烈波动时会分叉，恰恰是最需要看准的时候。
 //
-// ⚠ 引擎决策用的仍是【中间价】，不是这一列。原因是回测重放的是 K 线收盘价
-//   （成交价体系），全部 walk-forward 结论都建立在那个口径上；把实盘决策改成
-//   标记价会让实盘与回测系统性错位。所以中间价放进悬停提示，两个都能看到
+// 强平、未实现盈亏、强平触发，币安全部按标记价算。既然"离强平多远"是这个策略
+// 最关心的问题（套住长持、靠保证金预规划扛），那就让全系统只认这一个价。
 // ─────────────────────────────────────────────────────────────────────────────
 static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, double tick_size) {
     const bool has_mark = tick.mark_price > 0;
-    const double shown  = has_mark ? tick.mark_price : tick.last_price;
-    auto* it = new QTableWidgetItem(shown > 0 ? fmt_tick_px(shown, tick_size) : "--");
+    auto* it = new QTableWidgetItem(has_mark ? fmt_tick_px(tick.mark_price, tick_size) : "--");
     it->setTextAlignment(Qt::AlignCenter);
     it->setForeground(has_mark ? QColor("#e6edf3") : QColor("#8b949e"));
 
     QString tip;
     if (!has_mark) {
         tip = "标记价尚未到达（markPrice@1s 每秒一次，刚订阅时会有约 1 秒空窗）。\n"
-              "当前显示的是中间价，颜色转灰即表示这一格不是标记价。\n\n";
+              "此时引擎也没有价格可用，不会做任何开仓/止盈判定。\n\n";
     }
-    tip += QString("中间价 %1\n买一 %2\n卖一 %3")
-               .arg(tick.last_price > 0 ? fmt_tick_px(tick.last_price, tick_size) : "--")
-               .arg(tick.bid > 0 ? fmt_tick_px(tick.bid, tick_size) : "--")
-               .arg(tick.ask > 0 ? fmt_tick_px(tick.ask, tick_size) : "--");
-    if (has_mark && tick.last_price > 0) {
-        const double dev = (tick.mark_price / tick.last_price - 1.0) * 100.0;
-        tip += QString("\n标记价相对中间价偏离 %1%2%")
-                   .arg(dev >= 0 ? "+" : "").arg(dev, 0, 'f', 3);
+    if (tick.chg_ms > 0) {
+        tip += QString("24h 涨幅 %1%2%\n")
+                   .arg(tick.chg_24h >= 0 ? "+" : "").arg(tick.chg_24h, 0, 'f', 2);
     }
-    tip += "\n\n强平价与浮动盈亏都按标记价计算；\n"
-           "而引擎开仓/止盈的判定用的是中间价（与回测的成交价口径一致）。";
+    tip += "强平价、浮动盈亏、强平触发都按标记价计算，\n"
+           "引擎的开仓/止盈判定同样用它——全系统单一价格口径。";
     it->setToolTip(tip);
     return it;
 }

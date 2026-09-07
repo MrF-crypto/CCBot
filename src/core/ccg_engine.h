@@ -357,8 +357,14 @@ struct CcgConfig {
     // 周线口径下等于每周一闸门失效大半天，恰好是行情延续最常见的时点。
     // ⚠ 这两个阈值【没有回测依据】：v4.0.7 只做了实盘通路，回测侧的涨幅跟踪未实现，
     //   所以无法像 %B(0.60) / 净空(3.0) 那样给出实证默认值。默认 0=关，填多少靠手判
-    double      htf_day_chg_max    = 0;       // 0=关；近1根涨幅超过此% 拦新首仓（做多）
-    double      htf_week_chg_max   = 0;       // 0=关；近7根涨幅超过此%（1d 时即近7日）
+    // ⚠ v4.0.9 起这一条改用【24 小时滚动涨幅】（币安 @ticker 的 P 字段，
+    //   就是界面上那个"24h涨幅"），不再是"今日涨幅"。
+    //   原因：今日涨幅 = 现价相对上一根已收盘日线，每天 UTC 0 点归零——
+    //   而 UTC 0 点是北京时间早 8 点，是真实交易时段。某币 20:00–23:00 拉了 50%，
+    //   23:30 时闸门拦得住，00:30 就放行了，币还在一天前的 1.5 倍位置上。
+    //   归零时刻与拉盘时刻的相对位置基本随机，等于闸门有效性靠运气
+    double      htf_24h_chg_max    = 0;       // 0=关；24h涨幅超过此% 拦新首仓（做多）
+    double      htf_week_chg_max   = 0;       // 0=关；近7根日线涨幅超过此%
     bool        use_sr_support     = true;    // 结构①：脚下踩住够格支撑区
     bool        use_sr_headroom    = true;    // 结构②：头顶净空足够止盈
     int         sr_min_confluence  = 2;       // 够格区域的最低共振数
@@ -542,10 +548,14 @@ struct CcgBot {
     // 宏观：日线%B ＋ 同源的滚动涨幅
     bool   htf_ok    = false;
     double htf_pct_b = 0.5;
-    bool   htf_chg_ok    = false;   // 涨幅是否算得出（历史不足 8 根时为 false）
-    double htf_day_chg   = 0;       // 近1根涨幅%
-    double htf_week_chg  = 0;       // 近7根涨幅%
+    bool   htf_chg_ok    = false;   // 7日涨幅是否算得出（历史不足 8 根时为 false）
+    double htf_week_chg  = 0;       // 近7根日线涨幅%
     std::chrono::steady_clock::time_point htf_time{};
+    // 24h 滚动涨幅走另一条路：来自 @ticker 推送流，不是日线K线。
+    // 新鲜度与 htf_time 分开记——两条流的更新频率差两个数量级
+    bool   h24_ok        = false;
+    double h24_chg       = 0;
+    std::chrono::steady_clock::time_point h24_time{};
     // 结构：相对现价的区域摘要（应用层用 decision::digest_zones 算好推进来）
     bool   sr_ok       = false;
     bool   sr_at_support = false;
@@ -743,9 +753,11 @@ public:
     void update_trend(const std::string& bot_id, bool bearish);
 
     // ── v3.0 结构数据写入（应用层喂入，同指标/趋势的快照模式）────────────────
-    // chg_ok/day_chg/week_chg 默认值使回测的三个调用点无需改动（那边不跟踪涨幅）
+    // chg_ok/week_chg 默认值使回测的三个调用点无需改动（那边不跟踪涨幅）
     void update_htf(const std::string& bot_id, double pct_b,
-                    bool chg_ok = false, double day_chg = 0, double week_chg = 0);
+                    bool chg_ok = false, double week_chg = 0);
+    // 24h 滚动涨幅（来自 @ticker 流，与日线K线无关，故单独一个入口）
+    void update_24h_change(const std::string& bot_id, bool ok, double pct);
     void update_sr_structure(const std::string& bot_id, bool at_support,
                              double sup_hi, double res_lo, double stop_level);
 

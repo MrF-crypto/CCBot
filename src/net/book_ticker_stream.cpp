@@ -111,31 +111,40 @@ void BookTickerStream::subscribe(const std::string& symbol) {
     // 99% 的带宽是白扔的。逐品种与 bookTicker 的订阅模式也一致。
     // 一条连接最多 1024 个流，每品种两条流对实际用量来说远远够
     std::string s_mark = to_lower(symbol) + "@markPrice@1s";
-    bool need_book, need_mark;
+    // 24h 滚动涨幅。没有别的免费来源：日线 K 线只能算出"今日涨幅"（每天 UTC 0 点
+    // 归零），要真正的滚动 24 小时得按小时线回看 24 根，那是每品种一次额外 REST；
+    // 而 @ticker 的 P 字段就是币安官方的 24h 滚动涨幅，推送式、零请求成本
+    std::string s_tick = to_lower(symbol) + "@ticker";
+    bool need_book, need_mark, need_tick;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         need_book = streams_.insert(s_book).second;
         need_mark = streams_.insert(s_mark).second;
+        need_tick = streams_.insert(s_tick).second;
     }
     if (connected_.load()) {
         if (need_book) send_sub(s_book, true);
         if (need_mark) send_sub(s_mark, true);
+        if (need_tick) send_sub(s_tick, true);
     }
 }
 
 void BookTickerStream::unsubscribe(const std::string& symbol) {
     std::string s_book = to_lower(symbol) + "@bookTicker";
     std::string s_mark = to_lower(symbol) + "@markPrice@1s";
-    bool had_book, had_mark;
+    std::string s_tick = to_lower(symbol) + "@ticker";
+    bool had_book, had_mark, had_tick;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         had_book = streams_.erase(s_book) > 0;
         had_mark = streams_.erase(s_mark) > 0;
+        had_tick = streams_.erase(s_tick) > 0;
         cache_.erase(symbol);
     }
     if (connected_.load()) {
         if (had_book) send_sub(s_book, false);
         if (had_mark) send_sub(s_mark, false);
+        if (had_tick) send_sub(s_tick, false);
     }
 }
 
@@ -210,6 +219,22 @@ void BookTickerStream::on_message(const std::string& json) {
         c.symbol     = symbol;
         c.mark_price = mp;
         c.mark_ms    = now_ms();
+    } else if (ev == "24hrTicker") {
+        // {"e":"24hrTicker","s":"BTCUSDT","P":"<24h涨幅%>","c":"<最新成交价>",...}
+        // 只取 P。这条流的其它字段（最新成交价、成交量）目前无人使用——
+        // 订阅它纯粹是为了拿到滚动 24h 涨幅，日线 K 线给不出这个数
+        std::string_view P_sv;
+        if (data["P"].get(P_sv) != simdjson::SUCCESS) return;
+        // 涨幅可以是负数也可以恰好是 0，不能像价格那样用 ">0" 判合法。
+        // 用"解析后字符串非空且不是纯垃圾"来判：safe_stod 失败返回 0，
+        // 而真实的 0 涨幅同样是 0——两者无法区分，所以直接检查原始字符串
+        if (P_sv.empty()) return;
+        std::lock_guard<std::mutex> lk(mtx_);
+        // 同样不碰 valid/recv_ms：陈旧判定归 bookTicker 那条流管
+        auto& c = cache_[symbol];
+        c.symbol  = symbol;
+        c.chg_24h = safe_stod(P_sv);
+        c.chg_ms  = now_ms();
     }
 }
 
@@ -228,6 +253,28 @@ double BookTickerStream::mid_price(const std::string& symbol) const {
     // 否则引擎会拿"僵尸价格"做补仓/止盈/止损判定，实际行情暴跌时完全失明
     if (now_ms() - t.recv_ms > 10000) return 0.0;
     return (t.bid + t.ask) / 2.0;
+}
+
+double BookTickerStream::mark_price(const std::string& symbol) const {
+    auto t = get(symbol);
+    if (t.mark_price <= 0) return 0.0;
+    // 陈旧保护按【标记价自己的】收包时间判，不能用 recv_ms——那是 bookTicker 的。
+    // markPrice@1s 每秒一包，10 秒没来就是这条流断了，此时 bookTicker 可能还活着，
+    // 拿冻结的标记价继续决策与拿冻结的中间价一样危险
+    if (now_ms() - t.mark_ms > 10000) return 0.0;
+    return t.mark_price;
+}
+
+bool BookTickerStream::change_24h(const std::string& symbol, double& out_pct) const {
+    auto t = get(symbol);
+    // chg_ms==0 表示这条流一次都没到过。涨幅本身可以合法地为 0 或负数，
+    // 所以不能用数值判有无，只能看有没有收过包
+    if (t.chg_ms == 0) return false;
+    // @ticker 是每秒一推，容忍度给到 60 秒——它比 bookTicker 慢，
+    // 且 24h 涨幅本身是慢变量，几十秒的陈旧不影响"最近涨得多急"这个判断
+    if (now_ms() - t.chg_ms > 60000) return false;
+    out_pct = t.chg_24h;
+    return true;
 }
 
 } // namespace ccbot

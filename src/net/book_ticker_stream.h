@@ -30,6 +30,11 @@ public:
         // 更新频率 1s（bookTicker 是逐笔），所以单独记收包时间，不与 recv_ms 混用
         double  mark_price = 0;
         int64_t mark_ms    = 0;
+        // 24 小时滚动涨幅%（<symbol>@ticker 的 P 字段，就是币安界面上那个"24h涨幅"）。
+        // 高位拦截用它，而不是"今日涨幅"——后者每天 UTC 0 点归零，
+        // 而 UTC 0 点是北京时间早 8 点，是真实交易时段，闸门会在那里瞎掉
+        double  chg_24h    = 0;
+        int64_t chg_ms     = 0;
         int64_t recv_ms   = 0;   // 本地收包时间戳(ms)
         bool    valid     = false;
     };
@@ -53,6 +58,12 @@ public:
     // 线程安全读最新 tick；未收到时 valid=false
     Tick   get      (const std::string& symbol) const;
     double mid_price(const std::string& symbol) const;  // (bid+ask)/2, 0=无效
+    // 标记价，带与 mid_price 相同的陈旧保护（超时返回 0）。
+    // 引擎决策用这个：强平、未实现盈亏、强平触发币安全部按标记价算，
+    // 用中间价决策等于拿一套体系的价格去撞另一套体系的强平线
+    double mark_price(const std::string& symbol) const;
+    // 24 小时滚动涨幅%；无数据或过期返回 false
+    bool   change_24h(const std::string& symbol, double& out_pct) const;
 
     void on_tick(TickCb cb);   // 每条消息回调（运行在 WS 线程）
 
