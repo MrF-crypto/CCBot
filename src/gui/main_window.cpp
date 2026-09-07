@@ -2848,14 +2848,30 @@ static QString fmt_tick_px(double p, double tick) {
 // ─────────────────────────────────────────────────────────────────────────────
 static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, double tick_size) {
     const bool has_mark = tick.mark_price > 0;
+    // 陈旧判定必须和引擎用同一把尺子（BookTickerStream::kStaleMs）：超过阈值时
+    // mark_price() 对引擎返回 0，界面却还在照常显示那个数字——一个【冻结的价格
+    // 长得和实时价一模一样】是最危险的显示方式。
+    // 停止的 bot 尤其容易撞上：它被排除在喂价循环之外，REST 兜底也不会跑，
+    // 于是这一格就永远停在平仓那一刻的价位上
+    const int64_t age = has_mark ? (BookTickerStream::now_ms() - tick.mark_ms) : -1;
+    const bool stale  = has_mark && age > BookTickerStream::kStaleMs;
+
     auto* it = new QTableWidgetItem(has_mark ? fmt_tick_px(tick.mark_price, tick_size) : "--");
     it->setTextAlignment(Qt::AlignCenter);
-    it->setForeground(has_mark ? QColor("#e6edf3") : QColor("#8b949e"));
+    it->setForeground(!has_mark ? QColor("#8b949e")
+                     : stale    ? QColor("#6e7681")     // 灰掉：这不是实时价
+                                : QColor("#e6edf3"));
 
     QString tip;
     if (!has_mark) {
         tip = "标记价尚未到达（markPrice@1s 每秒一次，刚订阅时会有约 1 秒空窗）。\n"
               "此时引擎也没有价格可用，不会做任何开仓/止盈判定。\n\n";
+    } else if (stale) {
+        tip = QString("⚠ 这不是实时价：已 %1 秒没有新的标记价，显示的是最后一次收到的值。\n"
+                      "引擎侧已判定为陈旧（超过 %2 秒即返回 0），不会拿它做任何决策。\n\n"
+                      "常见原因：该 bot 已停止（停止的 bot 不参与喂价循环），\n"
+                      "或 markPrice 推送流断了/未订阅成功。\n\n")
+                  .arg(age / 1000).arg(BookTickerStream::kStaleMs / 1000);
     }
     if (tick.chg_ms > 0) {
         tip += QString("24h 涨幅 %1%2%\n")

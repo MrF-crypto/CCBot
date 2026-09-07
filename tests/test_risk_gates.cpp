@@ -749,6 +749,7 @@ static void test_htf_change_gates() {
         in.is_long = true;  in.strict = true;
         in.use_htf = false;                 // 只测涨幅，把 %B 关掉
         in.htf_ok  = true;
+        in.day_chg_ok = true;               // 24h 数据就绪（来源独立于 htf_ok）
         in.use_sr_support = false; in.use_sr_headroom = false;
         return in;
     };
@@ -756,40 +757,41 @@ static void test_htf_change_gates() {
     // 阈值方向：超过拦，没超过放行
     { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 6.2;
       auto v = decision::evaluate(in);
-      check(v.day_chg_block && !v.pass(), "日涨6.2% > 阈值5% → 拦截"); }
+      check(v.day_chg_block && !v.pass(), "24h涨6.2% > 阈值5% → 拦截"); }
     { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 4.9;
       auto v = decision::evaluate(in);
-      check(!v.day_chg_block && v.pass(), "日涨4.9% < 阈值5% → 放行"); }
+      check(!v.day_chg_block && v.pass(), "24h涨4.9% < 阈值5% → 放行"); }
 
     // 边界：恰好等于阈值不拦（用 > 而非 >=）
     { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 5.0;
-      check(decision::evaluate(in).pass(), "日涨恰好等于阈值 → 放行"); }
+      check(decision::evaluate(in).pass(), "24h涨恰好等于阈值 → 放行"); }
 
     // 7日与日线互不干扰
     { auto in = base(); in.week_chg_max = 20.0; in.week_chg_pct = 25.0;
       in.day_chg_max = 5.0; in.day_chg_pct = 1.0;
       auto v = decision::evaluate(in);
-      check(v.week_chg_block && !v.day_chg_block, "7日过热但日线正常 → 只有7日那条拦"); }
+      check(v.week_chg_block && !v.day_chg_block, "7日过热但24h正常 → 只有7日那条拦"); }
 
     // 做空镜像：拦的是跌幅
     { auto in = base(); in.is_long = false; in.day_chg_max = 5.0; in.day_chg_pct = -6.2;
-      check(decision::evaluate(in).day_chg_block, "做空：日跌6.2% → 拦截"); }
+      check(decision::evaluate(in).day_chg_block, "做空：24h跌6.2% → 拦截"); }
     { auto in = base(); in.is_long = false; in.day_chg_max = 5.0; in.day_chg_pct = 6.2;
-      check(decision::evaluate(in).pass(), "做空：日涨6.2% 不该拦（镜像方向）"); }
+      check(decision::evaluate(in).pass(), "做空：24h涨6.2% 不该拦（镜像方向）"); }
 
     // 0 = 关：涨幅再离谱也放行
     { auto in = base(); in.day_chg_max = 0; in.day_chg_pct = 99.0;
       in.week_chg_max = 0; in.week_chg_pct = 300.0;
       check(decision::evaluate(in).pass(), "阈值 0 = 关闭，涨幅99%/300% 也放行"); }
 
-    // 数据缺失：strict 下必须拦，且不能被当成"涨幅为0"
-    { auto in = base(); in.htf_ok = false; in.day_chg_max = 5.0; in.day_chg_pct = 0;
+    // 数据缺失：strict 下必须拦，且不能被当成"涨幅为0"。
+    // 注意用的是 day_chg_ok 而不是 htf_ok——v4.0.11 起两条数据线的就绪状态分开
+    { auto in = base(); in.day_chg_ok = false; in.day_chg_max = 5.0; in.day_chg_pct = 0;
       auto v = decision::evaluate(in);
-      check(v.data_block && !v.pass(), "涨幅算不出 + strict → 拦截（不当成涨幅0放行）"); }
+      check(v.data_block && !v.pass(), "24h算不出 + strict → 拦截（不当成涨幅0放行）"); }
     // 非 strict（影子）下只标注不拦
-    { auto in = base(); in.strict = false; in.htf_ok = false; in.day_chg_max = 5.0;
+    { auto in = base(); in.strict = false; in.day_chg_ok = false; in.day_chg_max = 5.0;
       auto v = decision::evaluate(in);
-      check(v.htf_missing && v.pass(), "涨幅算不出 + 非strict → 只标注不拦"); }
+      check(v.day_chg_missing && v.pass(), "24h算不出 + 非strict → 只标注不拦"); }
 
     // 全部闸门都关时不该因为数据缺失而拦（use_chg=false 走不进那个分支）
     { auto in = base(); in.htf_ok = false;   // 三个阈值全 0
@@ -800,7 +802,32 @@ static void test_htf_change_gates() {
       in.day_chg_max = 5.0; in.day_chg_pct = 8.0;
       auto v = decision::evaluate(in);
       check(!v.htf_block && v.day_chg_block && !v.pass(),
-            "%B=0.30 未越界但日涨8% → 涨幅那条独立拦住"); }
+            "%B=0.30 未越界但24h涨8% → 涨幅那条独立拦住"); }
+
+    // ── 两条数据线的就绪状态必须【互不拖累】────────────────────────────────
+    // v4.0.11 之前 24h 与 %B 共用 htf_ok：@ticker 推送流没到时，日志会报
+    // "%B=缺失✗" 并提示"新上市品种需等日线21根历史"，而 %B 其实好好的。
+    // 排查方向被完全带偏——用户对着一条根本没问题的数据线查了半天
+    { auto in = base(); in.use_htf = true; in.htf_ok = true;      // 日线K线正常
+      in.htf_pct_b = 0.30; in.htf_pos_max = 0.60;
+      in.day_chg_max = 5.0; in.day_chg_ok = false;                 // 唯独 24h 没到
+      auto v = decision::evaluate(in);
+      check(v.day_chg_missing && !v.htf_missing,
+            "24h 推送流没到 → 只标 24h 缺失，不冤枉 %B"); 
+      check(v.data_block && !v.pass(), "  strict 下仍然拦截（数据没到不开仓）");
+      const auto txt = decision::summarize(in, v);
+      check(txt.find("%B=0.30") != std::string::npos,
+            "  摘要里 %B 显示真实值而非\"缺失\": " + txt);
+      check(txt.find("24h涨") != std::string::npos &&
+            txt.find("推送流未到") != std::string::npos,
+            "  摘要点名是推送流没到"); }
+
+    // 反过来：日线K线没到，不该冤枉 24h
+    { auto in = base(); in.use_htf = true; in.htf_ok = false;
+      in.day_chg_max = 5.0; in.day_chg_ok = true; in.day_chg_pct = 1.0;
+      auto v = decision::evaluate(in);
+      check(v.htf_missing && !v.day_chg_missing,
+            "日线K线没到 → 只标 %B 缺失，不冤枉 24h"); }
 }
 
 int main() {

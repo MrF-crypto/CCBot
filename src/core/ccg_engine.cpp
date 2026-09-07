@@ -1243,12 +1243,14 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         din.week_chg_pct = bot.htf_week_chg;
                         din.week_chg_max = bot.cfg.htf_week_chg_max;
                     }
-                    // 24h 涨幅来自 @ticker 推送流，与日线K线不同源，鲜度单独判。
-                    // 同样遵循 strict：拿不到就不开仓，不当成"涨幅 0"放行
+                    // 24h 涨幅来自 @ticker 推送流，与日线K线不同源，就绪状态【单独】判。
+                    // v4.0.11 之前这里写的是 din.htf_ok = din.htf_ok && h24_fresh ——
+                    // 24h 拿不到时把 %B 的标志一起压掉，日志显示 "%B=缺失✗" 并提示
+                    // "新上市品种需等日线21根历史"，而 %B 其实好好的，缺的是那条 WS 流。
+                    // 排查时被引向完全错误的方向
                     if (bot.cfg.htf_24h_chg_max > 0) {
-                        const bool h24_fresh = bot.h24_ok &&
+                        din.day_chg_ok  = bot.h24_ok &&
                             (snow - bot.h24_time) < std::chrono::minutes(5);
-                        din.htf_ok = din.htf_ok && h24_fresh;
                         din.day_chg_pct = bot.h24_chg;
                         din.day_chg_max = bot.cfg.htf_24h_chg_max;
                     }
@@ -1300,10 +1302,23 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                                                              : "三层决策拦截";
                         if (bot.last_action != why) {
                             bot.last_action = why;
-                            log(bot.cfg.symbol + " " + why + ": " + decision_snap +
-                                (verdict.data_block
-                                 ? "（数据到齐后自动放行；新上市品种需等日线21根+4h线60根历史）"
-                                 : ""));
+                            std::string hint;
+                            if (verdict.data_block) {
+                                // 提示必须指向【真正缺的那条线】。三个判据的数据来源
+                                // 完全不同，笼统说一句"新上市品种需等历史"会把人引偏——
+                                // 24h 涨幅缺失跟品种上市多久毫无关系
+                                hint = "（";
+                                if (verdict.day_chg_missing)
+                                    hint += "24h涨幅来自 @ticker 推送流，一直不到通常是"
+                                            "WebSocket 订阅失败（查日志里的\"行情WS服务端消息\"）"
+                                            "或网络不通；把该阈值填 0 可先关掉这条闸门。";
+                                if (verdict.htf_missing)
+                                    hint += "日线指标来自 REST，新上市品种需等日线21根历史。";
+                                if (verdict.sr_missing)
+                                    hint += "支撑/净空需 4h 线 60 根历史。";
+                                hint += "数据到齐后自动放行）";
+                            }
+                            log(bot.cfg.symbol + " " + why + ": " + decision_snap + hint);
                         }
                     }
                 }

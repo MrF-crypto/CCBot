@@ -106,10 +106,17 @@ struct Inputs {
     // 窄幅横盘时 %B 可以贴着上轨而涨幅微乎其微；急涨突破时涨幅巨大而 %B 未必越界。
     // 两者会给出相反的答案，所以是独立判据而不是 %B 的替代。
     // 各自 0=关，且不受 use_htf 开关约束（可以只用涨幅、不用 %B）
-    double day_chg_pct  = 0;   // 近 1 根高周期K线涨幅%
-    double week_chg_pct = 0;   // 近 7 根高周期K线涨幅%（htf_interval=1d 时即近7日）
+    // ⚠ 三个宏观判据【数据来源不同】，就绪状态必须分开报：
+    //     %B 与 7日涨幅  ← 日线K线（REST，每5分钟一拉）
+    //     24h 涨幅       ← @ticker 推送流（WebSocket）
+    //   v4.0.11 之前它们共用 htf_ok 一个标志：24h 拿不到时会把 %B 也标成"缺失"，
+    //   日志显示 "%B=缺失✗" 并提示"新上市品种需等日线21根历史"——而 %B 其实好好的，
+    //   真正缺的是那条 WebSocket 流。排查时被引向完全错误的方向
+    double day_chg_pct  = 0;   // 24h 滚动涨幅%
+    double week_chg_pct = 0;   // 近 7 根日线涨幅%
     double day_chg_max  = 0;   // 0=关；做多时涨幅高于此值拦截，做空镜像
     double week_chg_max = 0;   // 0=关
+    bool   day_chg_ok   = false;   // 24h 涨幅数据是否就绪（独立于 htf_ok）
     // 结构层拆成两个独立判据——它们问的是完全不同的问题：
     //   支撑：脚下此刻有没有踩住够格区域（"这里该不该买"）
     //   净空：头顶到最近够格阻力的空间够不够止盈（"买了跑不跑得掉"）
@@ -128,7 +135,8 @@ struct Verdict {
     bool week_chg_block = false;   // 宏观：7日涨幅过热
     bool support_block  = false;   // 结构：脚下无够格支撑
     bool headroom_block = false;   // 结构：头顶净空不足
-    bool htf_missing    = false;   // 数据缺失标注
+    bool htf_missing    = false;   // 日线K线缺失（%B 与 7日涨幅）
+    bool day_chg_missing= false;   // 24h 涨幅缺失（@ticker 推送流没到）
     bool sr_missing     = false;
     bool data_block     = false;   // strict 模式下因数据缺失而拦截
 
@@ -140,9 +148,8 @@ struct Verdict {
 
 inline Verdict evaluate(const Inputs& in) {
     Verdict v;
-    // %B 与两条涨幅共用同一份高周期K线，所以数据缺失只判一次
-    const bool use_chg = in.day_chg_max > 0 || in.week_chg_max > 0;
-    if (in.use_htf || use_chg) {
+    // ── 日线K线来源：%B 与 7日涨幅 ──
+    if (in.use_htf || in.week_chg_max > 0) {
         if (!in.htf_ok) {
             v.htf_missing = true;
             if (in.strict) v.data_block = true;   // 严格模式：数据没到不开仓
@@ -151,12 +158,19 @@ inline Verdict evaluate(const Inputs& in) {
                                           : (in.htf_pct_b < 1.0 - in.htf_pos_max)))
                 v.htf_block = true;     // 做多拦高位；做空镜像拦低位
             // 做多拦"涨太急"，做空镜像拦"跌太急"
-            if (in.day_chg_max > 0 && (in.is_long ? in.day_chg_pct >  in.day_chg_max
-                                                  : in.day_chg_pct < -in.day_chg_max))
-                v.day_chg_block = true;
             if (in.week_chg_max > 0 && (in.is_long ? in.week_chg_pct >  in.week_chg_max
                                                    : in.week_chg_pct < -in.week_chg_max))
                 v.week_chg_block = true;
+        }
+    }
+    // ── @ticker 推送流来源：24h 涨幅。就绪状态独立判，不能拖累上面那组 ──
+    if (in.day_chg_max > 0) {
+        if (!in.day_chg_ok) {
+            v.day_chg_missing = true;
+            if (in.strict) v.data_block = true;
+        } else if (in.is_long ? in.day_chg_pct >  in.day_chg_max
+                              : in.day_chg_pct < -in.day_chg_max) {
+            v.day_chg_block = true;
         }
     }
     if (in.use_sr_support || in.use_sr_headroom) {
@@ -184,11 +198,13 @@ inline std::string summarize(const Inputs& in, const Verdict& v) {
     if (v.htf_missing)      s += miss;
     else if (!in.use_htf)   s += "关";
     else                    s += num(in.htf_pct_b) + (v.htf_block ? "✗高位" : "✓");
-    // 两条涨幅只在启用时才占位，免得默认关闭的用户每行日志都看到两段"关"
+    // 两条涨幅只在启用时才占位，免得默认关闭的用户每行日志都看到两段"关"。
+    // 各自用【自己那条数据线】的缺失标志：24h 来自 WebSocket 推送流，
+    // 7日涨幅来自日线K线，把两者混报会让排查方向完全错掉
     if (in.day_chg_max > 0) {
-        s += " | 日涨";
-        if (v.htf_missing) s += miss;
-        else               s += num(in.day_chg_pct) + "%" + (v.day_chg_block ? "✗过热" : "✓");
+        s += " | 24h涨";
+        if (v.day_chg_missing) s += std::string(miss) + "(推送流未到)";
+        else                   s += num(in.day_chg_pct) + "%" + (v.day_chg_block ? "✗过热" : "✓");
     }
     if (in.week_chg_max > 0) {
         s += " | 7日涨";
