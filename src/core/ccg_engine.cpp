@@ -355,6 +355,17 @@ void CcgEngine::update_htf(const std::string& bot_id, double pct_b,
     it->second.htf_time  = host_.now_steady();
 }
 
+// 下单/平仓的异步任务抛出后统一收尾：复位 pending 与在途保证金。
+// 不复位的话那个 bot 会永久卡住——所有开仓/补仓/止盈路径都以 !pending 为前提
+void CcgEngine::clear_pending_after_throw(const std::string& bot_id, const std::string& what) {
+    log(what);
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    it->second.pending = false;
+    it->second.inflight_margin = 0;
+}
+
 void CcgEngine::update_24h_change(const std::string& bot_id, bool ok, double pct) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
@@ -736,11 +747,6 @@ void CcgEngine::remove_bot(const std::string& id) {
 void CcgEngine::stop_all() {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     for (auto& [id, b] : bots_) b.state = CcgBot::State::Stopped;
-}
-
-void CcgEngine::remove_all() {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    bots_.clear();
 }
 
 std::vector<CcgBot> CcgEngine::get_bots() const {
@@ -1632,13 +1638,13 @@ void CcgEngine::submit_entry(const std::string& bot_id) {
                 log(cfg.symbol + " 第" + std::to_string(level+1) + "仓失败: " + r.error);
             }
         } catch (const std::exception& e) {
-            log("submit_entry 异常: " + std::string(e.what()));
-            std::lock_guard<std::recursive_mutex> lk(mtx_);
-            auto it = bots_.find(bot_id);
-            if (it != bots_.end()) {
-                it->second.pending = false;
-                it->second.inflight_margin = 0;
-            }
+            clear_pending_after_throw(bot_id, "submit_entry 异常: " + std::string(e.what()));
+        } catch (...) {
+            // 非 std::exception 的东西逃出去，pending 会永久停留在 true——
+            // 那个 bot 从此既不下单也不平仓，且没有任何日志。
+            // 实践中 libcurl/simdjson 都抛 std::exception 派生类，概率很低，
+            // 但后果是"永久静默冻结"，值得一条兜底
+            clear_pending_after_throw(bot_id, "submit_entry 未知异常（非 std::exception）");
         }
     });
 }
@@ -1859,10 +1865,9 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
             }
             if (has_rec && cb_copy) cb_copy(rec);
         } catch (const std::exception& e) {
-            log("submit_close 异常: " + std::string(e.what()));
-            std::lock_guard<std::recursive_mutex> lk(mtx_);
-            auto it = bots_.find(bot_id);
-            if (it != bots_.end()) it->second.pending = false;
+            clear_pending_after_throw(bot_id, "submit_close 异常: " + std::string(e.what()));
+        } catch (...) {
+            clear_pending_after_throw(bot_id, "submit_close 未知异常（非 std::exception）");
         }
     });
 }

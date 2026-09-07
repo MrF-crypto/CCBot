@@ -666,7 +666,6 @@ public:
     void        close_bot (const std::string& bot_id);  // 立即市价平仓（手动触发，非策略止盈/止损）
     void        remove_bot(const std::string& bot_id);
     void        stop_all  ();
-    void        remove_all();
     std::vector<CcgBot> get_bots() const;
 
     void set_log_cb(LogCb cb);
@@ -789,6 +788,9 @@ private:
     void cancel_disaster_stop(const std::string& bot_id);
     void submit_entry   (const std::string& bot_id);
     void submit_close   (const std::string& bot_id, const std::string& reason);
+    // 异步下单/平仓任务抛出后的统一收尾：复位 pending 与在途保证金。
+    // 不复位那个 bot 会永久冻结——所有开仓/补仓/止盈路径都以 !pending 为前提
+    void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
     void log            (const std::string& msg);
 
     std::shared_ptr<ITradingClient> client_;
