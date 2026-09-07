@@ -65,7 +65,20 @@ public:
     // 24 小时滚动涨幅%；无数据或过期返回 false
     bool   change_24h(const std::string& symbol, double& out_pct) const;
 
+    // REST 取到的标记价写回缓存。
+    // 存在的理由：markPrice 流不可用时（未订阅成功/刚启动/断流），调用方会转 REST
+    // 兜底把价格喂给引擎——但界面读的是这个缓存，不写回的话引擎有价、界面空着。
+    // v4.0.9 就是这么漏的：策略照常跑，"标记价"那一列却一直显示 "--"
+    void   set_mark_price(const std::string& symbol, double price);
+
     void on_tick(TickCb cb);   // 每条消息回调（运行在 WS 线程）
+
+    // 服务端返回的【非数据消息】回调（运行在 WS 线程）。
+    // 这类消息没有 "stream" 字段，此前被消息入口第一行直接丢弃——包括
+    // {"code":2,"msg":"Invalid request..."} 这种订阅失败。后果是某条流没订上时
+    // 界面只是一片空白，没有任何线索指向"订阅被拒"。v4.0.9 的标记价就撞上了这个
+    using LogCb = std::function<void(const std::string&)>;
+    void on_server_msg(LogCb cb);
 
     static int64_t now_ms();
 
@@ -86,7 +99,10 @@ public:
 private:
     void on_open   ();
     void on_message(const std::string& json);
-    void send_sub  (const std::string& stream, bool sub);
+    // 批量订阅/退订。合并成一条消息而不是一条流一条消息：币安合约 WS 限制
+    // 【每秒最多 10 条入站消息】，超了直接断连。每品种 3 条流，逐条发的话
+    // 连续加 4 个品种就会触线
+    void send_subs (const std::vector<std::string>& streams, bool sub);
     void resubscribe_all();
 
     static std::string to_lower(std::string s);
@@ -102,6 +118,7 @@ private:
     std::unordered_map<std::string, Tick> cache_;     // UPPER symbol → Tick
 
     TickCb tick_cb_;
+    LogCb  srv_cb_;
 };
 
 } // namespace ccbot

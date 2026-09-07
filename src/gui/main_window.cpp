@@ -1281,6 +1281,13 @@ void MainWindow::onConnect() {
 
             // 启动盘口 WebSocket
             ticker_ = std::make_unique<BookTickerStream>(cfg.testnet);
+            // 订阅被拒之类的服务端消息此前被静默丢弃，某条流没订上时界面
+            // 只是空白、无从查起。回调跑在 WS 线程，转回 GUI 线程再写日志
+            ticker_->on_server_msg([this](const std::string& m) {
+                QMetaObject::invokeMethod(this, [this, m]() {
+                    log(QString::fromStdString(m), "WARN");
+                }, Qt::QueuedConnection);
+            });
             ticker_->start();
 
             srTickCount_    = 0;   // 保证"首tick立即拉取SR/趋势"在（罕见的）重连后依然成立
@@ -2775,7 +2782,12 @@ void MainWindow::onTick() {
     run_async([this, need_rest = std::move(need_rest)]() {
         for (const auto& sym : need_rest) {
             double price = client_->fetch_mark_price(sym);
-            if (price > 0) engine_->tick(sym, price);
+            if (price > 0) {
+                engine_->tick(sym, price);
+                // 写回缓存：界面那一列读的是缓存，不写回就会出现
+                // "引擎有价在跑、标记价列却一直空着"
+                if (ticker_) ticker_->set_mark_price(sym, price);
+            }
         }
         QMetaObject::invokeMethod(this, [this]() { refreshBotTable(); },
                                   Qt::QueuedConnection);

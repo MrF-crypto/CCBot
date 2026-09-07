@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <vector>
 #include <thread>
 
 using namespace ccbot;
@@ -220,6 +221,43 @@ int main() {
         ts.on_message_for_test(tick24_msg("btcusdt", "BTCUSDT", "0"));
         check(ts.change_24h("BTCUSDT", pct) && std::fabs(pct) < 1e-12,
               "涨幅恰好为 0 仍算有效（不能用 >0 判合法）");
+    }
+
+    // ── ⑪ REST 兜底的标记价必须写得回缓存 ───────────────────────────────────
+    // v4.0.9 的实际故障：markPrice 流没数据时，调用方转 REST 把价格喂给了引擎，
+    // 但没写回缓存，而界面读的正是缓存——于是"策略照常跑、标记价列一直空着"。
+    // 引擎有兜底、界面没有，这种半边修复比完全没修更难查
+    {
+        BookTickerStream ts2(/*testnet=*/true);
+        check_near(ts2.mark_price("BTCUSDT"), 0.0, 1e-12, "初始无标记价");
+        ts2.set_mark_price("BTCUSDT", 95123.45);
+        check_near(ts2.mark_price("BTCUSDT"), 95123.45, 1e-6,
+                   "REST 写回后 mark_price() 可读（引擎路径）");
+        check_near(ts2.get("BTCUSDT").mark_price, 95123.45, 1e-6,
+                   "  get() 也可读（界面路径，v4.0.9 漏的就是这条）");
+        ts2.set_mark_price("BTCUSDT", 0);
+        check_near(ts2.get("BTCUSDT").mark_price, 95123.45, 1e-6,
+                   "  写回 0 不覆盖已有值");
+    }
+
+    // ── ⑫ 服务端非数据消息必须能被上报 ──────────────────────────────────────
+    // 订阅被拒返回 {"code":...,"msg":...}，没有 "stream" 字段，此前被消息入口
+    // 第一行直接丢弃——某条流没订上时界面只是空白，没有任何线索
+    {
+        BookTickerStream ts3(/*testnet=*/true);
+        std::vector<std::string> got;
+        ts3.on_server_msg([&](const std::string& m) { got.push_back(m); });
+
+        ts3.on_message_for_test("{\"result\":null,\"id\":1}");
+        check(got.empty(), "正常订阅确认不打扰用户");
+
+        ts3.on_message_for_test("{\"code\":2,\"msg\":\"Invalid request: invalid stream\"}");
+        check(got.size() == 1 && got[0].find("Invalid request") != std::string::npos,
+              "订阅被拒会上报（这是 v4.0.9 查不出根因的直接原因）");
+
+        // 正常数据包不该触发这个回调
+        ts3.on_message_for_test(msg("btcusdt", "BTCUSDT", "100.0", "1", "101.0", "1"));
+        check(got.size() == 1, "  数据包不触发服务端消息回调");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

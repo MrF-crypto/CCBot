@@ -33,6 +33,11 @@ void BookTickerStream::on_tick(TickCb cb) {
     tick_cb_ = std::move(cb);
 }
 
+void BookTickerStream::on_server_msg(LogCb cb) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    srv_cb_ = std::move(cb);
+}
+
 // ── 启动 / 停止 ───────────────────────────────────────────────────────────────
 void BookTickerStream::start() {
     if (running_.load()) return;
@@ -81,29 +86,29 @@ void BookTickerStream::on_open() {
 }
 
 void BookTickerStream::resubscribe_all() {
-    std::set<std::string> to_sub;
+    std::vector<std::string> to_sub;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        to_sub = streams_;
+        to_sub.assign(streams_.begin(), streams_.end());
     }
     if (to_sub.empty()) return;
 
-    // 批量 SUBSCRIBE（一条消息）
-    std::ostringstream params;
-    bool first = true;
-    for (const auto& s : to_sub) {
-        if (!first) params << ',';
-        params << '"' << s << '"';
-        first = false;
+    // 币安合约 WS 单连接最多 200 条流（1024 是【现货】的数字，别搞混）。
+    // 每品种 3 条流 ⇒ 约 66 个品种到顶。超了要么整条 SUBSCRIBE 被拒、
+    // 要么连接被断，而两种情况此前都是静默的——所以在这里就说清楚
+    if (to_sub.size() > 200) {
+        LogCb cb;
+        { std::lock_guard<std::mutex> lk(mtx_); cb = srv_cb_; }
+        if (cb) cb("⚠ 行情WS流数量 " + std::to_string(to_sub.size()) +
+                   " 超过币安合约单连接上限 200（每品种3条流≈66个品种），"
+                   "超出部分不会有行情");
     }
-    std::string msg = "{\"method\":\"SUBSCRIBE\",\"params\":[" + params.str()
-                    + "],\"id\":" + std::to_string(req_id_++) + "}";
-    ws_->send(msg);
+    send_subs(to_sub, true);
 }
 
 // ── 订阅 / 取消 ───────────────────────────────────────────────────────────────
-// 每个品种只订阅 bookTicker 一个流（买一/卖一）。最新成交价直接取买一卖一
-// 中间价，不再单独订阅 ticker/aggTrade 流——减少连接数，界面也更稳定。
+// 每个品种三条流：bookTicker（买一卖一/延迟）、markPrice@1s（引擎决策与强平距离）、
+// ticker（24h 滚动涨幅，高位拦截用）。
 void BookTickerStream::subscribe(const std::string& symbol) {
     std::string s_book = to_lower(symbol) + "@bookTicker";
     // 标记价单独一条流。用逐品种的 @markPrice@1s 而不是全市场的
@@ -115,51 +120,60 @@ void BookTickerStream::subscribe(const std::string& symbol) {
     // 归零），要真正的滚动 24 小时得按小时线回看 24 根，那是每品种一次额外 REST；
     // 而 @ticker 的 P 字段就是币安官方的 24h 滚动涨幅，推送式、零请求成本
     std::string s_tick = to_lower(symbol) + "@ticker";
-    bool need_book, need_mark, need_tick;
+    std::vector<std::string> fresh;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        need_book = streams_.insert(s_book).second;
-        need_mark = streams_.insert(s_mark).second;
-        need_tick = streams_.insert(s_tick).second;
+        for (const auto& s : {s_book, s_mark, s_tick})
+            if (streams_.insert(s).second) fresh.push_back(s);
     }
-    if (connected_.load()) {
-        if (need_book) send_sub(s_book, true);
-        if (need_mark) send_sub(s_mark, true);
-        if (need_tick) send_sub(s_tick, true);
-    }
+    // 三条流合并成一条 SUBSCRIBE。逐条发的话每品种就是 3 条入站消息，
+    // 而币安合约 WS 限【每秒 10 条】，连续加 4 个品种即触线并被断连
+    if (connected_.load() && !fresh.empty()) send_subs(fresh, true);
 }
 
 void BookTickerStream::unsubscribe(const std::string& symbol) {
     std::string s_book = to_lower(symbol) + "@bookTicker";
     std::string s_mark = to_lower(symbol) + "@markPrice@1s";
     std::string s_tick = to_lower(symbol) + "@ticker";
-    bool had_book, had_mark, had_tick;
+    std::vector<std::string> gone;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        had_book = streams_.erase(s_book) > 0;
-        had_mark = streams_.erase(s_mark) > 0;
-        had_tick = streams_.erase(s_tick) > 0;
+        for (const auto& s : {s_book, s_mark, s_tick})
+            if (streams_.erase(s) > 0) gone.push_back(s);
         cache_.erase(symbol);
     }
-    if (connected_.load()) {
-        if (had_book) send_sub(s_book, false);
-        if (had_mark) send_sub(s_mark, false);
-        if (had_tick) send_sub(s_tick, false);
-    }
+    if (connected_.load() && !gone.empty()) send_subs(gone, false);
 }
 
-void BookTickerStream::send_sub(const std::string& stream, bool sub) {
-    std::string method = sub ? "SUBSCRIBE" : "UNSUBSCRIBE";
-    std::string msg = "{\"method\":\"" + method + "\","
-                      "\"params\":[\"" + stream + "\"],"
-                      "\"id\":" + std::to_string(req_id_++) + "}";
+void BookTickerStream::send_subs(const std::vector<std::string>& streams, bool sub) {
+    if (streams.empty()) return;
+    std::ostringstream params;
+    bool first = true;
+    for (const auto& s : streams) {
+        if (!first) params << ',';
+        params << '"' << s << '"';
+        first = false;
+    }
+    std::string msg = std::string("{\"method\":\"") + (sub ? "SUBSCRIBE" : "UNSUBSCRIBE")
+                    + "\",\"params\":[" + params.str()
+                    + "],\"id\":" + std::to_string(req_id_++) + "}";
     ws_->send(msg);
 }
 
 // ── 消息解析 ──────────────────────────────────────────────────────────────────
 void BookTickerStream::on_message(const std::string& json) {
-    // 过滤订阅响应（{"result":null,"id":1}）
-    if (json.size() < 20 || json.find("\"stream\"") == std::string::npos) return;
+    if (json.find("\"stream\"") == std::string::npos) {
+        // 不是数据包。{"result":null,"id":N} 是正常的订阅确认，安静丢掉；
+        // 其余（{"code":2,"msg":"Invalid request..."} 之类）必须让人看见——
+        // 这里此前一律静默返回，某条流没订上时界面只是空白，无从查起
+        if (json.find("\"result\":null") == std::string::npos) {
+            LogCb cb;
+            { std::lock_guard<std::mutex> lk(mtx_); cb = srv_cb_; }
+            if (cb) cb("行情WS服务端消息: " + json.substr(0, 300));
+        }
+        return;
+    }
+    if (json.size() < 20) return;
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -263,6 +277,15 @@ double BookTickerStream::mark_price(const std::string& symbol) const {
     // 拿冻结的标记价继续决策与拿冻结的中间价一样危险
     if (now_ms() - t.mark_ms > 10000) return 0.0;
     return t.mark_price;
+}
+
+void BookTickerStream::set_mark_price(const std::string& symbol, double price) {
+    if (price <= 0) return;
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto& c = cache_[symbol];
+    c.symbol     = symbol;
+    c.mark_price = price;
+    c.mark_ms    = now_ms();   // 与流来的包同等对待，陈旧保护照常生效
 }
 
 bool BookTickerStream::change_24h(const std::string& symbol, double& out_pct) const {

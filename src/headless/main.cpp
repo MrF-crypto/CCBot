@@ -247,6 +247,8 @@ int main(int argc, char** argv) {
     }
 
     BookTickerStream ticker(cfg.testnet);
+    // 订阅被拒等服务端消息此前静默丢弃：VPS 上没有界面，这类问题只能靠日志发现
+    ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
     ticker.start();
     std::set<std::string> symbols;
     for (const auto& c : cfg.bots) symbols.insert(c.symbol);
@@ -295,7 +297,11 @@ int main(int argc, char** argv) {
         // ── 1) 价格喂入 + 策略判定：永远最先执行，不被任何数据拉取阻塞 ────────
         for (const auto& sym : symbols) {
             double price = ticker.mark_price(sym);   // 内置10秒陈旧保护，冻结价返回0
-            if (price <= 0) price = client->fetch_mark_price(sym);
+            if (price <= 0) {
+                price = client->fetch_mark_price(sym);
+                // 写回缓存：headless 没有界面，但状态落盘与日志同样读它
+                if (price > 0) ticker.set_mark_price(sym, price);
+            }
             if (price > 0) {
                 engine->tick(sym, price);
                 stall_ticks[sym] = 0;
