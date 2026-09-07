@@ -21,7 +21,15 @@ public:
         double bid_qty    = 0;
         double ask        = 0;
         double ask_qty    = 0;
-        double last_price = 0;   // 最新成交价（取买一/卖一中间价，界面展示用）
+        // 买一卖一中间价。名字叫 last_price 是历史遗留——它【不是】最新成交价，
+        // 真实成交价会在买卖价之间来回跳，中间价平滑得多，所以界面一直用这个
+        double last_price = 0;
+        // 标记价（markPrice@1s）。这是币安用来算【强平价、未实现盈亏、强平触发】
+        // 的价，和成交价/中间价是两套体系：它带指数成分和资金费基差，抗单交易所插针。
+        // 想回答"我离强平还有多远"只能用它，用中间价算出来的距离是错的。
+        // 更新频率 1s（bookTicker 是逐笔），所以单独记收包时间，不与 recv_ms 混用
+        double  mark_price = 0;
+        int64_t mark_ms    = 0;
         int64_t recv_ms   = 0;   // 本地收包时间戳(ms)
         bool    valid     = false;
     };

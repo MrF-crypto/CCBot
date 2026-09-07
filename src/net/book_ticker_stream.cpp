@@ -106,23 +106,37 @@ void BookTickerStream::resubscribe_all() {
 // 中间价，不再单独订阅 ticker/aggTrade 流——减少连接数，界面也更稳定。
 void BookTickerStream::subscribe(const std::string& symbol) {
     std::string s_book = to_lower(symbol) + "@bookTicker";
-    bool need_book;
+    // 标记价单独一条流。用逐品种的 @markPrice@1s 而不是全市场的
+    // !markPrice@arr@1s：后者每秒推送【全部】约五百个合约，盯十个品种的场景下
+    // 99% 的带宽是白扔的。逐品种与 bookTicker 的订阅模式也一致。
+    // 一条连接最多 1024 个流，每品种两条流对实际用量来说远远够
+    std::string s_mark = to_lower(symbol) + "@markPrice@1s";
+    bool need_book, need_mark;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         need_book = streams_.insert(s_book).second;
+        need_mark = streams_.insert(s_mark).second;
     }
-    if (connected_.load() && need_book) send_sub(s_book, true);
+    if (connected_.load()) {
+        if (need_book) send_sub(s_book, true);
+        if (need_mark) send_sub(s_mark, true);
+    }
 }
 
 void BookTickerStream::unsubscribe(const std::string& symbol) {
     std::string s_book = to_lower(symbol) + "@bookTicker";
-    bool had_book;
+    std::string s_mark = to_lower(symbol) + "@markPrice@1s";
+    bool had_book, had_mark;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         had_book = streams_.erase(s_book) > 0;
+        had_mark = streams_.erase(s_mark) > 0;
         cache_.erase(symbol);
     }
-    if (connected_.load() && had_book) send_sub(s_book, false);
+    if (connected_.load()) {
+        if (had_book) send_sub(s_book, false);
+        if (had_mark) send_sub(s_mark, false);
+    }
 }
 
 void BookTickerStream::send_sub(const std::string& stream, bool sub) {
@@ -165,6 +179,10 @@ void BookTickerStream::on_message(const std::string& json) {
         TickCb cb;
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            // 先取回已有条目：标记价来自另一条流，这里【不能】用全新 Tick 覆盖，
+            // 否则 bookTicker 每来一包就把标记价抹成 0（bookTicker 是逐笔、
+            // markPrice 是每秒一次，抹掉的概率接近 100%）
+            t = cache_[symbol];
             t.symbol  = symbol;
             t.bid     = safe_stod(b_sv);
             t.bid_qty = safe_stod(B_sv);
@@ -172,12 +190,26 @@ void BookTickerStream::on_message(const std::string& json) {
             t.ask_qty = safe_stod(A_sv);
             t.recv_ms = now_ms();
             t.valid   = (t.bid > 0 && t.ask > 0);
-            // 最新成交价：买一卖一中间价（不再单独订阅 ticker 流）
+            // 中间价（字段名 last_price 是历史遗留，它不是最新成交价）
             t.last_price = t.valid ? (t.bid + t.ask) / 2.0 : 0.0;
             cache_[symbol] = t;
             cb = tick_cb_;
         }
         if (cb && t.valid) cb(t);
+    } else if (ev == "markPriceUpdate") {
+        // {"e":"markPriceUpdate","s":"BTCUSDT","p":"<标记价>","i":"<指数价>",...}
+        std::string_view p_sv;
+        if (data["p"].get(p_sv) != simdjson::SUCCESS) return;
+        const double mp = safe_stod(p_sv);
+        if (mp <= 0) return;
+        std::lock_guard<std::mutex> lk(mtx_);
+        // 同理：只更新标记价两个字段，不碰 bid/ask/valid/recv_ms。
+        // 尤其不能动 valid 和 recv_ms —— 陈旧判定靠它们，
+        // 让每秒一次的标记价去刷新"行情新鲜度"会掩盖 bookTicker 已经断流
+        auto& c = cache_[symbol];
+        c.symbol     = symbol;
+        c.mark_price = mp;
+        c.mark_ms    = now_ms();
     }
 }
 

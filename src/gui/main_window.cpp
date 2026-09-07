@@ -1098,7 +1098,7 @@ void MainWindow::buildUi() {
         botTable_ = new QTableWidget(0, 15);
         botTable_->setHorizontalHeaderLabels(
             {"#","品种","方向","策略","层进度",
-             "均价","最新成交价","延迟","浮动P&L","保证金","收益率","强平价",
+             "均价","标记价","延迟","浮动P&L","保证金","收益率","强平价",
              "已实现","状态","操作"});
         auto* hdr = botTable_->horizontalHeader();
         hdr->setSectionResizeMode(QHeaderView::Stretch);
@@ -2798,6 +2798,44 @@ static QString fmt_tick_px(double p, double tick) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 「标记价」单元格。优先标记价，拿不到时回退中间价并在提示里说明。
+//
+// 为什么这一列是标记价而不是中间价：强平价、未实现盈亏、强平触发，币安全部按
+// 标记价算。用中间价去比强平价是两套体系相减，平时差几个基点无所谓，但便宜的
+// 山寨币剧烈波动时会明显分叉——恰恰是最需要看准的时候。
+//
+// ⚠ 引擎决策用的仍是【中间价】，不是这一列。原因是回测重放的是 K 线收盘价
+//   （成交价体系），全部 walk-forward 结论都建立在那个口径上；把实盘决策改成
+//   标记价会让实盘与回测系统性错位。所以中间价放进悬停提示，两个都能看到
+// ─────────────────────────────────────────────────────────────────────────────
+static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, double tick_size) {
+    const bool has_mark = tick.mark_price > 0;
+    const double shown  = has_mark ? tick.mark_price : tick.last_price;
+    auto* it = new QTableWidgetItem(shown > 0 ? fmt_tick_px(shown, tick_size) : "--");
+    it->setTextAlignment(Qt::AlignCenter);
+    it->setForeground(has_mark ? QColor("#e6edf3") : QColor("#8b949e"));
+
+    QString tip;
+    if (!has_mark) {
+        tip = "标记价尚未到达（markPrice@1s 每秒一次，刚订阅时会有约 1 秒空窗）。\n"
+              "当前显示的是中间价，颜色转灰即表示这一格不是标记价。\n\n";
+    }
+    tip += QString("中间价 %1\n买一 %2\n卖一 %3")
+               .arg(tick.last_price > 0 ? fmt_tick_px(tick.last_price, tick_size) : "--")
+               .arg(tick.bid > 0 ? fmt_tick_px(tick.bid, tick_size) : "--")
+               .arg(tick.ask > 0 ? fmt_tick_px(tick.ask, tick_size) : "--");
+    if (has_mark && tick.last_price > 0) {
+        const double dev = (tick.mark_price / tick.last_price - 1.0) * 100.0;
+        tip += QString("\n标记价相对中间价偏离 %1%2%")
+                   .arg(dev >= 0 ? "+" : "").arg(dev, 0, 'f', 3);
+    }
+    tip += "\n\n强平价与浮动盈亏都按标记价计算；\n"
+           "而引擎开仓/止盈的判定用的是中间价（与回测的成交价口径一致）。";
+    it->setToolTip(tip);
+    return it;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 100ms 高频刷新：只更新"最新成交价"与"延迟"两列的文本，不touch行/按钮
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshLiveQuotes() {
@@ -2824,8 +2862,7 @@ void MainWindow::refreshLiveQuotes() {
             if (client_->try_get_symbol_info(b.cfg.symbol, info) && info.valid) tick_size = info.tick_size;
             else ensureSymbolInfoAsync(b.cfg.symbol);
         }
-        QString lastPx = (tick.last_price > 0) ? fmt_tick_px(tick.last_price, tick_size) : "--";
-        botTable_->setItem(i, 6, mkc(lastPx, QColor("#e6edf3")));
+        botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
 
         int64_t latency = (tick.last_price > 0 || tick.valid) ? (now_ms - tick.recv_ms) : -1;
         QColor lat_c = (latency < 0)   ? QColor("#484f58")
@@ -3125,8 +3162,7 @@ void MainWindow::refreshBotTable() {
             if (client_->try_get_symbol_info(b.cfg.symbol, info) && info.valid) tick_size = info.tick_size;
             else ensureSymbolInfoAsync(b.cfg.symbol);
         }
-        QString lastPx = (tick.last_price > 0) ? fmt_tick_px(tick.last_price, tick_size) : "--";
-        botTable_->setItem(i, 6,  mkc(lastPx, QColor("#e6edf3")));
+        botTable_->setItem(i, 6,  make_mark_cell(tick, tick_size));
 
         int64_t latency = (tick.last_price > 0 || tick.valid) ? (now_ms - tick.recv_ms) : -1;
         QColor lat_c = (latency < 0)   ? QColor("#484f58")
@@ -3180,7 +3216,31 @@ void MainWindow::refreshBotTable() {
 
         // 强平价：来自交易所真实持仓（refreshPositions() 每 3s 拉取一次），本地无法准确估算
         double liq = has_real_pos ? pit->second.liq_price : 0;
-        botTable_->setItem(i, 11, mkc(liq > 0 ? fmt_price(liq) : "--", QColor("#d29922")));
+        // 强平价 + 距强平百分比。距离必须用【标记价】算——强平就是拿标记价触发的，
+        // 用中间价算出来的距离是两套体系相减。拿不到标记价时不显示距离，
+        // 而不是退回中间价硬算一个看着像真的、其实口径错的数字
+        {
+            auto* liq_item = mkc(liq > 0 ? fmt_price(liq) : "--", QColor("#d29922"));
+            const double mk = tick.mark_price;
+            if (liq > 0 && mk > 0 && b.total_qty > 0) {
+                const bool is_long = (b.cfg.direction != CcgConfig::Direction::Short);
+                // 多头强平在下方，空头在上方；一律取"还要走多少百分比才碰到"
+                const double dist = (is_long ? (mk - liq) / mk : (liq - mk) / mk) * 100.0;
+                liq_item->setText(QString("%1 (%2%)")
+                                      .arg(fmt_price(liq)).arg(dist, 0, 'f', 1));
+                // 越近越红：20% 以内转黄，10% 以内转红
+                liq_item->setForeground(dist <= 10.0 ? QColor("#f85149")
+                                      : dist <= 20.0 ? QColor("#d29922")
+                                                     : QColor("#3fb950"));
+                liq_item->setToolTip(
+                    QString("强平价 %1\n标记价 %2\n距强平 %3%\n\n"
+                            "距离按标记价算——币安就是拿标记价触发强平的。\n"
+                            "名义仓位 ≤ 权益时强平价 ≤ 0，此列显示 --（数学上不可强平）。")
+                        .arg(fmt_price(liq)).arg(fmt_tick_px(mk, tick_size))
+                        .arg(dist, 0, 'f', 2));
+            }
+            botTable_->setItem(i, 11, liq_item);
+        }
 
         botTable_->setItem(i, 12, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
         auto* state_item = mkc(state_s, state_c);

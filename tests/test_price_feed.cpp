@@ -41,6 +41,14 @@ static std::string msg(const char* sym_lower, const char* SYM,
          + "\"T\":1787156044876,\"E\":1787156044880}}";
 }
 
+// 标记价流报文（<symbol>@markPrice@1s）。p=标记价，i=指数价，r=资金费率
+static std::string mark_msg(const char* sym_lower, const char* SYM, const char* p) {
+    return std::string("{\"stream\":\"") + sym_lower + "@markPrice@1s\",\"data\":{"
+         + "\"e\":\"markPriceUpdate\",\"E\":1787156044880,\"s\":\"" + SYM + "\","
+         + "\"p\":\"" + p + "\",\"i\":\"95010.00\",\"P\":\"95011.00\","
+         + "\"r\":\"0.00010000\",\"T\":1787156800000}}";
+}
+
 int main() {
     BookTickerStream ts(/*testnet=*/true);
 
@@ -116,6 +124,50 @@ int main() {
     // ── ⑦ 未订阅品种返回 0，不返回垃圾 ──────────────────────────────────────
     check_near(ts.mid_price("NOSUCHUSDT"), 0.0, 1e-12, "未知品种 mid_price 返回 0");
     check(!ts.get("NOSUCHUSDT").valid, "未知品种快照无效");
+
+    // ── ⑧ 标记价：与 bookTicker 是两条流，共用一个缓存条目 ──────────────────
+    // 这里最容易写错的是【互相覆盖】。bookTicker 是逐笔、markPrice 每秒一次，
+    // 如果 bookTicker 分支用全新 Tick 覆盖缓存，标记价几乎每次都会被抹成 0。
+    {
+        ts.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "95012.34"));
+        auto t = ts.get("BTCUSDT");
+        check_near(t.mark_price, 95012.34, 1e-6, "标记价报文解析");
+        check(t.mark_ms > 0, "  标记价收包时间已记录");
+        check_near(t.last_price, 95000.50, 1e-6, "  没有污染中间价");
+        check(t.bid > 0 && t.ask > 0, "  没有污染买一卖一");
+    }
+    {
+        // 再来一包 bookTicker：标记价必须还在
+        ts.on_message_for_test(msg("btcusdt", "BTCUSDT", "95100.00", "1.0", "95101.00", "1.0"));
+        auto t = ts.get("BTCUSDT");
+        check_near(t.mark_price, 95012.34, 1e-6,
+                   "bookTicker 到达后标记价仍在（这条防的是互相覆盖）");
+        check_near(t.last_price, 95100.50, 1e-6, "  中间价已更新");
+    }
+    {
+        // 标记价【不能】刷新行情新鲜度：否则 bookTicker 断流时，
+        // 每秒一次的标记价会把包龄一直压在低位，陈旧保护彻底失效
+        ts.age_cache_for_test("BTCUSDT", 11000);
+        ts.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "95020.00"));
+        check_near(ts.mid_price("BTCUSDT"), 0.0, 1e-12,
+                   "标记价不刷新 recv_ms：bookTicker 断流时陈旧保护仍然生效");
+        check_near(ts.get("BTCUSDT").mark_price, 95020.00, 1e-6,
+                   "  但标记价本身照常更新（它自己那条流是活的）");
+    }
+    {
+        // 非法标记价不得覆盖已有的好值
+        const double before = ts.get("BTCUSDT").mark_price;
+        ts.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "0"));
+        ts.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "-1"));
+        check_near(ts.get("BTCUSDT").mark_price, before, 1e-9,
+                   "标记价为 0/负数时不覆盖已有值");
+    }
+    {
+        // 微价品种：标记价同样不能被精度吃掉
+        ts.on_message_for_test(mark_msg("pepeusdt", "PEPEUSDT", "0.00000123499"));
+        check_near(ts.get("PEPEUSDT").mark_price, 0.00000123499, 1e-15,
+                   "微价标记价保留精度");
+    }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
