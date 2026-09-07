@@ -2,7 +2,7 @@
 #include "core/decision.h"
 #include "core/dynamic_params.h"
 // 引擎只依赖 ITradingClient 接口（在 ccg_engine.h 里），不再直接依赖具体的
-// TradingClient/curl——这样回测目标可以只编译引擎+模拟客户端，无需网络库
+// TradingClient/curl——单元测试因此可以只编译引擎+FakeClient，无需网络库
 #include "core/thread_pool.h"
 #include <sstream>
 #include <iomanip>
@@ -331,7 +331,6 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.use_sr_support      = new_cfg.use_sr_support;
     cfg.use_sr_headroom     = new_cfg.use_sr_headroom;
     cfg.sr_min_confluence   = new_cfg.sr_min_confluence;
-    cfg.sr_res_min_conf     = new_cfg.sr_res_min_conf;
     cfg.sr_independent_conf = new_cfg.sr_independent_conf;
     cfg.sr_lower_half_only  = new_cfg.sr_lower_half_only;
     cfg.sr_headroom_ratio   = new_cfg.sr_headroom_ratio;
@@ -347,9 +346,7 @@ void CcgEngine::update_htf(const std::string& bot_id, double pct_b,
     if (it == bots_.end()) return;
     it->second.htf_ok    = (pct_b >= -0.5);   // decision::pct_b 非法时返回 -1
     it->second.htf_pct_b = pct_b;
-    // 7日涨幅与 %B 同源同一次拉取，但历史不足 8 根时算不出来，单独一个 ok 标志。
-    // 回测的三个调用点走的是 2 参数默认形式（chg_ok=false）——回测侧不跟踪涨幅，
-    // 所以那两个阈值在回测里被强制归零，见 bt_replay.cpp / bt_portfolio.cpp
+    // 7日涨幅与 %B 同源同一次拉取，但历史不足 8 根时算不出来，单独一个 ok 标志
     it->second.htf_chg_ok   = chg_ok;
     it->second.htf_week_chg = week_chg;
     it->second.htf_time  = host_.now_steady();
@@ -1267,14 +1264,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     } else {
                         tp_dist = price * std::max(bot.cfg.dynamic_band_mode ? 1.0
                                                                              : bot.cfg.tp_pct, 0.1) / 100.0;
-                    }
-                    // 真实止盈距离：动态W模式还要满足"价格≥均价×(1+保底利润)"，
-                    // 首仓时均价即入场价，所以保底线就是 price×(1+floor)。两个条件
-                    // 取【更远】的那个才是真正要走的路
-                    if (bot.cfg.sr_headroom_true_tp && bot.cfg.dynamic_band_mode &&
-                        bot.cfg.min_profit_floor > 0) {
-                        tp_dist = std::max(tp_dist,
-                                           price * bot.cfg.min_profit_floor / 100.0);
                     }
                     // 净空：多头看上方阻力，空头镜像看下方支撑
                     double barrier = is_long ? bot.sr_res_lo

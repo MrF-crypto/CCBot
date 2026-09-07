@@ -105,19 +105,19 @@ if(MSVC)
     target_compile_options(ccbot_headless PRIVATE /utf-8)
 endif()
 
-# ── 回测工具（P0 数据层）：不依赖 Qt/网络，Windows/Linux 都能跑 ────────────────
-add_executable(ccbot_backtest
-    src/backtest/bt_main.cpp
-    src/backtest/bt_data.cpp
-    src/backtest/bt_replay.cpp
-    src/backtest/bt_portfolio.cpp
-    src/core/ccg_engine.cpp     # 回测跑引擎本尊，不是仿制品
-)
-target_include_directories(ccbot_backtest PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccbot_backtest PRIVATE Threads::Threads)
-if(MSVC)
-    target_compile_options(ccbot_backtest PRIVATE /utf-8)
-endif()
+# ── 回测已移出本仓库（v4.0.13）────────────────────────────────────────────────
+# src/backtest/ 整个子系统（3418 行，占当时代码量 18%）连同 ccbot_backtest 目标
+# 一并删除，回测由独立项目承担。
+#
+# 删它的理由不只是省代码量：那套东西是【第二份策略逻辑】。它要重新实现指标
+# 推进、K线聚合、撮合、资金费，任何一处与实盘的偏差都会让回测结论悄悄失真，
+# 而偏差在哪儿只有踩到才知道。v4.0.7 的涨幅拦截就已经出现"回测侧未实现，
+# 强制归零"这种补丁——两套逻辑之间的缝开始显形。本仓库现在只留一条真相。
+#
+# 保留的是 EngineHost 的时钟/执行器注入（ccg_engine.h）：那不是为回测存在的，
+# 13 套单元测试的虚拟时钟与确定性复现全靠它。
+#
+# 历史结论仍记录在 docs/BACKTEST.md 与各处代码注释里，只是产生它们的工具搬走了。
 
 # ── 梯子深度分析：满层能扛多深 / 剩多少保证金没花。不跑行情，纯确定性推演 ────
 add_executable(ladder_depth tools/ladder_depth.cpp src/core/ccg_engine.cpp)
@@ -234,16 +234,9 @@ if(MSVC)
     target_compile_options(ccg_persist_tests PRIVATE /utf-8)
 endif()
 
-# ── 回测强平模型测试：该爆的要爆，不该爆的一个数字都不能动 ────────────────────
-add_executable(ccg_liq_tests tests/test_liquidation.cpp
-                             src/backtest/bt_portfolio.cpp
-                             src/backtest/bt_data.cpp      # aggregate / interval_ms / BarStream
-                             src/core/ccg_engine.cpp)
-target_include_directories(ccg_liq_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_liq_tests PRIVATE Threads::Threads)
-if(MSVC)
-    target_compile_options(ccg_liq_tests PRIVATE /utf-8)
-endif()
+# ccg_liq_tests 随回测子系统一并移除（v4.0.13）。它测的全部是【回测模拟器
+# 内部】的强平会计（PortfolioResult / MultiSimClient / run_portfolio），
+# 实盘引擎侧不损失任何覆盖——实盘的强平价来自交易所，不由本地逻辑推算。
 
 # ── 压力测试（并发撕裂 / 极端行情）：实盘前的最后一道自检 ────────────────────
 add_executable(ccg_stress_tests tests/test_stress.cpp src/core/ccg_engine.cpp)
