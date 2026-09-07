@@ -2567,8 +2567,15 @@ void MainWindow::onClearStopped() {
             "清除")) return;
 
     int done = 0;
+    std::set<std::string> touched;
     for (const auto& b : engine_->get_bots())
-        if (b.state == CcgBot::State::Stopped) { engine_->remove_bot(b.bot_id); ++done; }
+        if (b.state == CcgBot::State::Stopped) {
+            touched.insert(b.cfg.symbol);
+            engine_->remove_bot(b.bot_id);
+            ++done;
+        }
+    // 全部删完之后再统一退订：边删边退会误判"还有别的 bot 在用"
+    for (const auto& s : touched) unsubscribeIfUnused(s);
     if (done > 0) log(QString("已清除 %1 个已停止Bot").arg(done), withPos > 0 ? "WARN" : "INFO");
     refreshBotTable();
     save_bots();
@@ -2881,19 +2888,21 @@ void MainWindow::refreshLiveQuotes() {
     for (int i = 0; i < (int)bots.size(); ++i) {
         const auto& b = bots[i];
         auto tick = ticker_->get(b.cfg.symbol);
-        double tick_size = 0;
-        if (client_) {
-            TradingClient::SymbolInfo info;
-            if (client_->try_get_symbol_info(b.cfg.symbol, info) && info.valid) tick_size = info.tick_size;
-            else ensureSymbolInfoAsync(b.cfg.symbol);
-        }
+        const double tick_size = tickSizeOf(b.cfg.symbol);
         botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
 
-        int64_t latency = (tick.last_price > 0 || tick.valid) ? (now_ms - tick.recv_ms) : -1;
-        QColor lat_c = (latency < 0)   ? QColor("#484f58")
-                     : (latency < 100) ? QColor("#3fb950")
-                     : (latency < 500) ? QColor("#d29922")
-                                       : QColor("#f85149");
+        // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
+        // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
+        // 这一格显示绿色，引擎却已经在走 REST 兜底。健康指示器指错了对象，
+        // 这也是标记价那次故障全程没有任何征兆的原因
+        int64_t latency = (tick.mark_ms > 0) ? (now_ms - tick.mark_ms) : -1;
+        // 阈值按 markPrice@1s 的节奏定：正常包龄在 0~1000ms 之间均匀分布，
+        // 用旧的 100/500ms 会一直显示红色。超过 3 秒说明丢了两三包，
+        // 超过 kStaleMs(10s) 引擎就当它断流转 REST 了
+        QColor lat_c = (latency < 0)    ? QColor("#484f58")
+                     : (latency < 1500) ? QColor("#3fb950")
+                     : (latency < 3000) ? QColor("#d29922")
+                                        : QColor("#f85149");
         botTable_->setItem(i, 7, mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
     }
 }
@@ -2901,6 +2910,22 @@ void MainWindow::refreshLiveQuotes() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 品种精度信息异步预取——GUI 线程只读缓存，缺失时丢到后台线程取，绝不同步等待
 // ─────────────────────────────────────────────────────────────────────────────
+double MainWindow::tickSizeOf(const std::string& symbol) {
+    if (!client_) return 0.0;
+    TradingClient::SymbolInfo info;
+    if (client_->try_get_symbol_info(symbol, info) && info.valid) return info.tick_size;
+    ensureSymbolInfoAsync(symbol);
+    return 0.0;
+}
+
+void MainWindow::unsubscribeIfUnused(const std::string& symbol) {
+    if (!ticker_ || !engine_) return;
+    // 同一品种可以同时有多头和空头两个 bot——删掉一个不能把另一个的行情退掉
+    for (const auto& b : engine_->get_bots())
+        if (b.cfg.symbol == symbol) return;
+    ticker_->unsubscribe(symbol);
+}
+
 void MainWindow::ensureSymbolInfoAsync(const std::string& symbol) {
     if (!client_ || pendingSymbolFetch_.count(symbol)) return;
     pendingSymbolFetch_.insert(symbol);
@@ -3181,19 +3206,21 @@ void MainWindow::refreshBotTable() {
 
         // 最新成交价 + 延迟：来自 WebSocket aggTrade 流，独立于策略引擎的 tick 价格
         auto tick = ticker_ ? ticker_->get(b.cfg.symbol) : BookTickerStream::Tick{};
-        double tick_size = 0;
-        if (client_) {
-            TradingClient::SymbolInfo info;
-            if (client_->try_get_symbol_info(b.cfg.symbol, info) && info.valid) tick_size = info.tick_size;
-            else ensureSymbolInfoAsync(b.cfg.symbol);
-        }
+        const double tick_size = tickSizeOf(b.cfg.symbol);
         botTable_->setItem(i, 6,  make_mark_cell(tick, tick_size));
 
-        int64_t latency = (tick.last_price > 0 || tick.valid) ? (now_ms - tick.recv_ms) : -1;
-        QColor lat_c = (latency < 0)   ? QColor("#484f58")
-                     : (latency < 100) ? QColor("#3fb950")
-                     : (latency < 500) ? QColor("#d29922")
-                                       : QColor("#f85149");
+        // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
+        // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
+        // 这一格显示绿色，引擎却已经在走 REST 兜底。健康指示器指错了对象，
+        // 这也是标记价那次故障全程没有任何征兆的原因
+        int64_t latency = (tick.mark_ms > 0) ? (now_ms - tick.mark_ms) : -1;
+        // 阈值按 markPrice@1s 的节奏定：正常包龄在 0~1000ms 之间均匀分布，
+        // 用旧的 100/500ms 会一直显示红色。超过 3 秒说明丢了两三包，
+        // 超过 kStaleMs(10s) 引擎就当它断流转 REST 了
+        QColor lat_c = (latency < 0)    ? QColor("#484f58")
+                     : (latency < 1500) ? QColor("#3fb950")
+                     : (latency < 3000) ? QColor("#d29922")
+                                        : QColor("#f85149");
         botTable_->setItem(i, 7,  mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
 
         botTable_->setItem(i, 8,  mkc(unr_s, unreal >= 0       ? QColor("#3fb950") : QColor("#f85149")));
@@ -3365,6 +3392,7 @@ void MainWindow::refreshBotTable() {
                             .arg(dsym).arg(warn),
                         "删除")) return;
                 engine_->remove_bot(bid);
+                unsubscribeIfUnused(dsym.toStdString());
                 refreshBotTable();
                 save_bots();
             });

@@ -80,6 +80,14 @@ private:
     void openTradeHistoryDialog();
     // 品种精度信息缓存未命中时，去后台线程取一次，绝不在 GUI 线程同步阻塞等待
     void ensureSymbolInfoAsync(const std::string& symbol);
+    // 品种的价格步长；缓存未命中时顺带发起异步预取，返回 0（调用方按数量级兜底）。
+    // 提成一个函数是因为这段查询原先在 refreshLiveQuotes 和 refreshBotTable 里
+    // 各有一份逐字相同的副本——同一处的 fmt_tick 就是这样被改了一份漏了一份
+    double tickSizeOf(const std::string& symbol);
+    // 删除 bot 后调用：若已无任何 bot 使用该品种，退订它的行情流。
+    // 不退订的话 streams_ 只增不减，重连时全量重订，反复增删会一路累积到
+    // 币安合约单连接 200 条流的上限，超出后【静默】失效
+    void unsubscribeIfUnused(const std::string& symbol);
 
     // 持久化（便携模式：数据存程序目录 data/ 下，不可写时回退 AppData）
     void migrate_appdata_if_needed();

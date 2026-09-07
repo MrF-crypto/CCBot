@@ -28,11 +28,6 @@ BookTickerStream::BookTickerStream(bool testnet)
 
 BookTickerStream::~BookTickerStream() { stop(); }
 
-void BookTickerStream::on_tick(TickCb cb) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    tick_cb_ = std::move(cb);
-}
-
 void BookTickerStream::on_server_msg(LogCb cb) {
     std::lock_guard<std::mutex> lk(mtx_);
     srv_cb_ = std::move(cb);
@@ -107,38 +102,32 @@ void BookTickerStream::resubscribe_all() {
 }
 
 // ── 订阅 / 取消 ───────────────────────────────────────────────────────────────
-// 每个品种三条流：bookTicker（买一卖一/延迟）、markPrice@1s（引擎决策与强平距离）、
-// ticker（24h 滚动涨幅，高位拦截用）。
+// 每个品种两条流。逐品种订阅而不是全市场的 !markPrice@arr@1s / !ticker@arr：
+// 后者每秒推送【全部】约五百个合约，盯十个品种的场景下 99% 的带宽是白扔的。
+// （反过来，将来做全市场扫描时那两条合并流才是对的——总数与品种数无关。）
+std::vector<std::string> BookTickerStream::streams_of(const std::string& symbol) {
+    const std::string s = to_lower(symbol);
+    return { s + "@markPrice@1s",   // 标记价：引擎决策、强平距离、界面显示
+             s + "@ticker" };        // 24h 滚动涨幅：高位拦截
+}
+
 void BookTickerStream::subscribe(const std::string& symbol) {
-    std::string s_book = to_lower(symbol) + "@bookTicker";
-    // 标记价单独一条流。用逐品种的 @markPrice@1s 而不是全市场的
-    // !markPrice@arr@1s：后者每秒推送【全部】约五百个合约，盯十个品种的场景下
-    // 99% 的带宽是白扔的。逐品种与 bookTicker 的订阅模式也一致。
-    // 一条连接最多 1024 个流，每品种两条流对实际用量来说远远够
-    std::string s_mark = to_lower(symbol) + "@markPrice@1s";
-    // 24h 滚动涨幅。没有别的免费来源：日线 K 线只能算出"今日涨幅"（每天 UTC 0 点
-    // 归零），要真正的滚动 24 小时得按小时线回看 24 根，那是每品种一次额外 REST；
-    // 而 @ticker 的 P 字段就是币安官方的 24h 滚动涨幅，推送式、零请求成本
-    std::string s_tick = to_lower(symbol) + "@ticker";
     std::vector<std::string> fresh;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        for (const auto& s : {s_book, s_mark, s_tick})
+        for (const auto& s : streams_of(symbol))
             if (streams_.insert(s).second) fresh.push_back(s);
     }
-    // 三条流合并成一条 SUBSCRIBE。逐条发的话每品种就是 3 条入站消息，
-    // 而币安合约 WS 限【每秒 10 条】，连续加 4 个品种即触线并被断连
+    // 合并成一条 SUBSCRIBE。逐条发的话币安合约 WS 的
+    // 【每秒 10 条入站消息】限制很容易触线，超了直接断连
     if (connected_.load() && !fresh.empty()) send_subs(fresh, true);
 }
 
 void BookTickerStream::unsubscribe(const std::string& symbol) {
-    std::string s_book = to_lower(symbol) + "@bookTicker";
-    std::string s_mark = to_lower(symbol) + "@markPrice@1s";
-    std::string s_tick = to_lower(symbol) + "@ticker";
     std::vector<std::string> gone;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        for (const auto& s : {s_book, s_mark, s_tick})
+        for (const auto& s : streams_of(symbol))
             if (streams_.erase(s) > 0) gone.push_back(s);
         cache_.erase(symbol);
     }
@@ -180,7 +169,7 @@ void BookTickerStream::on_message(const std::string& json) {
     auto ps = simdjson::padded_string(json);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) return;
 
-    // combined stream 格式: {"stream":"btcusdt@bookTicker","data":{...}}
+    // combined stream 格式: {"stream":"btcusdt@markPrice@1s","data":{...}}
     simdjson::dom::element data;
     if (doc["data"].get(data) != simdjson::SUCCESS) return;
 
@@ -191,44 +180,15 @@ void BookTickerStream::on_message(const std::string& json) {
     if (data["s"].get(sym_sv) != simdjson::SUCCESS) return;
     std::string symbol(sym_sv);
 
-    if (ev == "bookTicker") {
-        std::string_view b_sv, B_sv, a_sv, A_sv;
-        data["b"].get(b_sv);
-        data["B"].get(B_sv);
-        data["a"].get(a_sv);
-        data["A"].get(A_sv);
-
-        Tick t;
-        TickCb cb;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            // 先取回已有条目：标记价来自另一条流，这里【不能】用全新 Tick 覆盖，
-            // 否则 bookTicker 每来一包就把标记价抹成 0（bookTicker 是逐笔、
-            // markPrice 是每秒一次，抹掉的概率接近 100%）
-            t = cache_[symbol];
-            t.symbol  = symbol;
-            t.bid     = safe_stod(b_sv);
-            t.bid_qty = safe_stod(B_sv);
-            t.ask     = safe_stod(a_sv);
-            t.ask_qty = safe_stod(A_sv);
-            t.recv_ms = now_ms();
-            t.valid   = (t.bid > 0 && t.ask > 0);
-            // 中间价（字段名 last_price 是历史遗留，它不是最新成交价）
-            t.last_price = t.valid ? (t.bid + t.ask) / 2.0 : 0.0;
-            cache_[symbol] = t;
-            cb = tick_cb_;
-        }
-        if (cb && t.valid) cb(t);
-    } else if (ev == "markPriceUpdate") {
+    if (ev == "markPriceUpdate") {
         // {"e":"markPriceUpdate","s":"BTCUSDT","p":"<标记价>","i":"<指数价>",...}
         std::string_view p_sv;
         if (data["p"].get(p_sv) != simdjson::SUCCESS) return;
         const double mp = safe_stod(p_sv);
         if (mp <= 0) return;
         std::lock_guard<std::mutex> lk(mtx_);
-        // 同理：只更新标记价两个字段，不碰 bid/ask/valid/recv_ms。
-        // 尤其不能动 valid 和 recv_ms —— 陈旧判定靠它们，
-        // 让每秒一次的标记价去刷新"行情新鲜度"会掩盖 bookTicker 已经断流
+        // 两条流写同一个缓存条目，各自【只更新自己那几个字段】，
+        // 不构造全新 Tick 覆盖——否则一条流每来一包就把另一条的数据抹成 0
         auto& c = cache_[symbol];
         c.symbol     = symbol;
         c.mark_price = mp;
@@ -244,7 +204,8 @@ void BookTickerStream::on_message(const std::string& json) {
         // 而真实的 0 涨幅同样是 0——两者无法区分，所以直接检查原始字符串
         if (P_sv.empty()) return;
         std::lock_guard<std::mutex> lk(mtx_);
-        // 同样不碰 valid/recv_ms：陈旧判定归 bookTicker 那条流管
+        // 同样只碰自己的两个字段：不能让每秒一次的涨幅去刷新标记价的收包时间，
+        // 否则 markPrice 断流时陈旧保护会被这条流一直"续命"
         auto& c = cache_[symbol];
         c.symbol  = symbol;
         c.chg_24h = safe_stod(P_sv);
@@ -259,23 +220,13 @@ BookTickerStream::Tick BookTickerStream::get(const std::string& symbol) const {
     return (it != cache_.end()) ? it->second : Tick{};
 }
 
-double BookTickerStream::mid_price(const std::string& symbol) const {
-    auto t = get(symbol);
-    if (!t.valid) return 0.0;
-    // 陈旧保护：WS 半开/静默断流时 cache 里是冻结价（valid 永远为 true）——
-    // 超过10秒没有新包就视为无效，调用方会走 REST 标记价兜底。
-    // 否则引擎会拿"僵尸价格"做补仓/止盈/止损判定，实际行情暴跌时完全失明
-    if (now_ms() - t.recv_ms > 10000) return 0.0;
-    return (t.bid + t.ask) / 2.0;
-}
-
 double BookTickerStream::mark_price(const std::string& symbol) const {
     auto t = get(symbol);
     if (t.mark_price <= 0) return 0.0;
-    // 陈旧保护按【标记价自己的】收包时间判，不能用 recv_ms——那是 bookTicker 的。
-    // markPrice@1s 每秒一包，10 秒没来就是这条流断了，此时 bookTicker 可能还活着，
-    // 拿冻结的标记价继续决策与拿冻结的中间价一样危险
-    if (now_ms() - t.mark_ms > 10000) return 0.0;
+    // 陈旧保护：WS 半开/静默断流时缓存里躺着一个冻结价，看起来完全正常，
+    // 引擎会拿着僵尸价继续补仓/止盈/止损，实际行情暴跌时完全失明。
+    // markPrice@1s 每秒一包，10 秒没来就是这条流断了，调用方会转 REST 兜底
+    if (now_ms() - t.mark_ms > kStaleMs) return 0.0;
     return t.mark_price;
 }
 
@@ -293,8 +244,8 @@ bool BookTickerStream::change_24h(const std::string& symbol, double& out_pct) co
     // chg_ms==0 表示这条流一次都没到过。涨幅本身可以合法地为 0 或负数，
     // 所以不能用数值判有无，只能看有没有收过包
     if (t.chg_ms == 0) return false;
-    // @ticker 是每秒一推，容忍度给到 60 秒——它比 bookTicker 慢，
-    // 且 24h 涨幅本身是慢变量，几十秒的陈旧不影响"最近涨得多急"这个判断
+    // 容忍度给到 60 秒：24h 涨幅本身是慢变量，几十秒的陈旧不影响
+    // "最近涨得多急"这个判断，没必要跟标记价用同一个 10 秒阈值
     if (now_ms() - t.chg_ms > 60000) return false;
     out_pct = t.chg_24h;
     return true;
