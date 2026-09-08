@@ -41,7 +41,7 @@ FORBIDDEN_PAT = re.compile(
 # 允许的无后缀可执行文件名（macOS/Linux 包）。
 # ⚠ 往发布包里加新的可执行文件时，这里必须同步——否则白名单会在【打 tag 那一刻】
 #   拒绝整个包，而本机测试完全看不出来（Windows 的 .exe 走后缀白名单，不经过这里）
-ALLOWED_NOEXT = {"CCGMonitor", "ccbot_headless", "ladder_depth"}
+ALLOWED_NOEXT = {"TradingBot", "ccbot_headless", "ladder_depth"}
 
 
 def main() -> int:

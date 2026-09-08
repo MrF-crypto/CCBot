@@ -178,6 +178,8 @@ private:
 
     // 正在后台预取品种精度信息的品种集合，避免同一品种被重复发起请求（仅 GUI 线程访问）
     std::set<std::string> pendingSymbolFetch_;
+    // 已经报过"PRICE_FILTER 缺失"的品种，每个只报一次（仅 GUI 线程访问）
+    std::set<std::string> tickWarned_;
 
     // ── 各批次的 tick 计数（仅GUI线程访问）──
     int slowTickCount_  = 0;   // 慢批次节拍：对账(每20) / 重新对时(每300)

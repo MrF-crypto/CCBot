@@ -132,8 +132,8 @@ jobs:
         run: |
           VER="${GITHUB_REF#refs/tags/}"
           [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
-          cd pkg && zip -r "../ccbot-$VER-linux-x64.zip" . && cd ..
-          ls -la ccbot-*.zip
+          cd pkg && zip -r "../tradingbot-$VER-linux-x64.zip" . && cd ..
+          ls -la tradingbot-*.zip
 
       # 只在 tag 构建时上传：release job 靠它拿包，而 main 上的普通提交
       # 只需要验证"能编译、测试通过"，产物没人取用。
@@ -145,8 +145,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ccbot-linux-x64
-          path: ccbot-*.zip
+          name: tradingbot-linux-x64
+          path: tradingbot-*.zip
 
   release:
     needs: build
@@ -157,9 +157,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: ccbot-linux-x64
+          name: tradingbot-linux-x64
       - name: Attach to release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
-          files: ccbot-*.zip
+          files: tradingbot-*.zip
           fail_on_unmatched_files: true

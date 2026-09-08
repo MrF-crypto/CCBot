@@ -109,6 +109,9 @@ static bool backend_load(std::string& plain, const std::string& path) {
 // ─── macOS: 系统钥匙串（Keychain）──────────────────────────────────────────────
 // 密文不落自定义文件，直接存进当前用户的钥匙串（kSecClassGenericPassword 条目，
 // service=com.ccbot.CCGMonitor）。path 参数在本后端里不使用。
+// ⚠ 这个 service 名【不能改】：钥匙串条目按它查找，改了等于让所有 macOS
+//   用户的 API 凭证失联、必须重新录入。v4.0.18 产品更名为 TradingBot 时
+//   刻意保留了旧名——它不上界面，用户看不到，改它只有坏处
 // 首次访问时 macOS 可能弹出钥匙串授权框，选"始终允许"即可。
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>

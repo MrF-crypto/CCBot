@@ -97,7 +97,7 @@ jobs:
           set -e
           mkdir -p pkg/platforms
           cd build/Release
-          cp CCGMonitor.exe ladder_depth.exe *.dll ../../pkg/
+          cp TradingBot.exe ladder_depth.exe *.dll ../../pkg/
           cp platforms/qwindows.dll ../../pkg/platforms/
           cd ../..
           ls -la pkg | head -30
@@ -111,7 +111,7 @@ jobs:
           VER=""
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
           if [ -n "$VER" ]; then
-            python tools/leak_check.py pkg --expect-version "$VER" --exe CCGMonitor.exe
+            python tools/leak_check.py pkg --expect-version "$VER" --exe TradingBot.exe
           else
             python tools/leak_check.py pkg
           fi
@@ -121,8 +121,8 @@ jobs:
         run: |
           VER="${GITHUB_REF#refs/tags/}"
           [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
-          cd pkg && 7z a "../ccbot-$VER-win64.zip" . >/dev/null
-          cd .. && ls -la ccbot-*.zip
+          cd pkg && 7z a "../tradingbot-$VER-win64.zip" . >/dev/null
+          cd .. && ls -la tradingbot-*.zip
 
       # 只在 tag 构建时上传：release job 靠它拿包，而 main 上的普通提交
       # 只需要验证"能编译、测试通过"，产物没人取用。
@@ -134,8 +134,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ccbot-win64
-          path: ccbot-*.zip
+          name: tradingbot-win64
+          path: tradingbot-*.zip
 
   # 发布单独一个 job：只有它需要写权限，且只在打 tag 时运行。
   # 权限范围越窄，一旦某个 Action 被投毒能造成的破坏越小
@@ -148,9 +148,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: ccbot-win64
+          name: tradingbot-win64
       - name: Attach to release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
-          files: ccbot-*.zip
+          files: tradingbot-*.zip
           fail_on_unmatched_files: true

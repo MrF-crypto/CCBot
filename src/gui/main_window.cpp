@@ -118,7 +118,7 @@ MainWindow::MainWindow(QWidget* parent)
     , pool_(std::make_shared<ThreadPool>(4))
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
-    setWindowTitle(QString("CCG 合约监控  %1").arg(ccbot::kVersion));
+    setWindowTitle(QString("TradingBot  %1").arg(ccbot::kVersion));
     resize(1200, 800);
     qApp->setStyleSheet(DARK_QSS);
     buildUi();
@@ -851,7 +851,7 @@ void MainWindow::openSettingsDialog() {
         if (url.isEmpty()) { log("请先填写 Webhook URL 再测试", "WARN"); return; }
         run_async([this, url]() {
             std::string err;
-            bool ok = send_webhook(url.toStdString(), "CCGMonitor 测试消息：webhook 配置成功", &err);
+            bool ok = send_webhook(url.toStdString(), "TradingBot 测试消息：webhook 配置成功", &err);
             QMetaObject::invokeMethod(this, [this, ok, err]() {
                 log(ok ? "测试消息发送成功" : ("测试消息发送失败：" + QString::fromStdString(err)),
                     ok ? "OK" : "ERR");
@@ -1219,7 +1219,7 @@ void MainWindow::onConnect() {
                 log("连接失败: " + QString::fromStdString(info.error), "ERR");
                 if (!alertedDisconnect_) {
                     alertedDisconnect_ = true;
-                    sendAlert(QString("[CCGMonitor] 账户连接失败: %1")
+                    sendAlert(QString("[TradingBot] 账户连接失败: %1")
                               .arg(QString::fromStdString(info.error)));
                 }
                 return;
@@ -1247,7 +1247,7 @@ void MainWindow::onConnect() {
                     save_trades();
                     refreshStats();
                     if (tr.reason == "硬止损") {
-                        sendAlert(QString("[CCGMonitor] %1 触发硬止损平仓 | 均价 $%2 → 平仓 $%3 | 盈亏 %4$%5")
+                        sendAlert(QString("[TradingBot] %1 触发硬止损平仓 | 均价 $%2 → 平仓 $%3 | 盈亏 %4$%5")
                             .arg(QString::fromStdString(tr.symbol))
                             .arg(tr.entry_price, 0, 'f', 4).arg(tr.exit_price, 0, 'f', 4)
                             .arg(tr.pnl >= 0 ? "+" : "").arg(std::abs(tr.pnl), 0, 'f', 2));
@@ -1302,7 +1302,7 @@ void MainWindow::onConnect() {
                     if (!issues.empty()) {
                         save_bots();   // 收敛后的状态立刻落盘
                         refreshBotTable();
-                        QString msg = QString("[CCGMonitor] 启动对账发现 %1 处不一致，详见日志").arg(issues.size());
+                        QString msg = QString("[TradingBot] 启动对账发现 %1 处不一致，详见日志").arg(issues.size());
                         sendAlert(msg);
                     }
                     // 对账之后再重建交易所侧灾难止损单：必须等本地持仓收敛到真相，
@@ -1451,7 +1451,7 @@ void MainWindow::refreshAccount() {
                     .arg(netFailCount_).arg(QString::fromStdString(info.error)), "ERR");
                 if (!alertedDisconnect_) {
                     alertedDisconnect_ = true;
-                    sendAlert(QString("[CCGMonitor] 检测到网络异常，账户接口连续拉取失败: %1")
+                    sendAlert(QString("[TradingBot] 检测到网络异常，账户接口连续拉取失败: %1")
                               .arg(QString::fromStdString(info.error)));
                 }
             }
@@ -2514,7 +2514,7 @@ void MainWindow::onTick() {
             // 再打一遍就是双份。这里只做落盘、刷新和外部告警
             save_bots();          // 收敛后的状态立刻落盘
             refreshBotTable();
-            sendAlert(QString("[CCGMonitor] 运行中对账发现 %1 处不一致，详见日志")
+            sendAlert(QString("[TradingBot] 运行中对账发现 %1 处不一致，详见日志")
                       .arg(issues.size()));
         }
     }
@@ -2570,7 +2570,8 @@ void MainWindow::onTick() {
         }
         if ((!trend_bots.empty() || !htf_bots.empty()) && !trendFetchBusy_.load()) {
             trendFetchBusy_.store(true);
-            run_async([this, trend_bots, htf_bots]() {
+            const qint64 batch_t0 = QDateTime::currentMSecsSinceEpoch();
+            run_async([this, trend_bots, htf_bots, batch_t0]() {
                 for (const auto& b : trend_bots) {
                     auto t = client_->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
                                                    b.cfg.trend_ema_period);
@@ -2592,6 +2593,22 @@ void MainWindow::onTick() {
                         if (tier3) engine_->update_mtf_band(bid, 3, snap.boll_lb, snap.boll_ub);
                     }, Qt::QueuedConnection);
                 }
+                // 批次耗时自检。这一批是【单线程串行】遍历全部 bot：
+                // 每个 bot 最多两次 REST（4h 趋势 + 日线指标），品种一多就是几十次
+                // 串行往返。窗口是 100 个 tick × 3 秒 = 300 秒，超了 trendFetchBusy_
+                // 会让整轮被跳过，表现为 %B / 7日涨幅长时间不刷新而毫无提示。
+                // 把余量摆出来，不用等它出问题才发现
+                const qint64 el = QDateTime::currentMSecsSinceEpoch() - batch_t0;
+                const int reqs = (int)trend_bots.size() + (int)htf_bots.size();
+                const qint64 kWindowMs = 300000;
+                QMetaObject::invokeMethod(this, [this, el, reqs, kWindowMs]() {
+                    if (el * 2 >= kWindowMs)
+                        log(QString("⚠ 日线/趋势批次耗时 %1 秒（%2 次请求），"
+                                    "已超过 %3 秒窗口的一半——再慢就会整轮被跳过，"
+                                    "%B 与 7日涨幅将长时间不刷新")
+                                .arg(el / 1000.0, 0, 'f', 1).arg(reqs).arg(kWindowMs / 1000),
+                            "WARN");
+                }, Qt::QueuedConnection);
                 trendFetchBusy_.store(false);
             });
         }
@@ -2815,7 +2832,17 @@ bool MainWindow::chg24Of(const std::string& symbol, double& out_pct, bool& out_s
 double MainWindow::tickSizeOf(const std::string& symbol) {
     if (!client_) return 0.0;
     TradingClient::SymbolInfo info;
-    if (client_->try_get_symbol_info(symbol, info) && info.valid) return info.tick_size;
+    if (client_->try_get_symbol_info(symbol, info) && info.valid) {
+        // 精度自检：PRICE_FILTER 没解析到时 tick_size 会静默停在默认的 0.01。
+        // 这不只影响显示（那一列已改成取数量级兜底，看不出问题），更会让
+        // round_price(0.0015, 0.01) 取整成 0，便宜品种的限价单/止损单被拒。
+        // 每品种只报一次：有就是有，没有就永久沉默
+        if (!info.tick_found && tickWarned_.insert(symbol).second)
+            log(QString("⚠ %1 未取到 PRICE_FILTER，tick_size 用的是默认 0.01"
+                        "——该品种的限价单/交易所侧止损单价格可能被错误取整")
+                    .arg(QString::fromStdString(symbol)), "WARN");
+        return info.tick_size;
+    }
     ensureSymbolInfoAsync(symbol);
     return 0.0;
 }

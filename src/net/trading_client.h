@@ -171,6 +171,14 @@ public:
         double min_qty          = 0.001;
         double tick_size        = 0.01;
         bool   valid            = false;
+        // PRICE_FILTER 是否真的解析到了。
+        // 关键在于 tick_size 的默认值【不是 0 而是 0.01】，而 valid 只取决于
+        // LOT_SIZE——PRICE_FILTER 缺失时 valid 照样为真、tick_size 静默停在 0.01。
+        // 后果不只是显示：round_price(0.0015, 0.01) == 0，便宜品种的限价单/
+        // 止损单价格会被取整成 0 而被交易所拒单。
+        // 界面那一列已经改成"tick 推的位数与数量级取较大者"，所以【显示正常不再
+        // 是证据】——只有这个标志能说明 tick_size 到底可不可信
+        bool   tick_found       = false;
 
         // 返回市价单实际使用的步长
         double effective_market_step() const {

@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(CCGMonitor VERSION 4.0.17 LANGUAGES CXX)
+project(TradingBot VERSION 4.0.18 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,20 +48,20 @@ if(WIN32 OR APPLE)
     endif()
 
     # WIN32 关键字只在 Windows 生效（GUI 子系统，不带控制台窗口），macOS 上自动忽略
-    add_executable(CCGMonitor WIN32
+    add_executable(TradingBot WIN32
         src/main.cpp
         src/core/key_store.cpp
         src/gui/main_window.cpp
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )
-    target_include_directories(CCGMonitor PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(CCGMonitor PRIVATE ${CORE_LIBS} Qt6::Widgets)
-    target_compile_definitions(CCGMonitor PRIVATE ${CCBOT_VERSION_DEF})
+    target_include_directories(TradingBot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(TradingBot PRIVATE ${CORE_LIBS} Qt6::Widgets)
+    target_compile_definitions(TradingBot PRIVATE ${CCBOT_VERSION_DEF})
 
     if(WIN32)
-        target_link_libraries(CCGMonitor PRIVATE crypt32 ws2_32 wsock32)
-        target_compile_definitions(CCGMonitor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_link_libraries(TradingBot PRIVATE crypt32 ws2_32 wsock32)
+        target_compile_definitions(TradingBot PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
         # 构建后复制 Qt platform plugin（兼容共享 vcpkg_installed 与本地安装两种模式）
         if(DEFINED VCPKG_INSTALLED_DIR AND EXISTS "${VCPKG_INSTALLED_DIR}")
@@ -70,16 +70,16 @@ if(WIN32 OR APPLE)
             set(_vcpkg_inst "${CMAKE_BINARY_DIR}/vcpkg_installed")
         endif()
 
-        add_custom_command(TARGET CCGMonitor POST_BUILD
+        add_custom_command(TARGET TradingBot POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
-                "$<TARGET_FILE_DIR:CCGMonitor>/platforms"
+                "$<TARGET_FILE_DIR:TradingBot>/platforms"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_vcpkg_inst}/x64-windows/Qt6/plugins/platforms/qwindows.dll"
-                "$<TARGET_FILE_DIR:CCGMonitor>/platforms/qwindows.dll"
+                "$<TARGET_FILE_DIR:TradingBot>/platforms/qwindows.dll"
         )
     elseif(APPLE)
         # 密钥存储走系统钥匙串（key_store.cpp 的 __APPLE__ 分支）
-        target_link_libraries(CCGMonitor PRIVATE
+        target_link_libraries(TradingBot PRIVATE
             "-framework Security" "-framework CoreFoundation")
         # 本机 vcpkg 构建的 Qt 插件路径编译期已内置，构建机上直接运行即可，
         # 无需像 Windows 那样拷贝 platform plugin

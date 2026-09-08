@@ -989,7 +989,7 @@ TradingClient::SymbolInfo TradingClient::get_symbol_info(const std::string& sym)
                             std::string_view tick;
                             if (f["tickSize"].get(tick) == simdjson::SUCCESS) {
                                 double tv = safe_stod(tick);
-                                if (tv > 0) info.tick_size = tv;
+                                if (tv > 0) { info.tick_size = tv; info.tick_found = true; }
                             }
                         }
                     }
