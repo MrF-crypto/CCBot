@@ -105,11 +105,7 @@ static CcgConfig base_cfg() {
     c.tp_pct       = 5.0;
     c.trail_tp     = 2.0;
     c.use_htf_filter   = false;
-    c.use_sr_support   = false;
-    c.use_sr_headroom  = false;
     c.use_trend_filter = false;
-    c.sr_radar         = false;
-    c.use_structural_stop = false;
     c.auto_restart     = false;
     return c;
 }
@@ -750,7 +746,6 @@ static void test_htf_change_gates() {
         in.use_htf = false;                 // 只测涨幅，把 %B 关掉
         in.htf_ok  = true;
         in.day_chg_ok = true;               // 24h 数据就绪（来源独立于 htf_ok）
-        in.use_sr_support = false; in.use_sr_headroom = false;
         return in;
     };
 

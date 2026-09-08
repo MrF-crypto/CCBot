@@ -107,9 +107,7 @@ const char* TradingClient::ep(Ep e) const {
     switch (e) {
     case Ep::Account:          return pm ? "/papi/v1/um/account"           : "/fapi/v2/account";
     case Ep::PositionRisk:     return pm ? "/papi/v1/um/positionRisk"      : "/fapi/v2/positionRisk";
-    case Ep::OpenOrders:       return pm ? "/papi/v1/um/openOrders"        : "/fapi/v1/openOrders";
     case Ep::Order:            return pm ? "/papi/v1/um/order"             : "/fapi/v1/order";
-    case Ep::AllOpenOrders:    return pm ? "/papi/v1/um/allOpenOrders"     : "/fapi/v1/allOpenOrders";
     case Ep::PositionSideDual: return pm ? "/papi/v1/um/positionSide/dual" : "/fapi/v1/positionSide/dual";
     case Ep::Leverage:         return pm ? "/papi/v1/um/leverage"          : "/fapi/v1/leverage";
     // listenKey 在统一账户下**没有** um 前缀，是全账户一条流
@@ -637,38 +635,6 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions(bool* ok) {
     return result;
 }
 
-std::vector<TradingClient::OpenOrder> TradingClient::fetch_open_orders() {
-    std::vector<OpenOrder> result;
-    auto resp = http_get(ep(Ep::OpenOrders), "recvWindow=5000");
-    if (resp.empty()) return result;
-
-    simdjson::dom::parser p;
-    simdjson::dom::array arr;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return result;
-
-    for (auto item : arr) {
-        std::string_view sym, side, type, status;
-        int64_t oid = 0;
-        item["symbol"].get(sym);
-        item["side"].get(side);
-        item["type"].get(type);
-        item["status"].get(status);
-        item["orderId"].get(oid);
-
-        OpenOrder ord;
-        ord.order_id  = std::to_string(oid);
-        ord.symbol    = std::string(sym);
-        ord.side      = std::string(side);
-        ord.type      = std::string(type);
-        ord.status    = std::string(status);
-        ord.price     = parse_dbl_str(item, "price");
-        ord.orig_qty  = parse_dbl_str(item, "origQty");
-        ord.exec_qty  = parse_dbl_str(item, "executedQty");
-        result.push_back(ord);
-    }
-    return result;
-}
 
 // 根据持仓模式生成 positionSide 字段
 // dual=true  开仓: BUY→LONG  SELL→SHORT
@@ -838,42 +804,6 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
     return r;  // 返回最后一次 -1111 错误
 }
 
-TradingClient::OrderResult TradingClient::place_limit(const std::string& sym,
-                                                       const std::string& side,
-                                                       double qty, double price,
-                                                       bool reduce_only) {
-    OrderResult r;
-    qty   = round_qty(sym, qty);
-    price = round_price(sym, price);
-    if (qty <= 0) { r.error = "数量小于最小下单量"; return r; }
-
-    const auto& linfo = get_symbol_info(sym);
-    std::ostringstream oss;
-    oss << "symbol=" << sym << "&side=" << side
-        << "&type=LIMIT&timeInForce=GTC"
-        << "&quantity=" << fmt_qty(qty, linfo.step_size)
-        << "&price=" << std::fixed << std::setprecision(step_decimals(linfo.tick_size)) << price
-        << "&recvWindow=5000";
-
-    if (dual_mode_) {
-        oss << pos_side_param(true, side, reduce_only);
-    } else if (reduce_only) {
-        oss << "&reduceOnly=true";
-    }
-
-    auto resp = http_post(ep(Ep::Order), oss.str());
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; return r; }
-    if (binance_error(doc, r.error)) return r;
-
-    int64_t oid = 0;
-    doc["orderId"].get(oid);
-    r.order_id = std::to_string(oid);
-    r.ok = true;
-    return r;
-}
 
 bool TradingClient::fetch_position_mode() {
     auto resp = http_get(ep(Ep::PositionSideDual), "recvWindow=5000");
@@ -888,27 +818,7 @@ bool TradingClient::fetch_position_mode() {
     return dual;
 }
 
-bool TradingClient::cancel_order(const std::string& sym, const std::string& order_id) {
-    auto resp = http_del(ep(Ep::Order),
-        "symbol=" + sym + "&orderId=" + order_id + "&recvWindow=5000");
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
-    std::string err;
-    return !binance_error(doc, err);
-}
 
-bool TradingClient::cancel_all_orders(const std::string& sym) {
-    auto resp = http_del(ep(Ep::AllOpenOrders),
-        "symbol=" + sym + "&recvWindow=5000");
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
-    std::string err;
-    return !binance_error(doc, err);
-}
 
 bool TradingClient::close_position(const std::string& sym) {
     // 先拿持仓方向和数量
@@ -1230,20 +1140,8 @@ bool TradingClient::cancel_disaster_stop(const std::string& sym,
     return true;
 }
 
-TradingClient::OrderResult
-TradingClient::place_tp_market(const std::string& sym, double stop_price,
-                                const std::string& entry_side, double qty) {
-    return place_cond_market(sym, "TAKE_PROFIT_MARKET", stop_price, entry_side, qty);
-}
-
-TradingClient::OrderResult
-TradingClient::place_sl_market(const std::string& sym, double stop_price,
-                                const std::string& entry_side, double qty) {
-    return place_cond_market(sym, "STOP_MARKET", stop_price, entry_side, qty);
-}
-
 // ── K线拉取+解析（统一入口）─────────────────────────────────────────────────
-// 原先 fetch_rsi / fetch_indicators / fetch_trend / fetch_bars 四处各自拼一遍
+// 原先 fetch_indicators / fetch_trend 等几处各自拼一遍
 // URL、各自解析一遍数组，四份几乎相同的代码。改动 K 线口径时漏掉一处就会出现
 // "指标和趋势用的不是同一批数据"这种极难查的问题，所以合成一处。
 // 只要收盘价的调用方多解析 4 个字段，几百根 K 线的开销可以忽略。
@@ -1297,13 +1195,6 @@ static std::vector<double> closes_of(const std::vector<TradingClient::Bar>& bars
     return c;
 }
 
-// ── RSI（1h K线，公开接口）────────────────────────────────────────────────────
-double TradingClient::fetch_rsi(const std::string& sym,
-                                 const std::string& interval, int period) {
-    auto closes = closes_of(fetch_klines(sym, interval, period + 20));
-    if (closes.empty()) return 50.0;
-    return indicators::rsi(closes, period);
-}
 
 // ── BOLL + RSI 快照（一次K线拉取，两个指标一起算）───────────────────────────────
 TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
@@ -1364,11 +1255,6 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend(
     return out;
 }
 
-// ── 完整 OHLCV K线（SR区域检测用）────────────────────────────────────────────
-std::vector<TradingClient::Bar> TradingClient::fetch_bars(
-        const std::string& sym, const std::string& interval, int limit) {
-    return fetch_klines(sym, interval, limit);
-}
 
 std::unordered_map<std::string, double> TradingClient::fetch_all_24h_changes() {
     std::unordered_map<std::string, double> out;

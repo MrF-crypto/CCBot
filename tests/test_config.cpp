@@ -98,17 +98,9 @@ int main() {
         eq(g.use_trend_filter, d.use_trend_filter, "use_trend_filter");
         eq(g.trend_interval, d.trend_interval, "trend_interval");
         eq((int)g.trend_ema_period, (int)d.trend_ema_period, "trend_ema_period");
-        eq(g.sr_radar,      d.sr_radar,      "sr_radar");
-        eq(g.sr_interval,   d.sr_interval,   "sr_interval");
         eq(g.use_htf_filter, d.use_htf_filter, "use_htf_filter");
         eq(g.htf_interval,  d.htf_interval,  "htf_interval");
         eqd(g.htf_pos_max,  d.htf_pos_max,  "htf_pos_max");
-        eq(g.use_sr_support, d.use_sr_support, "use_sr_support");
-        eq(g.use_sr_headroom, d.use_sr_headroom, "use_sr_headroom");
-        eq((int)g.sr_min_confluence, (int)d.sr_min_confluence, "sr_min_confluence");
-        eqd(g.sr_headroom_ratio, d.sr_headroom_ratio, "sr_headroom_ratio");
-        eq(g.use_sr_exit,   d.use_sr_exit,   "use_sr_exit");
-        eq(g.use_structural_stop, d.use_structural_stop, "use_structural_stop");
     }
 
     // ── ② 显式填写的值必须被采纳（别修完默认值把读取也弄坏了）────────────────

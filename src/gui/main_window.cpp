@@ -108,7 +108,14 @@ QToolTip{background:#1c2128;color:#e6edf3;border:1px solid #30363d;padding:4px 6
 // ─────────────────────────────────────────────────────────────────────────────
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    , pool_(std::make_shared<ThreadPool>(2))        // 引擎专用：下单/平仓，绝不排队
+    // 引擎专用：下单/平仓/灾难止损单的挂撤。与 headless 对齐为 4——
+    // 此前 GUI 是 2 而 headless 是 4，两边【正好写反了】，而 GUI 才是跑几十个
+    // bot 的那一端。注释写着"绝不排队"，但 2 个线程配 47 个 bot 做不到：
+    // 这个池还兼跑灾难止损单的挂/撤（每次补仓成交都要撤旧挂新两次 HTTP），
+    // 全市场同时止盈时手动平仓会排在后面，而一次 place_market 最坏 42 秒
+    // （POST 超时 10s + 查单恢复 3×10s）。
+    // 上限来自签名连接池 kCurlPoolSize=6：取 4 仍留 2 个槽给 tick 循环的同步调用
+    , pool_(std::make_shared<ThreadPool>(4))
     , fetchPool_(std::make_shared<ThreadPool>(4))   // 数据拉取专用：慢任务全在这
 {
     setWindowTitle(QString("CCG 合约监控  %1").arg(ccbot::kVersion));
@@ -361,21 +368,11 @@ void MainWindow::save_bots() {
         o["use_trend_filter"]  = c.use_trend_filter;
         o["trend_interval"]    = QString::fromStdString(c.trend_interval);
         o["trend_ema_period"]  = c.trend_ema_period;
-        o["sr_radar"]          = c.sr_radar;
-        o["sr_interval"]       = QString::fromStdString(c.sr_interval);
         o["use_htf_filter"]      = c.use_htf_filter;
         o["htf_interval"]        = QString::fromStdString(c.htf_interval);
         o["htf_pos_max"]         = c.htf_pos_max;
         o["htf_24h_chg_max"]     = c.htf_24h_chg_max;
         o["htf_week_chg_max"]    = c.htf_week_chg_max;
-        o["use_sr_support"]      = c.use_sr_support;
-        o["use_sr_headroom"]     = c.use_sr_headroom;
-        o["sr_min_confluence"]   = c.sr_min_confluence;
-        o["sr_independent_conf"] = c.sr_independent_conf;
-        o["sr_lower_half_only"]  = c.sr_lower_half_only;
-        o["sr_headroom_ratio"]   = c.sr_headroom_ratio;
-        o["use_sr_exit"]         = c.use_sr_exit;
-        o["use_structural_stop"] = c.use_structural_stop;
 
         // 持仓/状态快照 —— 没有这些字段的话，App 重启后本地均价/持仓量会从零重新累积，
         // 跟交易所实际仓位脱节（这正是均价跟交易所对不上的根因之一）
@@ -480,8 +477,6 @@ void MainWindow::load_and_restore_bots() {
         c.use_trend_filter  = o["use_trend_filter"].toBool(true);
         c.trend_interval    = o["trend_interval"].toString("4h").toStdString();
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
-        c.sr_radar          = o["sr_radar"].toBool(true);
-        c.sr_interval       = o["sr_interval"].toString("4h").toStdString();
         c.use_htf_filter      = o["use_htf_filter"].toBool(true);
         c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
@@ -493,25 +488,11 @@ void MainWindow::load_and_restore_bots() {
                               ? o["htf_24h_chg_max"].toDouble(0.0)
                               : o["htf_day_chg_max"].toDouble(0.0);
         c.htf_week_chg_max    = o["htf_week_chg_max"].toDouble(0.0);
-        // v3.8 迁移：老配置只有 smart_gates 总开关 + use_sr_gate。
-        // 总开关为 false 时三层完全不参与，升级后必须保持这个行为——否则
-        // 老 bot 会突然开始拦截
-        const bool legacy_smart = o["smart_gates"].toBool(true);
-        const bool legacy_sr    = o["use_sr_gate"].toBool(true);
-        if (o.contains("use_sr_support")) {
-            c.use_sr_support  = o["use_sr_support"].toBool(true);
-            c.use_sr_headroom = o["use_sr_headroom"].toBool(true);
-        } else {
-            c.use_sr_support  = legacy_smart && legacy_sr;
-            c.use_sr_headroom = legacy_smart && legacy_sr;
-        }
-        if (!o.contains("use_sr_support") && !legacy_smart) c.use_htf_filter = false;
-        c.sr_min_confluence   = o["sr_min_confluence"].toInt(2);
-        c.sr_independent_conf = o["sr_independent_conf"].toBool(true);
-        c.sr_lower_half_only  = o["sr_lower_half_only"].toBool(false);
-        c.sr_headroom_ratio   = o["sr_headroom_ratio"].toDouble(3.0);
-        c.use_sr_exit         = o["use_sr_exit"].toBool(false);
-        c.use_structural_stop = o["use_structural_stop"].toBool(false);
+        // v3.8 迁移：老配置只有 smart_gates 总开关，为 false 时拦截完全不参与，
+        // 升级后必须保持——否则老 bot 会突然开始拦截。
+        // v4.0.16 移除结构层后，需要迁移的只剩 %B 这一条
+        if (!o.contains("use_sr_support") && !o["smart_gates"].toBool(true))
+            c.use_htf_filter = false;
         if (c.symbol.empty()) continue;
 
         CcgBot bot;
@@ -1292,7 +1273,7 @@ void MainWindow::onConnect() {
             });
             ticker_->start();
 
-            srTickCount_    = 0;   // 保证"首tick立即拉取SR/趋势"在（罕见的）重连后依然成立
+            slowTickCount_  = 0;   // 保证"首tick立即对账/对时"在（罕见的）重连后依然成立
             trendTickCount_ = 0;
             tick_timer_->start();
 
@@ -1424,110 +1405,6 @@ void MainWindow::refreshFunding() {
             fundFetchBusy_.store(false);
         }, Qt::QueuedConnection);
     });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SR雷达（影子模式）：自动支撑/阻力区检测 + 触区告警 + 展示，不参与下单
-// ─────────────────────────────────────────────────────────────────────────────
-void MainWindow::refreshSrZones() {
-    if (!client_ || !engine_) return;
-    // 收集开了 SR 雷达的品种（同品种多bot取任一配置的周期）
-    std::map<std::string, std::string> radar;   // symbol → interval
-    for (const auto& b : engine_->get_bots())
-        if (b.cfg.sr_radar && b.state != CcgBot::State::Stopped)
-            radar.emplace(b.cfg.symbol, b.cfg.sr_interval);
-
-    // 清理已关闭雷达/已删除的品种，否则旧区域会永远用陈旧数据持续误报
-    for (auto it = srStates_.begin(); it != srStates_.end();)
-        it = radar.count(it->first) ? std::next(it) : srStates_.erase(it);
-
-    if (radar.empty() || srFetchBusy_.load()) return;
-    srFetchBusy_.store(true);
-
-    run_async([this, radar]() {
-        for (const auto& [sym, interval] : radar) {
-            auto raw = client_->fetch_bars(sym, interval, 400);
-            if (raw.size() < 50) continue;   // 新品种历史不够，跳过
-            std::vector<srzones::Bar> bars;
-            bars.reserve(raw.size());
-            for (const auto& r : raw) bars.push_back({r.open, r.high, r.low, r.close, r.volume});
-            auto zones = srzones::detect_zones(bars);
-            double atr = srzones::atr(bars, 14);
-            QMetaObject::invokeMethod(this, [this, sym, atr, zones = std::move(zones)]() {
-                auto& st = srStates_[sym];
-                st.zones       = zones;
-                st.atr         = atr;
-                st.computed_ms = QDateTime::currentMSecsSinceEpoch();
-            }, Qt::QueuedConnection);
-        }
-        srFetchBusy_.store(false);
-    });
-}
-
-// 触区告警已移除：SR 区域现在是三层拦截的内部数据源，不再是需要人盯的事件。
-// 它每 tick 都可能触发，是运行日志里最占地方的一类，而拦截生效后"价格进了某个区域"
-// 本身并不需要人做任何事——该拦的闸门已经拦了。
-void MainWindow::openSrZonesDialog(const std::string& symbol) {
-    auto it = srStates_.find(symbol);
-    double price = ticker_ ? ticker_->mark_price(symbol) : 0;
-
-    QDialog dlg(this);
-    dlg.setWindowTitle(QString("支撑/阻力区 - %1").arg(QString::fromStdString(symbol)));
-    dlg.resize(620, 420);
-    auto* dv = new QVBoxLayout(&dlg);
-
-    if (it == srStates_.end() || it->second.zones.empty()) {
-        auto* lbl = new QLabel(
-            "暂无区域数据。\n\n请先在该品种的策略配置里勾选【SR雷达】，"
-            "开启后约15分钟内完成首次计算（4h K线，摆动点聚类+FVG检测）。");
-        lbl->setWordWrap(true);
-        dv->addWidget(lbl);
-    } else {
-        auto& st = it->second;
-        auto* info = new QLabel(QString("现价 %1  |  区域按价格从高到低排列，绿色=现价所在区域  |  更新于 %2")
-            .arg(price, 0, 'f', 4)
-            .arg(QDateTime::fromMSecsSinceEpoch(st.computed_ms).toString("HH:mm:ss")));
-        info->setStyleSheet("color:#8b949e;font-size:11px;");
-        dv->addWidget(info);
-
-        auto zones = st.zones;
-        std::sort(zones.begin(), zones.end(),
-                  [](const srzones::Zone& a, const srzones::Zone& b) { return a.mid() > b.mid(); });
-
-        auto* table = new QTableWidget((int)zones.size(), 7);
-        table->setHorizontalHeaderLabels({"类型","共振","区间下沿","区间上沿","距现价%","触碰","评分"});
-        table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-        table->verticalHeader()->setVisible(false);
-        table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        for (int i = 0; i < (int)zones.size(); ++i) {
-            const auto& z = zones[i];
-            bool at_zone = price > 0 && z.contains(price);
-            QColor c = at_zone ? QColor("#3fb950")
-                     : (price > 0 && z.hi < price) ? QColor("#58a6ff")   // 下方=潜在支撑
-                                                    : QColor("#d29922"); // 上方=潜在阻力
-            auto mk = [&](const QString& s) {
-                auto* itc = new QTableWidgetItem(s);
-                itc->setTextAlignment(Qt::AlignCenter);
-                itc->setForeground(c);
-                return itc;
-            };
-            double dist = price > 0 ? (z.mid() - price) / price * 100.0 : 0;
-            int conf = z.confluence_independent();   // 与决策层同口径
-            table->setItem(i, 0, mk(QString::fromStdString(srzones::src_label(z))));
-            table->setItem(i, 1, mk(conf >= 2 ? QString("×%1").arg(conf) : "-"));
-            table->setItem(i, 2, mk(QString::number(z.lo, 'f', 4)));
-            table->setItem(i, 3, mk(QString::number(z.hi, 'f', 4)));
-            table->setItem(i, 4, mk(QString("%1%2%").arg(dist >= 0 ? "+" : "").arg(dist, 0, 'f', 2)));
-            table->setItem(i, 5, mk(QString::number(z.touches)));
-            table->setItem(i, 6, mk(QString::number(z.score, 'f', 1)));
-        }
-        dv->addWidget(table);
-    }
-
-    auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Close);
-    dv->addWidget(btnBox);
-    connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-    dlg.exec();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1676,13 +1553,8 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
     // bot，再点顶部的【清除已停止】按钮，两步操作天然防误触
     QMenu menu(this);
     QAction* actConfig = menu.addAction("配置策略...");
-    QAction* actSr     = menu.addAction("支撑/阻力区...");
     QAction* chosen = menu.exec(botTable_->viewport()->mapToGlobal(pos));
-    if (chosen == actConfig) {
-        openStrategyDialog(sym);
-    } else if (chosen == actSr) {
-        openSrZonesDialog(sym);
-    }
+    if (chosen == actConfig) openStrategyDialog(sym);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1919,11 +1791,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     syncMtfUi();
     connect(mtfBox, &QCheckBox::toggled, &dlg, [syncMtfUi](bool) { syncMtfUi(); });
 
-    // SR 雷达不再是独立选项：它是三层拦截/止盈锚/结构止损的【内部数据源】，
-    // 由下面那几个开关自动带上（见提交时的 cfg.sr_radar 赋值）。
-    // 曾经暴露成勾选框，是影子模式时期"先验证眼睛准不准"的遗留——那个阶段已经过去，
-    // 而留着它只会让人把结构层的数据源关掉、把闸门变成永久 fail-open。
-
     // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
     auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
     trendBox->setChecked(prefill ? prefill->cfg.use_trend_filter : true);
@@ -1938,8 +1805,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                      "（间距完全由档位带宽推导）；「空头态暂停新首仓」照常生效。");
 
 
-    // ── v3.0 三层决策 ────────────────────────────────────────────────────────
-    // 三个判据平级独立（v3.8 起不再有"三层决策拦截"总开关）。
+    // ── v3.0 宏观许可层 ────────────────────────────────────────────────────────
+    // 三个判据平级独立（v3.8 起不再有"宏观拦截"总开关）。
     // 拆开的价值在可归因：绑在一起时无法知道拦截来自哪一条
     auto* htfBox = new QCheckBox("① 高位拦截：日线%B 高于阈值不开新首仓");
     htfBox->setChecked(prefill ? prefill->cfg.use_htf_filter : true);
@@ -1947,24 +1814,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                        "%B = 价格在日线布林带中的相对位置，0=下轨 1=上轨。");
     addCheck(gateForm, htfBox);
 
-    auto* supBox = new QCheckBox("② 支撑拦截：价格须正踩在够格支撑区【内部】");
-    supBox->setChecked(prefill ? prefill->cfg.use_sr_support : true);
-    supBox->setToolTip(
-        "注意是「正处于区域内部」，不是「下方有支撑」——下方 2% 处有铁墙也不算。\n"
-        "够格 = 独立共振数≥2（摆动与其算术衍生的斐波归为一族，只计一票）。\n"
-        "⚠ 这通常是三条里最紧的一条：区域厚度约 0.5×ATR，而价格大部分时间\n"
-        "落在区域之间的空隙里。想放宽拦截先从这条入手。");
-    addCheck(gateForm, supBox);
-
-    auto* headBox = new QCheckBox("③ 净空拦截：头顶到最近够格阻力的空间须够止盈");
-    headBox->setChecked(prefill ? prefill->cfg.use_sr_headroom : true);
-    headBox->setToolTip(
-        "净空比 = 到上方最近够格阻力的距离 ÷ 预期止盈距离。\n"
-        "通俗说：赚到目标之前有没有一堵墙挡着。头顶无够格阻力时视为无限大（放行）。\n"
-        "实测阻力侧门槛放宽是灾难，说明这条判据有真实信息量。");
-    addCheck(gateForm, headBox);
-
-    addHint(gateForm, "三条平级独立，全不勾 = 三层决策完全不参与。"
+    addHint(gateForm, "下面三条平级独立，全部关闭 = 宏观许可层完全不参与。"
                       "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
     auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
     auto* dayChgEdit   = mkEditIn(gateForm, "24h涨幅拦截%（0=关）:",
@@ -1982,13 +1832,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             "「近7日」同样是滚动口径（相对 7 根日线前的收盘），不是本周 K 线。\n"
             "做空时镜像：拦的是跌幅。两条独立于上面的①开关，可以只用涨幅不用 %B。\n"
             "⚠ 这两个阈值没有回测依据，填多少靠手判。");
-    auto* headroomEdit = mkEditIn(gateForm, "净空比下限:", prefill ? prefill->cfg.sr_headroom_ratio : 3.0);
-    auto* srExitBox = new QCheckBox("止盈锚定阻力区（够格阻力比上轨近时在阻力前落袋，仅动态W）");
-    srExitBox->setChecked(prefill ? prefill->cfg.use_sr_exit : false);
-    addCheck(riskForm, srExitBox);
-    auto* structStopBox = new QCheckBox("结构性止损（持续跌破最深支撑区约1分钟平仓停机，仅动态W+多头）");
-    structStopBox->setChecked(prefill ? prefill->cfg.use_structural_stop : false);
-    addCheck(riskForm, structStopBox);
 
 
     // ── 指标信号配置（entryModeBox 选"指标信号"时才用得上）──────────────────────
@@ -2444,20 +2287,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.mtf_min_gap_pct   = to_d(mtfGapEdit, 2.0);
     cfg.use_trend_filter  = trendBox->isChecked();
     cfg.use_htf_filter      = htfBox->isChecked();
-    cfg.use_sr_support      = supBox->isChecked();
-    cfg.use_sr_headroom     = headBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
     cfg.htf_24h_chg_max     = to_d(dayChgEdit,   0.0);
     cfg.htf_week_chg_max    = to_d(weekChgEdit,  0.0);
-    cfg.sr_headroom_ratio   = to_d(headroomEdit, 3.0);
-    cfg.use_sr_exit         = srExitBox->isChecked();
-    cfg.use_structural_stop = structStopBox->isChecked();
-    // SR 雷达跟着依赖它的功能自动开关，用户不再单独控制：
-    // 开了三层拦截却没有区域数据，结构层会静默地永久 fail-open（闸门形同虚设）；
-    // 反过来三个都没开时雷达也没有存在意义，白占 K 线拉取额度
-    // SR 雷达跟随任一需要区域数据的功能（高位层用日线带，不依赖雷达）
-    cfg.sr_radar = cfg.use_sr_support || cfg.use_sr_headroom ||
-                   cfg.use_sr_exit || cfg.use_structural_stop;
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -2469,11 +2301,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
             // 否则手改过 JSON 的值会被静默重置回默认
             c.trend_interval    = existing->cfg.trend_interval;
             c.trend_ema_period  = existing->cfg.trend_ema_period;
-            c.sr_interval       = existing->cfg.sr_interval;
             c.htf_interval      = existing->cfg.htf_interval;
-            c.sr_min_confluence = existing->cfg.sr_min_confluence;
-            c.sr_independent_conf = existing->cfg.sr_independent_conf;
-            c.sr_lower_half_only  = existing->cfg.sr_lower_half_only;
             engine_->update_bot_cfg(existing->bot_id, c);
             log(QString("%1 %2 策略已更新").arg(symQ).arg(dirName), "OK");
             if (!existing->entries.empty() && c.leverage != existing->cfg.leverage) {
@@ -2504,9 +2332,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     refreshBotTable();
     save_bots();
 
-    // 配置保存即预热：立即触发一次SR区域重算和趋势/%B拉取，消除"新勾选雷达要等
-    // 15分钟、%B要等5分钟"的预热期——否则立即开仓模式的首仓永远在数据到达前发出
-    refreshSrZones();
+    // 配置保存即预热：立即触发一次趋势/%B 拉取，消除"%B 要等5分钟"的预热期
+    // ——否则立即开仓模式的首仓会在数据到达前发出
     trendTickCount_ = 0;   // 下一tick立即触发趋势+%B批次
 }
 
@@ -2623,8 +2450,7 @@ void MainWindow::onTick() {
         });
     }
 
-    // SR雷达：区域每 300 tick（约15分钟）重算一次（首tick立刻算），触区检查每tick做（本地、零开销）
-    if (srTickCount_++ % 300 == 0) refreshSrZones();
+    ++slowTickCount_;
 
     // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
@@ -2632,25 +2458,6 @@ void MainWindow::onTick() {
 
     // 成交明细的延迟落盘：save_trades 做了去抖，被压下的写在这里补上
     if (tradesDirty_) save_trades(true);
-
-    // v3.0 结构摘要喂入引擎：每tick按当前价重算"脚下支撑/头顶阻力/结构止损位"
-    // （纯本地计算零开销；区域本体15分钟一换，摘要跟着价格实时变）
-    if (engine_ && ticker_) {
-        for (const auto& b : engine_->get_bots()) {
-            auto sit = srStates_.find(b.cfg.symbol);
-            if (sit == srStates_.end() || sit->second.zones.empty()) continue;
-            double price = ticker_->mark_price(b.cfg.symbol);
-            if (price <= 0) continue;
-            decision::DigestOpts dop; dop.min_conf = b.cfg.sr_min_confluence;
-            dop.independent_conf = b.cfg.sr_independent_conf;
-            dop.lower_half_only  = b.cfg.sr_lower_half_only;
-            auto dg = decision::digest_zones(sit->second.zones, price, dop);
-            double stop_level = (dg.deep_sup_lo > 0 && sit->second.atr > 0)
-                                ? dg.deep_sup_lo - 0.25 * sit->second.atr : 0;
-            engine_->update_sr_structure(b.bot_id, dg.at_support, dg.sup_hi,
-                                         dg.res_lo, stop_level);
-        }
-    }
 
     // 每 15 分钟重新对时一次（tick=3s，300×3s=900s）：时钟漂移超过 recvWindow(5s)
     // 会让所有签名请求集体失败。
@@ -2666,7 +2473,7 @@ void MainWindow::onTick() {
     //
     // 成本可以忽略：/fapi/v1/time 权重 1，每小时 4 次 vs 限额 2400/分钟；
     // 且公开行情改走连接池后单次对时从冷连接 747ms 降到热连接 84ms
-    if (srTickCount_ % 300 == 0) {
+    if (slowTickCount_ % 300 == 0) {
         run_async([this]() {
             if (!client_) return;
             const auto ts = client_->sync_server_time();
@@ -2696,7 +2503,7 @@ void MainWindow::onTick() {
     // refreshPositions 只在【真正成功】时才更新 posCacheMs_，所以这里
     // 只要求它足够新；拿不到新数据就这一轮不对账，宁可晚一分钟发现
     const qint64 posAge = QDateTime::currentMSecsSinceEpoch() - posCacheMs_;
-    if (srTickCount_ % 20 == 0 && engine_ && posCacheMs_ > 0 && posAge < 30000) {
+    if (slowTickCount_ % 20 == 0 && engine_ && posCacheMs_ > 0 && posAge < 30000) {
         std::vector<CcgEngine::ExchangePos> ex;
         ex.reserve(pos_cache_.size());
         for (const auto& [k, p] : pos_cache_)
@@ -3128,7 +2935,7 @@ void MainWindow::refreshBotTable() {
                     // 「等待信号」原先是个黑盒：价格没到下轨、RSI没探底、探底了没回穿、
                     // 数据过期——四种情况长得一模一样，而拦截日志有去重（同一原因只打
                     // 一次），所以日志里也看不出来。这里把卡点直接显示出来。
-                    // 注意：指标信号是第①道闸，它不过就走不到三层拦截，也就不会有
+                    // 注意：指标信号是第①道闸，它不过就走不到宏观拦截，也就不会有
                     // 任何拦截日志——这正是"一直没提示也不开单"的成因
                     state_s = "等待信号"; state_c = QColor("#a371f7");
                     signal_tip.clear();
@@ -3181,15 +2988,15 @@ void MainWindow::refreshBotTable() {
                             signal_tip += QString("  需 ≥%1  %2")
                                 .arg(b.cfg.rsi_threshold, 0, 'f', 0).arg(rsiOk ? "✓" : "✗");
                         }
-                        signal_tip += "\n\n两条都满足后才会走到三层拦截；在那之前不会有任何拦截日志。";
+                        signal_tip += "\n\n两条都满足后才会走到宏观拦截；在那之前不会有任何拦截日志。";
                         // 引擎自己记的最近一次判定结果。信号已满足却不开仓时，
-                        // 答案就在这里（趋势/三层/保证金）——这个字段以前完全不上界面
+                        // 答案就在这里（趋势/宏观/保证金）——这个字段以前完全不上界面
                         if (!b.last_action.empty())
                             signal_tip += "\n当前引擎记录：" + QString::fromStdString(b.last_action);
                         // 完整判据快照带实时数字，每 tick 刷新——"信号已满足却不开仓"
                         // 时，这一行直接告诉你是三条里的哪一条把它挡住的
                         if (!b.last_decision.empty())
-                            signal_tip += "\n三层判据：" + QString::fromStdString(b.last_decision);
+                            signal_tip += "\n宏观判据：" + QString::fromStdString(b.last_decision);
                     }
                 } else {
                     // 「立即开仓」模式没有指标信号这道闸，所以卡住的原因只可能来自
@@ -3199,14 +3006,14 @@ void MainWindow::refreshBotTable() {
                     signal_tip = "立即开仓模式：没有指标信号这道闸，理论上下一个 tick 就会开首仓。\n"
                                  "若长时间停在这里，只可能被后面三道之一挡住：\n"
                                  "  ① 趋势过滤——高周期空头态暂停新首仓\n"
-                                 "  ② 三层拦截——高位 / 支撑 / 净空任一不满足\n"
+                                 "  ② 宏观拦截——高位 / 支撑 / 净空任一不满足\n"
                                  "  ③ 账户总保证金上限——已用额度不够再开一仓\n"
                                  "具体是哪一条，看运行日志里该品种最近的一条拦截提示"
                                  "（同一原因只打一次，不会重复刷）。";
                     if (!b.last_action.empty())
                         signal_tip += "\n\n当前引擎记录：" + QString::fromStdString(b.last_action);
                     if (!b.last_decision.empty())
-                        signal_tip += "\n三层判据：" + QString::fromStdString(b.last_decision);
+                        signal_tip += "\n宏观判据：" + QString::fromStdString(b.last_decision);
                 }
             } else {
                 state_s = b.cfg.dynamic_band_mode ? "运行中·动态W" : "运行中";

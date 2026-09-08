@@ -321,21 +321,11 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.use_trend_filter  = new_cfg.use_trend_filter;
     cfg.trend_interval    = new_cfg.trend_interval;
     cfg.trend_ema_period  = new_cfg.trend_ema_period;
-    cfg.sr_radar          = new_cfg.sr_radar;
-    cfg.sr_interval       = new_cfg.sr_interval;
     cfg.use_htf_filter      = new_cfg.use_htf_filter;
     cfg.htf_interval        = new_cfg.htf_interval;
     cfg.htf_pos_max         = new_cfg.htf_pos_max;
     cfg.htf_24h_chg_max     = new_cfg.htf_24h_chg_max;
     cfg.htf_week_chg_max    = new_cfg.htf_week_chg_max;
-    cfg.use_sr_support      = new_cfg.use_sr_support;
-    cfg.use_sr_headroom     = new_cfg.use_sr_headroom;
-    cfg.sr_min_confluence   = new_cfg.sr_min_confluence;
-    cfg.sr_independent_conf = new_cfg.sr_independent_conf;
-    cfg.sr_lower_half_only  = new_cfg.sr_lower_half_only;
-    cfg.sr_headroom_ratio   = new_cfg.sr_headroom_ratio;
-    cfg.use_sr_exit         = new_cfg.use_sr_exit;
-    cfg.use_structural_stop = new_cfg.use_structural_stop;
     return true;
 }
 
@@ -372,19 +362,6 @@ void CcgEngine::update_24h_change(const std::string& bot_id, bool ok, double pct
     it->second.h24_time = host_.now_steady();
 }
 
-void CcgEngine::update_sr_structure(const std::string& bot_id, bool at_support,
-                                    double sup_hi, double res_lo, double stop_level) {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    auto it = bots_.find(bot_id);
-    if (it == bots_.end()) return;
-    auto& bot = it->second;
-    bot.sr_ok         = true;
-    bot.sr_at_support = at_support;
-    bot.sr_sup_hi     = sup_hi;
-    bot.sr_res_lo     = res_lo;
-    bot.sr_stop_level = stop_level;
-    bot.sr_time       = host_.now_steady();
-}
 
 void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -884,18 +861,7 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
             double floor_th = bot.avg_price *
                 (is_long ? (1.0 + eff_floor / 100.0)
                          : (1.0 - eff_floor / 100.0));
-            // v3.0 止盈锚定：够格阻力比上轨更近且仍在保底线之上时，在阻力前落袋
-            // （不指望价格穿墙）。激活是一次性的，锚点天然锁定在激活时刻
             double target = is_long ? bot.ind_boll_ub : bot.ind_boll_lb;
-            bool sr_fresh = bot.sr_ok &&
-                (host_.now_steady() - bot.sr_time) < std::chrono::minutes(30);
-            if (bot.cfg.use_sr_exit && sr_fresh) {
-                if (is_long && bot.sr_res_lo > floor_th && bot.sr_res_lo < target)
-                    target = bot.sr_res_lo;
-                if (!is_long && bot.sr_sup_hi > 0 && bot.sr_sup_hi < floor_th &&
-                    bot.sr_sup_hi > target)
-                    target = bot.sr_sup_hi;
-            }
             // tp_floor_only：不等上轨，盈利达标即可激活（"够本就跑"）
             bool band_cond = eff.fresh &&
                 (bot.cfg.tp_floor_only ||
@@ -1085,21 +1051,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
 
             update_tracking(bot, price);
 
-            // v3.0 结构性止损（仅多头+动态W模式）：价格持续跌破参考位（最深支撑下沿
-            // -0.25×ATR）20个tick≈1分钟才触发——插针防护。未启用时不再打影子日志
-            bool struct_stop_fire = false;
-            if (!bot.entries.empty() && bot.cfg.direction == CcgConfig::Direction::Long &&
-                bot.cfg.dynamic_band_mode && bot.sr_stop_level > 0 && bot.sr_ok &&
-                (host_.now_steady() - bot.sr_time) < std::chrono::minutes(30)) {
-                if (price < bot.sr_stop_level) {
-                    ++bot.struct_stop_ticks;
-                    if (bot.struct_stop_ticks >= 20 && bot.cfg.use_structural_stop)
-                        struct_stop_fire = true;
-                } else {
-                    bot.struct_stop_ticks = 0;
-                }
-            }
-
             if (bot.entries.empty()) {
                 // 首仓：Immediate 模式一满足 Running 就立刻开；Indicator 模式要等
                 // BOLL+RSI 信号（UI 每 tick 异步拉取写入 bot.ind_*）才开
@@ -1170,7 +1121,7 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 }
 
                 // 出场价记忆：止盈后不在原地把仓位买回来。
-                // 放在三层决策【之前】判——它只读本地状态，比那三条便宜得多，
+                // 放在宏观许可层【之前】判——它只读本地状态，比那三条便宜得多，
                 // 而且是唯一不随时间衰减的高位判据（其余全是相对指标，见配置注释）
                 if (can_enter && bot.cfg.reentry_drawdown_pct > 0 && bot.last_tp_price > 0) {
                     bool expired = false;
@@ -1209,14 +1160,14 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     }
                 }
 
-                // v3.0 三层决策（宏观%B + 结构定位）。
+                // 首仓的宏观许可层。
                 // 三个判据平级独立，任一开启才走判定；全关则完全不参与
                 // （不判定、不记录，也不空跑去刷日志）
                 // 两条涨幅不受 use_htf_filter 约束：可以只用涨幅、不用 %B
                 const bool gates_on = bot.cfg.use_htf_filter ||
                                       bot.cfg.htf_24h_chg_max  > 0 ||
                                       bot.cfg.htf_week_chg_max > 0 ||
-                                      bot.cfg.use_sr_support || bot.cfg.use_sr_headroom;
+                                      bot.cfg.htf_24h_chg_max  > 0;
                 std::string decision_snap;
                 if (can_enter && gates_on) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -1251,10 +1202,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         din.day_chg_pct = bot.h24_chg;
                         din.day_chg_max = bot.cfg.htf_24h_chg_max;
                     }
-                    din.use_sr_support  = bot.cfg.use_sr_support;
-                    din.use_sr_headroom = bot.cfg.use_sr_headroom;
-                    din.sr_ok       = bot.sr_ok && (snow - bot.sr_time) < std::chrono::minutes(30);
-                    din.at_support  = bot.sr_at_support;
                     // 预期止盈距离：动态模式=到上轨的距离（那就是利润目标）；静态=止盈%
                     double tp_dist;
                     if (bot.cfg.dynamic_band_mode && bot.ind_ok &&
@@ -1265,18 +1212,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         tp_dist = price * std::max(bot.cfg.dynamic_band_mode ? 1.0
                                                                              : bot.cfg.tp_pct, 0.1) / 100.0;
                     }
-                    // 净空：多头看上方阻力，空头镜像看下方支撑
-                    double barrier = is_long ? bot.sr_res_lo
-                                             : (bot.sr_sup_hi > 0 ? bot.sr_sup_hi : 0);
-                    if (is_long) {
-                        din.headroom = decision::headroom_ratio(price, barrier, tp_dist);
-                    } else {
-                        din.headroom = (barrier > 0 && barrier < price && tp_dist > 0)
-                                       ? (price - barrier) / tp_dist : 1e9;
-                    }
-                    if (din.headroom < 0) din.headroom = 1e9;   // 数据非法按无限净空处理
-                    din.headroom_min = bot.cfg.sr_headroom_ratio;
-
                     auto verdict  = decision::evaluate(din);
                     decision_snap = decision::summarize(din, verdict);
                     // 每次判定都刷新（不管放行还是拦截），界面据此显示实时判据。
@@ -1287,8 +1222,8 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         can_enter = false;
                         // 数据未就绪与条件不满足分开提示——前者是"等一等"，
                         // 后者是"这里不该买"，用户看日志时需要能区分
-                        const char* why = verdict.data_block ? "三层数据未就绪，暂不开仓"
-                                                             : "三层决策拦截";
+                        const char* why = verdict.data_block ? "宏观数据未就绪，暂不开仓"
+                                                             : "宏观拦截";
                         if (bot.last_action != why) {
                             bot.last_action = why;
                             std::string hint;
@@ -1303,8 +1238,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                                             "或网络不通；把该阈值填 0 可先关掉这条闸门。";
                                 if (verdict.htf_missing)
                                     hint += "日线指标来自 REST，新上市品种需等日线21根历史。";
-                                if (verdict.sr_missing)
-                                    hint += "支撑/净空需 4h 线 60 根历史。";
                                 hint += "数据到齐后自动放行）";
                             }
                             log(bot.cfg.symbol + " " + why + ": " + decision_snap + hint);
@@ -1356,8 +1289,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 // 硬止损优先于追踪止盈
                 do_close.push_back({id, "硬止损"});
                 bot.pending = true;
-            } else if (struct_stop_fire) {
-                do_close.push_back({id, "结构止损"});
                 bot.pending = true;
             } else if (should_close(bot, price)) {
                 do_close.push_back({id, "追踪止盈"});

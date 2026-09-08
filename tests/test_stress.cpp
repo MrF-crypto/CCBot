@@ -207,7 +207,7 @@ static bool concurrency_stress(unsigned seed, int rounds) {
         c.leverage     = 5;
         c.entry_mode   = (i % 3) ? CcgConfig::EntryMode::Indicator
                                  : CcgConfig::EntryMode::Immediate;
-        c.use_htf_filter = c.use_sr_support = c.use_sr_headroom = false;
+        c.use_htf_filter     = false;
         c.use_trend_filter   = (i % 2 == 0);
         c.use_disaster_stop  = (i % 2 == 1);
         c.cooldown_secs      = 0;
@@ -265,7 +265,6 @@ static bool concurrency_stress(unsigned seed, int rounds) {
                 eng.update_indicator(id, mid - w, mid + w, 100.0 * u(rng));
                 eng.update_trend(id, u(rng) < 0.5);
                 eng.update_htf(id, u(rng));
-                eng.update_sr_structure(id, u(rng) < 0.5, mid * 0.9, mid * 1.1, mid * 0.8);
                 for (int t = 0; t < 4; ++t)
                     eng.update_mtf_band(id, t, mid - w * (t + 1), mid + w * (t + 1));
             }
@@ -423,7 +422,7 @@ static CcgConfig base_cfg(const std::string& sym) {
     c.tp_pct          = 3.0;
     c.trail_tp        = 1.0;
     c.use_trend_filter = false;
-    c.use_htf_filter = c.use_sr_support = c.use_sr_headroom = false;
+    c.use_htf_filter   = false;
     c.auto_restart    = true;
     c.cooldown_secs   = 0;
     return c;

@@ -52,16 +52,6 @@ public:
         int    leverage       = 1;
     };
 
-    struct OpenOrder {
-        std::string order_id;
-        std::string symbol;
-        std::string side;        // BUY / SELL
-        std::string type;        // LIMIT / MARKET / STOP_MARKET / ...
-        double price      = 0;
-        double orig_qty   = 0;
-        double exec_qty   = 0;
-        std::string status;
-    };
 
     struct OrderResult {
         bool        ok = false;
@@ -83,32 +73,15 @@ public:
     // 既可能是账户确实没有持仓，也可能是请求失败/响应无法解析。
     // 周期对账靠它区分两者：把失败当成"没有持仓"会凭空清掉真实仓位
     std::vector<Position>  fetch_positions(bool* ok = nullptr);
-    std::vector<OpenOrder> fetch_open_orders();
 
     OrderResult place_market(const std::string& symbol, const std::string& side,
                               double qty, bool reduce_only = false);
     // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
     OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
-    OrderResult place_limit (const std::string& symbol, const std::string& side,
-                              double qty, double price, bool reduce_only = false);
-
-    bool cancel_order(const std::string& symbol, const std::string& order_id);
-    bool cancel_all_orders(const std::string& symbol);
     bool close_position(const std::string& symbol);
     bool close_all_positions();
 
     // set_leverage / round_qty 见下方 ITradingClient 实现区（override 声明）
-
-    // TP/SL 条件市价平仓单（reduceOnly=true + 显式数量，兼容所有账户模式）
-    // entry_side: "BUY"=做多仓位, "SELL"=做空仓位; qty=持仓数量
-    OrderResult place_tp_market(const std::string& symbol, double stop_price,
-                                 const std::string& entry_side, double qty);
-    OrderResult place_sl_market(const std::string& symbol, double stop_price,
-                                 const std::string& entry_side, double qty);
-
-    // 拉取最近 K 线并计算 RSI（公开接口，无需签名）
-    double fetch_rsi(const std::string& symbol,
-                     const std::string& interval = "1h", int period = 14);
 
     // 布林带(BOLL) + RSI 快照——用于指标信号首单判定，公开接口不占用签名限流。
     // 拉的最后一根K线是币安还在滚动更新的"未收盘"K线，所以数值是实时估算值，
@@ -146,13 +119,10 @@ public:
                               const std::string& interval = "4h",
                               int ema_period = 200, int slope_bars = 3);
 
-    // 完整 OHLCV K线（SR区域检测等需要高低点/成交量的场景用，公开接口）
     struct Bar {
         double open = 0, high = 0, low = 0, close = 0, volume = 0;
     };
-    std::vector<Bar> fetch_bars(const std::string& symbol,
-                                const std::string& interval, int limit);
-    // 统一的 K 线拉取+解析（fetch_rsi/fetch_indicators/fetch_trend/fetch_bars 共用）
+    // 统一的 K 线拉取+解析（fetch_indicators / fetch_trend 共用）
     std::vector<Bar> fetch_klines(const std::string& symbol,
                                   const std::string& interval, int limit);
 
@@ -214,6 +184,7 @@ public:
     SymbolInfo get_symbol_info(const std::string& symbol);
     // 只读缓存，不发网络请求；未命中返回 false —— 给 GUI 线程用，绝不能阻塞界面
     bool try_get_symbol_info(const std::string& symbol, SymbolInfo& out) const;
+    // 价格对齐到 tick_size。目前唯一使用者是交易所侧灾难止损单的 stopPrice
     double round_price(const std::string& symbol, double price);
 
     // ── UserData Stream ─────────────────────────────────────────────────────
@@ -317,7 +288,7 @@ private:
     // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换（listenKey 就没有
     // um 前缀），所以用枚举查表，不做字符串拼接，免得漏改一处就打到错误的账户上。
     enum class Ep {
-        Account, PositionRisk, OpenOrders, Order, AllOpenOrders,
+        Account, PositionRisk, Order,
         PositionSideDual, Leverage, ListenKey,
         PmAccount,     // 统一账户专属：/papi/v1/account（全账户视角，uniMMR 在这里）
         CondOrder,     // 统一账户专属：条件单（STOP_MARKET / TAKE_PROFIT_MARKET）

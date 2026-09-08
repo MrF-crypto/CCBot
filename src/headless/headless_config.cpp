@@ -129,8 +129,6 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.use_trend_filter  = get_bool(bo, "use_trend_filter", c.use_trend_filter);
     c.trend_interval    = get_str(bo, "trend_interval", c.trend_interval);
     c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", c.trend_ema_period);
-    c.sr_radar          = get_bool(bo, "sr_radar", c.sr_radar);
-    c.sr_interval       = get_str(bo, "sr_interval", c.sr_interval);
     c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
     c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
     c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
@@ -138,27 +136,12 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.htf_24h_chg_max     = get_num(bo, "htf_day_chg_max", c.htf_24h_chg_max);
     c.htf_24h_chg_max     = get_num(bo, "htf_24h_chg_max", c.htf_24h_chg_max);
     c.htf_week_chg_max    = get_num(bo, "htf_week_chg_max", c.htf_week_chg_max);
-    // v3.8 迁移：老配置的 smart_gates 总开关为 false 时三层完全不参与，
-    // 升级后必须保持——否则老配置会突然开始拦截
-    {
-        const bool legacy_smart = get_bool(bo, "smart_gates", true);
-        const bool legacy_sr    = get_bool(bo, "use_sr_gate", true);
-        const bool has_new = (bo["use_sr_support"].error() == simdjson::SUCCESS);
-        if (has_new) {
-            c.use_sr_support  = get_bool(bo, "use_sr_support", c.use_sr_support);
-            c.use_sr_headroom = get_bool(bo, "use_sr_headroom", c.use_sr_headroom);
-        } else {
-            c.use_sr_support  = legacy_smart && legacy_sr;
-            c.use_sr_headroom = legacy_smart && legacy_sr;
-            if (!legacy_smart) c.use_htf_filter = false;
-        }
-    }
-    c.sr_min_confluence   = (int)get_num(bo, "sr_min_confluence", c.sr_min_confluence);
-    c.sr_independent_conf = get_bool(bo, "sr_independent_conf", c.sr_independent_conf);
-    c.sr_lower_half_only  = get_bool(bo, "sr_lower_half_only", c.sr_lower_half_only);
-    c.sr_headroom_ratio   = get_num(bo, "sr_headroom_ratio", c.sr_headroom_ratio);
-    c.use_sr_exit         = get_bool(bo, "use_sr_exit", c.use_sr_exit);
-    c.use_structural_stop = get_bool(bo, "use_structural_stop", c.use_structural_stop);
+    // v3.8 迁移：老配置的 smart_gates 总开关为 false 时拦截完全不参与，
+    // 升级后必须保持——否则老配置会突然开始拦截。
+    // v4.0.16 移除结构层后，需要迁移的只剩 %B 这一条
+    if (bo["use_sr_support"].error() != simdjson::SUCCESS &&
+        !get_bool(bo, "smart_gates", true))
+        c.use_htf_filter = false;
     return true;
 }
 
@@ -229,12 +212,9 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "dyn_fixed_interval",
         "tp_floor_only", "tp_fixed_profit", "fixed_trail_tp",
         "mtf_ladder", "mtf_tier_layers", "mtf_k", "mtf_min_gap_pct",
-        "use_trend_filter", "trend_interval", "trend_ema_period", "sr_radar", "sr_interval",
+        "use_trend_filter", "trend_interval", "trend_ema_period",
         "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max",
         "htf_day_chg_max", "htf_24h_chg_max", "htf_week_chg_max", "use_sr_gate",
-        "use_sr_support", "use_sr_headroom",
-        "sr_min_confluence", "sr_headroom_ratio", "use_sr_exit", "use_structural_stop",
-        "sr_independent_conf", "sr_lower_half_only",
     };
 
     for (auto elem : bots) {

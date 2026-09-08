@@ -21,7 +21,6 @@
 
 #include "core/ccg_engine.h"
 #include "core/funding_ledger.h"
-#include "core/sr_zones.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
 #include "net/book_ticker_stream.h"
@@ -69,13 +68,10 @@ private:
     // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）
     void openStrategyDialog(const std::string& symbol);
 
-    // ── SR雷达（v2.6 影子模式：检测+告警+展示，不参与下单）──
     // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
-    void refreshSrZones();
     void refreshFunding();
-    void refreshMtfBands();   // 多周期梯子的 4h/12h 档带值（1h/1d 由别处顺带喂）                                // 定期重算区域（约15分钟一次）
-    void openSrZonesDialog(const std::string& symbol);    // 右键查看区域列表
+    void refreshMtfBands();   // 多周期梯子的 4h/12h 档带值（1h/1d 由别处顺带喂）
     void refreshStats();
     void openTradeHistoryDialog();
     // 品种精度信息缓存未命中时，去后台线程取一次，绝不在 GUI 线程同步阻塞等待
@@ -115,7 +111,7 @@ private:
     // 后端
     std::shared_ptr<TradingClient>     client_;
     std::shared_ptr<CcgEngine>         engine_;
-    // pool_ = 引擎专用（下单/平仓）；fetchPool_ = 数据拉取专用（账户/持仓/指标/趋势/SR雷达）。
+    // pool_ = 引擎专用（下单/平仓）；fetchPool_ = 数据拉取专用（账户/持仓/指标/趋势）。
     // 必须分开：拉取任务动辄几百毫秒~几秒，混在一个池里会把手动平仓排到队尾等十几秒
     std::shared_ptr<ThreadPool>        pool_;
     std::shared_ptr<ThreadPool>        fetchPool_;
@@ -183,14 +179,8 @@ private:
     // 正在后台预取品种精度信息的品种集合，避免同一品种被重复发起请求（仅 GUI 线程访问）
     std::set<std::string> pendingSymbolFetch_;
 
-    // ── SR雷达状态（仅GUI线程访问）──
-    struct SrState {
-        std::vector<srzones::Zone> zones;
-        double atr = 0;           // 区域计算时的ATR（结构止损位推导用）
-        qint64 computed_ms = 0;   // 上次重算时间
-    };
-    std::map<std::string, SrState> srStates_;
-    int srTickCount_    = 0;
+    // ── 各批次的 tick 计数（仅GUI线程访问）──
+    int slowTickCount_  = 0;   // 慢批次节拍：对账(每20) / 重新对时(每300)
     int trendTickCount_ = 0;
     int fundTickCount_  = 0;
     // 资金费账本：每 8 小时结算一次的真实现金流出，不是浮亏。
@@ -217,7 +207,6 @@ private:
     std::unordered_map<std::string, double> chg24Rest_;
     std::mutex        chg24Mtx_;
     int64_t           chg24RestMs_ = 0;
-    std::atomic<bool> srFetchBusy_{false};
     std::atomic<bool> accFetchBusy_{false};
     std::atomic<bool> posFetchBusy_{false};
     std::atomic<bool> fundFetchBusy_{false};
