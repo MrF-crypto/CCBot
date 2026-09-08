@@ -203,16 +203,7 @@ private:
     // REST 价格兜底的防重入。串行遍历全部缺价品种，品种一多远超 3 秒的 tick 周期，
     // 没有这道闸会在 fetchPool_ 里无限堆积并饿死高周期指标拉取
     std::atomic<bool> restFetchBusy_{false};
-    // 每个品种当前用的行情来源，只在切换时打日志。默认 None：首次拿到
-    // 标记价不算"切换"（不刷启动噪音），而首次落到中间价/REST 一定要报
-    std::map<std::string, BookTickerStream::PxSrc> pxSrcSeen_;
-    // 24h 涨幅的 REST 兜底：全市场一次取回。
-    // 软/硬两条线是 stale-while-revalidate：超过 soft 就后台刷新但【继续用旧值】，
-    // 只有超过 hard 才判为无数据。单一阈值会在每次过期时制造一个假的"缺失"窗口，
-    // 让 strict 闸门假拦截一次并刷一条噪音日志（v4.0.14 的实盘日志里是精确的
-    // 90 秒周期、3 秒空窗）
-    static constexpr int64_t kChg24SoftMs = 60'000;    // 超过就后台续期
-    static constexpr int64_t kChg24HardMs = 600'000;   // 超过才算真没有
+    // 24h 涨幅的 REST 兜底：全市场一次取回，缓存到下一轮
     std::atomic<bool> chg24FetchBusy_{false};
     std::unordered_map<std::string, double> chg24Rest_;
     std::mutex        chg24Mtx_;

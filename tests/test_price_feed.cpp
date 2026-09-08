@@ -40,16 +40,6 @@ static std::string mark_msg(const char* sym_lower, const char* SYM, const char* 
          + "\"r\":\"0.00010000\",\"T\":1787156800000}}";
 }
 
-// 盘口报文（<symbol>@bookTicker）。b=买一 a=卖一
-static std::string book_msg(const char* sym_lower, const char* SYM,
-                            const char* b, const char* a) {
-    return std::string("{\"stream\":\"") + sym_lower + "@bookTicker\",\"data\":{"
-         + "\"e\":\"bookTicker\",\"u\":123456789,\"s\":\"" + SYM + "\","
-         + "\"b\":\"" + b + "\",\"B\":\"1.5\","
-         + "\"a\":\"" + a + "\",\"A\":\"2.5\","
-         + "\"T\":1787156044876,\"E\":1787156044880}}";
-}
-
 // 24h 行情流报文（<symbol>@ticker）。P=24h滚动涨幅%，c=最新成交价
 static std::string tick24_msg(const char* sym_lower, const char* SYM, const char* P) {
     return std::string("{\"stream\":\"") + sym_lower + "@ticker\",\"data\":{"
@@ -207,81 +197,17 @@ int main() {
         BookTickerStream ts4(/*testnet=*/true);
         check(ts4.stream_count_for_test() == 0, "初始无订阅");
         ts4.subscribe("BTCUSDT");
-        check(ts4.stream_count_for_test() == 3, "订阅一个品种 = 3 条流");
+        check(ts4.stream_count_for_test() == 2, "订阅一个品种 = 2 条流");
         ts4.subscribe("BTCUSDT");
-        check(ts4.stream_count_for_test() == 3, "  重复订阅不增加");
+        check(ts4.stream_count_for_test() == 2, "  重复订阅不增加");
         ts4.subscribe("ETHUSDT");
-        check(ts4.stream_count_for_test() == 6, "第二个品种 → 6 条流");
+        check(ts4.stream_count_for_test() == 4, "第二个品种 → 4 条流");
         ts4.unsubscribe("BTCUSDT");
-        check(ts4.stream_count_for_test() == 3, "退订后真的收缩（这条防的是流泄漏）");
+        check(ts4.stream_count_for_test() == 2, "退订后真的收缩（这条防的是流泄漏）");
         ts4.unsubscribe("NOSUCHUSDT");
-        check(ts4.stream_count_for_test() == 3, "  退订未订阅的品种是安全的 no-op");
+        check(ts4.stream_count_for_test() == 2, "  退订未订阅的品种是安全的 no-op");
         ts4.unsubscribe("ETHUSDT");
         check(ts4.stream_count_for_test() == 0, "全部退订后归零");
-    }
-
-    // ── ⑬ 47 个品种的订阅集合 ───────────────────────────────────────────────
-    // 94 条流塞进一条 SUBSCRIBE 时，实盘表现为连接成功、服务端不报错、
-    // 数据永远不来；而同样机制在 47 条流时正常。发送已改为分批，
-    // 但无论分不分批，最终应订阅的流集合必须一致
-    {
-        BookTickerStream ts5(/*testnet=*/true);
-        for (int i = 0; i < 47; ++i)
-            ts5.subscribe("SYM" + std::to_string(i) + "USDT");
-        check(ts5.stream_count_for_test() == 141, "47 个品种 → 141 条流（每品种3条）");
-        for (int i = 0; i < 47; ++i)
-            ts5.unsubscribe("SYM" + std::to_string(i) + "USDT");
-        check(ts5.stream_count_for_test() == 0, "  全部退订后归零（无残留）");
-    }
-
-    // ── ⑮ 三级降级：标记价 → 中间价 → 无 ────────────────────────────────────
-    // 实测某些网络路径只放行 bookTicker/depth，markPrice/ticker/aggTrade/kline
-    // 一个包都收不到。没有中间价这一档时引擎只能退到 REST：品种一多就是
-    // 串行几十秒一轮，网格拿着十秒前的价格判断补仓与止盈
-    {
-        BookTickerStream ts7(/*testnet=*/true);
-        auto src = BookTickerStream::PxSrc::Mark;
-
-        check_near(ts7.live_price("BTCUSDT", src), 0.0, 1e-12, "两条流都没有 → 返回 0");
-        check(src == BookTickerStream::PxSrc::None, "  来源标记为 None（调用方走 REST）");
-
-        // 只有 bookTicker：应降级到中间价
-        ts7.on_message_for_test(book_msg("btcusdt", "BTCUSDT", "100.0", "101.0"));
-        check_near(ts7.live_price("BTCUSDT", src), 100.5, 1e-9, "只有 bookTicker → 用中间价");
-        check(src == BookTickerStream::PxSrc::Mid, "  来源标记为 Mid");
-
-        // 标记价到了：必须优先（它与强平价、未实现盈亏同体系）
-        ts7.on_message_for_test(mark_msg("btcusdt", "BTCUSDT", "100.2"));
-        check_near(ts7.live_price("BTCUSDT", src), 100.2, 1e-9, "标记价可用时优先用标记价");
-        check(src == BookTickerStream::PxSrc::Mark, "  来源标记为 Mark");
-
-        // 标记价断流后自动退回中间价——不是退到 0
-        ts7.age_mark_for_test("BTCUSDT", 11000);
-        check_near(ts7.live_price("BTCUSDT", src), 100.5, 1e-9, "标记价陈旧 → 自动降级回中间价");
-        check(src == BookTickerStream::PxSrc::Mid, "  来源标记为 Mid");
-    }
-
-    // ── ⑯ 只有一边盘口有效时不得算出"半价" ──────────────────────────────────
-    // (bid+ask)/2 在只有一边时会得到真实价格的一半，引擎会以为价格瞬间腰斩、
-    // 直接触发深层补仓。这是恢复 bookTicker 时最容易漏掉的一条
-    {
-        BookTickerStream ts8(/*testnet=*/true);
-        ts8.on_message_for_test(book_msg("ethusdt", "ETHUSDT", "0", "3200.5"));
-        check_near(ts8.mid_price("ETHUSDT"), 0.0, 1e-12, "买一为 0 → 中间价不成立，返回 0");
-        ts8.on_message_for_test(book_msg("ethusdt", "ETHUSDT", "3199.5", "0"));
-        check_near(ts8.mid_price("ETHUSDT"), 0.0, 1e-12, "卖一为 0 → 同样返回 0");
-        ts8.on_message_for_test(book_msg("ethusdt", "ETHUSDT", "3199.5", "3200.5"));
-        check_near(ts8.mid_price("ETHUSDT"), 3200.0, 1e-9, "两边都有效 → 正常中间价");
-    }
-
-    // ── ⑭ 行情静默自检 ──────────────────────────────────────────────────────
-    // 把"什么都没发生"变成一条消息。但未启动/未连接时不该报警——
-    // 那两种状态各自已有日志，重复报只会制造噪音
-    {
-        BookTickerStream ts6(/*testnet=*/true);
-        check(ts6.silence_check().empty(), "未启动时静默自检不报警");
-        ts6.subscribe("BTCUSDT");
-        check(ts6.silence_check().empty(), "  未连接时也不报警（Close/Error 另有日志）");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

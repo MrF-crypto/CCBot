@@ -2714,12 +2714,6 @@ void MainWindow::onTick() {
     // 所以每个 tick 都喂，不必搭 5 分钟那班车。@ticker 每秒推一次，
     // 让引擎拿到的始终是最新值
     if (ticker_) {
-        // 行情静默自检：把"什么都没发生"变成一条消息。
-        // 连接成功 + 订阅已发 + 服务端不报错，三个正常信号加起来仍可能是
-        // 完全静默——实盘就撞上过，而系统内部没有任何机制会注意到
-        if (auto warn = ticker_->silence_check(); !warn.empty())
-            log(QString::fromStdString(warn), "WARN");
-
         bool need_rest_chg = false;
         for (const auto& b : bots) {
             if (b.state == CcgBot::State::Stopped) continue;
@@ -2732,17 +2726,12 @@ void MainWindow::onTick() {
                 // 高位拦截在 strict 下永久拦死，一单也开不出来。而其余数据
                 // （标记价、日线指标）都有 REST 兜底，所以 WS 故障只会从这一条
                 // 冒出来，还容易被误读成"这条数据本身有问题"
-                // 【先续期、后过期】：旧值一直可用到 kChg24HardMs，而在
-                // kChg24SoftMs 就开始后台刷新。
-                // v4.0.14 写反了——"过期→报缺失→才去取"，于是每 90 秒必然出现
-                // 一次假拦截 + 一条噪音日志，实盘日志里是精确的 90 秒周期、
-                // 3 秒空窗。24h 涨幅是慢变量，几分钟的旧值远好过一个假的"缺失"
                 std::lock_guard<std::mutex> lk(chg24Mtx_);
                 auto it = chg24Rest_.find(b.cfg.symbol);
-                const int64_t age = BookTickerStream::now_ms() - chg24RestMs_;
-                if (it != chg24Rest_.end() && age < kChg24HardMs) {
+                // 全市场快照 90 秒内有效：24h 涨幅是慢变量，这个新鲜度足够
+                if (it != chg24Rest_.end() &&
+                    BookTickerStream::now_ms() - chg24RestMs_ < 90000) {
                     pct = it->second; ok = true;
-                    if (age > kChg24SoftMs) need_rest_chg = true;   // 边用边刷
                 } else {
                     need_rest_chg = true;
                 }
@@ -2817,29 +2806,11 @@ void MainWindow::onTick() {
 
     std::set<std::string> need_rest;
     for (const auto& sym : syms) {
-        // 三级降级：标记价(WS) → 中间价(WS bookTicker) → REST。
-        // 实测某些网络路径只放行 bookTicker/depth，markPrice/ticker/aggTrade/kline
-        // 一个包都收不到（三次复测一致，关压缩/换品种/换合并流都不变）。
-        // 那种链路上没有中间价这一档的话，引擎只能退到 REST：47 个品种串行，
-        // 每个品种约 10 秒才更新一次价格——网格拿着 10 秒前的价格判断补仓与止盈
-        auto src = BookTickerStream::PxSrc::None;
-        double ws_price = ticker_ ? ticker_->live_price(sym, src) : 0.0;
+        double ws_price = ticker_ ? ticker_->mark_price(sym) : 0.0;
         if (ws_price > 0) {
             engine_->tick(sym, ws_price);
         } else {
             need_rest.insert(sym);
-        }
-        // 只在【档位变化】时打一条。静默降级正是此前最难查的那类问题：
-        // 策略照常跑，只是价格新鲜度从亚秒掉到十秒，界面上看不出任何异常
-        auto& prev = pxSrcSeen_[sym];
-        if (prev != src) {
-            if (prev != BookTickerStream::PxSrc::None || src != BookTickerStream::PxSrc::Mark)
-                log(QString("%1 行情来源切换：%2 → %3")
-                        .arg(QString::fromStdString(sym))
-                        .arg(BookTickerStream::px_src_name(prev))
-                        .arg(BookTickerStream::px_src_name(src)),
-                    src == BookTickerStream::PxSrc::Mark ? "OK" : "WARN");
-            prev = src;
         }
     }
 

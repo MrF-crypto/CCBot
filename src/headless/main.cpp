@@ -250,8 +250,6 @@ int main(int argc, char** argv) {
     // 24h 涨幅的 REST 兜底缓存（全市场一次取回，90 秒有效期）
     std::unordered_map<std::string, double> chg24_rest;
     int64_t chg24_rest_ms = 0;
-    // 每个品种当前的行情来源，只在切换时打日志
-    std::map<std::string, BookTickerStream::PxSrc> px_src_seen;
 
     BookTickerStream ticker(cfg.testnet);
     // 订阅被拒等服务端消息此前静默丢弃：VPS 上没有界面，这类问题只能靠日志发现
@@ -303,28 +301,11 @@ int main(int argc, char** argv) {
 
         // ── 1) 价格喂入 + 策略判定：永远最先执行，不被任何数据拉取阻塞 ────────
         for (const auto& sym : symbols) {
-            // 三级降级：标记价(WS) → 中间价(WS bookTicker) → REST。
-            // 某些网络路径只放行 bookTicker，没有中间价这一档时引擎会退到
-            // REST：品种一多就是串行几十秒一轮，网格拿着十秒前的价格做判定
-            auto src = BookTickerStream::PxSrc::None;
-            double price = ticker.live_price(sym, src);   // 内置陈旧保护，冻结价返回0
+            double price = ticker.mark_price(sym);   // 内置10秒陈旧保护，冻结价返回0
             if (price <= 0) {
                 price = client->fetch_mark_price(sym);
                 // 写回缓存：headless 没有界面，但状态落盘与日志同样读它
                 if (price > 0) ticker.set_mark_price(sym, price);
-            }
-            // 只在档位变化时报，避免每 tick 刷屏
-            {
-                auto& prev = px_src_seen[sym];
-                if (prev != src) {
-                    if (prev != BookTickerStream::PxSrc::None ||
-                        src  != BookTickerStream::PxSrc::Mark)
-                        log_line(sym + " 行情来源切换：" +
-                                 BookTickerStream::px_src_name(prev) + " → " +
-                                 BookTickerStream::px_src_name(src),
-                                 src == BookTickerStream::PxSrc::Mark ? "OK" : "WARN");
-                    prev = src;
-                }
             }
             if (price > 0) {
                 engine->tick(sym, price);
@@ -362,11 +343,6 @@ int main(int argc, char** argv) {
         //     这条数据原本是全系统【唯一没有兜底】的：WS 一断，高位拦截在
         //     strict 下永久拦死，一单也开不出来
         {
-            // 行情静默自检：VPS 上没有界面，这类"三个信号都正常却完全没数据"
-            // 的状态只能靠日志暴露
-            if (auto warn = ticker.silence_check(); !warn.empty())
-                log_line(warn, "WARN");
-
             bool need_rest_chg = false;
             for (const auto& b : engine->get_bots()) {
                 if (b.state == CcgBot::State::Stopped) continue;
@@ -374,15 +350,10 @@ int main(int argc, char** argv) {
                 double pct = 0;
                 bool ok = ticker.change_24h(b.cfg.symbol, pct);
                 if (!ok) {
-                    // 先续期、后过期（stale-while-revalidate）：超过 soft 就刷新但
-                    // 继续用旧值，只有超过 hard 才判无数据。单一阈值会在每次过期时
-                    // 制造假的"缺失"窗口，让 strict 闸门假拦截并刷噪音日志
-                    constexpr int64_t kSoftMs = 60'000, kHardMs = 600'000;
                     auto it = chg24_rest.find(b.cfg.symbol);
-                    const int64_t age = BookTickerStream::now_ms() - chg24_rest_ms;
-                    if (it != chg24_rest.end() && age < kHardMs) {
+                    if (it != chg24_rest.end() &&
+                        BookTickerStream::now_ms() - chg24_rest_ms < 90000) {
                         pct = it->second; ok = true;
-                        if (age > kSoftMs) need_rest_chg = true;
                     } else {
                         need_rest_chg = true;
                     }

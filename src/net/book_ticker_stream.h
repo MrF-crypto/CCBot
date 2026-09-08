@@ -34,16 +34,6 @@ public:
         // 而 UTC 0 点是北京时间早 8 点，是真实交易时段，闸门会在那里瞎掉
         double  chg_24h    = 0;
         int64_t chg_ms     = 0;
-        // 买一/卖一与中间价。v4.0.11 曾把这条流整个删掉（当时生产代码确已零引用），
-        // v4.0.15 恢复——因为实测发现某些网络路径上 markPrice/ticker/aggTrade/kline
-        // 全部收不到包，而 bookTicker 与 depth 照常每秒几百包。三次复测一致，
-        // 关压缩、换品种、换全市场合并流都不变，!markPrice@arr@1s 甚至被主动 RST。
-        // 那种链路上 bookTicker 是【唯一可用的实时行情】，删掉它等于把引擎
-        // 逼回 REST 兜底：47 个品种串行，每个品种约 10 秒才更新一次价格
-        double  bid        = 0;
-        double  ask        = 0;
-        double  mid        = 0;   // (bid+ask)/2，两边都有效时才置
-        int64_t mid_ms     = 0;
     };
 
     explicit BookTickerStream(bool testnet = false);
@@ -55,15 +45,6 @@ public:
     void start();
     void stop();
     bool is_connected() const { return connected_.load(); }
-
-    // 行情静默自检：连上了但久无数据时返回描述文本，否则返回空串。
-    // 调用方（GUI/headless 的 tick 循环）定期调一次，非空就写日志。
-    //
-    // 存在的理由：实盘出现过【连接成功、订阅已发、服务端不报错、数据永远不来】
-    // 这一种状态——三个"正常"信号加起来仍然是完全静默，而系统内部没有任何机制
-    // 会注意到，只有 24h 涨幅（唯一没有 REST 兜底的数据）会间接暴露它。
-    // 这个自检把"没有消息"本身变成一条消息
-    std::string silence_check(int64_t quiet_ms = 30000);
 
     // 订阅/取消（大写 symbol，如 "BTCUSDT"）。
     // ⚠ 删除 bot 时必须调用 unsubscribe：streams_ 不会自己收缩，重连时全量重订，
@@ -78,19 +59,6 @@ public:
     // 引擎决策用这个：WebSocket 半开时连接还在、数据早就不来了，缓存里躺着一个
     // 冻结的价格看起来完全正常，引擎会拿着僵尸价继续补仓/止盈/止损
     double mark_price(const std::string& symbol) const;
-
-    // 买一卖一中间价，带同样的陈旧保护。markPrice 流不可用时的降级价格源。
-    double mid_price(const std::string& symbol) const;
-
-    // 引擎用的实时价，按可用性自动降级：
-    //   ① markPrice 推送   正常网络（与强平、未实现盈亏同体系）
-    //   ② bookTicker 中间价 markPrice 收不到时（某些链路只放行这条流）
-    //   ③ 返回 0          两条都没有，调用方走 REST 兜底
-    // out_src 回填实际用了哪一档，调用方据此在【切换时】打一条日志——
-    // 静默降级正是此前最难查的那类问题：策略照常跑，只是价格延迟从亚秒变成十秒
-    enum class PxSrc { None, Mark, Mid };
-    double live_price(const std::string& symbol, PxSrc& out_src) const;
-    static const char* px_src_name(PxSrc s);
 
     // 24 小时滚动涨幅%；从未收到或过期返回 false。
     // 涨幅可以合法地为 0 或负数，所以不能像价格那样用返回值 0 表示"无数据"
@@ -149,9 +117,6 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<int>  req_id_   {1};
     std::atomic<bool> first_data_seen_{false};   // 首包只提示一次
-    std::atomic<int64_t> last_data_ms_{0};       // 最后一次收到数据包的时刻
-    std::atomic<bool> silence_warned_{false};    // 静默告警只报一次，恢复后重新武装
-
 
     mutable std::mutex                    mtx_;
     std::set<std::string>                 streams_;   // lowercase "btcusdt@markPrice@1s"
