@@ -2760,8 +2760,14 @@ void MainWindow::refreshLiveQuotes() {
         const double tick_size = tickSizeOf(b.cfg.symbol);
         botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
         {
+            // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，
+            // 等于在一个表达式内既通过引用【写】pct 又【读】pct，而 C++ 的
+            // 函数实参求值顺序是【未指定】的——MSVC 从右往左，先把还是初始值
+            // 的 pct(0) 拷进参数，chg24Of 之后才执行，于是永远显示 +0.00%。
+            // 引擎侧走的是另一条分支所以数据是对的，只有界面错，极难对上号
             double pct = 0; bool stale = false;
-            botTable_->setItem(i, 7, make_chg24_cell(chg24Of(b.cfg.symbol, pct, stale), pct));
+            const bool has = chg24Of(b.cfg.symbol, pct, stale);
+            botTable_->setItem(i, 7, make_chg24_cell(has, pct));
         }
 
         // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
@@ -3105,8 +3111,14 @@ void MainWindow::refreshBotTable() {
         const double tick_size = tickSizeOf(b.cfg.symbol);
         botTable_->setItem(i, 6,  make_mark_cell(tick, tick_size));
         {
+            // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，
+            // 等于在一个表达式内既通过引用【写】pct 又【读】pct，而 C++ 的
+            // 函数实参求值顺序是【未指定】的——MSVC 从右往左，先把还是初始值
+            // 的 pct(0) 拷进参数，chg24Of 之后才执行，于是永远显示 +0.00%。
+            // 引擎侧走的是另一条分支所以数据是对的，只有界面错，极难对上号
             double pct = 0; bool stale = false;
-            botTable_->setItem(i, 7, make_chg24_cell(chg24Of(b.cfg.symbol, pct, stale), pct));
+            const bool has = chg24Of(b.cfg.symbol, pct, stale);
+            botTable_->setItem(i, 7, make_chg24_cell(has, pct));
         }
 
         // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
