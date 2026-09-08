@@ -1099,21 +1099,23 @@ void MainWindow::buildUi() {
         // 资金费不进这张表：它是【账户级慢变量】（8小时才结算一次），而这张表是
         // 每3秒刷新的【逐品种实时行】。混在一起既挤掉实时数据的宽度，也不符合它
         // 的性质——账户合计放顶部栏，逐品种细节放"均价"列的悬停提示
-        botTable_ = new QTableWidget(0, 15);
+        botTable_ = new QTableWidget(0, 16);
         botTable_->setHorizontalHeaderLabels(
             {"#","品种","方向","策略","层进度",
-             "均价","标记价","延迟","浮动P&L","保证金","收益率","强平价",
+             "均价","标记价","24h涨跌","延迟","浮动P&L","保证金","收益率","强平价",
              "已实现","状态","操作"});
         auto* hdr = botTable_->horizontalHeader();
         hdr->setSectionResizeMode(QHeaderView::Stretch);
-        for (int c : {0, 4, 7, 13})
+        // 列索引在 v4.0.15 插入「24h涨跌」后整体后移：延迟 7→8、状态 13→14、操作 14→15
+        for (int c : {0, 4, 7, 8, 14})
             hdr->setSectionResizeMode(c, QHeaderView::Fixed);
         hdr->resizeSection(0, 26);
         hdr->resizeSection(4, 54);
-        hdr->resizeSection(7, 60);
-        hdr->resizeSection(13, 96);
-        hdr->setSectionResizeMode(14, QHeaderView::Fixed);
-        hdr->resizeSection(14, 175);
+        hdr->resizeSection(7, 72);    // 24h涨跌
+        hdr->resizeSection(8, 60);    // 延迟
+        hdr->resizeSection(14, 96);   // 状态
+        hdr->setSectionResizeMode(15, QHeaderView::Fixed);
+        hdr->resizeSection(15, 175);  // 操作
 
         botTable_->verticalHeader()->setVisible(false);
         botTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -2714,29 +2716,19 @@ void MainWindow::onTick() {
     // 所以每个 tick 都喂，不必搭 5 分钟那班车。@ticker 每秒推一次，
     // 让引擎拿到的始终是最新值
     if (ticker_) {
+        // 不再受「24h涨幅拦截」开关约束：这份数据现在也是界面上的一列，
+        // 闸门关着的 bot 同样要显示。成本几乎为零——@ticker 本就已订阅，
+        // REST 兜底是全市场一次取回（权重 40，90 秒一次），与品种数无关
         bool need_rest_chg = false;
         for (const auto& b : bots) {
             if (b.state == CcgBot::State::Stopped) continue;
-            if (b.cfg.htf_24h_chg_max <= 0) continue;
             double pct = 0;
-            bool ok = ticker_->change_24h(b.cfg.symbol, pct);
-            if (!ok) {
-                // 推送流没到 → 用 REST 兜底的那份缓存。
-                // 24h 涨幅原本是全系统【唯一没有兜底】的数据：WS 一断，
-                // 高位拦截在 strict 下永久拦死，一单也开不出来。而其余数据
-                // （标记价、日线指标）都有 REST 兜底，所以 WS 故障只会从这一条
-                // 冒出来，还容易被误读成"这条数据本身有问题"
-                std::lock_guard<std::mutex> lk(chg24Mtx_);
-                auto it = chg24Rest_.find(b.cfg.symbol);
-                // 全市场快照 90 秒内有效：24h 涨幅是慢变量，这个新鲜度足够
-                if (it != chg24Rest_.end() &&
-                    BookTickerStream::now_ms() - chg24RestMs_ < 90000) {
-                    pct = it->second; ok = true;
-                } else {
-                    need_rest_chg = true;
-                }
-            }
-            engine_->update_24h_change(b.bot_id, ok, pct);
+            bool stale = false;
+            const bool ok = chg24Of(b.cfg.symbol, pct, stale);
+            if (stale) need_rest_chg = true;
+            // 只有开了闸门的才喂给引擎；其余仅供显示
+            if (b.cfg.htf_24h_chg_max > 0)
+                engine_->update_24h_change(b.bot_id, ok, pct);
         }
         // 一次 REST 拿回全市场（权重 40），不是逐品种——47 个品种逐个查是
         // 47 次往返，而全取只要 1 次，权重也更省
@@ -2885,6 +2877,21 @@ static QString fmt_tick_px(double p, double tick) {
 // 强平、未实现盈亏、强平触发，币安全部按标记价算。既然"离强平多远"是这个策略
 // 最关心的问题（套住长持、靠保证金预规划扛），那就让全系统只认这一个价。
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 「24h涨跌」单元格。红绿口径与旁边的浮动P&L/收益率一致。
+//
+// 数据有两个来源，界面不关心用的哪个：@ticker 推送流优先，拿不到走全市场
+// REST 快照（一次调用取回所有品种，权重 40）。两者都没有才显示 "--"。
+// ─────────────────────────────────────────────────────────────────────────────
+static QTableWidgetItem* make_chg24_cell(bool has, double pct) {
+    auto* it = new QTableWidgetItem(
+        has ? QString("%1%2%").arg(pct >= 0 ? "+" : "").arg(pct, 0, 'f', 2) : "--");
+    it->setTextAlignment(Qt::AlignCenter);
+    it->setForeground(!has ? QColor("#484f58")
+                    : pct >= 0 ? QColor("#3fb950") : QColor("#f85149"));
+    return it;
+}
+
 static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, double tick_size) {
     const bool has_mark = tick.mark_price > 0;
     // 陈旧判定必须和引擎用同一把尺子（BookTickerStream::kStaleMs）：超过阈值时
@@ -2945,6 +2952,10 @@ void MainWindow::refreshLiveQuotes() {
         auto tick = ticker_->get(b.cfg.symbol);
         const double tick_size = tickSizeOf(b.cfg.symbol);
         botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
+        {
+            double pct = 0; bool stale = false;
+            botTable_->setItem(i, 7, make_chg24_cell(chg24Of(b.cfg.symbol, pct, stale), pct));
+        }
 
         // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
         // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
@@ -2958,13 +2969,36 @@ void MainWindow::refreshLiveQuotes() {
                      : (latency < 1500) ? QColor("#3fb950")
                      : (latency < 3000) ? QColor("#d29922")
                                         : QColor("#f85149");
-        botTable_->setItem(i, 7, mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
+        botTable_->setItem(i, 8, mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 品种精度信息异步预取——GUI 线程只读缓存，缺失时丢到后台线程取，绝不同步等待
 // ─────────────────────────────────────────────────────────────────────────────
+// 24h 涨跌：推送流优先，回落到全市场 REST 快照。
+// out_stale 回填"缓存该续期了"，由调用方在合适的时机去发那一次全市场请求
+// （引擎喂数与界面显示都会调这里，续期只应触发一次）
+bool MainWindow::chg24Of(const std::string& symbol, double& out_pct, bool& out_stale) {
+    out_stale = false;
+    if (!ticker_) return false;
+    if (ticker_->change_24h(symbol, out_pct)) return true;
+
+    std::lock_guard<std::mutex> lk(chg24Mtx_);
+    auto it = chg24Rest_.find(symbol);
+    const int64_t age = BookTickerStream::now_ms() - chg24RestMs_;
+    // 先续期、后过期：超过 soft 就该刷新，但旧值继续可用到 hard。
+    // 单一阈值会在每次过期时制造一个"没有数据"的空窗——v4.0.14 的实盘日志里
+    // 是精确的 90 秒周期、3 秒空窗，闸门会在那 3 秒里假拦截并刷一条噪音
+    if (it != chg24Rest_.end() && age < kChg24HardMs) {
+        out_pct = it->second;
+        if (age > kChg24SoftMs) out_stale = true;
+        return true;
+    }
+    out_stale = true;
+    return false;
+}
+
 double MainWindow::tickSizeOf(const std::string& symbol) {
     if (!client_) return 0.0;
     TradingClient::SymbolInfo info;
@@ -3263,6 +3297,10 @@ void MainWindow::refreshBotTable() {
         auto tick = ticker_ ? ticker_->get(b.cfg.symbol) : BookTickerStream::Tick{};
         const double tick_size = tickSizeOf(b.cfg.symbol);
         botTable_->setItem(i, 6,  make_mark_cell(tick, tick_size));
+        {
+            double pct = 0; bool stale = false;
+            botTable_->setItem(i, 7, make_chg24_cell(chg24Of(b.cfg.symbol, pct, stale), pct));
+        }
 
         // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
         // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
@@ -3276,16 +3314,16 @@ void MainWindow::refreshBotTable() {
                      : (latency < 1500) ? QColor("#3fb950")
                      : (latency < 3000) ? QColor("#d29922")
                                         : QColor("#f85149");
-        botTable_->setItem(i, 7,  mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
+        botTable_->setItem(i, 8,  mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
 
-        botTable_->setItem(i, 8,  mkc(unr_s, unreal >= 0       ? QColor("#3fb950") : QColor("#f85149")));
+        botTable_->setItem(i, 9,  mkc(unr_s, unreal >= 0       ? QColor("#3fb950") : QColor("#f85149")));
 
         // 保证金 / 收益率：优先用交易所真实名义价值/杠杆算，没有真实持仓时退回本地估算
         double margin = has_real_pos && pit->second.leverage > 0
             ? pit->second.notional / pit->second.leverage
             : (b.cfg.leverage > 0 ? b.total_cost / b.cfg.leverage : 0);
         QString margin_s = (margin > 0) ? fmt_price(margin) : "--";
-        botTable_->setItem(i, 9,  mkc(margin_s, QColor("#8b949e")));
+        botTable_->setItem(i, 10,  mkc(margin_s, QColor("#8b949e")));
 
         double roi = (margin > 0) ? unreal / margin * 100.0 : 0;
         QString roi_s = (margin > 0)
@@ -3319,7 +3357,7 @@ void MainWindow::refreshBotTable() {
             }
             roi_item->setToolTip(tip);
         }
-        botTable_->setItem(i, 10, roi_item);
+        botTable_->setItem(i, 11, roi_item);
 
         // 强平价：来自交易所真实持仓（refreshPositions() 每 3s 拉取一次），本地无法准确估算
         double liq = has_real_pos ? pit->second.liq_price : 0;
@@ -3346,13 +3384,13 @@ void MainWindow::refreshBotTable() {
                         .arg(fmt_price(liq)).arg(fmt_tick_px(mk, tick_size))
                         .arg(dist, 0, 'f', 2));
             }
-            botTable_->setItem(i, 11, liq_item);
+            botTable_->setItem(i, 12, liq_item);
         }
 
-        botTable_->setItem(i, 12, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
+        botTable_->setItem(i, 13, mkc(rea_s, b.realized_pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
         auto* state_item = mkc(state_s, state_c);
         if (!signal_tip.isEmpty()) state_item->setToolTip(signal_tip);
-        botTable_->setItem(i, 13, state_item);
+        botTable_->setItem(i, 14, state_item);
 
         // 操作列。
         // 这一列原先【每次刷新都整套重建】——3秒一次 × 每行3个按钮，31个bot就是
@@ -3455,7 +3493,7 @@ void MainWindow::refreshBotTable() {
         opL->addWidget(btnDel);
         opL->addStretch();
 
-        botTable_->setCellWidget(i, 14, opW);
+        botTable_->setCellWidget(i, 15, opW);
         if (i < (int)opRowKeys_.size()) opRowKeys_[i] = opKey;
     }
 

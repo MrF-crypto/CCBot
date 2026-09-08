@@ -84,6 +84,9 @@ private:
     // 提成一个函数是因为这段查询原先在 refreshLiveQuotes 和 refreshBotTable 里
     // 各有一份逐字相同的副本——同一处的 fmt_tick 就是这样被改了一份漏了一份
     double tickSizeOf(const std::string& symbol);
+    // 24h 涨跌：推送流优先，回落到全市场 REST 快照。
+    // out_stale 回填"该续期了"，调用方据此触发那一次全市场请求
+    bool   chg24Of(const std::string& symbol, double& out_pct, bool& out_stale);
     // 删除 bot 后调用：若已无任何 bot 使用该品种，退订它的行情流。
     // 不退订的话 streams_ 只增不减，重连时全量重订，反复增删会一路累积到
     // 币安合约单连接 200 条流的上限，超出后【静默】失效
@@ -204,6 +207,12 @@ private:
     // 没有这道闸会在 fetchPool_ 里无限堆积并饿死高周期指标拉取
     std::atomic<bool> restFetchBusy_{false};
     // 24h 涨幅的 REST 兜底：全市场一次取回，缓存到下一轮
+    // 软/硬两条线是 stale-while-revalidate：超过 soft 就后台刷新但【继续用旧值】，
+    // 只有超过 hard 才判为无数据。单一阈值会在每次过期时制造一个"没有数据"的
+    // 空窗——v4.0.14 的实盘日志里是精确的 90 秒周期、3 秒空窗，
+    // strict 闸门会在那 3 秒里假拦截一次并刷一条噪音日志
+    static constexpr int64_t kChg24SoftMs = 60'000;    // 超过就后台续期
+    static constexpr int64_t kChg24HardMs = 600'000;   // 超过才算真没有
     std::atomic<bool> chg24FetchBusy_{false};
     std::unordered_map<std::string, double> chg24Rest_;
     std::mutex        chg24Mtx_;
