@@ -56,6 +56,105 @@ std::string SarEngine::add_bot(const SarConfig& cfg) {
     return b.bot_id;
 }
 
+std::string SarEngine::restore_bot(SarBot snap) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    for (const auto& kv : bots_)
+        if (kv.second.cfg.symbol == snap.cfg.symbol &&
+            kv.second.state != SarBot::State::Stopped)
+            return {};
+
+    snap.bot_id  = "sar" + std::to_string(++seq_);
+    snap.pending = false;              // 落盘时的在途标记一律作废
+    // 信号一律作废重拉：落盘的 ATR 可能是几小时前的，而止损线的距离由它决定。
+    // sig_ok=false 时 sar::step 会沿用已有的止损线、不开新仓——正是想要的
+    snap.sig_ok  = false;
+    snap.atr = snap.atr_pct = 0;
+    snap.dc_ok = false;
+    snap.sig_time = {};
+    // 冷却与"这根K线数过没有"跨重启都失去意义：bar_open_ms 对不上新拉的K线
+    snap.bar_open_ms = snap.last_counted_bar_ms = 0;
+    if (snap.start_time.time_since_epoch().count() == 0)
+        snap.start_time = host_.now_wall();
+
+    const std::string id = snap.bot_id;
+    bots_[id] = std::move(snap);
+    const auto& b = bots_[id];
+    if (b.st.pos != sar::Pos::Flat)
+        log(b.cfg.symbol + " SAR 从落盘恢复：持" + sar::pos_name(b.st.pos) +
+            " qty=" + fmt(b.qty, 8) + " 开仓价=$" + fmt(b.st.entry_price) +
+            " 止损线=$" + fmt(b.st.stop));
+    else
+        log(b.cfg.symbol + " SAR 从落盘恢复：空仓");
+    return id;
+}
+
+std::vector<std::string> SarEngine::reconcile_positions(
+        const std::vector<ExchangePos>& exchange) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    std::vector<std::string> issues;
+
+    for (auto& kv : bots_) {
+        auto& b = kv.second;
+        // 在途的跳过：订单可能已在交易所生效而本地还没入账，此刻比对必然误判
+        if (b.pending) continue;
+
+        const ExchangePos* ex = nullptr;
+        for (const auto& e : exchange)
+            if (e.symbol == b.cfg.symbol && e.qty > 0) { ex = &e; break; }
+
+        const bool local_has = (b.st.pos != sar::Pos::Flat && b.qty > 0);
+
+        if (!local_has && !ex) continue;               // 两边都空，一致
+
+        if (!local_has && ex) {
+            // 孤儿仓：最危险的一种。不停的话，下一个突破信号会再开一笔，
+            // 而交易所上那笔无人管理——净敞口翻倍且没有任何止损线守着
+            issues.push_back(b.cfg.symbol + " 交易所有仓位(" +
+                             std::string(ex->direction > 0 ? "多" : "空") + " " +
+                             fmt(ex->qty, 8) + ")但本地无跟踪，已停止该bot");
+            b.state = SarBot::State::Stopped;
+            b.last_action = "⚠ 孤儿仓，已停止待核对";
+            continue;
+        }
+
+        if (local_has && !ex) {
+            issues.push_back(b.cfg.symbol + " 本地有仓位但交易所没有（外部已平/被强平），"
+                             "已清空本地状态并停止该bot");
+            sar::on_closed(b.st);
+            b.qty = 0;
+            b.state = SarBot::State::Stopped;
+            b.last_action = "⚠ 交易所侧已无仓位，已停止";
+            continue;
+        }
+
+        // 两边都有：先看方向，再看数量
+        const int local_dir = (b.st.pos == sar::Pos::Long) ? 1 : -1;
+        if (local_dir != ex->direction) {
+            // 方向都对不上，任何自动收敛都是在猜。停下来让人看
+            issues.push_back(b.cfg.symbol + " 本地方向(" + sar::pos_name(b.st.pos) +
+                             ")与交易所(" + (ex->direction > 0 ? "多" : "空") +
+                             ")不一致，已停止该bot");
+            b.state = SarBot::State::Stopped;
+            b.last_action = "⚠ 方向不一致，已停止";
+            continue;
+        }
+
+        const double diff = b.qty - ex->qty;
+        if (diff > 1e-12) {
+            issues.push_back(b.cfg.symbol + " 外部部分平仓：本地 " + fmt(b.qty, 8) +
+                             " → 交易所 " + fmt(ex->qty, 8) + "，已收敛");
+            b.qty = ex->qty;   // 开仓价与止损线保留，它们仍然成立
+        } else if (diff < -1e-12) {
+            // 只告警不动：外部手动加仓的话，按交易所数量接管等于让止损线
+            // 去管一笔不是自己开的仓，开仓价基准也不再成立
+            issues.push_back(b.cfg.symbol + " 交易所持仓(" + fmt(ex->qty, 8) +
+                             ")多于本地跟踪(" + fmt(b.qty, 8) +
+                             ")，可能有外部加仓，本地状态未改动");
+        }
+    }
+    return issues;
+}
+
 void SarEngine::stop_bot(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);

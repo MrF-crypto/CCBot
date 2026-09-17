@@ -102,6 +102,10 @@ public:
     SarEngine(std::shared_ptr<ITradingClient> client, EngineHost host);
 
     std::string add_bot(const SarConfig& cfg);   // 同品种已存在则返回空串
+    // 从落盘快照恢复：cfg 用传入的最新配置，仓位/止损线/统计用快照里的值。
+    // 与 add_bot 的区别是它【不清零持仓状态】——重启后本地跟踪必须对齐回
+    // 重启前，否则引擎以为自己空仓，看到信号会再开一笔，变成双倍敞口
+    std::string restore_bot(SarBot snapshot);
     void stop_bot  (const std::string& bot_id);
     void resume_bot(const std::string& bot_id);
     void close_bot (const std::string& bot_id);  // 手动市价平仓
@@ -118,6 +122,27 @@ public:
 
     // 由价格流每 tick 调用
     void tick(const std::string& symbol, double price);
+
+    // ── 与交易所对账 ────────────────────────────────────────────────────────
+    // 交易所实际持仓的精简视图（应用层从 TradingClient::fetch_positions 转换）
+    struct ExchangePos {
+        std::string symbol;
+        int         direction   = 0;   // 1=多 -1=空
+        double      qty         = 0;   // 绝对值
+        double      entry_price = 0;
+    };
+    // 判定规则（比 DCA 版保守，因为 SAR 没有"层"的概念可供收敛）：
+    //   本地有仓、交易所没有  → 外部已平：清空本地并【停止】该 bot。
+    //                          不自动续跑：分不清是人工平的还是被强平的，
+    //                          后者继续开仓是在往坑里跳
+    //   本地qty > 交易所qty   → 外部部分平仓：本地数量收敛到交易所值，
+    //                          止损线与开仓价保留（它们仍然成立）
+    //   本地qty < 交易所qty   → 交易所多出：仅告警，不动本地状态
+    //   本地空仓、交易所有仓  → 孤儿仓：【停止】该 bot 并告警。
+    //                          这是最危险的一种——不停的话引擎以为自己空仓，
+    //                          下一个突破信号会再开一笔，净敞口翻倍
+    // 返回每条不一致的可读描述（空 = 完全一致）
+    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange);
 
     // 仅测试用：见 CcgEngine::set_pending_for_test 的理由
     void set_pending_for_test(const std::string& bot_id, bool v);

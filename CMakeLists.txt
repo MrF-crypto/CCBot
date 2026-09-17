@@ -92,6 +92,7 @@ add_executable(ccbot_headless
     src/headless/main.cpp
     src/headless/headless_config.cpp
     src/headless/headless_state.cpp
+    src/headless/sar_state.cpp
     ${CORE_SOURCES}
 )
 target_include_directories(ccbot_headless PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -149,6 +150,16 @@ target_include_directories(ccg_sar_engine_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_sar_engine_tests PRIVATE Threads::Threads)
 if(MSVC)
     target_compile_options(ccg_sar_engine_tests PRIVATE /utf-8)
+endif()
+
+# ── SAR 持久化与对账测试：守"引擎以为空仓而交易所有仓"这一类裸敞口 ───────────
+add_executable(ccg_sar_state_tests tests/test_sar_state.cpp
+                                   src/headless/sar_state.cpp
+                                   src/core/sar_engine.cpp)
+target_include_directories(ccg_sar_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_sar_state_tests PRIVATE simdjson::simdjson Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_sar_state_tests PRIVATE /utf-8)
 endif()
 
 # ── 风控闸门测试（保证金上限 / 交易所侧灾难止损单）：用假客户端单跑引擎 ────────

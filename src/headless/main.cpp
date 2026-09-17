@@ -11,6 +11,7 @@
 #include "net/alert.h"
 #include "headless/headless_config.h"
 #include "headless/headless_state.h"
+#include "headless/sar_state.h"
 
 #include <csignal>
 #include <atomic>
@@ -234,6 +235,9 @@ int main(int argc, char** argv) {
     //    重启前请手动平掉 SAR 仓位，或只在测试网上跑。这是当前最大的缺口
     std::shared_ptr<SarEngine> sar_engine;
     std::vector<std::string> sar_ids;
+    // 与 DCA 的状态文件分开：两套策略字段完全不同，混在一个文件里会让
+    // 两边的读写互相牵制
+    const std::string sar_state_path = cfg.state_path + ".sar";
     if (!cfg.sar_bots.empty()) {
         sar_engine = std::make_shared<SarEngine>(client, pool);
         sar_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
@@ -249,12 +253,49 @@ int main(int argc, char** argv) {
                      << tr.reason << "," << tr.entry_price << "," << tr.exit_price << ","
                      << tr.qty << "," << tr.pnl << ",0\n";
         });
+        // 先恢复落盘状态，再把配置里新增、落盘没有的品种全新起步。
+        // 顺序不能反：反了的话 add_bot 会先占住品种名，restore_bot 被拒，
+        // 引擎以为自己空仓而交易所上的仓位还在
+        auto sar_saved = load_sar_state(sar_state_path, cfg.sar_bots);
+        std::set<std::string> sar_restored;
+        for (auto& b : sar_saved) {
+            auto id = sar_engine->restore_bot(b);
+            if (!id.empty()) { sar_ids.push_back(id); sar_restored.insert(b.cfg.symbol); }
+        }
         for (const auto& c : cfg.sar_bots) {
+            if (sar_restored.count(c.symbol)) continue;
             auto id = sar_engine->add_bot(c);
             if (!id.empty()) sar_ids.push_back(id);
         }
-        log_line("SAR 引擎已启动，" + std::to_string(sar_ids.size()) + " 个品种。"
-                 "⚠ SAR 仓位不落盘，重启会丢失本地状态", "WARN");
+        log_line("SAR 引擎已启动，" + std::to_string(sar_ids.size()) + " 个品种（其中 " +
+                 std::to_string(sar_restored.size()) + " 个从落盘恢复）");
+
+        // SAR 启动对账。和 DCA 那次分开做：两个引擎各自跟踪自己的品种，
+        // 而对账的判定规则也不同（SAR 没有"层"可供收敛）
+        {
+            bool pos_ok = false;
+            auto ex_pos = client->fetch_positions(&pos_ok);
+            if (pos_ok) {
+                std::vector<SarEngine::ExchangePos> ex;
+                ex.reserve(ex_pos.size());
+                for (const auto& p : ex_pos)
+                    ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+                auto issues = sar_engine->reconcile_positions(ex);
+                if (!issues.empty()) {
+                    for (const auto& i : issues) log_line("⚠ SAR对账: " + i, "WARN");
+                    save_sar_state(sar_state_path, sar_engine->get_bots());
+                    if (!cfg.alert_webhook.empty()) {
+                        std::string msg = "[ccbot] SAR 启动对账发现 " +
+                                          std::to_string(issues.size()) + " 处不一致:";
+                        for (const auto& i : issues) msg += "\n" + i;
+                        send_webhook(cfg.alert_webhook, msg);
+                    }
+                }
+            } else {
+                log_line("⚠ SAR 启动对账跳过：拉取交易所持仓失败。"
+                         "本地跟踪可能与交易所不一致，请留意", "WARN");
+            }
+        }
     }
 
     // 启动对账：本地落盘的仓位 vs 交易所实际持仓（外部手动平过仓/强平过的话本地状态是错的）
@@ -297,7 +338,7 @@ int main(int argc, char** argv) {
     // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     std::atomic<bool> ind_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
-    std::atomic<bool> sar_sig_busy{false};
+    std::atomic<bool> sar_sig_busy{false}, sar_rec_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
     // 数据池要同时承载价格 REST 兜底、日线/趋势、1h 指标三类批次，2 个线程在
@@ -529,6 +570,11 @@ int main(int argc, char** argv) {
         if (state_dirty.exchange(false)) {
             save_headless_state(cfg.state_path, engine->get_bots());
         }
+        // SAR 状态每约1分钟落一次。这里【不用】脏标记：止损线的棘轮推进不产生
+        // 日志（不置脏），而它正是重启后最不能丢的那个值——丢了止损线就是
+        // 一笔无人看管的裸仓位
+        if (sar_engine && tick_n % 20 == 0)
+            save_sar_state(sar_state_path, sar_engine->get_bots());
 
         // ── 6) 心跳（异步，约1分钟一次）─────────────────────────────────────
         if (tick_n % 20 == 0 && !hb_busy.load()) {
@@ -707,6 +753,37 @@ int main(int argc, char** argv) {
                 rec_busy.store(false);
             });
         }
+
+        // ── SAR 周期对账（与上面那批错开 30 秒，避免两次 fetch_positions 挤在
+        //    同一 tick 上白白多花一次权重）───────────────────────────────────
+        if (sar_engine && tick_n % 20 == 10 && !sar_rec_busy.load()) {
+            sar_rec_busy.store(true);
+            fetch_pool->submit([client, sar_engine, &sar_rec_busy,
+                                sp = sar_state_path, w = webhook]() {
+                bool pos_ok = false;
+                auto ex_pos = client->fetch_positions(&pos_ok);
+                // 拉取失败绝不对账：空列表既可能是"确实没仓"也可能是请求失败，
+                // 把后者当前者会凭空清掉真实持仓，而 SAR 清掉的是带止损线的仓位
+                if (pos_ok) {
+                    std::vector<SarEngine::ExchangePos> ex;
+                    ex.reserve(ex_pos.size());
+                    for (const auto& p : ex_pos)
+                        ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+                    auto issues = sar_engine->reconcile_positions(ex);
+                    if (!issues.empty()) {
+                        for (const auto& i : issues) log_line("⚠ SAR对账: " + i, "WARN");
+                        save_sar_state(sp, sar_engine->get_bots());
+                        if (!w.empty()) {
+                            std::string msg = "[ccbot] SAR 运行中对账发现 " +
+                                              std::to_string(issues.size()) + " 处不一致:";
+                            for (const auto& i : issues) msg += "\n" + i;
+                            send_webhook(w, msg);
+                        }
+                    }
+                }
+                sar_rec_busy.store(false);
+            });
+        }
     }
 
     log_line("收到退出信号，等待在途订单落地后保存状态…");
@@ -722,6 +799,7 @@ int main(int argc, char** argv) {
     fetch_pool->wait_idle(5000);
 
     save_headless_state(cfg.state_path, engine->get_bots());
+    if (sar_engine) save_sar_state(sar_state_path, sar_engine->get_bots());
     funding.save(funding_path);
 
     // 没排空就直接结束进程，不跑析构。在途任务捏着 engine 的裸指针，而
