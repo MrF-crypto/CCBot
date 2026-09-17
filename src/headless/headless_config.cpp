@@ -194,10 +194,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     }
 
     simdjson::dom::array bots;
-    if (root["bots"].get(bots) != simdjson::SUCCESS) {
-        err = "配置文件缺少 bots 数组";
-        return false;
-    }
+    const bool has_bots = (root["bots"].get(bots) == simdjson::SUCCESS);
 
     // 已知的 bot 配置键：拼错键名会静默落回默认值（比如 stop_loss_pct 拼错 = 没有止损），
     // 所以未知键必须显式告警
@@ -217,7 +214,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "htf_day_chg_max", "htf_24h_chg_max", "htf_week_chg_max", "use_sr_gate",
     };
 
-    for (auto elem : bots) {
+    if (has_bots) for (auto elem : bots) {
         simdjson::dom::object bo;
         if (elem.get(bo) != simdjson::SUCCESS) continue;
 
@@ -237,8 +234,84 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         out.bots.push_back(c);
     }
 
-    if (out.bots.empty()) {
-        err = "配置文件 bots 数组为空或每一项都缺少 symbol";
+    // ── SAR 趋势跟随策略 ────────────────────────────────────────────────────
+    static const std::set<std::string> sar_keys = {
+        "symbol", "budget_usdt", "leverage", "interval",
+        "donchian_period", "atr_period", "atr_mult",
+        "allow_reverse", "reverse_needs_signal",
+        "max_consecutive_reverses", "cooldown_bars", "signal_max_age_sec",
+    };
+    simdjson::dom::array sarr;
+    if (root["sar_bots"].get(sarr) == simdjson::SUCCESS) {
+        for (auto elem : sarr) {
+            simdjson::dom::object so;
+            if (elem.get(so) != simdjson::SUCCESS) continue;
+
+            SarConfig c;
+            c.symbol = get_str(so, "symbol", "");
+            if (c.symbol.empty()) continue;
+
+            for (auto field : so) {
+                std::string k(field.key);
+                if (!sar_keys.count(k))
+                    out.warnings.push_back(c.symbol + " sar_bots 配置里有无法识别的键 \"" +
+                                           k + "\"（拼写错误?），该项被忽略、"
+                                           "对应参数使用默认值");
+            }
+
+            c.budget_usdt = get_num(so, "budget_usdt", c.budget_usdt);
+            c.leverage    = (int)get_num(so, "leverage", c.leverage);
+            c.interval    = get_str(so, "interval", c.interval);
+            c.signal_max_age_sec = (int)get_num(so, "signal_max_age_sec",
+                                                c.signal_max_age_sec);
+
+            c.rule.donchian_period = (int)get_num(so, "donchian_period",
+                                                  c.rule.donchian_period);
+            c.rule.atr_period      = (int)get_num(so, "atr_period", c.rule.atr_period);
+            c.rule.atr_mult        = get_num(so, "atr_mult", c.rule.atr_mult);
+            c.rule.allow_reverse   = get_bool(so, "allow_reverse", c.rule.allow_reverse);
+            c.rule.reverse_needs_signal =
+                get_bool(so, "reverse_needs_signal", c.rule.reverse_needs_signal);
+            c.rule.max_consecutive_reverses =
+                (int)get_num(so, "max_consecutive_reverses",
+                             c.rule.max_consecutive_reverses);
+            c.rule.cooldown_bars = (int)get_num(so, "cooldown_bars",
+                                                c.rule.cooldown_bars);
+
+            if (c.budget_usdt <= 0) { err = c.symbol + " sar: budget_usdt 必须大于0"; return false; }
+            if (c.leverage    <= 0) { err = c.symbol + " sar: leverage 必须大于0";    return false; }
+            if (c.rule.donchian_period < 2) {
+                err = c.symbol + " sar: donchian_period 至少为2"; return false;
+            }
+            if (c.rule.atr_period < 2) {
+                err = c.symbol + " sar: atr_period 至少为2"; return false;
+            }
+            if (c.rule.atr_mult <= 0) {
+                err = c.symbol + " sar: atr_mult 必须大于0（它是止损距离的倍数）";
+                return false;
+            }
+            // 无条件反手在震荡市是绞肉机，配置里关掉信号闸时明确告警一次
+            if (c.rule.allow_reverse && !c.rule.reverse_needs_signal)
+                out.warnings.push_back(c.symbol + " sar: reverse_needs_signal=false "
+                                       "（无条件反手）——震荡市里每次止损都会立刻反向"
+                                       "开仓，连续绞杀的损耗很快，确认这是你要的");
+
+            out.sar_bots.push_back(c);
+        }
+    }
+
+    // 同一品种被两套策略同时接管：两个引擎各下各的单，在交易所上叠成一个
+    // 谁也算不清的净仓位——SAR 的 reduceOnly 平仓会平掉 DCA 的层，反之亦然
+    for (const auto& sc : out.sar_bots)
+        for (const auto& bc : out.bots)
+            if (sc.symbol == bc.symbol) {
+                err = sc.symbol + " 同时出现在 bots 和 sar_bots 里。两套策略会在同一个"
+                      "交易所仓位上互相平掉对方的单，必须二选一";
+                return false;
+            }
+
+    if (out.bots.empty() && out.sar_bots.empty()) {
+        err = "配置文件里 bots 与 sar_bots 都为空（或每一项都缺少 symbol），至少要配一个";
         return false;
     }
 

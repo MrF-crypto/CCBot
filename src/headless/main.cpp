@@ -2,6 +2,7 @@
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
 #include "version.h"
 #include "core/ccg_engine.h"
+#include "core/sar_engine.h"
 #include "core/funding_ledger.h"
 #include "core/decision.h"
 #include "core/thread_pool.h"
@@ -227,6 +228,35 @@ int main(int argc, char** argv) {
         if (!id.empty()) log_line(c.symbol + " 新建 bot，按配置文件立即开始监控");
     }
 
+    // ── SAR 趋势跟随引擎 ────────────────────────────────────────────────────
+    // 与 DCA 引擎并列，共用同一个下单线程池和同一个 TradingClient。
+    // ⚠ 目前【没有持久化】：进程重启后 SAR 仓位状态会丢，而交易所上的仓位还在。
+    //    重启前请手动平掉 SAR 仓位，或只在测试网上跑。这是当前最大的缺口
+    std::shared_ptr<SarEngine> sar_engine;
+    std::vector<std::string> sar_ids;
+    if (!cfg.sar_bots.empty()) {
+        sar_engine = std::make_shared<SarEngine>(client, pool);
+        sar_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
+        sar_engine->set_trade_cb([&](const SarTrade& tr) {
+            std::ostringstream ss;
+            ss << "[SAR] " << tr.symbol << " " << tr.reason
+               << " 开=$" << tr.entry_price << " 平=$" << tr.exit_price
+               << " P&L=" << tr.pnl << "U" << (tr.reversed ? "（已反手）" : "");
+            log_line(ss.str(), tr.pnl >= 0 ? "OK" : "WARN");
+            std::ofstream f(trades_csv, std::ios::app);
+            if (f) f << now_str() << "," << tr.symbol << ","
+                     << (tr.side == sar::Pos::Short ? "sar_short" : "sar_long") << ","
+                     << tr.reason << "," << tr.entry_price << "," << tr.exit_price << ","
+                     << tr.qty << "," << tr.pnl << ",0\n";
+        });
+        for (const auto& c : cfg.sar_bots) {
+            auto id = sar_engine->add_bot(c);
+            if (!id.empty()) sar_ids.push_back(id);
+        }
+        log_line("SAR 引擎已启动，" + std::to_string(sar_ids.size()) + " 个品种。"
+                 "⚠ SAR 仓位不落盘，重启会丢失本地状态", "WARN");
+    }
+
     // 启动对账：本地落盘的仓位 vs 交易所实际持仓（外部手动平过仓/强平过的话本地状态是错的）
     {
         auto ex_pos = client->fetch_positions();
@@ -255,7 +285,8 @@ int main(int argc, char** argv) {
     ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
     ticker.start();
     std::set<std::string> symbols;
-    for (const auto& c : cfg.bots) symbols.insert(c.symbol);
+    for (const auto& c : cfg.bots)     symbols.insert(c.symbol);
+    for (const auto& c : cfg.sar_bots) symbols.insert(c.symbol);
     for (const auto& s : symbols) ticker.subscribe(s);
 
     log_line("主循环启动，Ctrl+C 退出");
@@ -266,6 +297,7 @@ int main(int argc, char** argv) {
     // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     std::atomic<bool> ind_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
+    std::atomic<bool> sar_sig_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
     // 数据池要同时承载价格 REST 兜底、日线/趋势、1h 指标三类批次，2 个线程在
@@ -309,6 +341,7 @@ int main(int argc, char** argv) {
             }
             if (price > 0) {
                 engine->tick(sym, price);
+                if (sar_engine) sar_engine->tick(sym, price);
                 stall_ticks[sym] = 0;
                 if (stall_alerted.erase(sym)) {
                     log_line(sym + " 行情已恢复", "OK");
@@ -377,6 +410,32 @@ int main(int argc, char** argv) {
                 hf << std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count()
                    << " tick=" << tick_n << " bots=" << bots.size() << "\n";
+            }
+        }
+
+        // ── 1c) SAR 信号拉取（ATR + 唐奇安通道）──────────────────────────────
+        // 每 20 个 tick（约 60 秒）一轮。信号周期通常是 4h，用不着更密；
+        // 而止损线的推进【不靠这个】——它在每个 tick 用实时价推，只有 ATR 的
+        // 数值来自这里。所以这一批慢一点不影响保护
+        if (sar_engine && !sar_sig_busy.load() && (tick_n % 20) == 1) {
+            auto sbots = sar_engine->get_bots();
+            std::vector<SarBot> need;
+            for (const auto& b : sbots)
+                if (b.state == SarBot::State::Running) need.push_back(b);
+            if (!need.empty()) {
+                sar_sig_busy.store(true);
+                fetch_pool->submit([client, sar_engine, need, &sar_sig_busy]() {
+                    for (const auto& b : need) {
+                        auto snap = client->fetch_sar_signal(
+                            b.cfg.symbol, b.cfg.interval,
+                            b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
+                        if (!snap.ok) continue;
+                        sar_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
+                                                  snap.dc_ok, snap.dc_up, snap.dc_dn,
+                                                  snap.bar_open_ms);
+                    }
+                    sar_sig_busy.store(false);
+                });
             }
         }
 

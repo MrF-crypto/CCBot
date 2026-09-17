@@ -1,5 +1,6 @@
 #pragma once
 #include "core/ccg_engine.h"
+#include "core/sar_engine.h"
 #include <string>
 #include <vector>
 
@@ -22,6 +23,10 @@ struct HeadlessConfig {
     std::string state_path = "ccbot_state.json";   // 仓位运行时状态落盘路径，重启续跑用
     std::string log_path;                // 空=只输出到 stdout，不落盘
     std::vector<CcgConfig> bots;
+    // SAR 趋势跟随策略（与 bots 是两套并列的策略，可以只配其中一套，
+    // 也可以同时配——但同一个品种不要两套都配，两个引擎会各自按自己的
+    // 逻辑下单，在交易所上叠成一个谁也算不清的净仓位）
+    std::vector<SarConfig> sar_bots;
     std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 
 };

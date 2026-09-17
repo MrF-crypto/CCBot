@@ -22,6 +22,7 @@ find_package(Threads REQUIRED)
 # ── 核心引擎/网络代码：GUI 版和无界面(headless)版共用，不含任何 Qt/Windows 专属代码 ──
 set(CORE_SOURCES
     src/core/ccg_engine.cpp
+    src/core/sar_engine.cpp
     src/core/funding_ledger.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
@@ -232,7 +233,8 @@ endif()
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
-                                                            src/core/ccg_engine.cpp)
+                                src/core/ccg_engine.cpp
+                                src/core/sar_engine.cpp)
 target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)

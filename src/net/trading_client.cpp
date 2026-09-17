@@ -1163,12 +1163,16 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
     for (auto kline : arr) {
         simdjson::dom::array ka;
         if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
-        // klines 数组下标：1=open 2=high 3=low 4=close 5=volume（都是字符串）
+        // klines 数组下标：0=开盘时间(整数毫秒) 1=open 2=high 3=low 4=close 5=volume
+        // （1~5 是字符串，0 是整数——类型不同，必须分开取）
         Bar b;
         int idx = 0;
         bool ok = true;
         for (auto field : ka) {
-            if (idx >= 1 && idx <= 5) {
+            if (idx == 0) {
+                int64_t t = 0;
+                if (field.get(t) == simdjson::SUCCESS) b.open_ms = t;
+            } else if (idx >= 1 && idx <= 5) {
                 std::string_view sv;
                 if (field.get(sv) != simdjson::SUCCESS) { ok = false; break; }
                 double v = 0;
@@ -1244,6 +1248,38 @@ TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
     }
 
     out.ok = boll.ok;
+    return out;
+}
+
+// ── SAR 信号快照（ATR + 唐奇安通道）──────────────────────────────────────────
+TradingClient::SarSnapshot TradingClient::fetch_sar_signal(
+        const std::string& sym, const std::string& interval,
+        int donchian_period, int atr_period) {
+    SarSnapshot out;
+    if (donchian_period <= 0 || atr_period <= 0) return out;
+
+    // 通道要 period+1 根（+1 是被排除的当前根）；ATR 的 Wilder 平滑要预热，
+    // 只喂 period+1 根拿到的是 seed 而不是稳定值，所以额外多给 3 倍周期
+    const int need = std::max(donchian_period + 1, atr_period * 4) + 5;
+    auto bars = fetch_klines(sym, interval, need);
+    if (bars.empty()) return out;
+
+    out.price       = bars.back().close;
+    out.bar_open_ms = bars.back().open_ms;
+
+    std::vector<indicators::Ohlc> oh;
+    oh.reserve(bars.size());
+    for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
+
+    out.atr = indicators::atr(oh, atr_period);
+    if (out.atr > 0 && out.price > 0) out.atr_pct = out.atr / out.price * 100.0;
+
+    const auto d = indicators::donchian(oh, donchian_period);   // exclude_last=1
+    out.dc_ok = d.ok;
+    out.dc_up = d.up;
+    out.dc_dn = d.dn;
+
+    out.ok = (out.atr > 0 && d.ok && out.price > 0);
     return out;
 }
 

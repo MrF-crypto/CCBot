@@ -125,11 +125,34 @@ public:
                               int ema_period = 200, int slope_bars = 3);
 
     struct Bar {
-        double open = 0, high = 0, low = 0, close = 0, volume = 0;
+        double  open = 0, high = 0, low = 0, close = 0, volume = 0;
+        // 开盘时间（毫秒）。SAR 的冷却按【K线根数】计数，需要它来判断跨没跨根——
+        // 按 tick 计数的话，"冷却3根4h线"会在 9 秒内走完，等于没有冷却
+        int64_t open_ms = 0;
     };
     // 统一的 K 线拉取+解析（fetch_indicators / fetch_trend 共用）
     std::vector<Bar> fetch_klines(const std::string& symbol,
                                   const std::string& interval, int limit);
+
+    // ── SAR 策略信号快照（ATR + 唐奇安通道）────────────────────────────────
+    // 公开接口，不占签名限流。一次K线拉取同时算出止损距离和入场信号。
+    //
+    // ⚠ 通道【排除当前未收盘K线】（indicators::donchian 的 exclude_last=1）：
+    //   当前K线的最高价本身就是上沿的一部分，算进去等于"价格>=上沿"恒成立。
+    //   而价格用的【是】当前未收盘K线的实时收盘值——用已收盘的通道，让实时
+    //   价格去撞它，这才是突破
+    struct SarSnapshot {
+        bool    ok      = false;   // ATR 与通道都算得出来
+        double  price   = 0;
+        double  atr     = 0;       // ATR(period, Wilder)，0=数据不足
+        double  atr_pct = 0;       // atr/price*100，跨品种可比
+        bool    dc_ok   = false;
+        double  dc_up   = 0;
+        double  dc_dn   = 0;
+        int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
+    };
+    SarSnapshot fetch_sar_signal(const std::string& symbol, const std::string& interval,
+                                 int donchian_period, int atr_period);
 
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);

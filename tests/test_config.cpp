@@ -165,6 +165,74 @@ int main() {
         check(!load_headless_config(path, hc2, err2), "文件不存在返回失败");
     }
 
+    // ── ⑥ SAR 策略配置 ──────────────────────────────────────────────────────
+    {
+        // 只配 sar_bots、完全不配 bots，必须能启动——两套策略是并列的，
+        // 不该强迫想跑趋势策略的人也配一个 DCA bot
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "只配 sar_bots 应能加载");
+        check(hc.bots.empty() && hc.sar_bots.size() == 1, "应解析出 1 个 SAR bot");
+
+        // 漏填的字段必须落到引擎默认值。解析器用 c.rule.xxx 自身作兜底
+        // （而不是抄一遍字面量），所以引擎改默认值时这里不会悄悄漂走
+        const SarConfig def;
+        const auto& g = hc.sar_bots[0];
+        check(g.rule.donchian_period == def.rule.donchian_period, "  通道周期取默认值");
+        check(g.rule.atr_period == def.rule.atr_period,           "  ATR周期取默认值");
+        check(std::fabs(g.rule.atr_mult - def.rule.atr_mult) < 1e-9, "  k 取默认值");
+        check(g.rule.reverse_needs_signal == def.rule.reverse_needs_signal,
+              "  反手信号闸默认开启（无条件反手在震荡市是绞肉机）");
+        check(g.interval == def.interval, "  信号周期取默认值");
+    }
+    {
+        // 同一品种被两套策略同时接管必须拒绝启动：SAR 的 reduceOnly 平仓会
+        // 平掉 DCA 的层，两个引擎在同一个交易所仓位上互相拆台
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"bots\":[{\"symbol\":\"BTCUSDT\"}],"
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "同品种同时配两套策略应被拒绝");
+        check(err.find("BTCUSDT") != std::string::npos, "  错误信息点名了品种");
+    }
+    {
+        // 两套都空 = 没有任何策略，应报错而不是静默空转
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\"}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "两套策略都没配应被拒绝");
+    }
+    {
+        // k=0 等于没有止损线，必须拒绝
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mult\":0}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "atr_mult=0 应被拒绝");
+    }
+    {
+        // SAR 段的拼写错误同样要告警
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mlut\":3}]}");
+        HeadlessConfig hc; std::string err;
+        load_headless_config(path, hc, err);
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("atr_mlut") != std::string::npos) warned = true;
+        check(warned, "SAR 段拼错的键产生告警");
+    }
+    {
+        // 关掉信号闸（无条件反手）要明确告警一次
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"reverse_needs_signal\":false}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "无条件反手应能加载（是合法配置）");
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("reverse_needs_signal") != std::string::npos) warned = true;
+        check(warned, "无条件反手应产生告警");
+    }
+
     std::remove(path.c_str());
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
