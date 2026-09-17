@@ -131,7 +131,8 @@ int main(int argc, char** argv) {
     // 顺带让版本串真正进到二进制里——发布流水线的泄漏检查靠它核对
     // "包里的可执行文件是不是这个 tag 编出来的"
     log_line(std::string("ccbot headless ") + ccbot::kVersion + " 启动，配置文件: "
-             + config_path + "，共 " + std::to_string(cfg.bots.size()) + " 个 bot");
+             + config_path + "，DCA " + std::to_string(cfg.bots.size())
+             + " 个 / SAR " + std::to_string(cfg.sar_bots.size()) + " 个");
 
     TradingClient::Config tc_cfg;
     tc_cfg.api_key    = cfg.api_key;
