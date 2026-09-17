@@ -183,6 +183,10 @@ private:
 
     // ── 各批次的 tick 计数（仅GUI线程访问）──
     int slowTickCount_  = 0;   // 慢批次节拍：对账(每20) / 重新对时(每300)
+    // ATR 观测日志节拍（每10轮打一次，SAR 选 k 用）。
+    // ⚠ 与上下这些不同，它在【拉取线程】上自增——批次守卫保证同时只有一个批次，
+    //   但别人看到这一堆计数器会默认"仅GUI线程"，用 atomic 把意图写死
+    std::atomic<int> atrLogTick_{0};
     int trendTickCount_ = 0;
     int fundTickCount_  = 0;
     // 资金费账本：每 8 小时结算一次的真实现金流出，不是浮亏。

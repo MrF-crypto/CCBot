@@ -136,6 +136,13 @@ if(MSVC)
 endif()
 
 # ── 风控闸门测试（保证金上限 / 交易所侧灾难止损单）：用假客户端单跑引擎 ────────
+# ── SAR 趋势跟随决策测试（纯头文件逻辑，不链任何库）──────────────────────────
+add_executable(ccg_sar_tests tests/test_sar.cpp)
+target_include_directories(ccg_sar_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(ccg_sar_tests PRIVATE /utf-8)
+endif()
+
 add_executable(ccg_risk_tests tests/test_risk_gates.cpp src/core/ccg_engine.cpp)
 target_include_directories(ccg_risk_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_risk_tests PRIVATE Threads::Threads)

@@ -2592,7 +2592,23 @@ void MainWindow::onTick() {
                         // 复用：宏观层拉的就是日线带，正好是第3档
                         if (tier3) engine_->update_mtf_band(bid, 3, snap.boll_lb, snap.boll_ub);
                     }, Qt::QueuedConnection);
+                    // ATR 观测（SAR 策略选 k 用）。日线 K 线已经拉过了，这里零额外成本。
+                    // 每品种每 10 轮打一条，够看量级又不淹没日志
+                    if (snap.atr_pct > 0 && (atrLogTick_ % 10) == 0) {
+                        const std::string s = b.cfg.symbol;
+                        const double ap = snap.atr_pct;
+                        QMetaObject::invokeMethod(this, [this, s, ap]() {
+                            log(QString("ATR观测 %1 日线ATR=%2%  →  k=2.5/3.0/3.5 对应止损距离 "
+                                        "%3% / %4% / %5%")
+                                    .arg(QString::fromStdString(s))
+                                    .arg(ap, 0, 'f', 2)
+                                    .arg(ap * 2.5, 0, 'f', 1)
+                                    .arg(ap * 3.0, 0, 'f', 1)
+                                    .arg(ap * 3.5, 0, 'f', 1));
+                        }, Qt::QueuedConnection);
+                    }
                 }
+                ++atrLogTick_;
                 // 批次耗时自检。这一批是【单线程串行】遍历全部 bot：
                 // 每个 bot 最多两次 REST（4h 趋势 + 日线指标），品种一多就是几十次
                 // 串行往返。窗口是 100 个 tick × 3 秒 = 300 秒，超了 trendFetchBusy_

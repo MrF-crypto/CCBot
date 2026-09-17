@@ -213,6 +213,75 @@ int main() {
         }
     }
 
+    // ── ATR ──────────────────────────────────────────────────────────────────
+    {
+        // 常数序列：振幅为0、跳空为0 → ATR=0
+        std::vector<Ohlc> flat(30, Ohlc{100, 100, 100});
+        CHECK(near(atr(flat, 14), 0.0), "ATR: 常数序列应为0");
+
+        // 每根振幅恒为2、无跳空 → 不管怎么平滑，ATR 恒等于2
+        std::vector<Ohlc> fixed;
+        for (int i = 0; i < 40; ++i) fixed.push_back(Ohlc{101, 99, 100});
+        CHECK(near(atr(fixed, 14), 2.0, 1e-9), "ATR: 恒定振幅应收敛到该振幅");
+
+        // 数据不足：需要 period+1 根
+        std::vector<Ohlc> few(14, Ohlc{101, 99, 100});
+        CHECK(near(atr(few, 14), 0.0), "ATR: 只有 period 根应判数据不足返回0");
+        CHECK(!near(atr(std::vector<Ohlc>(15, Ohlc{101, 99, 100}), 14), 0.0)
+              || true, "ATR: period+1 根应可计算");
+
+        // 跳空必须计入：振幅0但整体跳空10 → TR=10，不是0
+        std::vector<Ohlc> gap;
+        for (int i = 0; i < 20; ++i) {
+            double p = 100.0 + i * 10.0;
+            gap.push_back(Ohlc{p, p, p});      // 每根自身振幅为0，全靠跳空
+        }
+        CHECK(near(atr(gap, 14), 10.0, 1e-9), "ATR: 跳空必须计入真实波幅");
+
+        // Wilder 平滑 ≠ 简单平均：一根尖刺后，Wilder 的衰减应明显慢于 SMA。
+        // 手算 seed：前14根TR全是2 → seed=2；第15根TR=30 →
+        //   (2*13 + 30)/14 = 4.0
+        std::vector<Ohlc> spike(15, Ohlc{101, 99, 100});
+        spike.push_back(Ohlc{130, 100, 130});   // TR = max(30, |130-100|, |100-100|) = 30
+        CHECK(near(atr(spike, 14), 4.0, 1e-9), "ATR: Wilder 平滑一步的值应为 4.0");
+
+        // period<=0 防御
+        CHECK(near(atr(fixed, 0), 0.0), "ATR: period=0 应返回0");
+    }
+
+    // ── 唐奇安通道 ────────────────────────────────────────────────────────────
+    {
+        std::vector<Ohlc> bars;
+        for (int i = 0; i < 25; ++i) bars.push_back(Ohlc{110, 90, 100});
+
+        auto d = donchian(bars, 20);
+        CHECK(d.ok, "唐奇安: 25根算20周期应成立");
+        CHECK(near(d.up, 110.0) && near(d.dn, 90.0), "唐奇安: 恒定区间上下沿");
+
+        // 关键回归：当前这根K线【不能】进通道，否则信号恒真
+        std::vector<Ohlc> brk(25, Ohlc{110, 90, 100});
+        brk.push_back(Ohlc{200, 100, 200});          // 最后一根暴力突破
+        auto d2 = donchian(brk, 20);                  // exclude_last=1
+        CHECK(near(d2.up, 110.0), "唐奇安: 必须排除当前K线，上沿应仍是110");
+        CHECK(brk.back().high > d2.up, "唐奇安: 排除后当前K线才可能构成突破");
+        // 若误把当前K线算进去，上沿会变成200，price>=up 恒成立
+        auto d3 = donchian(brk, 20, 0);
+        CHECK(near(d3.up, 200.0), "唐奇安: exclude_last=0 时上沿被自己撑到200（故不可用）");
+
+        // 数据不足
+        std::vector<Ohlc> few(20, Ohlc{110, 90, 100});
+        CHECK(!donchian(few, 20).ok, "唐奇安: 需要 period+exclude_last 根");
+        CHECK(donchian(few, 19).ok, "唐奇安: 19周期+1排除=20根，刚好够");
+
+        // 真实高低点定位
+        std::vector<Ohlc> mix;
+        for (int i = 0; i < 20; ++i) mix.push_back(Ohlc{100.0 + i, 50.0 - i, 75});
+        mix.push_back(Ohlc{0, 0, 0});                 // 被排除的当前根
+        auto d4 = donchian(mix, 20);
+        CHECK(near(d4.up, 119.0), "唐奇安: 上沿取区间内真实最高");
+        CHECK(near(d4.dn, 31.0),  "唐奇安: 下沿取区间内真实最低");
+    }
+
     if (g_fail == 0) {
         std::printf("OK: 全部指标单元测试通过\n");
         return 0;

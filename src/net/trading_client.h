@@ -101,6 +101,11 @@ public:
         bool   chg_ok  = false;
         double chg_1   = 0;      // 近 1 根涨幅%
         double chg_7   = 0;      // 近 7 根涨幅%
+        // ATR(14, Wilder)。0 = 数据不足。
+        // atr_pct = atr/price*100，跨品种唯一可比的口径——SAR 的止损距离
+        // 取 k×atr_pct%，所以 BTC 和新上山寨能共用同一组参数
+        double atr     = 0;
+        double atr_pct = 0;
     };
     IndicatorSnapshot fetch_indicators(const std::string& symbol, const std::string& interval,
                                         int boll_period, double boll_mult, int rsi_period);
