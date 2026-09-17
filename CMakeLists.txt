@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 4.0.18 LANGUAGES CXX)
+project(TradingBot VERSION 4.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,6 +53,7 @@ if(WIN32 OR APPLE)
         src/main.cpp
         src/core/key_store.cpp
         src/gui/main_window.cpp
+        src/gui/sar_panel.cpp
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )

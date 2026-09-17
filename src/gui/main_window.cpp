@@ -10,6 +10,7 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QSplitter>
+#include <QTabWidget>
 #include <QMessageBox>
 #include <QScrollArea>
 #include <QDateTime>
@@ -1107,7 +1108,14 @@ void MainWindow::buildUi() {
                 this, &MainWindow::onWatchlistContextMenu);
         tv->addWidget(botTable_, 1);
 
-        vSplit->addWidget(tw);
+        // ── 两套策略分标签页 ────────────────────────────────────────────────
+        // 不并排也不上下堆：两张表的列语义完全不同（DCA 有层进度/均价/强平价，
+        // SAR 有止损线/距离/反手数），挤在一个视野里只会让两边都读不清。
+        // 同一时刻你关心的也只是其中一套
+        auto* tabs = new QTabWidget();
+        tabs->addTab(tw, "网格 DCA");
+        tabs->addTab(buildSarTab(), "趋势 SAR");
+        vSplit->addWidget(tabs);
     }
 
     // ── 底部日志区 ─────────────────────────────────────────────────────────────
@@ -1241,6 +1249,37 @@ void MainWindow::onConnect() {
                     save_bots();
                 }, Qt::QueuedConnection);
             });
+            // SAR 引擎：与 DCA 并列，共用同一个下单池和同一个 client
+            sar_engine_ = std::make_shared<SarEngine>(client_, pool_);
+            sar_engine_->set_log_cb([this](const std::string& msg) {
+                QMetaObject::invokeMethod(this, [this, msg]() {
+                    log(QString::fromStdString(msg));
+                    refreshSarTable();
+                    save_sar_bots();
+                }, Qt::QueuedConnection);
+            });
+            sar_engine_->set_trade_cb([this](const SarTrade& tr) {
+                QMetaObject::invokeMethod(this, [this, tr]() {
+                    // 复用 DCA 的成交明细表：层数恒为 0，原因带 SAR 前缀区分
+                    TradeRecord rec;
+                    rec.symbol      = tr.symbol;
+                    rec.direction   = (tr.side == sar::Pos::Short)
+                                      ? CcgConfig::Direction::Short
+                                      : CcgConfig::Direction::Long;
+                    rec.entry_price = tr.entry_price;
+                    rec.exit_price  = tr.exit_price;
+                    rec.qty         = tr.qty;
+                    rec.pnl         = tr.pnl;
+                    rec.layers      = 0;
+                    rec.reason      = "SAR " + tr.reason;
+                    rec.close_time  = tr.close_time;
+                    trades_.push_back(rec);
+                    save_trades();
+                    refreshStats();
+                    save_sar_bots();
+                }, Qt::QueuedConnection);
+            });
+
             engine_->set_trade_cb([this](const TradeRecord& tr) {
                 QMetaObject::invokeMethod(this, [this, tr]() {
                     trades_.push_back(tr);
@@ -1287,6 +1326,7 @@ void MainWindow::onConnect() {
 
             // 恢复上次保存的 Bot
             load_and_restore_bots();
+            load_and_restore_sar();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
@@ -1561,6 +1601,21 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
 // 策略配置弹窗：新建或编辑一个品种的 bot，保存后回到监控页面
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::openStrategyDialog(const std::string& symbol) {
+    // 同品种已被 SAR 接管则拒绝。两个引擎会在同一个交易所仓位上互相拆台：
+    // SAR 的 reduceOnly 平仓会平掉 DCA 的层，而 DCA 的补仓会让 SAR 的
+    // 开仓价基准失效、止损线管着一个不是自己开的仓位。
+    // openSarDialog 里有对称的一道——两边都要有，否则从任一侧都能绕过去
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots())
+            if (b.cfg.symbol == symbol && b.state != SarBot::State::Stopped) {
+                QMessageBox::warning(this, "品种冲突",
+                    QString::fromStdString(symbol) +
+                    " 已经由趋势 SAR 策略接管。\n\n"
+                    "两套策略会在同一个交易所仓位上互相平掉对方的单，必须二选一。");
+                return;
+            }
+    }
+
     auto bots = engine_ ? engine_->get_bots() : std::vector<CcgBot>{};
     const CcgBot* longBot = nullptr;
     const CcgBot* shortBot = nullptr;
@@ -2421,6 +2476,61 @@ void MainWindow::onTick() {
 
     auto bots = engine_->get_bots();
 
+    // ── SAR 信号拉取（ATR + 唐奇安通道），每 20 个 tick 约 60 秒 ───────────────
+    // 止损线的推进【不靠这个】：它在每个 tick 用实时价推进，只有 ATR 的数值
+    // 来自这里。所以这一批慢一点不影响保护，只影响新仓位的入场判定
+    if (sar_engine_ && (slowTickCount_ % 20) == 1 && !sarSigBusy_.load()) {
+        std::vector<SarBot> need;
+        for (const auto& b : sar_engine_->get_bots())
+            if (b.state == SarBot::State::Running) need.push_back(b);
+        if (!need.empty()) {
+            sarSigBusy_.store(true);
+            run_async([this, need]() {
+                for (const auto& b : need) {
+                    if (!client_ || !sar_engine_) break;
+                    auto snap = client_->fetch_sar_signal(
+                        b.cfg.symbol, b.cfg.interval,
+                        b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
+                    if (!snap.ok) continue;
+                    sar_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
+                                               snap.dc_ok, snap.dc_up, snap.dc_dn,
+                                               snap.bar_open_ms);
+                }
+                sarSigBusy_.store(false);
+                QMetaObject::invokeMethod(this, [this]() { refreshSarTable(); },
+                                          Qt::QueuedConnection);
+            });
+        }
+    }
+
+    // ── SAR 周期对账，每 20 个 tick，与 DCA 那批错开半分钟 ────────────────────
+    if (sar_engine_ && (slowTickCount_ % 20) == 11 && !sarRecBusy_.load()) {
+        sarRecBusy_.store(true);
+        run_async([this]() {
+            bool pos_ok = false;
+            auto ex_pos = client_ ? client_->fetch_positions(&pos_ok)
+                                  : std::vector<TradingClient::Position>{};
+            QMetaObject::invokeMethod(this, [this, ex_pos, pos_ok]() {
+                // 拉取失败绝不对账：空列表既可能是"确实没仓"也可能是请求失败，
+                // 把后者当前者会凭空清掉带止损线的真实持仓
+                if (pos_ok && sar_engine_) {
+                    std::vector<SarEngine::ExchangePos> ex;
+                    ex.reserve(ex_pos.size());
+                    for (const auto& p : ex_pos)
+                        ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+                    for (const auto& i : sar_engine_->reconcile_positions(ex)) {
+                        log("SAR对账: " + QString::fromStdString(i), "WARN");
+                        sendAlert(QString("[TradingBot] SAR对账: %1")
+                                      .arg(QString::fromStdString(i)));
+                    }
+                    refreshSarTable();
+                    save_sar_bots();
+                }
+                sarRecBusy_.store(false);
+            }, Qt::QueuedConnection);
+        });
+    }
+
     // 指标拉取（公开接口，不占用签名限流）：
     //  - 指标信号首单：等待 BOLL/RSI 信号的 bot（运行中+还没开首仓+指标模式）
     //  - 动态W模式：持仓中也要持续拉取——补仓锚定下轨/止盈锚定上轨都依赖实时轨道
@@ -2634,19 +2744,30 @@ void MainWindow::onTick() {
     for (const auto& b : bots)
         if (b.state != CcgBot::State::Stopped)
             syms.insert(b.cfg.symbol);
-    if (syms.empty()) { refreshBotTable(); return; }
+    // SAR 的品种与 DCA 没有交集（同品种被两套接管是被拒绝的），必须单独收集，
+    // 否则只配了 SAR 时上面的 syms 是空的，价格永远喂不到 SAR 引擎
+    std::set<std::string> sar_syms;
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots())
+            if (b.state != SarBot::State::Stopped) {
+                sar_syms.insert(b.cfg.symbol);
+                syms.insert(b.cfg.symbol);
+            }
+    }
+    if (syms.empty()) { refreshBotTable(); refreshSarTable(); return; }
 
     std::set<std::string> need_rest;
     for (const auto& sym : syms) {
         double ws_price = ticker_ ? ticker_->mark_price(sym) : 0.0;
         if (ws_price > 0) {
             engine_->tick(sym, ws_price);
+            if (sar_engine_ && sar_syms.count(sym)) sar_engine_->tick(sym, ws_price);
         } else {
             need_rest.insert(sym);
         }
     }
 
-    if (need_rest.empty()) { refreshBotTable(); return; }
+    if (need_rest.empty()) { refreshBotTable(); refreshSarTable(); return; }
 
     // 防重入：这一批是【串行】遍历所有缺价的品种，47 个品种要跑几十秒，
     // 而引擎 tick 是 3 秒一次。没有这道闸的话每 3 秒就再投递一批，
@@ -2661,14 +2782,17 @@ void MainWindow::onTick() {
             double price = client_->fetch_mark_price(sym);
             if (price > 0) {
                 engine_->tick(sym, price);
+                if (sar_engine_) sar_engine_->tick(sym, price);
                 // 写回缓存：界面那一列读的是缓存，不写回就会出现
                 // "引擎有价在跑、标记价列却一直空着"
                 if (ticker_) ticker_->set_mark_price(sym, price);
             }
         }
         restFetchBusy_.store(false);
-        QMetaObject::invokeMethod(this, [this]() { refreshBotTable(); },
-                                  Qt::QueuedConnection);
+        QMetaObject::invokeMethod(this, [this]() {
+            refreshBotTable();
+            refreshSarTable();
+        }, Qt::QueuedConnection);
     });
 }
 
@@ -2868,6 +2992,13 @@ void MainWindow::unsubscribeIfUnused(const std::string& symbol) {
     // 同一品种可以同时有多头和空头两个 bot——删掉一个不能把另一个的行情退掉
     for (const auto& b : engine_->get_bots())
         if (b.cfg.symbol == symbol) return;
+    // SAR 引擎也在用同一条行情流。漏掉它的话，删掉某个 DCA bot 会把一个
+    // 正在持仓的 SAR bot 的行情退订——那个 bot 从此收不到价格，
+    // 止损线永远不会被触发，仓位静默裸奔
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots())
+            if (b.cfg.symbol == symbol) return;
+    }
     ticker_->unsubscribe(symbol);
 }
 

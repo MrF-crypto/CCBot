@@ -20,6 +20,7 @@
 #include <set>
 
 #include "core/ccg_engine.h"
+#include "core/sar_engine.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
@@ -52,6 +53,7 @@ private slots:
     void onClearStopped();
     void onTick();
     void refreshBotTable();
+    void refreshSarTable();
     void refreshLiveQuotes();
     void refreshPositions();
     void onWatchlistContextMenu(const QPoint& pos);
@@ -67,6 +69,17 @@ private:
 
     // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）
     void openStrategyDialog(const std::string& symbol);
+
+    // ── SAR 趋势跟随（与 DCA 并列的第二套策略，界面上是第二个标签页）────────
+    // 品种右键 → SAR 策略配置弹窗（新建或编辑已存在的都走这里）
+    QWidget* buildSarTab();
+    void openSarDialog(const std::string& symbol);
+    void onSarContextMenu(const QPoint& pos);
+    void onAddSarSymbol();
+    std::string sar_cfg_path()   const;
+    std::string sar_state_path() const;
+    void save_sar_bots();          // 配置 + 运行时状态一起落盘
+    void load_and_restore_sar();
 
     // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
@@ -115,6 +128,7 @@ private:
     // 必须分开：拉取任务动辄几百毫秒~几秒，混在一个池里会把手动平仓排到队尾等十几秒
     std::shared_ptr<ThreadPool>        pool_;
     std::shared_ptr<ThreadPool>        fetchPool_;
+    std::shared_ptr<SarEngine>         sar_engine_;
     std::unique_ptr<BookTickerStream>  ticker_;
 
     QTimer* tick_timer_  = nullptr;
@@ -158,6 +172,11 @@ private:
 
     // ── 实盘监控表（右键品种 → 策略配置弹窗）──
     QTableWidget* botTable_    = nullptr;
+    // ── SAR 表 ──
+    QTableWidget* sarTable_     = nullptr;
+    QLabel*       sarSummary_   = nullptr;
+    QLineEdit*    addSarEdit_   = nullptr;
+    std::vector<QString> sarOpRowKeys_;   // 操作列重建键，同 opRowKeys_
     QLabel*       summaryLabel_ = nullptr;
     // 操作列按钮的重建键：键没变就不重建控件（避免点击被刷新吞掉）
     std::vector<QString> opRowKeys_;
@@ -217,6 +236,10 @@ private:
     std::atomic<bool> posFetchBusy_{false};
     std::atomic<bool> fundFetchBusy_{false};
     std::atomic<bool> mtfFetchBusy_{false};
+    // SAR 信号拉取（ATR + 唐奇安）。与指标批次分开：周期不同（60秒 vs 5分钟），
+    // 而且 SAR 的 bot 集合与 DCA 的完全没有交集
+    std::atomic<bool> sarSigBusy_{false};
+    std::atomic<bool> sarRecBusy_{false};
 
     // ── 日志 ──
     QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的
