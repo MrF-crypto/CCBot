@@ -2479,26 +2479,43 @@ void MainWindow::onTick() {
     // ── SAR 信号拉取（ATR + 唐奇安通道），每 20 个 tick 约 60 秒 ───────────────
     // 止损线的推进【不靠这个】：它在每个 tick 用实时价推进，只有 ATR 的数值
     // 来自这里。所以这一批慢一点不影响保护，只影响新仓位的入场判定
-    if (sar_engine_ && (slowTickCount_ % 20) == 1 && !sarSigBusy_.load()) {
+    if (sar_engine_ && !sarSigBusy_.load() &&
+        ((slowTickCount_ % 20) == 1 || sarSigForce_.exchange(false))) {
         std::vector<SarBot> need;
         for (const auto& b : sar_engine_->get_bots())
             if (b.state == SarBot::State::Running) need.push_back(b);
         if (!need.empty()) {
             sarSigBusy_.store(true);
             run_async([this, need]() {
+                // 失败的品种要报出来。原先这里是 `if (!snap.ok) continue;`——
+                // 完全静默，于是"信号拉不到"和"拉到了但没突破"在界面上长得
+                // 一模一样，都是"等信号"。用户唯一能做的就是干等
+                QStringList failed;
+                int okn = 0;
                 for (const auto& b : need) {
                     if (!client_ || !sar_engine_) break;
                     auto snap = client_->fetch_sar_signal(
                         b.cfg.symbol, b.cfg.interval,
                         b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
-                    if (!snap.ok) continue;
+                    if (!snap.ok) {
+                        failed << QString::fromStdString(b.cfg.symbol);
+                        continue;
+                    }
+                    ++okn;
                     sar_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                snap.bar_open_ms);
                 }
                 sarSigBusy_.store(false);
-                QMetaObject::invokeMethod(this, [this]() { refreshSarTable(); },
-                                          Qt::QueuedConnection);
+                QMetaObject::invokeMethod(this, [this, failed, okn]() {
+                    if (!failed.isEmpty())
+                        log(QString("⚠ SAR 信号拉取失败 %1 个品种：%2"
+                                    "（成功 %3 个）。拉不到 K 线 = 没有 ATR = "
+                                    "没有止损线，这些品种不会开新仓")
+                                .arg(failed.size()).arg(failed.join(", ")).arg(okn),
+                            "WARN");
+                    refreshSarTable();
+                }, Qt::QueuedConnection);
             });
         }
     }

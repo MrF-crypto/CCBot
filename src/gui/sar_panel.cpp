@@ -35,7 +35,7 @@ namespace {
 // 表格列。和 DCA 那张表刻意不对齐：SAR 没有层、没有均价、没有强平价
 // （名义仓位远小于权益，强平价没有意义），而止损线和它离现价多远才是全部
 enum SarCol {
-    C_IDX = 0, C_SYM, C_DIR, C_STATE, C_ENTRY, C_MARK,
+    C_IDX = 0, C_SYM, C_DIR, C_STATE, C_ATR, C_ENTRY, C_MARK,
     C_STOP, C_DIST, C_UPNL, C_REAL, C_WIN, C_REV, C_DECISION, C_OP,
     C_COUNT
 };
@@ -93,14 +93,15 @@ QWidget* MainWindow::buildSarTab() {
 
     sarTable_ = new QTableWidget(0, C_COUNT);
     sarTable_->setHorizontalHeaderLabels(
-        {"#", "品种", "方向", "状态", "开仓价", "标记价",
+        {"#", "品种", "方向", "状态", "ATR", "开仓价", "标记价",
          "止损线", "距离", "浮动P&L", "已实现", "胜率", "反手", "决策", "操作"});
     auto* hdr = sarTable_->horizontalHeader();
     hdr->setSectionResizeMode(QHeaderView::Stretch);
-    for (int c : {C_IDX, C_DIR, C_DIST, C_WIN, C_REV})
+    for (int c : {C_IDX, C_DIR, C_ATR, C_DIST, C_WIN, C_REV})
         hdr->setSectionResizeMode(c, QHeaderView::Fixed);
     hdr->resizeSection(C_IDX, 26);
     hdr->resizeSection(C_DIR, 44);
+    hdr->resizeSection(C_ATR, 62);
     hdr->resizeSection(C_DIST, 60);
     hdr->resizeSection(C_WIN, 64);
     hdr->resizeSection(C_REV, 44);
@@ -164,6 +165,27 @@ void MainWindow::refreshSarTable() {
         sarTable_->setItem(i, C_STATE,
             mk(st, b.state == SarBot::State::Stopped ? "#f85149"
                  : has_pos                           ? "#58a6ff" : "#8b949e"));
+
+        // ATR 列同时是"信号到没到"的指示灯：显示 — 就是这个品种的 K 线没拉到，
+        // 而没有 ATR 就没有止损线，引擎绝不会开新仓。这一列存在的全部理由，
+        // 就是让"等信号"和"拉不到数据"在界面上长得不一样
+        auto* atr_it = mk(b.atr_pct > 0 ? QString::number(b.atr_pct, 'f', 2) + "%" : "—",
+                          b.atr_pct > 0 ? "#8b949e" : "#f85149");
+        if (b.atr_pct > 0) {
+            atr_it->setToolTip(
+                QString("%1 周期 ATR = %2%（跨品种可比口径）\n"
+                        "当前 k=%3 ⇒ 止损距离约 %4%")
+                    .arg(QString::fromStdString(b.cfg.interval))
+                    .arg(b.atr_pct, 0, 'f', 2)
+                    .arg(b.cfg.rule.atr_mult, 0, 'f', 1)
+                    .arg(b.atr_pct * b.cfg.rule.atr_mult, 0, 'f', 1));
+        } else {
+            atr_it->setToolTip("尚未拉到 K 线数据。没有 ATR 就没有止损线，"
+                               "引擎不会开新仓。\n"
+                               "刚添加的品种最多等 60 秒；持续显示 — 请看日志里的"
+                               "「SAR 信号拉取失败」告警");
+        }
+        sarTable_->setItem(i, C_ATR, atr_it);
 
         sarTable_->setItem(i, C_ENTRY, mk(has_pos ? fmt_px(b.st.entry_price) : "—"));
         sarTable_->setItem(i, C_MARK,  mk(fmt_px(b.current_price)));
@@ -452,6 +474,7 @@ void MainWindow::openSarDialog(const std::string& symbol) {
         return;
     }
     if (ticker_) ticker_->subscribe(c.symbol);
+    sarSigForce_.store(true);   // 下一个 tick 立刻拉信号，不等满 20 拍
     log(QString("SAR %1 已配置：通道%2 / ATR%3 / k=%4 / %5")
             .arg(QString::fromStdString(c.symbol))
             .arg(c.rule.donchian_period).arg(c.rule.atr_period)
@@ -570,7 +593,10 @@ void MainWindow::load_and_restore_sar() {
             if (ticker_) ticker_->subscribe(b.cfg.symbol);
         }
     }
-    if (n > 0) log(QString("已恢复 %1 个 SAR bot").arg(n), "OK");
+    if (n > 0) {
+        log(QString("已恢复 %1 个 SAR bot").arg(n), "OK");
+        sarSigForce_.store(true);
+    }
     refreshSarTable();
 }
 

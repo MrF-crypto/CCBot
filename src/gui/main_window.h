@@ -239,6 +239,10 @@ private:
     // SAR 信号拉取（ATR + 唐奇安）。与指标批次分开：周期不同（60秒 vs 5分钟），
     // 而且 SAR 的 bot 集合与 DCA 的完全没有交集
     std::atomic<bool> sarSigBusy_{false};
+    // 新增/恢复 SAR bot 后置位，让下一个 tick 立刻拉一次信号而不是等满 20 拍。
+    // 没有它的话刚添加的品种会干等最多 60 秒，界面上什么都没有——
+    // 而用户此刻正盯着看它到底有没有在工作
+    std::atomic<bool> sarSigForce_{false};
     std::atomic<bool> sarRecBusy_{false};
 
     // ── 日志 ──
