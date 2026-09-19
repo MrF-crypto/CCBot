@@ -389,7 +389,7 @@ void MainWindow::openSarDialog(const std::string& symbol) {
     k->setToolTip("止损距离 = k × ATR（Chandelier Exit）。\n"
                   "棘轮，只朝有利方向移动，绝不回退。\n"
                   "k 越小假突破越多，越大回吐越多。经典值 2.5~3.5。\n"
-                  "日志里的「ATR观测」会给出各品种 k 对应的实际止损距离%。");
+                  "表格里的 ATR 列悬停可看当前 k 对应的实际止损距离%。");
     form->addRow("ATR 倍数 k", k);
 
     auto* rev = new QCheckBox("亏损止损后反向入场");

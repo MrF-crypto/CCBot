@@ -1205,25 +1205,11 @@ TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
         const std::string& sym, const std::string& interval,
         int boll_period, double boll_mult, int rsi_period) {
     IndicatorSnapshot out;
-    // +20 是给 ATR(14) 的 Wilder 平滑留预热余量：只喂 15 根算出来的是 seed，
-    // 和长序列滚动出的稳定值差得远
-    int need = std::max({boll_period, rsi_period + 20, 40}) + 5;
-    auto bars   = fetch_klines(sym, interval, need);
-    auto closes = closes_of(bars);
+    int need = std::max(boll_period, rsi_period + 20) + 5;
+    auto closes = closes_of(fetch_klines(sym, interval, need));
     if (closes.empty()) return out;
 
     out.price = closes.back();
-
-    // ATR：SAR 策略的止损距离来源。这里顺带算出来是因为 K 线【已经拉过了】，
-    // 不额外占限流权重。绝对值和百分比都给——跨品种比较只能看百分比
-    {
-        std::vector<indicators::Ohlc> oh;
-        oh.reserve(bars.size());
-        for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
-        out.atr = indicators::atr(oh, 14);
-        if (out.atr > 0 && out.price > 0)
-            out.atr_pct = out.atr / out.price * 100.0;
-    }
 
     auto boll = indicators::bollinger(closes, boll_period, boll_mult);
     out.boll_ub = boll.ub;
