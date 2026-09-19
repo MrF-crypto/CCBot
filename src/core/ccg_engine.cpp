@@ -446,8 +446,10 @@ double CcgEngine::total_margin_used() const {
 // 代价只是外部平仓要多等最多 30 秒才被发现，而此前是"不重启就永远发现不了"
 static constexpr int kReconcileSettleSecs = 30;
 
-std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<ExchangePos>& exchange,
-                                                        ReconcileMode mode) {
+std::vector<std::string> CcgEngine::reconcile_positions(
+        const std::vector<ExchangePos>& exchange,
+        ReconcileMode mode,
+        const std::set<std::string>& managed_elsewhere) {
     std::vector<std::string> issues;
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
@@ -567,6 +569,9 @@ std::vector<std::string> CcgEngine::reconcile_positions(const std::vector<Exchan
     // 不认领的话不但仓位无人止盈止损，Immediate 模式的 bot 还会再开一份→双倍敞口
     for (const auto& ex : exchange) {
         if (ex.qty <= 0) continue;
+        // 另一套引擎（SAR）管着的品种：有主，不是孤儿。它的止盈止损由那边负责，
+        // 在这里报警只会每分钟刷一条假告警，把真正的孤儿仓淹掉
+        if (managed_elsewhere.count(ex.symbol)) continue;
         auto dir = (ex.direction > 0) ? CcgConfig::Direction::Long : CcgConfig::Direction::Short;
 
         bool tracked = false;

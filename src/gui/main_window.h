@@ -244,7 +244,6 @@ private:
     // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
     std::set<std::string> sarSigFailed_;
     std::atomic<bool> dcaAtrBusy_{false};   // DCA 的 ATR 移动止损拉取守卫
-    std::atomic<bool> sarRecBusy_{false};
 
     // ── 日志 ──
     QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的

@@ -412,6 +412,65 @@ static void test_max_open_positions() {
 // 周期对账的难点不在"发现"，而在【不误判】：正在平仓的 bot，订单已在交易所
 // 生效、本地还没入账，此刻比对必然对不上——若当成"外部平仓"，一次完全正常的
 // 止盈会被清空状态并停掉。所以这里三条一起测。
+// 两套引擎共用一份持仓快照：SAR 管着的品种对 DCA 不是孤儿仓。
+// 漏了这条，SAR 开的每一笔都会被 DCA 报成"无人管理的孤儿仓位"并发 webhook，
+// 每分钟一次——真正的孤儿仓（崩溃期间成交、确实没人管的那种）会被淹掉
+static void test_cross_engine_not_orphan() {
+    std::printf("\n── 用例：SAR 管的品种不该被 DCA 报成孤儿仓 ──\n");
+    int64_t vnow = 1'700'000'000'000LL;
+    auto fc = std::make_shared<FakeClient>();
+    CcgEngine eng(fc, make_host(vnow));
+
+    CcgConfig c = base_cfg();
+    c.symbol = "BTCUSDT";
+    eng.add_bot(c);
+
+    // 交易所上有两笔：BTCUSDT 是本引擎的（还没开仓，属于可认领），
+    // ETHUSDT 完全没有 DCA bot —— 它是 SAR 开的
+    std::vector<CcgEngine::ExchangePos> ex = {
+        {"ETHUSDT", 1, 2.0, 3000.0},
+    };
+
+    // 不告诉它 ETHUSDT 有主 → 报成孤儿仓
+    {
+        auto issues = eng.reconcile_positions(ex, CcgEngine::ReconcileMode::Startup);
+        bool warned = false;
+        for (const auto& i : issues)
+            if (i.find("ETHUSDT") != std::string::npos &&
+                i.find("孤儿") != std::string::npos) warned = true;
+        check(warned, "不传 managed_elsewhere 时，确实会报孤儿仓（基线）");
+    }
+
+    // 告诉它 ETHUSDT 由 SAR 管 → 不该再报
+    {
+        std::set<std::string> sar_owned = {"ETHUSDT"};
+        auto issues = eng.reconcile_positions(ex, CcgEngine::ReconcileMode::Startup,
+                                              sar_owned);
+        bool warned = false;
+        for (const auto& i : issues)
+            if (i.find("ETHUSDT") != std::string::npos) warned = true;
+        check(!warned, "SAR 管着的品种不得被报成孤儿仓");
+    }
+
+    // 但【真正】的孤儿仓还得报——不能因为加了这个参数就把整段核查关掉
+    {
+        std::vector<CcgEngine::ExchangePos> ex2 = {
+            {"ETHUSDT", 1, 2.0, 3000.0},     // SAR 的
+            {"SOLUSDT", 1, 5.0, 150.0},      // 谁都不认识 → 真孤儿
+        };
+        std::set<std::string> sar_owned = {"ETHUSDT"};
+        auto issues = eng.reconcile_positions(ex2, CcgEngine::ReconcileMode::Startup,
+                                              sar_owned);
+        bool sol_warned = false, eth_warned = false;
+        for (const auto& i : issues) {
+            if (i.find("SOLUSDT") != std::string::npos) sol_warned = true;
+            if (i.find("ETHUSDT") != std::string::npos) eth_warned = true;
+        }
+        check(sol_warned, "真正无主的仓位仍然必须报警");
+        check(!eth_warned, "  同时不得误报 SAR 的仓位");
+    }
+}
+
 static void test_periodic_reconcile() {
     std::printf("\n── 用例：周期对账（外部平仓检测 + 防误判）──\n");
     using RM = CcgEngine::ReconcileMode;
@@ -838,6 +897,7 @@ int main() {
     test_mtf_alloc();
     test_adopt_reconstructs_levels();
     test_periodic_reconcile();
+    test_cross_engine_not_orphan();
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -10,6 +10,7 @@
 #include <memory>
 #include <atomic>
 #include <array>
+#include <set>
 
 namespace ccbot {
 
@@ -690,8 +691,14 @@ public:
     //   本地qty > 交易所qty    → 外部部分平仓：本地数量收敛到交易所值（均价保留）
     //   本地qty < 交易所qty    → 交易所多出（外部手动加仓）：仅告警不动本地状态
     // 同一品种有多个持仓bot时无法归属，跳过并告警。返回每条不一致的可读描述（空=完全一致）
-    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange,
-                                                 ReconcileMode mode = ReconcileMode::Startup);
+    // managed_elsewhere：由【本程序的另一套引擎】（SAR）管理的品种。
+    // 这些品种的交易所仓位不是"无人管理的孤儿仓"——它们有主，只是主不在这里。
+    // 不传的话，SAR 开的每一笔仓都会被这里报成孤儿仓并发 webhook，每分钟一次。
+    // 只影响"反向核查"那一段；本引擎自己 bot 的比对完全不受它影响
+    std::vector<std::string> reconcile_positions(
+        const std::vector<ExchangePos>& exchange,
+        ReconcileMode mode = ReconcileMode::Startup,
+        const std::set<std::string>& managed_elsewhere = {});
 
     // 仅测试用：直接摆布 pending 标志。
     // 存在的理由是"订单已在交易所生效、本地还没入账"这个【瞬间】无法在测试里

@@ -304,7 +304,12 @@ int main(int argc, char** argv) {
         auto ex_pos = client->fetch_positions();
         std::vector<CcgEngine::ExchangePos> ex;
         for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-        auto issues = engine->reconcile_positions(ex);
+        std::set<std::string> sar_owned;
+        if (sar_engine)
+            for (const auto& b : sar_engine->get_bots())
+                sar_owned.insert(b.cfg.symbol);
+        auto issues = engine->reconcile_positions(
+            ex, CcgEngine::ReconcileMode::Startup, sar_owned);
         if (!issues.empty()) {
             save_headless_state(cfg.state_path, engine->get_bots());   // 把收敛后的状态立刻落盘
             if (!cfg.alert_webhook.empty()) {
@@ -339,7 +344,7 @@ int main(int argc, char** argv) {
     // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     std::atomic<bool> ind_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
-    std::atomic<bool> sar_sig_busy{false}, sar_rec_busy{false};
+    std::atomic<bool> sar_sig_busy{false};
     std::atomic<bool> dca_atr_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
@@ -749,19 +754,30 @@ int main(int argc, char** argv) {
         // 主循环里除了价格兜底之外的每一个 HTTP 都走 fetch_pool，这里同理
         if (tick_n % 20 == 0 && !rec_busy.load()) {
             rec_busy.store(true);
-            fetch_pool->submit([client, engine, &rec_busy,
-                                sp = cfg.state_path, w = cfg.alert_webhook]() {
+            fetch_pool->submit([client, engine, sar_engine, &rec_busy,
+                                sp = cfg.state_path, ssp = sar_state_path,
+                                w = cfg.alert_webhook]() {
                 bool pos_ok = false;
                 auto ex_pos = client->fetch_positions(&pos_ok);
                 // 拉取失败绝不对账：空的持仓列表既可能是"确实没仓"也可能是请求
                 // 失败，把后者当成前者会凭空清掉真实持仓
                 if (pos_ok) {
+                    // ⚠ 两套引擎【共用同一份持仓快照】，只发一次请求。
+                    // 它们都是本程序开的单，没有第三方——所以 SAR 管着的品种
+                    // 对 DCA 来说不是"无人管理的孤儿仓"，只是主不在那边。
+                    // 不告诉 DCA 的话，SAR 开的每一笔都会被报成孤儿仓并发 webhook，
+                    // 每分钟一次，把真正的孤儿仓（崩溃期间成交的那种）淹掉
+                    std::set<std::string> sar_owned;
+                    if (sar_engine)
+                        for (const auto& b : sar_engine->get_bots())
+                            sar_owned.insert(b.cfg.symbol);
+
                     std::vector<CcgEngine::ExchangePos> ex;
                     ex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
                     auto issues = engine->reconcile_positions(
-                        ex, CcgEngine::ReconcileMode::Periodic);
+                        ex, CcgEngine::ReconcileMode::Periodic, sar_owned);
                     // 明细不在这里打——引擎内部已经逐条 log 过（"⚠ 对账: ..."）
                     if (!issues.empty()) {
                         save_headless_state(sp, engine->get_bots());
@@ -772,39 +788,27 @@ int main(int argc, char** argv) {
                             send_webhook(w, msg);
                         }
                     }
-                }
-                rec_busy.store(false);
-            });
-        }
 
-        // ── SAR 周期对账（与上面那批错开 30 秒，避免两次 fetch_positions 挤在
-        //    同一 tick 上白白多花一次权重）───────────────────────────────────
-        if (sar_engine && tick_n % 20 == 10 && !sar_rec_busy.load()) {
-            sar_rec_busy.store(true);
-            fetch_pool->submit([client, sar_engine, &sar_rec_busy,
-                                sp = sar_state_path, w = webhook]() {
-                bool pos_ok = false;
-                auto ex_pos = client->fetch_positions(&pos_ok);
-                // 拉取失败绝不对账：空列表既可能是"确实没仓"也可能是请求失败，
-                // 把后者当前者会凭空清掉真实持仓，而 SAR 清掉的是带止损线的仓位
-                if (pos_ok) {
-                    std::vector<SarEngine::ExchangePos> ex;
-                    ex.reserve(ex_pos.size());
-                    for (const auto& p : ex_pos)
-                        ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto issues = sar_engine->reconcile_positions(ex);
-                    if (!issues.empty()) {
-                        for (const auto& i : issues) log_line("⚠ SAR对账: " + i, "WARN");
-                        save_sar_state(sp, sar_engine->get_bots());
-                        if (!w.empty()) {
-                            std::string msg = "[ccbot] SAR 运行中对账发现 " +
-                                              std::to_string(issues.size()) + " 处不一致:";
-                            for (const auto& i : issues) msg += "\n" + i;
-                            send_webhook(w, msg);
+                    if (sar_engine) {
+                        std::vector<SarEngine::ExchangePos> sex;
+                        sex.reserve(ex_pos.size());
+                        for (const auto& p : ex_pos)
+                            sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+                        auto sissues = sar_engine->reconcile_positions(sex);
+                        if (!sissues.empty()) {
+                            for (const auto& i : sissues)
+                                log_line("⚠ SAR对账: " + i, "WARN");
+                            save_sar_state(ssp, sar_engine->get_bots());
+                            if (!w.empty()) {
+                                std::string msg = "[ccbot] SAR 运行中对账发现 " +
+                                                  std::to_string(sissues.size()) + " 处不一致:";
+                                for (const auto& i : sissues) msg += "\n" + i;
+                                send_webhook(w, msg);
+                            }
                         }
                     }
                 }
-                sar_rec_busy.store(false);
+                rec_busy.store(false);
             });
         }
     }

@@ -1360,7 +1360,13 @@ void MainWindow::onConnect() {
                     if (!engine_) return;
                     std::vector<CcgEngine::ExchangePos> ex;
                     for (const auto& p : ex_pos) ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto issues = engine_->reconcile_positions(ex);
+                    // SAR 管着的品种对 DCA 不是孤儿仓——两边都是本程序开的单
+                    std::set<std::string> sar_owned;
+                    if (sar_engine_)
+                        for (const auto& b : sar_engine_->get_bots())
+                            sar_owned.insert(b.cfg.symbol);
+                    auto issues = engine_->reconcile_positions(
+                        ex, CcgEngine::ReconcileMode::Startup, sar_owned);
                     if (!issues.empty()) {
                         save_bots();   // 收敛后的状态立刻落盘
                         refreshBotTable();
@@ -2633,34 +2639,6 @@ void MainWindow::onTick() {
         }
     }
 
-    // ── SAR 周期对账，每 20 个 tick，与 DCA 那批错开半分钟 ────────────────────
-    if (sar_engine_ && (slowTickCount_ % 20) == 11 && !sarRecBusy_.load()) {
-        sarRecBusy_.store(true);
-        run_async([this]() {
-            bool pos_ok = false;
-            auto ex_pos = client_ ? client_->fetch_positions(&pos_ok)
-                                  : std::vector<TradingClient::Position>{};
-            QMetaObject::invokeMethod(this, [this, ex_pos, pos_ok]() {
-                // 拉取失败绝不对账：空列表既可能是"确实没仓"也可能是请求失败，
-                // 把后者当前者会凭空清掉带止损线的真实持仓
-                if (pos_ok && sar_engine_) {
-                    std::vector<SarEngine::ExchangePos> ex;
-                    ex.reserve(ex_pos.size());
-                    for (const auto& p : ex_pos)
-                        ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    for (const auto& i : sar_engine_->reconcile_positions(ex)) {
-                        log("SAR对账: " + QString::fromStdString(i), "WARN");
-                        sendAlert(QString("[TradingBot] SAR对账: %1")
-                                      .arg(QString::fromStdString(i)));
-                    }
-                    refreshSarTable();
-                    save_sar_bots();
-                }
-                sarRecBusy_.store(false);
-            }, Qt::QueuedConnection);
-        });
-    }
-
     // 指标拉取（公开接口，不占用签名限流）：
     //  - 指标信号首单：等待 BOLL/RSI 信号的 bot（运行中+还没开首仓+指标模式）
     //  - 动态W模式：持仓中也要持续拉取——补仓锚定下轨/止盈锚定上轨都依赖实时轨道
@@ -2748,7 +2726,17 @@ void MainWindow::onTick() {
         ex.reserve(pos_cache_.size());
         for (const auto& [k, p] : pos_cache_)
             ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-        auto issues = engine_->reconcile_positions(ex, CcgEngine::ReconcileMode::Periodic);
+        // ⚠ 两套引擎【共用同一份持仓快照】。它们都是本程序开的单，没有第三方——
+        // 所以 SAR 管着的品种对 DCA 来说不是"无人管理的孤儿仓"，只是主不在这边。
+        // 不告诉 DCA 的话，SAR 开的每一笔都会被报成孤儿仓并发 webhook，每分钟一次，
+        // 把真正的孤儿仓（崩溃期间成交、确实没人管的那种）淹掉
+        std::set<std::string> sar_owned;
+        if (sar_engine_)
+            for (const auto& b : sar_engine_->get_bots())
+                sar_owned.insert(b.cfg.symbol);
+
+        auto issues = engine_->reconcile_positions(
+            ex, CcgEngine::ReconcileMode::Periodic, sar_owned);
         if (!issues.empty()) {
             // 明细不在这里打——引擎内部已经逐条 log 过（"⚠ 对账: ..."），
             // 再打一遍就是双份。这里只做落盘、刷新和外部告警
@@ -2756,6 +2744,23 @@ void MainWindow::onTick() {
             refreshBotTable();
             sendAlert(QString("[TradingBot] 运行中对账发现 %1 处不一致，详见日志")
                       .arg(issues.size()));
+        }
+
+        // SAR 用同一份快照对账，不再单独发一次 fetch_positions
+        if (sar_engine_) {
+            std::vector<SarEngine::ExchangePos> sex;
+            sex.reserve(pos_cache_.size());
+            for (const auto& [k, p] : pos_cache_)
+                sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
+            auto sissues = sar_engine_->reconcile_positions(sex);
+            if (!sissues.empty()) {
+                for (const auto& i : sissues)
+                    log("SAR对账: " + QString::fromStdString(i), "WARN");
+                save_sar_bots();
+                refreshSarTable();
+                sendAlert(QString("[TradingBot] SAR 对账发现 %1 处不一致，详见日志")
+                          .arg(sissues.size()));
+            }
         }
     }
 
