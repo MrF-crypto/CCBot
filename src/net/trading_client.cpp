@@ -1269,6 +1269,21 @@ TradingClient::SarSnapshot TradingClient::fetch_sar_signal(
     return out;
 }
 
+double TradingClient::fetch_atr(const std::string& sym, const std::string& interval,
+                               int period) {
+    if (period < 2) return 0;
+    // Wilder 平滑要预热：只喂 period+1 根拿到的是 seed 而非稳定值，
+    // 而止损距离直接由它决定。4 倍周期足够收敛
+    const int need = period * 4 + 5;
+    auto bars = fetch_klines(sym, interval, need);
+    if (bars.empty()) return 0;
+
+    std::vector<indicators::Ohlc> oh;
+    oh.reserve(bars.size());
+    for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
+    return indicators::atr(oh, period);
+}
+
 // ── 高周期趋势快照（趋势状态机）───────────────────────────────────────────────
 TradingClient::TrendSnapshot TradingClient::fetch_trend(
         const std::string& sym, const std::string& interval,

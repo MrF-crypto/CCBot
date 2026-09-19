@@ -75,6 +75,7 @@ v4.1.0 起本程序同时提供两套风险形状**镜像**的策略。界面上
 | **指标信号首单** | 等 1h K线的 BOLL + RSI 满足才开首仓。RSI 支持「瞬时快照」与「反转确认（先探底再回穿）」两种模式 |
 | **多周期梯子** | 1h / 4h / 12h / 1d 四档带值分配层数，越深的层要求越极端的证据 |
 | **快进快出** | 不等上轨、够本就跑：`tp_floor_only` / `tp_fixed_profit` / `fixed_trail_tp` |
+| **ATR 移动止损** | 勾选即**冻结梯子**：不再补仓，改用 `持仓期极值 ∓ k×ATR` 的棘轮止损线管理现有仓位。两种用法——已套仓位反弹时锁住回升，或空仓时就勾上让首仓直接进入追踪模式（相当于「DCA 的入场闸门 + 趋势跟随的出场」） |
 
 ### 策略 B：趋势 SAR（v4.1.0 新增）
 
@@ -278,14 +279,15 @@ data/
 
 ## 测试
 
-15 套单元测试，覆盖引擎、网络、持久化、并发：
+16 套单元测试，覆盖引擎、网络、持久化、并发：
 
 ```powershell
 cmake --build build --config Release
 for %t in (ccg_indicator_tests ccg_key_store_tests ccg_risk_tests ccg_funding_tests ^
            ccg_rate_tests ccg_order_tests ccg_stress_tests ccg_persist_tests ^
            ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_pool_tests ^
-           ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests) do ^
+           ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests ^
+           ccg_atr_trail_tests) do ^
     build\Release\%t.exe
 ```
 
@@ -301,6 +303,7 @@ for %t in (ccg_indicator_tests ccg_key_store_tests ccg_risk_tests ccg_funding_te
 | `ccg_sar_tests` | 止损线棘轮绝不回退；盈利出场不反手；连续反手上限与冷却按K线计；唐奇安必须排除当前K线 |
 | `ccg_sar_engine_tests` | **平仓失败时绝不开反向仓**（反手方案A唯一的致命失败模式）；零成交/状态不明/-2022/取整归零 |
 | `ccg_sar_state_tests` | 止损线逐位无损往返（它就是出场价）；半截状态当空仓丢弃；本地空仓而交易所有仓必须停 bot |
+| `ccg_atr_trail_tests` | **武装后绝不再补仓**——漏了这条，止损线和补仓位会同时生效，而止损线总是更近，梯子永远只有第一层 |
 
 三平台（Windows / Linux / macOS）CI 全量跑，发布包另有**泄漏检查硬门禁**（白名单校验 + 内嵌版本号核对）。
 

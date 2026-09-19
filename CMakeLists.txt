@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 4.1.2 LANGUAGES CXX)
+project(TradingBot VERSION 4.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -161,6 +161,14 @@ target_include_directories(ccg_sar_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_sar_state_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)
     target_compile_options(ccg_sar_state_tests PRIVATE /utf-8)
+endif()
+
+# ── ATR 移动止损测试：守"武装后绝不再补仓"这条定义本身 ──────────────────────
+add_executable(ccg_atr_trail_tests tests/test_atr_trail.cpp src/core/ccg_engine.cpp)
+target_include_directories(ccg_atr_trail_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_atr_trail_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_atr_trail_tests PRIVATE /utf-8)
 endif()
 
 # ── 风控闸门测试（保证金上限 / 交易所侧灾难止损单）：用假客户端单跑引擎 ────────

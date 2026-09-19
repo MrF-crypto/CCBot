@@ -293,6 +293,10 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.stop_loss_pct  = new_cfg.stop_loss_pct;
     cfg.use_disaster_stop = new_cfg.use_disaster_stop;
     cfg.disaster_stop_pct = new_cfg.disaster_stop_pct;
+    cfg.use_atr_trail      = new_cfg.use_atr_trail;
+    cfg.atr_trail_mult     = new_cfg.atr_trail_mult;
+    cfg.atr_trail_period   = new_cfg.atr_trail_period;
+    cfg.atr_trail_interval = new_cfg.atr_trail_interval;
     cfg.entry_mode     = new_cfg.entry_mode;
     cfg.kline_interval = new_cfg.kline_interval;
     cfg.boll_period    = new_cfg.boll_period;
@@ -351,6 +355,15 @@ void CcgEngine::clear_pending_after_throw(const std::string& bot_id, const std::
     if (it == bots_.end()) return;
     it->second.pending = false;
     it->second.inflight_margin = 0;
+}
+
+void CcgEngine::update_atr(const std::string& bot_id, double atr) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    if (!(atr > 0) || !std::isfinite(atr)) return;   // 非法值不覆盖上一条有效 ATR
+    it->second.atr_value = atr;
+    it->second.atr_time  = host_.now_steady();
 }
 
 void CcgEngine::update_24h_change(const std::string& bot_id, bool ok, double pct) {
@@ -779,6 +792,40 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
 
     if (bot.entries.empty()) return;  // 尚未建仓，不用追踪
 
+    // ── ATR 移动止损：武装与棘轮推进 ─────────────────────────────────────────
+    // 武装条件是【勾选 + 有仓位 + 拿到 ATR】三者齐备。缺 ATR 时不武装：
+    // 没有止损线却冻结梯子，等于既不补仓也不保护，是三种状态里最差的一种
+    if (bot.cfg.use_atr_trail) {
+        if (!bot.atr_armed && bot.atr_value > 0) {
+            bot.atr_armed = true;
+            bot.atr_peak  = price;
+            bot.atr_stop  = is_long ? price - bot.cfg.atr_trail_mult * bot.atr_value
+                                    : price + bot.cfg.atr_trail_mult * bot.atr_value;
+            std::ostringstream ss;
+            ss << bot.cfg.symbol << " ATR移动止损已武装 @" << price
+               << " 止损线=" << bot.atr_stop
+               << "（梯子已冻结，不再补仓；第" << bot.entries.size() << "层为最终层）";
+            log(ss.str());
+        }
+        if (bot.atr_armed) {
+            bot.atr_peak = is_long ? std::max(bot.atr_peak, price)
+                                   : std::min(bot.atr_peak, price);
+            // ATR 断流时沿用上一条线，绝不因为数据没到就撤掉保护
+            if (bot.atr_value > 0) {
+                const double cand = is_long
+                    ? bot.atr_peak - bot.cfg.atr_trail_mult * bot.atr_value
+                    : bot.atr_peak + bot.cfg.atr_trail_mult * bot.atr_value;
+                bot.atr_stop = is_long ? std::max(bot.atr_stop, cand)   // 棘轮
+                                       : std::min(bot.atr_stop, cand);
+            }
+        }
+    } else if (bot.atr_armed) {
+        // 运行中取消勾选：解除武装，梯子恢复补仓
+        bot.atr_armed = false;
+        bot.atr_peak = bot.atr_stop = 0;
+        log(bot.cfg.symbol + " ATR移动止损已解除，梯子恢复补仓");
+    }
+
     const EffParams eff = eff_params(bot);
     const double eff_interval = apply_layer_growth(
         bot, apply_trend_interval(bot, eff.interval_pct, host_.now_steady()));
@@ -899,6 +946,9 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
 }
 
 bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
+    // ATR 移动止损已武装 = 梯子冻结。这是该功能的定义本身：
+    // 止损线总比补仓位更近，两者并存会让梯子永远只有第一层
+    if (bot.atr_armed) return false;
     if ((int)bot.entries.size() >= bot.cfg.max_entries) return false;
     if (!bot.interval_hit) return false;
     if (bot.tp_reached)    return false;  // 达到止盈时不加仓
@@ -949,6 +999,9 @@ bool CcgEngine::dca_gate_blocked(const CcgBot& bot,
 
 bool CcgEngine::should_close(const CcgBot& bot, double price) const {
     if (bot.entries.empty()) return false;
+    // 武装后由 ATR 线独占出场。常规追踪止盈的触发距离（动态模式 0.2~0.6%）
+    // 比 k×ATR（通常 6~10%）小一个量级，并存的结果是 ATR 线永远轮不到触发
+    if (bot.atr_armed)       return false;
     if (!bot.tp_reached)     return false;
 
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -966,6 +1019,14 @@ bool CcgEngine::should_close(const CcgBot& bot, double price) const {
                            : std::min(trail_th, floor_th);
     }
     return is_long ? (price <= trail_th) : (price >= trail_th);
+}
+
+bool CcgEngine::should_atr_trail_close(const CcgBot& bot, double price) const {
+    if (!bot.atr_armed)      return false;
+    if (bot.entries.empty()) return false;
+    if (bot.atr_stop <= 0)   return false;
+    const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
+    return is_long ? (price <= bot.atr_stop) : (price >= bot.atr_stop);
 }
 
 bool CcgEngine::should_stop_loss(const CcgBot& bot, double price) const {
@@ -1286,9 +1347,11 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                             std::to_string(price) + " | " + decision_snap);
                 }
             } else if (should_stop_loss(bot, price)) {
-                // 硬止损优先于追踪止盈
+                // 硬止损优先于一切追踪出场
                 do_close.push_back({id, "硬止损"});
                 bot.pending = true;
+            } else if (should_atr_trail_close(bot, price)) {
+                do_close.push_back({id, "ATR移动止损"});
                 bot.pending = true;
             } else if (should_close(bot, price)) {
                 do_close.push_back({id, "追踪止盈"});

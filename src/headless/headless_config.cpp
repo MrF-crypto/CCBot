@@ -96,6 +96,18 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.stop_loss_pct = get_num(bo, "stop_loss_pct", c.stop_loss_pct);
     c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
     c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
+    c.use_atr_trail      = get_bool(bo, "use_atr_trail", c.use_atr_trail);
+    c.atr_trail_mult     = get_num(bo, "atr_trail_mult", c.atr_trail_mult);
+    c.atr_trail_period   = (int)get_num(bo, "atr_trail_period", c.atr_trail_period);
+    c.atr_trail_interval = get_str(bo, "atr_trail_interval", c.atr_trail_interval);
+    if (c.use_atr_trail && c.atr_trail_mult <= 0) {
+        err = c.symbol + ": atr_trail_mult 必须大于0（它是止损距离的倍数）";
+        return false;
+    }
+    if (c.use_atr_trail && c.atr_trail_period < 2) {
+        err = c.symbol + ": atr_trail_period 至少为2";
+        return false;
+    }
     // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
     // 而使用者以为仓位已经有进程外保护了
     if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
@@ -203,6 +215,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "interval_pct", "trail_entry", "tp_pct", "trail_tp", "auto_restart",
         "cooldown_secs", "reentry_drawdown_pct", "reentry_memory_days",
         "stop_loss_pct", "use_disaster_stop", "disaster_stop_pct",
+        "use_atr_trail", "atr_trail_mult", "atr_trail_period", "atr_trail_interval",
         "entry_mode", "kline_interval",
         "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
         "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",

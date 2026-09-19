@@ -340,6 +340,7 @@ int main(int argc, char** argv) {
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     std::atomic<bool> ind_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
     std::atomic<bool> sar_sig_busy{false}, sar_rec_busy{false};
+    std::atomic<bool> dca_atr_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
     // 数据池要同时承载价格 REST 兜底、日线/趋势、1h 指标三类批次，2 个线程在
@@ -452,6 +453,27 @@ int main(int argc, char** argv) {
                 hf << std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count()
                    << " tick=" << tick_n << " bots=" << bots.size() << "\n";
+            }
+        }
+
+        // ── 1b2) DCA 的 ATR 移动止损：只为勾了开关的 bot 拉 ATR ──────────────
+        // 没勾的一次请求都不发。ATR 对普通网格毫无意义
+        if (!dca_atr_busy.load() && (tick_n % 20) == 5) {
+            std::vector<CcgBot> need;
+            for (const auto& b : bots)
+                if (b.cfg.use_atr_trail && b.state != CcgBot::State::Stopped)
+                    need.push_back(b);
+            if (!need.empty()) {
+                dca_atr_busy.store(true);
+                fetch_pool->submit([client, engine, need, &dca_atr_busy]() {
+                    for (const auto& b : need) {
+                        const double a = client->fetch_atr(b.cfg.symbol,
+                                                           b.cfg.atr_trail_interval,
+                                                           b.cfg.atr_trail_period);
+                        if (a > 0) engine->update_atr(b.bot_id, a);
+                    }
+                    dca_atr_busy.store(false);
+                });
             }
         }
 

@@ -105,6 +105,31 @@ struct CcgConfig {
     bool        use_disaster_stop = false;
     double      disaster_stop_pct = 30.0;   // 仅在 use_disaster_stop=true 时生效
 
+    // ── ATR 移动止损（勾选即冻结梯子）───────────────────────────────────────
+    // 勾上之后这个 bot 从"网格"切换成"持有并追踪"：
+    //   · 【不再补仓】——已有的层保留，但不会再加新的
+    //   · 止损线 = 持仓期极值 ∓ k×ATR，棘轮，只朝有利方向移动
+    //   · 常规追踪止盈停用（它的触发距离比 k×ATR 小一个量级，并存等于
+    //     ATR 线永远轮不到触发）；硬止损与交易所侧灾难止损照常生效
+    //
+    // 为什么必须冻结梯子：止损线和补仓位都在现价下方，而止损线【总是更近】
+    //   （k×ATR 通常 6~10%，补仓间隔 6%，且止损线随极值上移、补仓位不动）。
+    //   两者并存的结果是价格一跌先打止损，梯子永远只有第一层——
+    //   等于把一个 DCA bot 伪装成单笔交易，而预算/层数/曲线全部失效。
+    //
+    // 典型用法有两个，对应"目前仓位"和"首仓"两种时机：
+    //   ① 已经套着的仓位反弹回来了，勾上它锁住这波回升，不等上轨；
+    //   ② 空仓时就勾上，于是首仓开出来就直接进入追踪模式，永远只有一层——
+    //      相当于"DCA 的入场闸门 + 趋势跟随的出场"
+    //
+    // ⚠ 勾选时若仓位正深套，止损线会落在现价下方 k×ATR 处，那是一个
+    //   【真实的亏损出场价】。这与"套住长持不止损"的取向直接冲突，
+    //   界面上会明确提示当前线位和对应的盈亏
+    bool        use_atr_trail       = false;
+    double      atr_trail_mult      = 3.0;    // 止损距离 = k × ATR
+    int         atr_trail_period    = 14;     // ATR 周期（Wilder）
+    std::string atr_trail_interval  = "4h";   // ATR 的K线周期
+
     // RSI 确认方式：Snapshot=当前这一刻 RSI 到没到阈值就行；
     // CrossFromOversold=必须先探底跌破 rsi_oversold_th，之后再回穿 rsi_threshold 才算数
     // （更严格的"动能反转"确认，避免在强趋势下跌中过早进场）
@@ -455,6 +480,15 @@ struct CcgBot {
     bool   tp_reached       = false;
     double tp_extreme       = 0;
 
+    // ── ATR 移动止损的运行时状态（use_atr_trail 时用）──────────────────────
+    // atr_value 由应用层周期喂入（0=还没拿到）。没有 ATR 就没有止损线，
+    // 此时【不武装】——绝不能因为数据没到就把梯子冻结在一个没有保护的状态
+    double atr_value  = 0;
+    std::chrono::steady_clock::time_point atr_time{};
+    bool   atr_armed  = false;   // 已武装：梯子冻结，止损线生效
+    double atr_peak   = 0;       // 武装后的极值（多=最高，空=最低）
+    double atr_stop   = 0;       // 棘轮止损线，只朝有利方向移动
+
     // 指标信号快照（entry_mode==Indicator 时，由 UI 每个 tick 异步拉取后写入）
     bool   ind_ok      = false;
     double ind_boll_lb = 0;
@@ -691,6 +725,9 @@ public:
                     bool chg_ok = false, double week_chg = 0);
     // 24h 滚动涨幅（来自 @ticker 流，与日线K线无关，故单独一个入口）
     void update_24h_change(const std::string& bot_id, bool ok, double pct);
+    // ATR 移动止损的 ATR 值（应用层按 bot 的 atr_trail_interval 周期拉取后喂入）。
+    // 只有勾了 use_atr_trail 的 bot 才需要——别的 bot 不该为它多发一次请求
+    void update_atr(const std::string& bot_id, double atr);
 
     // ── 工具 ──────────────────────────────────────────────────────────────────
     static std::vector<double> entry_usdt(const CcgConfig& cfg);  // 各层 USDT 分配
@@ -715,6 +752,7 @@ private:
                            std::chrono::steady_clock::time_point now) const;
     bool should_close     (const CcgBot& bot, double price) const;
     bool should_stop_loss (const CcgBot& bot, double price) const;
+    bool should_atr_trail_close(const CcgBot& bot, double price) const;
     // 交易所侧灾难止损单的挂/改/撤（在线程池里跑，内部不持 mtx_ 做 HTTP）
     void sync_disaster_stop  (const std::string& bot_id);
     void cancel_disaster_stop(const std::string& bot_id);

@@ -149,6 +149,12 @@ public:
     SarSnapshot fetch_sar_signal(const std::string& symbol, const std::string& interval,
                                  int donchian_period, int atr_period);
 
+    // 单独的 ATR 拉取（DCA 的 ATR 移动止损用）。公开接口，不占签名限流。
+    // 与 fetch_sar_signal 分开是因为这里【不需要唐奇安通道】——
+    // DCA 的入场由自己那套闸门决定，ATR 只用来定止损距离。
+    // 返回 0 = 数据不足或请求失败，调用方据此判定"不武装"
+    double fetch_atr(const std::string& symbol, const std::string& interval, int period);
+
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);
 

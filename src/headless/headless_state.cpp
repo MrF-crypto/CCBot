@@ -96,6 +96,11 @@ void save_headless_state(const std::string& path, const std::vector<CcgBot>& bot
            << "\"tp_reached\":"    << (b.tp_reached ? "true" : "false") << ","
            << "\"ind_dipped\":"    << (b.ind_dipped ? "true" : "false") << ","
            << "\"tp_extreme\":"    << b.tp_extreme << ","
+           // ATR 移动止损：武装状态和止损线必须跨重启存活。丢了的话重启后
+           // 梯子会解冻继续补仓，而用户以为自己已经切成"持有并追踪"了
+           << "\"atr_armed\":"    << (b.atr_armed ? "true" : "false") << ","
+           << "\"atr_peak\":"     << b.atr_peak << ","
+           << "\"atr_stop\":"     << b.atr_stop << ","
            << "\"realized_pnl\":"  << b.realized_pnl << ","
            << "\"cycle_count\":"   << b.cycle_count << ","
            << "\"full_layer_secs\":" << b.full_layer_secs << ","
@@ -189,6 +194,16 @@ std::vector<CcgBot> load_headless_state(const std::string& path, const std::vect
         bot.tp_reached        = get_bool(o, "tp_reached", false);
         bot.ind_dipped        = get_bool(o, "ind_dipped", false);
         bot.tp_extreme        = get_num(o, "tp_extreme", 0.0);
+        bot.atr_armed         = get_bool(o, "atr_armed", false);
+        bot.atr_peak          = get_num(o, "atr_peak", 0.0);
+        bot.atr_stop          = get_num(o, "atr_stop", 0.0);
+        // 半截状态：武装了却没有止损线，多头的 price<=stop 永远不成立，
+        // 梯子冻结却毫无保护——三种状态里最差的一种。当成未武装，
+        // 下一个 tick 拿到 ATR 后会重新武装并重新定线
+        if (bot.atr_armed && bot.atr_stop <= 0) {
+            bot.atr_armed = false;
+            bot.atr_peak = bot.atr_stop = 0;
+        }
         bot.realized_pnl      = get_num(o, "realized_pnl", 0.0);
         bot.cycle_count       = (int)get_num(o, "cycle_count", 0.0);
         bot.full_layer_secs   = (int64_t)get_num(o, "full_layer_secs", 0.0);

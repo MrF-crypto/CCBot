@@ -349,6 +349,10 @@ void MainWindow::save_bots() {
         o["stop_loss_pct"]= c.stop_loss_pct;
         o["use_disaster_stop"] = c.use_disaster_stop;
         o["disaster_stop_pct"] = c.disaster_stop_pct;
+        o["use_atr_trail"]      = c.use_atr_trail;
+        o["atr_trail_mult"]     = c.atr_trail_mult;
+        o["atr_trail_period"]   = c.atr_trail_period;
+        o["atr_trail_interval"] = QString::fromStdString(c.atr_trail_interval);
 
         o["entry_mode"]     = (int)c.entry_mode;
         o["kline_interval"] = QString::fromStdString(c.kline_interval);
@@ -389,6 +393,11 @@ void MainWindow::save_bots() {
         o["tp_reached"]        = b.tp_reached;
         o["ind_dipped"]        = b.ind_dipped;
         o["tp_extreme"]        = b.tp_extreme;
+        // 武装状态与止损线必须跨重启存活：丢了的话重启后梯子会解冻继续补仓，
+        // 而用户以为自己已经切成"持有并追踪"了
+        o["atr_armed"]         = b.atr_armed;
+        o["atr_peak"]          = b.atr_peak;
+        o["atr_stop"]          = b.atr_stop;
         o["realized_pnl"]      = b.realized_pnl;
         o["cycle_count"]       = b.cycle_count;
         // 满层健康度：随 bot 落盘，重启后继续累加（口径=自创建以来）
@@ -456,6 +465,10 @@ void MainWindow::load_and_restore_bots() {
         c.stop_loss_pct= o["stop_loss_pct"].toDouble(0.0);
         c.use_disaster_stop = o["use_disaster_stop"].toBool(false);
         c.disaster_stop_pct = o["disaster_stop_pct"].toDouble(30.0);
+        c.use_atr_trail      = o["use_atr_trail"].toBool(false);
+        c.atr_trail_mult     = o["atr_trail_mult"].toDouble(3.0);
+        c.atr_trail_period   = o["atr_trail_period"].toInt(14);
+        c.atr_trail_interval = o["atr_trail_interval"].toString("4h").toStdString();
 
         c.entry_mode     = (CcgConfig::EntryMode)o["entry_mode"].toInt(1);
         c.kline_interval = o["kline_interval"].toString("1h").toStdString();
@@ -510,6 +523,15 @@ void MainWindow::load_and_restore_bots() {
         bot.tp_reached        = o["tp_reached"].toBool();
         bot.ind_dipped        = o["ind_dipped"].toBool(false);
         bot.tp_extreme        = o["tp_extreme"].toDouble();
+        bot.atr_armed         = o["atr_armed"].toBool(false);
+        bot.atr_peak          = o["atr_peak"].toDouble(0);
+        bot.atr_stop          = o["atr_stop"].toDouble(0);
+        // 半截状态：武装了却没有止损线 ⇒ 梯子冻结却毫无保护。
+        // 当成未武装，下一个 tick 拿到 ATR 后重新定线
+        if (bot.atr_armed && bot.atr_stop <= 0) {
+            bot.atr_armed = false;
+            bot.atr_peak = bot.atr_stop = 0;
+        }
         bot.realized_pnl      = o["realized_pnl"].toDouble();
         bot.cycle_count       = o["cycle_count"].toInt();
         bot.full_layer_secs   = (int64_t)o["full_layer_secs"].toDouble();
@@ -1752,6 +1774,47 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         addHint(riskForm, t);
     }
 
+    // ── ATR 移动止损（勾选即冻结梯子）───────────────────────────────────────
+    auto* atrTrailBox = new QCheckBox("ATR 移动止损（勾选后不再补仓）");
+    atrTrailBox->setChecked(prefill ? prefill->cfg.use_atr_trail : false);
+    addCheck(riskForm, atrTrailBox);
+    auto* atrKEdit    = new QLineEdit(QString::number(
+                            prefill ? prefill->cfg.atr_trail_mult : 3.0));
+    auto* atrPerEdit  = new QLineEdit(QString::number(
+                            prefill ? prefill->cfg.atr_trail_period : 14));
+    auto* atrItvCombo = new QComboBox();
+    atrItvCombo->addItems({"15m", "1h", "4h", "12h", "1d"});
+    atrItvCombo->setCurrentText(QString::fromStdString(
+        prefill ? prefill->cfg.atr_trail_interval : std::string("4h")));
+    addSub(riskForm, "ATR 倍数 k", atrKEdit);
+    addSub(riskForm, "ATR 周期", atrPerEdit);
+    addSub(riskForm, "ATR K线周期", atrItvCombo);
+    for (QWidget* w : {(QWidget*)atrKEdit, (QWidget*)atrPerEdit, (QWidget*)atrItvCombo}) {
+        w->setEnabled(atrTrailBox->isChecked());
+        connect(atrTrailBox, &QCheckBox::toggled, w, &QWidget::setEnabled);
+    }
+    {
+        QString t =
+            "把这个 bot 从「网格」切换成「持有并追踪」：\n"
+            "· 【不再补仓】——已有的层保留，但不会再加新的\n"
+            "· 止损线 = 持仓期最高价 − k×ATR，棘轮，只上移不下移\n"
+            "· 常规追踪止盈停用（它的触发距离比 k×ATR 小一个量级，"
+            "并存的话 ATR 线永远轮不到触发）；硬止损与交易所灾难止损照常\n"
+            "\n"
+            "为什么必须冻结梯子：止损线和补仓位都在现价下方，而止损线总是更近"
+            "（k×ATR 通常 6~10%，补仓间隔 6%，且止损线会随新高上移、补仓位不动）。"
+            "两者并存的结果是价格一跌先打止损，梯子永远只有第一层。\n"
+            "\n"
+            "两种用法：\n"
+            "① 已经套着的仓位反弹回来了，勾上它锁住这波回升，不用等上轨；\n"
+            "② 空仓时就勾上，首仓开出来直接进入追踪模式，永远只有一层"
+            "——相当于「DCA 的入场闸门 + 趋势跟随的出场」。\n"
+            "\n"
+            "⚠ 如果勾选时仓位正深套，止损线会落在现价下方 k×ATR 处，"
+            "那是一个真实的亏损出场价。与「套住长持不止损」的取向直接冲突。";
+        addHint(riskForm, t);
+    }
+
     auto* autoRestartBox = new QCheckBox("自动重启");
     autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
     addCheck(form, autoRestartBox);
@@ -2320,6 +2383,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.stop_loss_pct = to_d(stopLossEdit,  0.0);
     cfg.use_disaster_stop = disStopBox->isChecked();
     cfg.disaster_stop_pct = to_d(disStopEdit, 30.0);
+    cfg.use_atr_trail      = atrTrailBox->isChecked();
+    cfg.atr_trail_mult     = to_d(atrKEdit, 3.0);
+    cfg.atr_trail_period   = (int)to_d(atrPerEdit, 14);
+    cfg.atr_trail_interval = atrItvCombo->currentText().toStdString();
+    if (cfg.atr_trail_mult <= 0)   cfg.atr_trail_mult   = 3.0;
+    if (cfg.atr_trail_period < 2)  cfg.atr_trail_period = 14;
 
     cfg.entry_mode     = (entryModeBox->currentIndex() == 1)
                         ? CcgConfig::EntryMode::Indicator : CcgConfig::EntryMode::Immediate;
@@ -2535,6 +2604,31 @@ void MainWindow::onTick() {
                         log(QString("SAR 信号已恢复：%1").arg(healed.join(", ")), "OK");
                     refreshSarTable();
                 }, Qt::QueuedConnection);
+            });
+        }
+    }
+
+    // ── DCA 的 ATR 移动止损：只为勾了这个开关的 bot 拉 ATR ───────────────────
+    // 每 20 个 tick 约 60 秒。没勾的 bot 一次请求都不发——ATR 对普通网格
+    // 毫无意义，v4.1.2 刚把它从 DCA 的公共批次里整条拆掉，别又加回去
+    if ((slowTickCount_ % 20) == 5 && !dcaAtrBusy_.load()) {
+        std::vector<CcgBot> need;
+        for (const auto& b : bots)
+            if (b.cfg.use_atr_trail && b.state != CcgBot::State::Stopped)
+                need.push_back(b);
+        if (!need.empty()) {
+            dcaAtrBusy_.store(true);
+            run_async([this, need]() {
+                for (const auto& b : need) {
+                    if (!client_ || !engine_) break;
+                    const double a = client_->fetch_atr(b.cfg.symbol,
+                                                        b.cfg.atr_trail_interval,
+                                                        b.cfg.atr_trail_period);
+                    if (a > 0) engine_->update_atr(b.bot_id, a);
+                }
+                dcaAtrBusy_.store(false);
+                QMetaObject::invokeMethod(this, [this]() { refreshBotTable(); },
+                                          Qt::QueuedConnection);
             });
         }
     }
@@ -3280,7 +3374,33 @@ void MainWindow::refreshBotTable() {
             } else {
                 tip += "\n\n健康：回测中满层<10% 的品种 22/22 盈利。";
             }
-            it->setToolTip(tip);
+            // 梯子被 ATR 移动止损冻结时，层进度必须一眼看出来——否则用户会
+            // 盯着"3/10"等第 4 层，而它永远不会来
+            if (b.atr_armed) {
+                it->setText(layers + "🔒");
+                it->setForeground(QColor("#d29922"));
+                QString atip = QString("ATR 移动止损已武装，梯子已冻结——不会再补仓。\n"
+                                       "当前第 %1 层即最终层。\n\n止损线 $%2")
+                                   .arg(b.entries.size())
+                                   .arg(b.atr_stop, 0, 'f', 6);
+                if (b.current_price > 0 && b.atr_stop > 0) {
+                    const double d = std::fabs(b.current_price - b.atr_stop)
+                                     / b.current_price * 100.0;
+                    atip += QString("（距现价 %1%）").arg(d, 0, 'f', 2);
+                }
+                if (b.avg_price > 0 && b.atr_stop > 0) {
+                    const bool is_long = (b.cfg.direction == CcgConfig::Direction::Long);
+                    const double pnl_pct = (b.atr_stop - b.avg_price) / b.avg_price
+                                           * 100.0 * (is_long ? 1.0 : -1.0);
+                    // 把"现在被打掉是赚是亏"直接摆出来。深套时勾选这个功能
+                    // 会把浮亏变成实亏，这个数是唯一能提前看见它的地方
+                    atip += QString("\n触发时相对均价 %1%2%")
+                                .arg(pnl_pct >= 0 ? "+" : "").arg(pnl_pct, 0, 'f', 2);
+                }
+                it->setToolTip(atip);
+            } else {
+                it->setToolTip(tip);
+            }
             botTable_->setItem(i, 4, it);
         }
         // 均价 + 资金费修正后的回本价（悬停）。放在均价上是有道理的：回本价本质

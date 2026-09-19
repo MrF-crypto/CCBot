@@ -64,7 +64,9 @@ cmake --build build --config Release --target ccbot_headless
 | `reentry_drawdown_pct` | 止盈后重开需回撤% | `0`=关。多头要求现价 ≤ 上次止盈价×(1−此值)，空头镜像。**只记追踪止盈**，止损/手动平仓不记 |
 | `reentry_memory_days` | 上述记忆的过期天数 | 默认 `30`，`0`=永不过期。必须有过期——一个再也回不去的价位会把 bot 永久锁死 |
 | `use_disaster_stop` / `disaster_stop_pct` | 交易所侧灾难止损单 | 默认关。在**交易所**挂 `STOP_MARKET + closePosition`，程序崩了它依然生效——唯一的进程外保护。⚠ 它会把浮亏变成实亏，与「套住长持」的取向冲突 |
-
+| `use_atr_trail` | **ATR 移动止损（勾选即冻结梯子）** | `true` 时这个 bot 从「网格」切换成「持有并追踪」：**不再补仓**，已有的层保留；止损线 = 持仓期极值 ∓ k×ATR，棘轮只朝有利方向移动；常规追踪止盈停用（它的触发距离比 k×ATR 小一个量级，并存等于 ATR 线永远轮不到触发），硬止损与交易所灾难止损照常 |
+| `atr_trail_mult` | 止损距离倍数 k | 默认 `3.0`。止损距离 = k × ATR |
+| `atr_trail_period` / `atr_trail_interval` | ATR 参数 | 默认 `14` / `4h` |
 ## SAR 趋势跟随策略（`sar_bots`）
 
 和 `bots`（DCA 网格）是**两套并列的策略**，可以只配一套，也可以同时配不同品种。
