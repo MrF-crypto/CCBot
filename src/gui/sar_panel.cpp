@@ -303,10 +303,16 @@ void MainWindow::refreshSarTable() {
 
 void MainWindow::onAddSarSymbol() {
     if (!addSarEdit_) return;
-    const QString sym = addSarEdit_->text().trimmed().toUpper();
-    if (sym.isEmpty()) return;
+    QString raw = addSarEdit_->text().trimmed().toUpper();
     addSarEdit_->clear();
-    openSarDialog(sym.toStdString());
+    if (raw.isEmpty()) return;
+
+    // 与 DCA 的加品种框同款补全：只输代币符号即可，默认 USDT 永续。
+    // 不补全的话 "BTC" 会被原样拿去请求 K 线——币安合约没有这个交易对，
+    // 于是永远拉不到数据、永远"等信号"，而界面上看不出任何异常
+    if (raw.endsWith("USDT")) raw.chop(4);
+    if (raw.isEmpty()) return;
+    openSarDialog((raw + "USDT").toStdString());
 }
 
 void MainWindow::onSarContextMenu(const QPoint& pos) {
@@ -468,6 +474,21 @@ void MainWindow::openSarDialog(const std::string& symbol) {
             }
     }
 
+    // 品种是否真的存在。补全后缀只能救 "BTC" 这类漏写，救不了拼错的币名——
+    // 而拼错的后果是永远拉不到 K 线、永远"等信号"，除非去翻日志否则看不出来。
+    // 这里一次同步查询（有缓存，通常是内存命中），比让用户干等一小时划算
+    if (client_) {
+        auto info = client_->get_symbol_info(c.symbol);
+        if (!info.valid) {
+            QMessageBox::warning(this, "品种不存在",
+                QString::fromStdString(c.symbol) +
+                " 在币安 USDT-M 合约上不存在。\n\n"
+                "请检查拼写。只需要输入代币符号（如 BTC / ETH / SUI），"
+                "程序会自动补全 USDT 后缀。");
+            return;
+        }
+    }
+
     const auto id = sar_engine_->add_bot(c);
     if (id.empty()) {
         QMessageBox::warning(this, "添加失败", "该品种已存在一个未停止的 SAR bot。");
@@ -547,8 +568,18 @@ void MainWindow::load_and_restore_sar() {
     for (const auto& v : doc.array()) {
         if (!v.isObject()) continue;
         const auto o = v.toObject();
-        const auto sym = o["symbol"].toString();
+        auto sym = o["symbol"].toString();
         if (sym.isEmpty()) continue;
+
+        // 迁移：v4.1.1 之前 SAR 的加品种框不补 USDT 后缀，存进来的可能是 "BTC"。
+        // 这种条目永远拉不到 K 线、永远"等信号"。补全并明确告知，
+        // 否则用户升级后还得自己找出来删掉重加
+        if (!sym.endsWith("USDT")) {
+            const QString fixed = sym + "USDT";
+            log(QString("SAR 品种 %1 缺少 USDT 后缀，已自动更正为 %2"
+                        "（币安合约的代码形如 BTCUSDT）").arg(sym, fixed), "WARN");
+            sym = fixed;
+        }
 
         SarBot b;
         b.cfg.symbol      = sym.toStdString();
@@ -586,6 +617,22 @@ void MainWindow::load_and_restore_sar() {
             (b.st.entry_price <= 0 || b.st.stop <= 0 || b.qty <= 0)) {
             b.st = sar::State{};
             b.qty = 0;
+        }
+
+        // 跨引擎冲突：弹窗里两个方向都拦了，但【恢复路径没有】——落盘文件是
+        // 手工改过的、或者两套配置在不同版本里先后加上的，就会漏进来。
+        // 两个引擎接管同一个交易所仓位会互相平掉对方的单，宁可不恢复
+        bool taken_by_dca = false;
+        if (engine_) {
+            for (const auto& db : engine_->get_bots())
+                if (db.cfg.symbol == b.cfg.symbol &&
+                    db.state != CcgBot::State::Stopped) { taken_by_dca = true; break; }
+        }
+        if (taken_by_dca) {
+            log(QString("SAR %1 未恢复：该品种已由网格 DCA 接管。"
+                        "两套策略会在同一个交易所仓位上互相平掉对方的单，必须二选一")
+                    .arg(QString::fromStdString(b.cfg.symbol)), "WARN");
+            continue;
         }
 
         if (!sar_engine_->restore_bot(b).empty()) {

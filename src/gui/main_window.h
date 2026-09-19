@@ -243,6 +243,10 @@ private:
     // 没有它的话刚添加的品种会干等最多 60 秒，界面上什么都没有——
     // 而用户此刻正盯着看它到底有没有在工作
     std::atomic<bool> sarSigForce_{false};
+    // 已经报过「信号拉不到」的品种（仅 GUI 线程访问）。存在的理由是去重：
+    // 拉取每分钟一轮，而一个拼错的品种会永远失败——不去重就是每小时 60 条
+    // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
+    std::set<std::string> sarSigFailed_;
     std::atomic<bool> sarRecBusy_{false};
 
     // ── 日志 ──

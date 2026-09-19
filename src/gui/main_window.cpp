@@ -2508,12 +2508,31 @@ void MainWindow::onTick() {
                 }
                 sarSigBusy_.store(false);
                 QMetaObject::invokeMethod(this, [this, failed, okn]() {
-                    if (!failed.isEmpty())
-                        log(QString("⚠ SAR 信号拉取失败 %1 个品种：%2"
-                                    "（成功 %3 个）。拉不到 K 线 = 没有 ATR = "
-                                    "没有止损线，这些品种不会开新仓")
-                                .arg(failed.size()).arg(failed.join(", ")).arg(okn),
-                            "WARN");
+                    // 只在【集合变化】时报。拉取每分钟一轮，而一个拼错的品种会
+                    // 永远失败——每轮都报就是每小时 60 条同样的告警，把真正有用
+                    // 的日志全冲走（本项目踩过这个：150 行日志里 120 行是噪音）
+                    std::set<std::string> now;
+                    for (const auto& f : failed) now.insert(f.toStdString());
+
+                    QStringList fresh;
+                    for (const auto& s : now)
+                        if (!sarSigFailed_.count(s))
+                            fresh << QString::fromStdString(s);
+                    QStringList healed;
+                    for (const auto& s : sarSigFailed_)
+                        if (!now.count(s))
+                            healed << QString::fromStdString(s);
+                    sarSigFailed_ = std::move(now);
+
+                    if (!fresh.isEmpty())
+                        log(QString("⚠ SAR 信号拉取失败：%1（本轮成功 %2 个）。"
+                                    "拉不到 K 线 = 没有 ATR = 没有止损线，"
+                                    "这些品种不会开新仓。"
+                                    "最常见的原因是品种名不对——币安合约的代码形如 "
+                                    "BTCUSDT，不是 BTC")
+                                .arg(fresh.join(", ")).arg(okn), "WARN");
+                    if (!healed.isEmpty())
+                        log(QString("SAR 信号已恢复：%1").arg(healed.join(", ")), "OK");
                     refreshSarTable();
                 }, Qt::QueuedConnection);
             });
