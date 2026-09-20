@@ -153,9 +153,19 @@ void MainWindow::refreshSarTable() {
 
         sarTable_->setItem(i, C_IDX, mk(QString::number(i + 1)));
         sarTable_->setItem(i, C_SYM, mk(QString::fromStdString(b.cfg.symbol)));
-        sarTable_->setItem(i, C_DIR,
-            mk(has_pos ? (is_long ? "多" : "空") : "—",
-               has_pos ? (is_long ? "#3fb950" : "#f85149") : "#8b949e"));
+        // 方向列带上金字塔档数：持 3 档和持 1 档的敞口差 3 倍，
+        // 不显示的话你看不出这个仓位到底压了多重
+        QString dir_txt = has_pos ? (is_long ? "多" : "空") : "—";
+        if (has_pos && b.cfg.rule.pyramid_max_adds > 0)
+            dir_txt += QString("×%1").arg(b.st.adds_done + 1);
+        auto* dir_it = mk(dir_txt,
+                          has_pos ? (is_long ? "#3fb950" : "#f85149") : "#8b949e");
+        if (has_pos && b.cfg.rule.pyramid_max_adds > 0)
+            dir_it->setToolTip(QString("已加到 %1/%2 档（首档 + %3 次加仓）")
+                                   .arg(b.st.adds_done + 1)
+                                   .arg(b.cfg.rule.pyramid_max_adds + 1)
+                                   .arg(b.st.adds_done));
+        sarTable_->setItem(i, C_DIR, dir_it);
 
         QString st = (b.state == SarBot::State::Stopped) ? "已停止"
                    : b.pending                            ? "下单中"
@@ -354,8 +364,32 @@ void MainWindow::openSarDialog(const std::string& symbol) {
     budget->setRange(10, 10'000'000);
     budget->setDecimals(2);
     budget->setValue(c.budget_usdt);
-    budget->setToolTip("每笔仓位的名义价值。SAR 是单仓位、没有分层，这就是全部。");
-    form->addRow("仓位名义价值 (USDT)", budget);
+    budget->setToolTip("固定名义模式：每笔仓位的名义价值。\n"
+                       "等风险模式：名义价值的【上限】（ATR 极小时兜住公式算出的天量仓位）。");
+    form->addRow("仓位名义/上限 (USDT)", budget);
+
+    auto* sizeMode = new QComboBox();
+    sizeMode->addItem("固定名义", (int)SarConfig::SizeMode::Notional);
+    sizeMode->addItem("按 ATR 等风险", (int)SarConfig::SizeMode::RiskBased);
+    sizeMode->setCurrentIndex(c.size_mode == SarConfig::SizeMode::RiskBased ? 1 : 0);
+    sizeMode->setToolTip(
+        "固定名义：每笔都是同样的名义价值。\n"
+        "等风险：名义 = 单次愿亏 / (k×ATR%)，每笔止损亏的钱固定。\n\n"
+        "为什么需要等风险：同一份名义，在 4h ATR 1.6% 的 LTC 和 5.3% 的 COTI 上，"
+        "单次止损亏的钱差 3.3 倍。固定名义 = 风险全压在高波动那几个品种上，"
+        "而「铺开品种分散风险」就此失效。这是海龟的「单位」概念。");
+    form->addRow("仓位算法", sizeMode);
+
+    auto* riskEdit = new QDoubleSpinBox();
+    riskEdit->setRange(0, 1'000'000);
+    riskEdit->setDecimals(2);
+    riskEdit->setValue(c.risk_usdt);
+    riskEdit->setToolTip("单次止损愿意亏多少钱（USDT）。只在等风险模式下生效。\n"
+                         "账户 10000U、每次探测愿亏 1% ⇒ 填 100。");
+    form->addRow("单次愿亏 (USDT)", riskEdit);
+    riskEdit->setEnabled(sizeMode->currentIndex() == 1);
+    connect(sizeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            riskEdit, [riskEdit](int i) { riskEdit->setEnabled(i == 1); });
 
     auto* lev = new QSpinBox();
     lev->setRange(1, 125);
@@ -419,6 +453,31 @@ void MainWindow::openSarDialog(const std::string& symbol) {
     cd->setToolTip("触顶后冷却多少根【K线】（不是 tick）。");
     form->addRow("冷却K线数", cd);
 
+    auto* pyrMax = new QSpinBox();
+    pyrMax->setRange(0, 10);
+    pyrMax->setValue(c.rule.pyramid_max_adds);
+    pyrMax->setToolTip(
+        "金字塔加仓档数（0=关）。探测仓开出来后，每朝有利方向再走若干个 ATR "
+        "就加一档。\n\n"
+        "它回答的是「怎么低成本试出单边大行情」：错了只亏第一档，对了越骑越重。\n"
+        "与 DCA 的补仓方向【相反】——DCA 是跌了加（摊薄），这里是涨了加（顺势）。\n\n"
+        "加仓不额外挪止损线：ATR 棘轮本来就跟着新高走，加仓时线已经在更高位置了。");
+    form->addRow("顺势加仓档数", pyrMax);
+
+    auto* pyrStep = new QDoubleSpinBox();
+    pyrStep->setRange(0.1, 10.0);
+    pyrStep->setSingleStep(0.1);
+    pyrStep->setDecimals(2);
+    pyrStep->setValue(c.rule.pyramid_step_atr);
+    pyrStep->setToolTip("每走多少个 ATR 加一档（海龟原版 0.5）。\n"
+                        "间距从【上一档的成交价】量起，不是首档——否则越加越密。");
+    form->addRow("加仓间距 (×ATR)", pyrStep);
+    for (QWidget* w : {(QWidget*)pyrStep}) {
+        w->setEnabled(pyrMax->value() > 0);
+        connect(pyrMax, QOverload<int>::of(&QSpinBox::valueChanged),
+                w, [w](int v) { w->setEnabled(v > 0); });
+    }
+
     auto* note = new QLabel(
         "没有固定止盈，这是设计而非遗漏：趋势跟随胜率天然只有 30~40%，\n"
         "收益全来自少数几笔跑得很远的单子。固定止盈会砍断它们，\n"
@@ -445,6 +504,17 @@ void MainWindow::openSarDialog(const std::string& symbol) {
     c.rule.reverse_needs_signal = revSig->isChecked();
     c.rule.max_consecutive_reverses = maxRev->value();
     c.rule.cooldown_bars   = cd->value();
+    c.size_mode = (SarConfig::SizeMode)sizeMode->currentData().toInt();
+    c.risk_usdt = riskEdit->value();
+    c.rule.pyramid_max_adds = pyrMax->value();
+    c.rule.pyramid_step_atr = pyrStep->value();
+
+    if (c.size_mode == SarConfig::SizeMode::RiskBased && c.risk_usdt <= 0) {
+        QMessageBox::warning(this, "缺少参数",
+            "选择了「按 ATR 等风险」，但没有填「单次愿亏」。\n\n"
+            "这个模式用 单次愿亏 ÷ (k×ATR) 反推仓位，没有它算不出任何数量。");
+        return;
+    }
 
     if (existing) {
         // 编辑已有：先删再建会丢掉持仓跟踪，所以有持仓时不允许改。
@@ -532,6 +602,10 @@ void MainWindow::save_sar_bots() {
         o["reverse_needs_signal"] = b.cfg.rule.reverse_needs_signal;
         o["max_consecutive_reverses"] = b.cfg.rule.max_consecutive_reverses;
         o["cooldown_bars"]   = b.cfg.rule.cooldown_bars;
+        o["size_mode"]       = (int)b.cfg.size_mode;
+        o["risk_usdt"]       = b.cfg.risk_usdt;
+        o["pyramid_max_adds"] = b.cfg.rule.pyramid_max_adds;
+        o["pyramid_step_atr"] = b.cfg.rule.pyramid_step_atr;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
         o["state"]           = (int)b.state;
         // ── 运行时状态 ──
@@ -543,6 +617,8 @@ void MainWindow::save_sar_bots() {
         o["stop"]            = b.st.stop;
         o["consec_reverses"] = b.st.consec_reverses;
         o["cooldown_left"]   = b.st.cooldown_left;
+        o["adds_done"]       = b.st.adds_done;
+        o["last_add_price"]  = b.st.last_add_price;
         o["qty"]             = b.qty;
         o["realized_pnl"]    = b.realized_pnl;
         o["trade_count"]     = b.trade_count;
@@ -593,6 +669,10 @@ void MainWindow::load_and_restore_sar() {
         b.cfg.rule.reverse_needs_signal = o["reverse_needs_signal"].toBool(true);
         b.cfg.rule.max_consecutive_reverses = o["max_consecutive_reverses"].toInt(2);
         b.cfg.rule.cooldown_bars   = o["cooldown_bars"].toInt(3);
+        b.cfg.size_mode = (SarConfig::SizeMode)o["size_mode"].toInt(0);
+        b.cfg.risk_usdt = o["risk_usdt"].toDouble(0);
+        b.cfg.rule.pyramid_max_adds = o["pyramid_max_adds"].toInt(0);
+        b.cfg.rule.pyramid_step_atr = o["pyramid_step_atr"].toDouble(0.5);
         b.cfg.signal_max_age_sec   = o["signal_max_age_sec"].toInt(900);
         b.state = (SarBot::State)o["state"].toInt(0);
 
@@ -605,6 +685,8 @@ void MainWindow::load_and_restore_sar() {
         b.st.stop            = o["stop"].toDouble(0);
         b.st.consec_reverses = o["consec_reverses"].toInt(0);
         b.st.cooldown_left   = o["cooldown_left"].toInt(0);
+        b.st.adds_done       = o["adds_done"].toInt(0);
+        b.st.last_add_price  = o["last_add_price"].toDouble(0);
         b.qty          = o["qty"].toDouble(0);
         b.realized_pnl = o["realized_pnl"].toDouble(0);
         b.trade_count  = o["trade_count"].toInt(0);

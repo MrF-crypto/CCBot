@@ -32,8 +32,23 @@
 namespace ccbot {
 
 struct SarConfig {
+    // 仓位大小的两种算法：
+    //   Notional  —— 固定名义价值（budget_usdt 就是名义）
+    //   RiskBased —— 固定【单次愿亏金额】，名义由 ATR 反推：
+    //                  名义 = risk_usdt / (k × ATR%)
+    //
+    // 为什么要有 RiskBased：同一份名义价值，在 4h ATR 1.6% 的 LTC 和 5.3% 的
+    // COTI 上，单次止损亏的钱差 3.3 倍。固定名义 = 风险全压在高波动那几个品种上，
+    // 而"铺开品种分散风险"这件事就此失效。等风险下单才让多品种配置真正成立。
+    // 这是海龟的"单位"概念。
+    enum class SizeMode { Notional, RiskBased };
+
     std::string symbol;
-    double      budget_usdt = 1000;   // 每笔仓位的名义价值
+    SizeMode    size_mode   = SizeMode::Notional;
+    // RiskBased 时：单次止损愿意亏多少钱。名义上限仍由 budget_usdt 兜住——
+    // ATR 极小时 risk/(k×ATR) 会算出一个荒谬的大仓位，必须有帽子
+    double      risk_usdt   = 0;
+    double      budget_usdt = 1000;   // Notional：名义价值；RiskBased：名义上限
     int         leverage    = 3;
     std::string interval    = "4h";   // 信号K线周期
     sar::Config rule;                 // 通道/ATR/k/反手规则
@@ -152,11 +167,14 @@ private:
     void submit_close(const std::string& bot_id, const std::string& reason,
                       sar::Pos reverse_to);
     void submit_open (const std::string& bot_id, sar::Pos dir, bool from_reverse);
+    void submit_add  (const std::string& bot_id);
     void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
     void log(const std::string& msg) const;
 
     // 计算下单数量。名义预算 / 价格，再按交易所步长取整
-    double plan_qty(const SarConfig& cfg, double price) const;
+    // 计算下单数量。Notional 用固定名义；RiskBased 按 ATR 反推并受 budget 封顶。
+    // atr 传 0 时 RiskBased 无法计算，返回 0（调用方据此跳过下单）
+    double plan_qty(const SarConfig& cfg, double price, double atr) const;
 
     std::shared_ptr<ITradingClient> client_;
     std::shared_ptr<ThreadPool>     pool_;

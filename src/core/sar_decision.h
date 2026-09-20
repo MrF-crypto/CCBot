@@ -43,6 +43,20 @@ struct Config {
     // 连续反手本身就是"当前是震荡市"的信号
     int    max_consecutive_reverses = 2;
     int    cooldown_bars            = 3;   // 触顶后冷却多少根K线（0=不冷却）
+
+    // ── 金字塔加仓（0=关）──────────────────────────────────────────────────
+    // 探测仓开出来之后，每朝有利方向再走 pyramid_step_atr 个 ATR 就加一档，
+    // 最多加 pyramid_max_adds 档。海龟原版的做法。
+    //
+    // 它回答的是"怎么低成本试出单边大行情"：错了只亏第一档，对了越骑越重。
+    // 与 DCA 的补仓【方向相反】——DCA 是跌了加（摊薄），这里是涨了加（顺势）。
+    //
+    // ⚠ 加仓不额外挪止损线：Chandelier 棘轮本来就跟着极值走，加仓时极值已经
+    //   推上去了，线自然在更高的位置。再单独挪一次等于把两套逻辑叠在一起。
+    // ⚠ 加完之后 entry_price 变成【加权均价】，否则"出场价≥成本"会按第一档
+    //   的价格判，把一笔实际亏损的出场误判成盈利出场（进而不反手）
+    int    pyramid_max_adds  = 0;
+    double pyramid_step_atr  = 0.5;
 };
 
 struct State {
@@ -52,6 +66,10 @@ struct State {
     double stop        = 0;   // 棘轮止损线，只朝有利方向移动
     int    consec_reverses = 0;
     int    cooldown_left   = 0;   // 剩余冷却K线数
+    // 金字塔加仓状态。last_add_price 是【最近一档的成交价】，不是首档——
+    // 加仓间距从上一档量起（海龟口径），否则越加越密
+    int    adds_done       = 0;
+    double last_add_price  = 0;
 };
 
 struct Inputs {
@@ -70,6 +88,7 @@ enum class Action {
     Close,              // 平掉当前仓位，转观望
     CloseReverseLong,   // 平空并反手做多
     CloseReverseShort,  // 平多并反手做空
+    Add,                // 金字塔加仓（方向同当前持仓）
 };
 
 struct Verdict {
@@ -125,6 +144,20 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
 
         const bool hit = is_long ? (in.price <= st.stop) : (in.price >= st.stop);
         if (!hit) {
+            // 没触线 → 看要不要金字塔加仓。顺序不能反：先判出场再判加仓，
+            // 否则同一 tick 里既触线又够加仓间距时会先加一档再被平掉
+            if (cfg.pyramid_max_adds > 0 && st.adds_done < cfg.pyramid_max_adds &&
+                in.atr > 0 && cfg.pyramid_step_atr > 0 && st.last_add_price > 0) {
+                const double step_px = cfg.pyramid_step_atr * in.atr;
+                const bool far_enough = is_long
+                    ? (in.price >= st.last_add_price + step_px)
+                    : (in.price <= st.last_add_price - step_px);
+                if (far_enough) {
+                    v.action = Action::Add;
+                    v.reason = "顺势加仓";
+                    return v;
+                }
+            }
             v.reason = "持仓中";
             return v;
         }
@@ -194,11 +227,26 @@ inline void on_filled(State& st, Pos p, double fill_price, double atr,
     st.peak        = fill_price;
     st.stop        = chandelier(p, fill_price, atr, cfg.atr_mult);
     st.consec_reverses = from_reverse ? st.consec_reverses + 1 : 0;
+    // 新一轮的金字塔计数归零。反手开出来的仓位同样从第 0 档重新算——
+    // 否则上一轮加过的档数会让这一轮少加几档
+    st.adds_done      = 0;
+    st.last_add_price = fill_price;
+}
+
+// 加仓成交后调用。new_avg_entry 由引擎按数量加权算出并传进来：
+// 决策核心不跟踪持仓数量，但 entry_price 必须是加权均价，否则
+// "出场价≥成本"会拿第一档的价格去判，把实际亏损的出场误判成盈利出场
+inline void on_added(State& st, double fill_price, double new_avg_entry) {
+    ++st.adds_done;
+    st.last_add_price = fill_price;
+    if (new_avg_entry > 0) st.entry_price = new_avg_entry;
 }
 
 inline void on_closed(State& st) {
     st.pos = Pos::Flat;
     st.entry_price = st.peak = st.stop = 0;
+    st.adds_done = 0;
+    st.last_add_price = 0;
 }
 
 inline const char* pos_name(Pos p) {

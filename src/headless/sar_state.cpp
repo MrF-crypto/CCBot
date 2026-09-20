@@ -78,6 +78,8 @@ void save_sar_state(const std::string& path, const std::vector<SarBot>& bots) {
            << "\"stop\":"        << b.st.stop << ","
            << "\"consec_reverses\":" << b.st.consec_reverses << ","
            << "\"cooldown_left\":"   << b.st.cooldown_left << ","
+           << "\"adds_done\":"      << b.st.adds_done << ","
+           << "\"last_add_price\":" << b.st.last_add_price << ","
            << "\"qty\":"          << b.qty << ","
            << "\"current_price\":" << b.current_price << ","
            << "\"realized_pnl\":" << b.realized_pnl << ","
@@ -148,6 +150,8 @@ std::vector<SarBot> load_sar_state(const std::string& path,
         b.st.stop            = get_num(o, "stop", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.st.cooldown_left   = (int)get_num(o, "cooldown_left", 0);
+        b.st.adds_done       = (int)get_num(o, "adds_done", 0);
+        b.st.last_add_price  = get_num(o, "last_add_price", 0);
         b.qty           = get_num(o, "qty", 0);
         b.current_price = get_num(o, "current_price", 0);
         b.realized_pnl  = get_num(o, "realized_pnl", 0);

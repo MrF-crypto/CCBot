@@ -345,6 +345,160 @@ int main() {
         check(!b.pending, "手动平仓后 pending 必须复位");
     }
 
+    // ── 按 ATR 等风险下单 ────────────────────────────────────────────────────
+    {
+        // 同样的 risk_usdt，ATR 大的品种应当拿到更小的名义——这正是"铺开品种
+        // 分散风险"能成立的前提。固定名义下，高波动品种会独占全部风险
+        auto cli = std::make_shared<FakeClient>();
+        cli->qty_step = 1e-8;              // 不让取整掩盖差异
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.size_mode   = SarConfig::SizeMode::RiskBased;
+        cfg.risk_usdt   = 100.0;           // 每次止损愿亏 100U
+        cfg.budget_usdt = 1'000'000.0;     // 名义上限设很高，先看纯公式
+        cfg.rule.atr_mult = 3.0;
+        auto id = eng.add_bot(cfg);
+
+        feed(eng, id, 2.0, 110, 90);       // ATR=2.0，价 110 ⇒ 止损距离 6.0
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(cli->calls.size() == 1, "等风险模式应能下单");
+        // 数量 = risk / (k×ATR) = 100 / 6 = 16.667
+        check(std::fabs(cli->calls[0].qty - 100.0 / 6.0) < 1e-6,
+              "数量应为 risk/(k×ATR)");
+        // 止损被打时亏的钱 = qty × 止损距离 = 100U，与 ATR 无关
+        check(std::fabs(cli->calls[0].qty * 6.0 - 100.0) < 1e-6,
+              "  单次止损亏损应恰为 risk_usdt");
+    }
+    {
+        // ATR 翻倍 ⇒ 名义减半
+        auto cli = std::make_shared<FakeClient>();
+        cli->qty_step = 1e-8;
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.size_mode   = SarConfig::SizeMode::RiskBased;
+        cfg.risk_usdt   = 100.0;
+        cfg.budget_usdt = 1'000'000.0;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 4.0, 110, 90);       // ATR 翻倍
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(std::fabs(cli->calls[0].qty - 100.0 / 12.0) < 1e-6,
+              "ATR 翻倍时数量应减半");
+    }
+    {
+        // 名义上限必须兜住：ATR 趋近 0 时公式会算出荒谬的大仓位
+        auto cli = std::make_shared<FakeClient>();
+        cli->qty_step = 1e-8;
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.size_mode   = SarConfig::SizeMode::RiskBased;
+        cfg.risk_usdt   = 100.0;
+        cfg.budget_usdt = 500.0;           // 名义上限
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 0.001, 110, 90);     // ATR 极小 ⇒ 公式给出天量
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(std::fabs(cli->calls[0].qty - 500.0 / 110.0) < 1e-6,
+              "ATR 极小时必须被 budget_usdt 封顶，否则一个品种能吃掉整个账户");
+    }
+
+    // ── 金字塔加仓 ───────────────────────────────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.pyramid_max_adds = 2;
+        cfg.rule.pyramid_step_atr = 0.5;   // ATR=2.0 ⇒ 每涨 1.0 加一档
+        auto id = eng.add_bot(cfg);
+
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);       // 开多 @110，线 104
+        check(cli->calls.size() == 1, "首档已开");
+
+        eng.tick("TESTUSDT", 110.5);       // 只涨 0.5，不够一档
+        check(cli->calls.size() == 1, "未达加仓间距不得加仓");
+
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);       // 涨 1.0 = 0.5×ATR ⇒ 加第1档
+        check(cli->calls.size() == 2, "达到间距应加仓");
+        check(!cli->calls[1].reduce_only && cli->calls[1].side == "BUY",
+              "加仓单应是同向非 reduceOnly");
+        auto b = eng.get_bots()[0];
+        check(b.st.adds_done == 1, "加仓档数应为1");
+        // 加权均价。固定名义模式下两档的【数量不同】（同样 1000U，110 买到的
+        // 比 111 多），所以不是简单中点——按实际成交量算期望值
+        {
+            const double q1 = cli->calls[0].qty, q2 = cli->calls[1].qty;
+            const double want = (110.0 * q1 + 111.0 * q2) / (q1 + q2);
+            check(std::fabs(b.st.entry_price - want) < 1e-9,
+                  "entry_price 必须更新为加权均价，否则盈亏判定会用错基准");
+            check(b.st.entry_price > 110.0 && b.st.entry_price < 111.0,
+                  "  加权均价应落在两档成交价之间");
+        }
+
+        cli->fill_price = 112.0;
+        eng.tick("TESTUSDT", 112.0);       // 再涨 1.0 ⇒ 加第2档
+        check(cli->calls.size() == 3, "应加到第2档");
+        check(eng.get_bots()[0].st.adds_done == 2, "加仓档数应为2");
+
+        cli->fill_price = 113.0;
+        eng.tick("TESTUSDT", 113.0);       // 已达上限
+        check(cli->calls.size() == 3, "达到 pyramid_max_adds 后不得再加");
+    }
+    {
+        // 触线与加仓同时满足时，【出场优先】——否则会先加一档再立刻被平掉
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.pyramid_max_adds = 3;
+        cfg.rule.pyramid_step_atr = 0.5;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);       // 线 104
+        const int before = (int)cli->calls.size();
+        cli->fill_price = 104.0;
+        eng.tick("TESTUSDT", 104.0);       // 触线
+        check((int)cli->calls.size() > before, "触线应产生平仓/反手单");
+        check(cli->calls[before].reduce_only, "  且第一笔必须是平仓，不是加仓");
+    }
+    {
+        // 关闭时（默认 0）完全不加仓
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto id = eng.add_bot(mk_cfg());   // pyramid_max_adds 默认 0
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        for (double p : {112.0, 115.0, 120.0, 130.0}) eng.tick("TESTUSDT", p);
+        check(cli->calls.size() == 1, "未开启金字塔时不得加仓");
+    }
+    {
+        // 反手开出来的仓位，加仓档数必须从 0 重新算
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.pyramid_max_adds = 2;
+        cfg.rule.pyramid_step_atr = 0.5;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);       // 加了一档
+        check(eng.get_bots()[0].st.adds_done == 1, "加了一档");
+
+        cli->fill_price = 104.0;
+        eng.tick("TESTUSDT", 104.0);       // 触线亏损 → 反手开空
+        auto b = eng.get_bots()[0];
+        check(b.st.pos == sar::Pos::Short, "应已反手");
+        check(b.st.adds_done == 0, "反手后加仓档数必须归零");
+        check(std::fabs(b.st.last_add_price - 104.0) < 1e-6,
+              "  加仓基准价应为新仓成交价");
+    }
+
     if (g_fail == 0) {
         std::printf("OK: SAR 引擎订单路径测试全部通过\n");
         return 0;

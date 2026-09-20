@@ -233,6 +233,52 @@ int main() {
         check(warned, "无条件反手应产生告警");
     }
 
+    // ── ⑦ SAR 等风险下单 + 金字塔加仓 ───────────────────────────────────────
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"size_mode\":\"risk\",\"risk_usdt\":100,"
+                         "\"pyramid_max_adds\":3,\"pyramid_step_atr\":0.5}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "等风险+金字塔配置应能加载");
+        if (hc.sar_bots.size() == 1) {
+            const auto& g = hc.sar_bots[0];
+            check(g.size_mode == SarConfig::SizeMode::RiskBased, "  size_mode=risk");
+            check(std::fabs(g.risk_usdt - 100.0) < 1e-9,           "  risk_usdt");
+            check(g.rule.pyramid_max_adds == 3,                    "  加仓档数");
+            check(std::fabs(g.rule.pyramid_step_atr - 0.5) < 1e-9, "  加仓间距");
+        }
+    }
+    {
+        // size_mode=risk 却没填 risk_usdt：算不出任何数量，必须拒绝启动
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"size_mode\":\"risk\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err),
+              "size_mode=risk 但缺 risk_usdt 应被拒绝");
+    }
+    {
+        // 加仓间距为 0 会在同一价位无限加仓
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"pyramid_max_adds\":3,\"pyramid_step_atr\":0}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "pyramid_step_atr=0 应被拒绝");
+    }
+    {
+        // 默认必须是关闭的：这两个功能都会改变下单行为，不能悄悄生效
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+        HeadlessConfig hc; std::string err;
+        load_headless_config(path, hc, err);
+        if (hc.sar_bots.size() == 1) {
+            check(hc.sar_bots[0].size_mode == SarConfig::SizeMode::Notional,
+                  "默认仓位算法必须是固定名义");
+            check(hc.sar_bots[0].rule.pyramid_max_adds == 0,
+                  "默认必须不加仓");
+        }
+    }
+
     std::remove(path.c_str());
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;

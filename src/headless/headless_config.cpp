@@ -253,6 +253,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "donchian_period", "atr_period", "atr_mult",
         "allow_reverse", "reverse_needs_signal",
         "max_consecutive_reverses", "cooldown_bars", "signal_max_age_sec",
+        "size_mode", "risk_usdt", "pyramid_max_adds", "pyramid_step_atr",
     };
     simdjson::dom::array sarr;
     if (root["sar_bots"].get(sarr) == simdjson::SUCCESS) {
@@ -290,6 +291,26 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                              c.rule.max_consecutive_reverses);
             c.rule.cooldown_bars = (int)get_num(so, "cooldown_bars",
                                                 c.rule.cooldown_bars);
+
+            // 仓位模式：notional=固定名义（默认）；risk=按 ATR 等风险
+            const std::string sm = get_str(so, "size_mode", "notional");
+            c.size_mode = (sm == "risk" || sm == "risk_based")
+                          ? SarConfig::SizeMode::RiskBased
+                          : SarConfig::SizeMode::Notional;
+            c.risk_usdt = get_num(so, "risk_usdt", c.risk_usdt);
+            c.rule.pyramid_max_adds = (int)get_num(so, "pyramid_max_adds",
+                                                   c.rule.pyramid_max_adds);
+            c.rule.pyramid_step_atr = get_num(so, "pyramid_step_atr",
+                                              c.rule.pyramid_step_atr);
+
+            if (c.size_mode == SarConfig::SizeMode::RiskBased && c.risk_usdt <= 0) {
+                err = c.symbol + " sar: size_mode=risk 时必须设置 risk_usdt（单次愿亏金额）";
+                return false;
+            }
+            if (c.rule.pyramid_max_adds > 0 && c.rule.pyramid_step_atr <= 0) {
+                err = c.symbol + " sar: pyramid_step_atr 必须大于0，否则会在同一价位无限加仓";
+                return false;
+            }
 
             if (c.budget_usdt <= 0) { err = c.symbol + " sar: budget_usdt 必须大于0"; return false; }
             if (c.leverage    <= 0) { err = c.symbol + " sar: leverage 必须大于0";    return false; }

@@ -230,9 +230,23 @@ void SarEngine::update_signal(const std::string& id, double atr, double atr_pct,
     }
 }
 
-double SarEngine::plan_qty(const SarConfig& cfg, double price) const {
+double SarEngine::plan_qty(const SarConfig& cfg, double price, double atr) const {
     if (!std::isfinite(price) || price <= 0) return 0;
-    double q = client_->round_qty(cfg.symbol, cfg.budget_usdt / price);
+
+    double notional = cfg.budget_usdt;
+    if (cfg.size_mode == SarConfig::SizeMode::RiskBased) {
+        // 止损距离（绝对价格）= k × ATR。止损时亏的钱 = 数量 × 止损距离，
+        // 令它等于 risk_usdt 反推数量，再乘价格得名义
+        const double stop_dist = cfg.rule.atr_mult * atr;
+        if (!(atr > 0) || !(stop_dist > 0) || !(cfg.risk_usdt > 0)) return 0;
+        notional = cfg.risk_usdt * price / stop_dist;
+        // 名义上限：ATR 极小时上面那个除法会算出荒谬的大仓位。
+        // 没有这道帽子，一个刚上市、K线还平着的品种能把整个账户吃掉
+        if (cfg.budget_usdt > 0) notional = std::min(notional, cfg.budget_usdt);
+    }
+    if (!std::isfinite(notional) || notional <= 0) return 0;
+
+    double q = client_->round_qty(cfg.symbol, notional / price);
     return (std::isfinite(q) && q > 0) ? q : 0;
 }
 
@@ -241,7 +255,7 @@ void SarEngine::tick(const std::string& symbol, double price) {
     // CcgEngine::tick 同源——曾经放进去之后会带着 NaN 数量去下单
     if (!std::isfinite(price) || price <= 0) return;
 
-    std::string to_close, close_reason, to_open;
+    std::string to_close, close_reason, to_open, to_add;
     sar::Pos reverse_to = sar::Pos::Flat, open_dir = sar::Pos::Flat;
 
     {
@@ -294,6 +308,12 @@ void SarEngine::tick(const std::string& symbol, double price) {
                                                                     : sar::Pos::Short;
                 }
                 break;
+            case sar::Action::Add:
+                if (to_add.empty() && to_open.empty() && to_close.empty()) {
+                    b.pending = true;
+                    to_add    = b.bot_id;
+                }
+                break;
             case sar::Action::Close:
             case sar::Action::CloseReverseLong:
             case sar::Action::CloseReverseShort:
@@ -315,6 +335,7 @@ void SarEngine::tick(const std::string& symbol, double price) {
     // 救不了"别人看到的是半更新状态"
     if (!to_close.empty()) submit_close(to_close, close_reason, reverse_to);
     if (!to_open.empty())  submit_open (to_open,  open_dir, false);
+    if (!to_add.empty())   submit_add  (to_add);
 }
 
 void SarEngine::clear_pending_after_throw(const std::string& id, const std::string& what) {
@@ -347,7 +368,7 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
                 log("⚠ " + cfg.symbol + " 杠杆设置失败（目标 " +
                     std::to_string(cfg.leverage) + "x），按交易所原有杠杆开仓");
 
-            const double qty = plan_qty(cfg, price);
+            const double qty = plan_qty(cfg, price, atr);
             if (qty <= 0 || atr <= 0) {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
@@ -403,6 +424,95 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
             clear_pending_after_throw(id, "submit_open 异常: " + std::string(e.what()));
         } catch (...) {
             clear_pending_after_throw(id, "submit_open 未知异常");
+        }
+    });
+}
+
+void SarEngine::submit_add(const std::string& id) {
+    host_.submit([this, id]() {
+        try {
+            SarConfig cfg;
+            double price = 0, atr = 0, have_qty = 0, avg = 0;
+            sar::Pos pos = sar::Pos::Flat;
+            int adds_before = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto it = bots_.find(id);
+                if (it == bots_.end()) return;
+                cfg      = it->second.cfg;
+                price    = it->second.current_price;
+                atr      = it->second.atr;
+                have_qty = it->second.qty;
+                avg      = it->second.st.entry_price;
+                pos      = it->second.st.pos;
+                adds_before = it->second.st.adds_done;
+            }
+            if (pos == sar::Pos::Flat || have_qty <= 0 || atr <= 0) {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto it = bots_.find(id);
+                if (it != bots_.end()) it->second.pending = false;
+                return;
+            }
+
+            const double qty = plan_qty(cfg, price, atr);
+            if (qty <= 0) {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto it = bots_.find(id);
+                if (it != bots_.end()) {
+                    it->second.pending = false;
+                    it->second.last_action = "加仓数量不足，跳过";
+                }
+                return;
+            }
+
+            // 加仓单与开仓单一样是非 reduceOnly 的同向市价单
+            auto r = client_->place_market_order(cfg.symbol, side_of(pos, false), qty, false);
+
+            std::lock_guard<std::recursive_mutex> lk(mtx_);
+            auto it = bots_.find(id);
+            if (it == bots_.end()) return;
+            auto& b = it->second;
+            b.pending = false;
+
+            if (r.ok && r.executed_qty <= 0) {
+                b.last_action = "加仓零成交，下个tick重试";
+                log(cfg.symbol + " 加仓已提交但零成交（流动性不足?），不入账");
+                return;
+            }
+            if (r.ok) {
+                const double fill = (r.avg_price > 0) ? r.avg_price : price;
+                const double new_qty = have_qty + r.executed_qty;
+                // 加权均价。必须更新，否则"出场价≥成本"会拿第一档的价格去判，
+                // 把一笔实际亏损的出场误判成盈利出场（进而该反手时不反手）
+                const double new_avg = (avg * have_qty + fill * r.executed_qty) / new_qty;
+                b.qty = new_qty;
+                sar::on_added(b.st, fill, new_avg);
+
+                std::ostringstream ss;
+                ss << cfg.symbol << " 顺势加仓 第" << b.st.adds_done << "/"
+                   << cfg.rule.pyramid_max_adds << " 档 qty=" << r.executed_qty
+                   << " @$" << fmt(fill) << " 新均价=$" << fmt(new_avg)
+                   << " 总量=" << fmt(new_qty, 8)
+                   << " 止损线=$" << fmt(b.st.stop);
+                log(ss.str());
+                b.last_action = "加仓至" + std::to_string(b.st.adds_done + 1) + "档";
+            } else if (r.uncertain) {
+                // 加仓和开仓一样【不幂等】：盲目重试会多出一档。停掉待核对
+                b.state = SarBot::State::Stopped;
+                b.last_action = "⚠ 加仓状态不明，已停止待核对";
+                log("⚠ " + cfg.symbol + " 加仓状态不明（" + r.error +
+                    "），已停止该bot，请核对交易所仓位后手动恢复");
+            } else {
+                // 加仓失败不影响已有仓位，止损线照常守着。下个 tick 若仍满足
+                // 间距条件会再试一次——adds_done 没有增加，不会错过这一档
+                b.last_action = "加仓失败";
+                log(cfg.symbol + " 加仓失败: " + r.error + "（已有仓位不受影响）");
+                (void)adds_before;
+            }
+        } catch (const std::exception& e) {
+            clear_pending_after_throw(id, "submit_add 异常: " + std::string(e.what()));
+        } catch (...) {
+            clear_pending_after_throw(id, "submit_add 未知异常");
         }
     });
 }
