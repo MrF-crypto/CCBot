@@ -268,6 +268,77 @@ int main() {
         check(eng.get_bots()[0].entries.empty(), "硬止损应先于 ATR 线触发");
     }
 
+    // ── 审计抓到的 bug：平仓后武装状态必须重置 ─────────────────────────────
+    // 六处 entries.clear() 没有一处重置 atr_*。ATR 线触发平仓 → 冷却后重开
+    // 首仓 → update_tracking 看到"已武装"跳过重新定线 → 沿用上一轮的旧线。
+    // 旧线若高于新开仓价，下一个 tick 就把新仓位平掉。
+    {
+        std::printf("\n── 平仓后重开：旧止损线不得残留 ──\n");
+        int64_t now = 1'700'000'000'000LL;
+        auto fc = std::make_shared<FakeClient>();
+        CcgEngine eng(fc, make_host(now));
+        auto c = base_cfg();
+        c.use_atr_trail  = true;
+        c.atr_trail_mult = 3.0;
+        c.tp_pct         = 1e9;
+        c.auto_restart   = true;     // 关键：平仓后要重开
+        c.cooldown_secs  = 0;
+        auto id = eng.add_bot(c);
+
+        fc->next_fill_price = 100.0;
+        eng.tick("BTCUSDT", 100.0);
+        eng.update_atr(id, 2.0);
+        now += 3000; eng.tick("BTCUSDT", 150.0);      // 线推到 144
+        check(std::fabs(eng.get_bots()[0].atr_stop - 144.0) < 1e-9, "第一轮线 144");
+
+        fc->next_fill_price = 144.0;
+        now += 3000; eng.tick("BTCUSDT", 144.0);      // 触线平仓
+        check(eng.get_bots()[0].entries.empty(), "第一轮已平仓");
+
+        // 冷却结束、重开首仓——价格已经回落到 100
+        fc->next_fill_price = 100.0;
+        now += 3000; eng.tick("BTCUSDT", 100.0);
+        now += 3000; eng.tick("BTCUSDT", 100.0);
+        auto b = eng.get_bots()[0];
+        check(!b.entries.empty(), "第二轮应已开首仓");
+        // 若旧线 144 残留：100 <= 144 立刻触发 → 新仓位瞬间被平
+        check(!(b.atr_stop > 100.0),
+              "第二轮的止损线不得是上一轮残留的 144（那会立刻平掉新仓位）");
+        now += 3000; eng.tick("BTCUSDT", 100.0);
+        check(!eng.get_bots()[0].entries.empty(),
+              "重开后的仓位不得被旧止损线立刻打掉");
+        check(std::fabs(eng.get_bots()[0].atr_stop - 94.0) < 1e-9,
+              "第二轮应按新开仓价重新定线：100 − 3×2 = 94");
+    }
+
+    // ── ATR 过期：沿用旧线，不推新线；但已武装的保护不撤 ─────────────────────
+    {
+        std::printf("\n── ATR 过期 ──\n");
+        int64_t now = 1'700'000'000'000LL;
+        auto fc = std::make_shared<FakeClient>();
+        CcgEngine eng(fc, make_host(now));
+        auto c = base_cfg();
+        c.use_atr_trail  = true;
+        c.atr_trail_mult = 3.0;
+        c.tp_pct         = 1e9;
+        auto id = eng.add_bot(c);
+
+        fc->next_fill_price = 100.0;
+        eng.tick("BTCUSDT", 100.0);
+        eng.update_atr(id, 2.0);
+        now += 3000; eng.tick("BTCUSDT", 100.0);      // 武装，线 94
+
+        now += 11 * 60 * 1000;                        // 11 分钟没有新 ATR
+        eng.tick("BTCUSDT", 120.0);                   // 新高
+        check(std::fabs(eng.get_bots()[0].atr_stop - 94.0) < 1e-9,
+              "ATR 过期时不得用它推新线（沿用 94）");
+        check(eng.get_bots()[0].atr_armed, "过期不撤武装");
+
+        fc->next_fill_price = 94.0;
+        now += 3000; eng.tick("BTCUSDT", 94.0);
+        check(eng.get_bots()[0].entries.empty(), "过期期间旧线仍然生效");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

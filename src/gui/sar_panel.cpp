@@ -618,9 +618,6 @@ void MainWindow::openSarDialog(const std::string& symbol) {
 std::string MainWindow::sar_cfg_path() const {
     return (portable_data_dir() + "/sar_bots.json").toStdString();
 }
-std::string MainWindow::sar_state_path() const {
-    return sar_cfg_path();   // 同一个文件
-}
 
 void MainWindow::save_sar_bots() {
     if (!sar_engine_) return;

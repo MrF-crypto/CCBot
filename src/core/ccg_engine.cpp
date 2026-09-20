@@ -795,12 +795,29 @@ static double apply_layer_growth(const CcgBot& bot, double interval_pct) {
 void CcgEngine::update_tracking(CcgBot& bot, double price) {
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
 
-    if (bot.entries.empty()) return;  // 尚未建仓，不用追踪
+    if (bot.entries.empty()) {
+        // 空仓即解除武装。这里是【唯一】的复位点——entries.clear() 散落在六处
+        // （止盈/止损/冷却重启/对账/认领/手动），在每一处都记得重置 atr_* 是
+        // 做不到的。漏掉的后果不是"不保护"，是【错误保护】：上一轮的止损线
+        // 被原样套到新开的仓位上，旧线若高于新开仓价，下一个 tick 就把它平掉
+        if (bot.atr_armed) {
+            bot.atr_armed = false;
+            bot.atr_peak = bot.atr_stop = 0;
+        }
+        return;
+    }
 
     // ── ATR 移动止损：武装与棘轮推进 ─────────────────────────────────────────
     // 武装条件是【勾选 + 有仓位 + 拿到 ATR】三者齐备。缺 ATR 时不武装：
     // 没有止损线却冻结梯子，等于既不补仓也不保护，是三种状态里最差的一种
     if (bot.cfg.use_atr_trail) {
+        // ATR 新鲜度。拉取每分钟一轮，超过 10 分钟没更新说明拉取批次死了
+        // （网络/限流）。过期的 ATR 不用来【推线】——沿用上一条线，和 SAR 侧
+        // "数据断流不撤保护"同一语义。但【武装】不看新鲜度：能拿到过一个
+        // ATR 就武装，否则拉取批次一抖梯子就解冻了
+        const bool atr_fresh = bot.atr_value > 0 &&
+            (host_.now_steady() - bot.atr_time) <= std::chrono::minutes(10);
+
         if (!bot.atr_armed && bot.atr_value > 0) {
             bot.atr_armed = true;
             bot.atr_peak  = price;
@@ -815,8 +832,8 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
         if (bot.atr_armed) {
             bot.atr_peak = is_long ? std::max(bot.atr_peak, price)
                                    : std::min(bot.atr_peak, price);
-            // ATR 断流时沿用上一条线，绝不因为数据没到就撤掉保护
-            if (bot.atr_value > 0) {
+            // ATR 断流/过期时沿用上一条线，绝不因为数据没到就撤掉保护
+            if (atr_fresh) {
                 const double cand = is_long
                     ? bot.atr_peak - bot.cfg.atr_trail_mult * bot.atr_value
                     : bot.atr_peak + bot.cfg.atr_trail_mult * bot.atr_value;

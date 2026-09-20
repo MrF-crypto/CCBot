@@ -171,7 +171,6 @@ private:
     void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
     void log(const std::string& msg) const;
 
-    // 计算下单数量。名义预算 / 价格，再按交易所步长取整
     // 计算下单数量。Notional 用固定名义；RiskBased 按 ATR 反推并受 budget 封顶。
     // atr 传 0 时 RiskBased 无法计算，返回 0（调用方据此跳过下单）
     double plan_qty(const SarConfig& cfg, double price, double atr) const;

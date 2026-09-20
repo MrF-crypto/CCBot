@@ -2901,12 +2901,14 @@ void MainWindow::onTick() {
     // 品种数越多雪崩得越快，恰恰是最需要它撑住的时候
     if (restFetchBusy_.exchange(true)) { refreshBotTable(); return; }
 
-    run_async([this, need_rest = std::move(need_rest)]() {
+    run_async([this, need_rest = std::move(need_rest), sar_syms]() {
         for (const auto& sym : need_rest) {
             double price = client_->fetch_mark_price(sym);
             if (price > 0) {
                 engine_->tick(sym, price);
-                if (sar_engine_) sar_engine_->tick(sym, price);
+                // 只喂 SAR 自己的品种：喂全部会让 SAR 引擎对每个 DCA 品种都取一次
+                // 锁、空转一遍——47 个品种的 REST 兜底轮里就是 47 次无谓的锁竞争
+                if (sar_engine_ && sar_syms.count(sym)) sar_engine_->tick(sym, price);
                 // 写回缓存：界面那一列读的是缓存，不写回就会出现
                 // "引擎有价在跑、标记价列却一直空着"
                 if (ticker_) ticker_->set_mark_price(sym, price);

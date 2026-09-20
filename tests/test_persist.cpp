@@ -183,6 +183,38 @@ int main() {
         check(lo.empty(), "配置里没有的品种，落盘状态被丢弃");
     }
 
+    // ── ⑦ ATR 移动止损的武装状态必须跨重启存活 ──────────────────────────────
+    // 丢了的话重启后梯子会解冻继续补仓，而用户以为自己已经切成"持有并追踪"了。
+    // 止损线本身更要紧：它是重启后唯一还护着仓位的东西
+    {
+        std::vector<CcgConfig> cfgs = { make_cfg("BTCUSDT", CcgConfig::Direction::Long) };
+        cfgs[0].use_atr_trail = true;
+        CcgBot b;
+        b.cfg = cfgs[0];
+        CcgEntry e; e.level = 0; e.price = 100.0; e.qty = 1.0; e.cost_usdt = 100.0;
+        b.entries.push_back(e);
+        b.total_qty = 1.0; b.total_cost = 100.0; b.avg_price = 100.0;
+        b.atr_armed = true;
+        b.atr_peak  = 123.456789012345;
+        b.atr_stop  = 117.456789012345;
+        save_headless_state(path, { b });
+        auto lo = load_headless_state(path, cfgs);
+        check(lo.size() == 1, "ATR 武装状态：读回 1 个 bot");
+        if (lo.size() == 1) {
+            check(lo[0].atr_armed, "  atr_armed 往返");
+            check_rel(lo[0].atr_peak, b.atr_peak, 1e-15, "  atr_peak 逐位无损");
+            check_rel(lo[0].atr_stop, b.atr_stop, 1e-15, "  atr_stop 逐位无损（它就是出场价）");
+        }
+
+        // 半截状态：武装了却没有止损线 → 梯子冻结却毫无保护，比空仓危险。
+        // 必须当成未武装，下一个 tick 拿到 ATR 重新定线
+        b.atr_stop = 0;
+        save_headless_state(path, { b });
+        lo = load_headless_state(path, cfgs);
+        check(lo.size() == 1 && !lo[0].atr_armed,
+              "  武装但止损线为 0 的半截状态应当成未武装");
+    }
+
     std::remove(path.c_str());
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;

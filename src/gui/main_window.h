@@ -76,8 +76,7 @@ private:
     void openSarDialog(const std::string& symbol);
     void onSarContextMenu(const QPoint& pos);
     void onAddSarSymbol();
-    std::string sar_cfg_path()   const;
-    std::string sar_state_path() const;
+    std::string sar_cfg_path()   const;   // 配置与运行时状态同一个文件
     void save_sar_bots();          // 配置 + 运行时状态一起落盘
     void load_and_restore_sar();
 

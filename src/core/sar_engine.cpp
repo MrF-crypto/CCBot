@@ -255,6 +255,12 @@ void SarEngine::tick(const std::string& symbol, double price) {
     // CcgEngine::tick 同源——曾经放进去之后会带着 NaN 数量去下单
     if (!std::isfinite(price) || price <= 0) return;
 
+    // ⚠ 每个品种最多【一个】Running 的 bot（add_bot/restore_bot 强制），而 tick
+    //   是按品种调用的——所以下面的循环每次最多命中一个 bot，"一个槽位"就够。
+    //   这个前提很重要：sar::step 的出场分支有副作用（重置连续反手计数、
+    //   写入冷却），它假定给出的动作【一定会被执行】。如果某天允许同品种多个
+    //   bot 而这里还是单槽，被挤掉的那个 bot 会带着已改写的状态等下一个 tick，
+    //   再次判定时走的是另一条分支——动作就错了。到那时这里必须改成向量派发
     std::string to_close, close_reason, to_open, to_add;
     sar::Pos reverse_to = sar::Pos::Flat, open_dir = sar::Pos::Flat;
 

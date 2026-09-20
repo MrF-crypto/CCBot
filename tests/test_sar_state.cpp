@@ -90,6 +90,23 @@ int main() {
         }
     }
 
+    // ── 金字塔状态往返 ───────────────────────────────────────────────────────
+    // adds_done 丢了会让重启后【多加几档】（引擎以为一档都没加过）；
+    // last_add_price 丢了会让下一档的间距从 0 量起，立刻再加一档
+    {
+        auto b = mk_bot("BTCUSDT", sar::Pos::Long, 100.0, 105.0, 99.0, 3.0);
+        b.st.adds_done      = 2;
+        b.st.last_add_price = 103.456789012345;
+        save_sar_state(path, {b});
+        auto got = load_sar_state(path, {mk_cfg("BTCUSDT")});
+        check(got.size() == 1, "金字塔状态：读回 1 个 bot");
+        if (got.size() == 1) {
+            check(got[0].st.adds_done == 2, "  adds_done 往返");
+            check(got[0].st.last_add_price == b.st.last_add_price,
+                  "  last_add_price 逐位无损（下一档的间距从它量起）");
+        }
+    }
+
     // ── 空头往返 ─────────────────────────────────────────────────────────────
     {
         auto b = mk_bot("ETHUSDT", sar::Pos::Short, 3000.5, 2800.25, 2950.75, 1.5);
