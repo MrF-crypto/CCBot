@@ -23,6 +23,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QScrollArea>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
@@ -357,17 +358,23 @@ void MainWindow::openSarDialog(const std::string& symbol) {
 
     QDialog dlg(this);
     dlg.setWindowTitle(QString("SAR 策略配置 — %1").arg(QString::fromStdString(symbol)));
-    dlg.setMinimumWidth(460);
-    auto* form = new QFormLayout(&dlg);
+    dlg.setMinimumWidth(480);
+    dlg.resize(520, 700);
 
-    auto* budget = new QDoubleSpinBox();
-    budget->setRange(10, 10'000'000);
-    budget->setDecimals(2);
-    budget->setValue(c.budget_usdt);
-    budget->setToolTip("固定名义模式：每笔仓位的名义价值。\n"
-                       "等风险模式：名义价值的【上限】（ATR 极小时兜住公式算出的天量仓位）。");
-    form->addRow("仓位名义/上限 (USDT)", budget);
+    // 滚动区 + 固定在底部的按钮。参数长到一屏放不下时，没有滚动区会把
+    // "创建/保存"顶出屏幕外——DCA 的弹窗当初就是因为这个才改的，这里别重犯
+    auto* outer = new QVBoxLayout(&dlg);
+    outer->setContentsMargins(0, 0, 0, 0);
+    auto* scroll = new QScrollArea();
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto* inner = new QWidget();
+    auto* form = new QFormLayout(inner);
+    scroll->setWidget(inner);
+    outer->addWidget(scroll, 1);
 
+    // ⚠ 仓位算法排在最前面：它决定了下面两个框各自的含义（名义价值 vs 名义上限），
+    //   放在后面的话用户会先填完再发现填错了地方
     auto* sizeMode = new QComboBox();
     sizeMode->addItem("固定名义", (int)SarConfig::SizeMode::Notional);
     sizeMode->addItem("按 ATR 等风险", (int)SarConfig::SizeMode::RiskBased);
@@ -380,16 +387,44 @@ void MainWindow::openSarDialog(const std::string& symbol) {
         "而「铺开品种分散风险」就此失效。这是海龟的「单位」概念。");
     form->addRow("仓位算法", sizeMode);
 
+    auto* budget = new QDoubleSpinBox();
+    budget->setRange(10, 10'000'000);
+    budget->setDecimals(2);
+    budget->setValue(c.budget_usdt);
+    budget->setToolTip("固定名义模式：每笔仓位的名义价值。\n"
+                       "等风险模式：名义价值的【上限】（ATR 极小时兜住公式算出的天量仓位）。");
+    auto* budgetLabel = new QLabel();
+    form->addRow(budgetLabel, budget);
+
     auto* riskEdit = new QDoubleSpinBox();
     riskEdit->setRange(0, 1'000'000);
     riskEdit->setDecimals(2);
     riskEdit->setValue(c.risk_usdt);
-    riskEdit->setToolTip("单次止损愿意亏多少钱（USDT）。只在等风险模式下生效。\n"
+    // 值为 0（= 最小值）时显示这行字而不是"0.00"。此前它是一个灰掉的"0"，
+    // 看起来像"这个功能坏了"，而真实原因只是仓位算法还没切过去
+    riskEdit->setSpecialValueText("未设置");
+    riskEdit->setToolTip("单次止损愿意亏多少钱（USDT）。仅「按 ATR 等风险」模式使用。\n"
                          "账户 10000U、每次探测愿亏 1% ⇒ 填 100。");
-    form->addRow("单次愿亏 (USDT)", riskEdit);
-    riskEdit->setEnabled(sizeMode->currentIndex() == 1);
+    auto* riskLabel = new QLabel();
+    form->addRow(riskLabel, riskEdit);
+
+    // 两个框的标签和可用性都跟着算法走。写成 lambda 是因为初始化和切换时
+    // 要做完全相同的事——分开写必然有一天只改一处
+    auto syncSizeMode = [budget, budgetLabel, riskEdit, riskLabel](int idx) {
+        const bool risk = (idx == 1);
+        budgetLabel->setText(risk ? "　名义上限 (USDT)" : "　仓位名义价值 (USDT)");
+        riskLabel->setText(risk ? "　单次愿亏 (USDT)"
+                                : "　单次愿亏（切到「按 ATR 等风险」后可填）");
+        riskLabel->setEnabled(risk);
+        riskEdit->setEnabled(risk);
+        if (risk && riskEdit->value() <= 0) {
+            riskEdit->setFocus();
+            riskEdit->selectAll();
+        }
+    };
+    syncSizeMode(sizeMode->currentIndex());
     connect(sizeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            riskEdit, [riskEdit](int i) { riskEdit->setEnabled(i == 1); });
+            riskEdit, [syncSizeMode](int i) { syncSizeMode(i); });
 
     auto* lev = new QSpinBox();
     lev->setRange(1, 125);
@@ -488,7 +523,8 @@ void MainWindow::openSarDialog(const std::string& symbol) {
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     bb->button(QDialogButtonBox::Ok)->setText(existing ? "保存修改" : "创建");
-    form->addRow(bb);
+    bb->setContentsMargins(9, 6, 9, 9);
+    outer->addWidget(bb);   // 在滚动区【外面】，永远可见
     connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
 
