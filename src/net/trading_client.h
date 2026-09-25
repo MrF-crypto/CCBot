@@ -155,6 +155,24 @@ public:
     // 返回 0 = 数据不足或请求失败，调用方据此判定"不武装"
     double fetch_atr(const std::string& symbol, const std::string& interval, int period);
 
+    // ── 裸K线快照（SAR 的 BarPattern 模式）──────────────────────────────────
+    // 刚收盘那根的方向 + 它【之前】N 根的最高/最低价。
+    //
+    // ⚠ 索引口径（与用户规格一致）：bars 最后一根是未收盘的当前根，
+    //   倒数第二根是"刚收盘那根"（用户编号的 bar 0），再往前 N 根才是
+    //   算摆动高低点的窗口（用户编号的 1..N）。信号根自己【不在】窗口里
+    struct BarSnapshot {
+        bool    ok      = false;
+        double  price   = 0;       // 当前未收盘根的实时收盘值
+        bool    bullish = false;   // bar 0 收盘 > 开盘
+        bool    bearish = false;   // bar 0 收盘 < 开盘（十字星两者皆 false）
+        double  swing_low  = 0;    // bar 1..N 的最低价
+        double  swing_high = 0;    // bar 1..N 的最高价
+        int64_t bar_open_ms = 0;   // 当前未收盘根的开盘时间
+    };
+    BarSnapshot fetch_bar_pattern(const std::string& symbol,
+                                  const std::string& interval, int swing_bars);
+
     // 拉取标记价格（公开接口，CCG 价格轮询用）
     double fetch_mark_price(const std::string& symbol);
 

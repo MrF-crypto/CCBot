@@ -24,10 +24,35 @@ namespace ccbot::sar {
 
 enum class Pos { Flat, Long, Short };
 
+// 入场与止损的两套算法。刻意做成一个开关而不是两个：它们是成套的，
+// 混搭（比如唐奇安入场 + 摆动低点止损）没有实证依据，多开一个维度只会
+// 让参数空间翻倍而没人知道该怎么填。
+enum class Mode {
+    Donchian,    // 唐奇安通道突破入场 + Chandelier ATR 止损（海龟）
+    BarPattern,  // 裸K线：阳线入场 + 最近 N 根摆动低点止损
+};
+
 struct Config {
+    Mode   mode = Mode::Donchian;
+
     int    donchian_period = 20;    // 入场通道周期（海龟原版 20）
     int    atr_period      = 14;    // ATR 周期
     double atr_mult        = 3.0;   // Chandelier k：止损距离 = k×ATR
+
+    // ── 裸K线模式 ───────────────────────────────────────────────────────────
+    // 入场：刚收盘那根（bar 0）收盘价 > 开盘价 ⇒ 做多；反之做空。
+    // 止损：bar 0 之【前】的 swing_bars 根的最低价（做多）/ 最高价（做空）。
+    //       窗口随K线右移，棘轮只朝有利方向。
+    //
+    // ⚠ 窗口最小值的止损，棘轮【理论上是自带的】：M 只有在新K线的最低价
+    //   跌破旧 M 时才会下移，而那一刻价格已经穿过止损线了。但有两个例外
+    //   必须靠显式棘轮兜住：
+    //     ① 信号根自己的低点不在初始窗口里（初始窗口是 1..N，不含 bar 0）。
+    //        bar 0 若是长下影的锤子线，它进入窗口时会把 M 拉下去，而那根
+    //        下影发生在【入场之前】，没打到我们
+    //     ② 引擎每 3 秒采样一次标记价，而K线的 low 记录的是连续极值。
+    //        一根 2 秒的插针引擎看不见，但下一根K线的 low 会记下来
+    int    swing_bars = 3;
 
     // ── 反手规则 ────────────────────────────────────────────────────────────
     bool   allow_reverse   = true;  // 亏损止损后是否反向入场
@@ -79,6 +104,13 @@ struct Inputs {
     double dc_up  = 0;
     double dc_dn  = 0;
     bool   new_bar = false;  // 本 tick 是否跨入新K线（冷却按K线计数）
+
+    // ── 裸K线模式的输入 ────────────────────────────────────────────────────
+    bool   bar_ok      = false;  // 裸K线数据是否就绪
+    bool   bar_bullish = false;  // 刚收盘那根是阳线（收盘>开盘）
+    bool   bar_bearish = false;  // 刚收盘那根是阴线。十字星两者皆 false
+    double swing_low   = 0;      // bar 0 之前 N 根的最低价
+    double swing_high  = 0;      // bar 0 之前 N 根的最高价
 };
 
 enum class Action {
@@ -98,19 +130,52 @@ struct Verdict {
     bool        profitable_exit = false;   // 本次出场是否 >= 成本价
 };
 
-// 数据是否足以做任何决策。缺 ATR 就没有止损线，缺通道就没有信号——
-// 两者任一缺失都【不开新仓】，但已有仓位仍按最后一条有效止损线守着
-inline bool data_ready(const Inputs& in) {
-    return in.price > 0 && std::isfinite(in.price) && in.atr > 0 && in.dc_ok;
+// 数据是否足以【开新仓】。两种模式要的东西不同：
+//   唐奇安：要 ATR（止损线靠它）+ 通道
+//   裸K线：只要K线本身。止损线是摆动低点，不用 ATR
+// 已有仓位不受影响，仍按最后一条有效止损线守着
+inline bool data_ready(const Inputs& in, const Config& cfg) {
+    if (!(in.price > 0 && std::isfinite(in.price))) return false;
+    if (cfg.mode == Mode::BarPattern)
+        return in.bar_ok && in.swing_low > 0 && in.swing_high > 0;
+    return in.atr > 0 && in.dc_ok;
 }
 
 // 突破判定。用 >= / <=：通道沿本身就算突破（价格刚好打平前高即视为创新高）
 inline bool break_up  (const Inputs& in) { return in.dc_ok && in.price >= in.dc_up; }
 inline bool break_down(const Inputs& in) { return in.dc_ok && in.price <= in.dc_dn; }
 
+// 入场信号（模式无关的统一入口）。
+// ⚠ 裸K线模式只在【跨新K线】那一拍成立：规格是"bar 0 收盘时判定"，
+//   不加这道门的话，同一根K线的每个 tick 都会重复开仓
+inline bool entry_long(const Inputs& in, const Config& cfg) {
+    if (cfg.mode == Mode::BarPattern) return in.new_bar && in.bar_ok && in.bar_bullish;
+    return break_up(in);
+}
+inline bool entry_short(const Inputs& in, const Config& cfg) {
+    if (cfg.mode == Mode::BarPattern) return in.new_bar && in.bar_ok && in.bar_bearish;
+    return break_down(in);
+}
+
 // Chandelier 止损线。多头挂在极值下方，空头挂在极值上方
 inline double chandelier(Pos p, double peak, double atr, double k) {
     return p == Pos::Long ? peak - k * atr : peak + k * atr;
+}
+
+// 本 tick 的止损【候选线】。棘轮由调用方施加——两种模式都需要它：
+//   唐奇安：ATR 抖动会让候选线来回跳
+//   裸K线：窗口最小值理论上自带棘轮，但信号根的下影与 3 秒采样这两个
+//          例外会让它下移（详见 Config::swing_bars 的说明）
+// 返回 0 = 本 tick 没有有效候选，调用方应沿用旧线（绝不撤保护）
+inline double stop_candidate(Pos p, const State& st, const Config& cfg,
+                             const Inputs& in) {
+    if (cfg.mode == Mode::BarPattern) {
+        if (!in.bar_ok) return 0;
+        const double sw = (p == Pos::Long) ? in.swing_low : in.swing_high;
+        return sw > 0 ? sw : 0;
+    }
+    if (!(in.atr > 0)) return 0;
+    return chandelier(p, st.peak, in.atr, cfg.atr_mult);
 }
 
 // 推进一个 tick：更新极值与棘轮止损线，然后给出动作。
@@ -134,9 +199,8 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         st.peak = is_long ? std::max(st.peak, in.price)
                           : std::min(st.peak, in.price);
 
-        // ATR 缺失时不推新线，沿用上一条有效止损线——绝不因为数据断流就撤掉保护
-        if (in.atr > 0) {
-            double cand = chandelier(st.pos, st.peak, in.atr, cfg.atr_mult);
+        // 数据缺失时不推新线，沿用上一条有效止损线——绝不因为数据断流就撤掉保护
+        if (const double cand = stop_candidate(st.pos, st, cfg, in); cand > 0) {
             st.stop = is_long ? std::max(st.stop, cand)    // 棘轮：只上不下
                               : std::min(st.stop, cand);
         }
@@ -190,15 +254,16 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             return v;
         }
         // 反手是否需要反向信号确认
-        const bool sig = is_long ? break_down(in) : break_up(in);
+        const bool sig = is_long ? entry_short(in, cfg) : entry_long(in, cfg);
         if (cfg.reverse_needs_signal && !sig) {
             v.action = Action::Close;
             v.reason = "止损出场：反向信号未成立，转观望";
             return v;
         }
-        if (in.atr <= 0) {   // 反手要开新仓，没有 ATR 就没有新止损线
+        // 反手要开新仓，而新仓需要一条止损线。拿不到就只平不反手
+        if (!data_ready(in, cfg)) {
             v.action = Action::Close;
-            v.reason = "止损出场：ATR 缺失，不反手";
+            v.reason = "止损出场：数据缺失，不反手";
             return v;
         }
         v.action = is_long ? Action::CloseReverseShort : Action::CloseReverseLong;
@@ -208,24 +273,44 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
 
     // ── 空仓：等入场信号 ──────────────────────────────────────────────────────
     v.stop = 0;
-    if (st.cooldown_left > 0) { v.reason = "冷却中"; return v; }
-    if (!data_ready(in))      { v.reason = "数据不足，不开新仓"; return v; }
+    if (st.cooldown_left > 0)   { v.reason = "冷却中"; return v; }
+    if (!data_ready(in, cfg))   { v.reason = "数据不足，不开新仓"; return v; }
 
-    if (break_up(in))   { v.action = Action::OpenLong;  v.reason = "上破通道"; return v; }
-    if (break_down(in)) { v.action = Action::OpenShort; v.reason = "下破通道"; return v; }
+    const bool bar_mode = (cfg.mode == Mode::BarPattern);
+    if (entry_long(in, cfg)) {
+        v.action = Action::OpenLong;
+        v.reason = bar_mode ? "阳线收盘" : "上破通道";
+        return v;
+    }
+    if (entry_short(in, cfg)) {
+        v.action = Action::OpenShort;
+        v.reason = bar_mode ? "阴线收盘" : "下破通道";
+        return v;
+    }
 
-    v.reason = "无信号";
+    v.reason = bar_mode ? "等本根收盘" : "无信号";
     return v;
 }
 
 // 建仓成交后由调用方调用：写入仓位状态并布下初始止损线。
 // 初始线同样是 Chandelier，只是极值就是成交价本身
-inline void on_filled(State& st, Pos p, double fill_price, double atr,
+// 建仓时的初始止损线。唐奇安模式用 Chandelier（极值就是成交价本身）；
+// 裸K线模式用 bar 0 之【前】N 根的摆动低点——注意它不含信号根自己
+inline double initial_stop(Pos p, double fill_price, const Config& cfg,
+                           const Inputs& in) {
+    if (cfg.mode == Mode::BarPattern) {
+        const double sw = (p == Pos::Long) ? in.swing_low : in.swing_high;
+        if (sw > 0) return sw;
+    }
+    return chandelier(p, fill_price, in.atr, cfg.atr_mult);
+}
+
+inline void on_filled(State& st, Pos p, double fill_price, double stop_price,
                       const Config& cfg, bool from_reverse) {
     st.pos         = p;
     st.entry_price = fill_price;
     st.peak        = fill_price;
-    st.stop        = chandelier(p, fill_price, atr, cfg.atr_mult);
+    st.stop        = stop_price;
     st.consec_reverses = from_reverse ? st.consec_reverses + 1 : 0;
     // 新一轮的金字塔计数归零。反手开出来的仓位同样从第 0 档重新算——
     // 否则上一轮加过的档数会让这一轮少加几档

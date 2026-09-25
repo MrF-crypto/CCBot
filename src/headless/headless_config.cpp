@@ -254,6 +254,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "allow_reverse", "reverse_needs_signal",
         "max_consecutive_reverses", "cooldown_bars", "signal_max_age_sec",
         "size_mode", "risk_usdt", "pyramid_max_adds", "pyramid_step_atr",
+        "mode", "swing_bars",
     };
     simdjson::dom::array sarr;
     if (root["sar_bots"].get(sarr) == simdjson::SUCCESS) {
@@ -302,6 +303,16 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                                                    c.rule.pyramid_max_adds);
             c.rule.pyramid_step_atr = get_num(so, "pyramid_step_atr",
                                               c.rule.pyramid_step_atr);
+
+            // 入场/止损算法：donchian（默认，海龟）或 bar（裸K线）
+            const std::string md = get_str(so, "mode", "donchian");
+            c.rule.mode = (md == "bar" || md == "bar_pattern")
+                          ? sar::Mode::BarPattern : sar::Mode::Donchian;
+            c.rule.swing_bars = (int)get_num(so, "swing_bars", c.rule.swing_bars);
+            if (c.rule.mode == sar::Mode::BarPattern && c.rule.swing_bars < 1) {
+                err = c.symbol + " sar: swing_bars 至少为1";
+                return false;
+            }
 
             if (c.size_mode == SarConfig::SizeMode::RiskBased && c.risk_usdt <= 0) {
                 err = c.symbol + " sar: size_mode=risk 时必须设置 risk_usdt（单次愿亏金额）";

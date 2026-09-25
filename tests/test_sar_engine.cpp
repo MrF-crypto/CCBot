@@ -345,6 +345,89 @@ int main() {
         check(!b.pending, "手动平仓后 pending 必须复位");
     }
 
+    // ── 裸K线模式：完整下单路径 ──────────────────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.mode = sar::Mode::BarPattern;
+        cfg.rule.swing_bars = 3;
+        cfg.rule.reverse_needs_signal = false;
+        auto id = eng.add_bot(cfg);
+
+        // 只喂K线，【完全不喂 ATR】——裸K线模式的止损不该依赖它
+        eng.update_bars(id, true, false, 94.0, 106.0, 1);
+        cli->fill_price = 100.0;
+        eng.tick("TESTUSDT", 100.0);
+
+        check(cli->calls.size() == 1, "裸K线：阳线收盘应开多（无需 ATR）");
+        check(cli->calls[0].side == "BUY", "  方向为 BUY");
+        auto b = eng.get_bots()[0];
+        check(b.st.pos == sar::Pos::Long, "  应记为持多");
+        check(std::fabs(b.st.stop - 94.0) < 1e-9,
+              "  止损线 = 前 3 根最低价 94，不是 k×ATR");
+
+        eng.update_bars(id, true, false, 97.0, 110.0, 2);
+        eng.tick("TESTUSDT", 105.0);
+        check(std::fabs(eng.get_bots()[0].st.stop - 97.0) < 1e-9, "  止损线跟到 97");
+
+        eng.update_bars(id, true, false, 90.0, 110.0, 3);
+        eng.tick("TESTUSDT", 104.0);
+        check(std::fabs(eng.get_bots()[0].st.stop - 97.0) < 1e-9,
+              "  摆动低点下移时止损线必须钉住（棘轮）");
+
+        const int before = (int)cli->calls.size();
+        cli->fill_price = 97.0;
+        eng.update_bars(id, false, true, 90.0, 110.0, 4);
+        eng.tick("TESTUSDT", 97.0);
+        check((int)cli->calls.size() > before, "  触线应下平仓单");
+        check(cli->calls[before].reduce_only, "  平仓单是 reduceOnly");
+    }
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.mode = sar::Mode::BarPattern;
+        auto id = eng.add_bot(cfg);
+        eng.update_bars(id, false, false, 94.0, 106.0, 1);
+        eng.tick("TESTUSDT", 100.0);
+        check(cli->calls.empty(), "裸K线：十字星不得开仓");
+    }
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.mode = sar::Mode::BarPattern;
+        auto id = eng.add_bot(cfg);
+        eng.update_bars(id, true, false, 0, 0, 1);
+        eng.tick("TESTUSDT", 100.0);
+        check(cli->calls.empty(), "裸K线：摆动数据缺失不得开仓");
+    }
+    {
+        // 等风险下单在裸K线模式下必须按【真实止损距离】算，不是 k×ATR。
+        // 这是 plan_qty 改签名的全部理由
+        auto cli = std::make_shared<FakeClient>();
+        cli->qty_step = 1e-8;
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.mode = sar::Mode::BarPattern;
+        cfg.rule.swing_bars = 3;
+        cfg.rule.atr_mult   = 3.0;
+        cfg.size_mode   = SarConfig::SizeMode::RiskBased;
+        cfg.risk_usdt   = 100.0;
+        cfg.budget_usdt = 1000000.0;
+        auto id = eng.add_bot(cfg);
+
+        eng.update_bars(id, true, false, 94.0, 106.0, 1);
+        cli->fill_price = 100.0;
+        eng.tick("TESTUSDT", 100.0);
+        check(cli->calls.size() == 1, "裸K线 + 等风险：应能下单");
+        check(std::fabs(cli->calls[0].qty - 100.0 / 6.0) < 1e-6,
+              "  数量 = risk / |现价-止损线|，不是 risk/(k*ATR)");
+        check(std::fabs(cli->calls[0].qty * 6.0 - 100.0) < 1e-6,
+              "  单次止损亏损恰为 risk_usdt");
+    }
+
     // ── 按 ATR 等风险下单 ────────────────────────────────────────────────────
     {
         // 同样的 risk_usdt，ATR 大的品种应当拿到更小的名义——这正是"铺开品种

@@ -222,7 +222,12 @@ void SarEngine::update_signal(const std::string& id, double atr, double atr_pct,
     b.dc_up   = dc_up;
     b.dc_dn   = dc_dn;
     b.sig_time = host_.now_steady();
-    b.sig_ok   = (atr > 0 && dc_ok);
+    // ⚠ 裸K线模式下不能用通道就绪与否来判 sig_ok：那个模式根本不算通道，
+    //   而 update_bars 已经按K线数据设过 sig_ok 了。两个函数会先后调用
+    //   （裸K线模式也要 ATR 喂给等风险下单和金字塔），这里覆盖就会把
+    //   刚设好的 true 打回 false，表现为"永远数据不足、一单不开"
+    if (b.cfg.rule.mode != sar::Mode::BarPattern)
+        b.sig_ok = (atr > 0 && dc_ok);
     // bar_open_ms 变了 = 跨入新K线。冷却按K线计数，不按 tick——
     // 3 秒一个 tick 的话，"冷却3根4h线"会在 9 秒内走完，等于没有冷却
     if (bar_open_ms > 0 && bar_open_ms != b.bar_open_ms) {
@@ -230,15 +235,46 @@ void SarEngine::update_signal(const std::string& id, double atr, double atr_pct,
     }
 }
 
-double SarEngine::plan_qty(const SarConfig& cfg, double price, double atr) const {
+int SarEngine::signal_period_sec(const std::string& interval) {
+    static const struct { const char* name; int sec; } kTable[] = {
+        {"1m", 60}, {"3m", 180}, {"5m", 300}, {"15m", 900}, {"30m", 1800},
+        {"1h", 3600}, {"2h", 7200}, {"4h", 14400}, {"6h", 21600},
+        {"12h", 43200}, {"1d", 86400},
+    };
+    int bar_sec = 14400;   // 认不出来就按 4h 处理，取保守的慢节奏
+    for (const auto& e : kTable)
+        if (interval == e.name) { bar_sec = e.sec; break; }
+    return std::max(15, std::min(60, bar_sec / 4));
+}
+
+void SarEngine::update_bars(const std::string& id, bool bullish, bool bearish,
+                            double swing_low, double swing_high,
+                            int64_t bar_open_ms) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(id);
+    if (it == bots_.end()) return;
+    auto& b = it->second;
+    b.bar_bullish = bullish;
+    b.bar_bearish = bearish;
+    b.swing_low   = swing_low;
+    b.swing_high  = swing_high;
+    b.bar_ok      = (swing_low > 0 && swing_high > 0);
+    b.sig_time    = host_.now_steady();
+    // 裸K线模式不需要 ATR 也能工作，所以 sig_ok 在这个模式下只看K线本身
+    if (b.cfg.rule.mode == sar::Mode::BarPattern) b.sig_ok = b.bar_ok;
+    if (bar_open_ms > 0 && bar_open_ms != b.bar_open_ms) b.bar_open_ms = bar_open_ms;
+}
+
+double SarEngine::plan_qty(const SarConfig& cfg, double price,
+                           double stop_price) const {
     if (!std::isfinite(price) || price <= 0) return 0;
 
     double notional = cfg.budget_usdt;
     if (cfg.size_mode == SarConfig::SizeMode::RiskBased) {
-        // 止损距离（绝对价格）= k × ATR。止损时亏的钱 = 数量 × 止损距离，
-        // 令它等于 risk_usdt 反推数量，再乘价格得名义
-        const double stop_dist = cfg.rule.atr_mult * atr;
-        if (!(atr > 0) || !(stop_dist > 0) || !(cfg.risk_usdt > 0)) return 0;
+        // 止损时亏的钱 = 数量 × |现价 − 止损线|，令它等于 risk_usdt 反推数量。
+        // 用真实止损线而不是 k×ATR：裸K线模式的止损是摆动低点，与 ATR 无关
+        const double stop_dist = std::fabs(price - stop_price);
+        if (!(stop_price > 0) || !(stop_dist > 0) || !(cfg.risk_usdt > 0)) return 0;
         notional = cfg.risk_usdt * price / stop_dist;
         // 名义上限：ATR 极小时上面那个除法会算出荒谬的大仓位。
         // 没有这道帽子，一个刚上市、K线还平着的品种能把整个账户吃掉
@@ -286,6 +322,11 @@ void SarEngine::tick(const std::string& symbol, double price) {
             in.dc_ok = fresh && b.dc_ok;
             in.dc_up = b.dc_up;
             in.dc_dn = b.dc_dn;
+            in.bar_ok      = fresh && b.bar_ok;
+            in.bar_bullish = b.bar_bullish;
+            in.bar_bearish = b.bar_bearish;
+            in.swing_low   = b.swing_low;
+            in.swing_high  = b.swing_high;
             // new_bar 由 update_signal 翻新 bar_open_ms 驱动；这里每 tick 只传一次 true
             in.new_bar = (b.bar_open_ms != 0 && b.bar_open_ms != b.last_counted_bar_ms);
             if (in.new_bar) b.last_counted_bar_ms = b.bar_open_ms;
@@ -296,6 +337,8 @@ void SarEngine::tick(const std::string& symbol, double price) {
                 std::ostringstream d;
                 d << sar::pos_name(b.st.pos);
                 if (b.st.pos != sar::Pos::Flat) d << " 止损线=" << fmt(b.st.stop);
+                else if (b.cfg.rule.mode == sar::Mode::BarPattern && in.bar_ok)
+                    d << " 摆动[" << fmt(in.swing_low) << "," << fmt(in.swing_high) << "]";
                 else if (in.dc_ok) d << " 通道[" << fmt(in.dc_dn) << "," << fmt(in.dc_up) << "]";
                 if (!fresh) d << " 信号过期";
                 d << " | " << v.reason;
@@ -358,14 +401,23 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
     host_.submit([this, id, dir, from_reverse]() {
         try {
             SarConfig cfg;
-            double price = 0, atr = 0;
+            double price = 0, atr = 0, init_stop = 0;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
                 if (it == bots_.end()) return;
-                cfg   = it->second.cfg;
-                price = it->second.current_price;
-                atr   = it->second.atr;
+                const auto& b = it->second;
+                cfg   = b.cfg;
+                price = b.current_price;
+                atr   = b.atr;
+                // 初始止损线在【持锁时】按当前快照算好带出去：下单是异步的，
+                // 等回来再算的话快照可能已经换了一根K线，止损线会和成交价错配
+                sar::Inputs si;
+                si.price      = price;
+                si.atr        = b.atr;
+                si.swing_low  = b.swing_low;
+                si.swing_high = b.swing_high;
+                init_stop = sar::initial_stop(dir, price, cfg.rule, si);
             }
 
             // 杠杆失败不拦下单：敞口由 qty×价格决定，与杠杆无关，错过入场的代价
@@ -374,16 +426,20 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
                 log("⚠ " + cfg.symbol + " 杠杆设置失败（目标 " +
                     std::to_string(cfg.leverage) + "x），按交易所原有杠杆开仓");
 
-            const double qty = plan_qty(cfg, price, atr);
-            if (qty <= 0 || atr <= 0) {
+            const double qty = plan_qty(cfg, price, init_stop);
+            // 没有止损线就不开仓——这条对两种模式都成立，只是缺的东西不同
+            // （唐奇安缺 ATR，裸K线缺摆动低点）
+            const bool stop_ok = init_stop > 0 &&
+                (dir == sar::Pos::Long ? init_stop < price : init_stop > price);
+            if (qty <= 0 || !stop_ok) {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
                 if (it != bots_.end()) {
                     it->second.pending = false;
-                    it->second.last_action = (atr <= 0) ? "ATR缺失，跳过开仓"
-                                                        : "数量不足，跳过开仓";
+                    it->second.last_action = !stop_ok ? "止损线缺失，跳过开仓"
+                                                      : "数量不足，跳过开仓";
                 }
-                log(cfg.symbol + (atr <= 0 ? " ATR 缺失，不开仓（没有ATR就没有止损线）"
+                log(cfg.symbol + (!stop_ok ? " 算不出有效止损线，不开仓"
                                            : " 开仓数量不足，跳过"));
                 return;
             }
@@ -405,7 +461,9 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
             }
             if (r.ok) {
                 const double fill = (r.avg_price > 0) ? r.avg_price : price;
-                sar::on_filled(b.st, dir, fill, atr, cfg.rule, from_reverse);
+                // 成交价可能偏离下单时的快照价，但止损线是【结构位】（摆动低点
+                // 或入场时的 Chandelier），不该随滑点漂移——用持锁时算好的那条
+                sar::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse);
                 b.qty = r.executed_qty;
                 std::ostringstream ss;
                 ss << cfg.symbol << " 开" << sar::pos_name(dir)
@@ -438,7 +496,7 @@ void SarEngine::submit_add(const std::string& id) {
     host_.submit([this, id]() {
         try {
             SarConfig cfg;
-            double price = 0, atr = 0, have_qty = 0, avg = 0;
+            double price = 0, atr = 0, have_qty = 0, avg = 0, cur_stop = 0;
             sar::Pos pos = sar::Pos::Flat;
             int adds_before = 0;
             {
@@ -451,6 +509,7 @@ void SarEngine::submit_add(const std::string& id) {
                 have_qty = it->second.qty;
                 avg      = it->second.st.entry_price;
                 pos      = it->second.st.pos;
+                cur_stop = it->second.st.stop;
                 adds_before = it->second.st.adds_done;
             }
             if (pos == sar::Pos::Flat || have_qty <= 0 || atr <= 0) {
@@ -460,7 +519,9 @@ void SarEngine::submit_add(const std::string& id) {
                 return;
             }
 
-            const double qty = plan_qty(cfg, price, atr);
+            // 加仓的风险单位用【当前止损线】：线已经棘轮上移过，这一档的
+            // 真实风险比首档小，按首档的距离算会加得过重
+            const double qty = plan_qty(cfg, price, cur_stop);
             if (qty <= 0) {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);

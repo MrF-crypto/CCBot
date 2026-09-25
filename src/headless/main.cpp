@@ -486,15 +486,36 @@ int main(int argc, char** argv) {
         // 每 20 个 tick（约 60 秒）一轮。信号周期通常是 4h，用不着更密；
         // 而止损线的推进【不靠这个】——它在每个 tick 用实时价推，只有 ATR 的
         // 数值来自这里。所以这一批慢一点不影响保护
-        if (sar_engine && !sar_sig_busy.load() && (tick_n % 20) == 1) {
+        if (sar_engine && !sar_sig_busy.load()) {
             auto sbots = sar_engine->get_bots();
             std::vector<SarBot> need;
-            for (const auto& b : sbots)
-                if (b.state == SarBot::State::Running) need.push_back(b);
+            for (const auto& b : sbots) {
+                if (b.state != SarBot::State::Running) continue;
+                // 每个 bot 按自己周期的节奏拉：3m 要 45 秒一次才不会错过收盘，
+                // 4h 每 60 秒一次就够。tick 是 3 秒一拍
+                const int ticks = std::max(1,
+                    SarEngine::signal_period_sec(b.cfg.interval) / 3);
+                if ((tick_n % ticks) == 1) need.push_back(b);
+            }
             if (!need.empty()) {
                 sar_sig_busy.store(true);
                 fetch_pool->submit([client, sar_engine, need, &sar_sig_busy]() {
                     for (const auto& b : need) {
+                        if (b.cfg.rule.mode == sar::Mode::BarPattern) {
+                            auto bp = client->fetch_bar_pattern(
+                                b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
+                            if (!bp.ok) continue;
+                            sar_engine->update_bars(b.bot_id, bp.bullish, bp.bearish,
+                                                    bp.swing_low, bp.swing_high,
+                                                    bp.bar_open_ms);
+                            const double a = client->fetch_atr(
+                                b.cfg.symbol, b.cfg.interval, b.cfg.rule.atr_period);
+                            if (a > 0 && bp.price > 0)
+                                sar_engine->update_signal(b.bot_id, a,
+                                                          a / bp.price * 100.0,
+                                                          false, 0, 0, bp.bar_open_ms);
+                            continue;
+                        }
                         auto snap = client->fetch_sar_signal(
                             b.cfg.symbol, b.cfg.interval,
                             b.cfg.rule.donchian_period, b.cfg.rule.atr_period);

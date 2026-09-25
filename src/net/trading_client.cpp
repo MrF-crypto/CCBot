@@ -1284,6 +1284,36 @@ double TradingClient::fetch_atr(const std::string& sym, const std::string& inter
     return indicators::atr(oh, period);
 }
 
+TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
+        const std::string& sym, const std::string& interval, int swing_bars) {
+    BarSnapshot out;
+    if (swing_bars < 1) return out;
+
+    // 需要：未收盘根(1) + 信号根(1) + 摆动窗口(N)，再多拿几根兜底
+    const int need = swing_bars + 2 + 3;
+    auto bars = fetch_klines(sym, interval, need);
+    if ((int)bars.size() < swing_bars + 2) return out;
+
+    const int n = (int)bars.size();
+    out.price       = bars[n - 1].close;      // 未收盘根的实时值
+    out.bar_open_ms = bars[n - 1].open_ms;
+
+    const auto& sig = bars[n - 2];            // 刚收盘那根 = 用户的 bar 0
+    out.bullish = sig.close > sig.open;
+    out.bearish = sig.close < sig.open;
+
+    // 摆动窗口 = 信号根【之前】的 N 根（用户的 1..N），不含信号根自己
+    double lo = bars[n - 3].low, hi = bars[n - 3].high;
+    for (int i = n - 3; i > n - 3 - swing_bars && i >= 0; --i) {
+        lo = std::min(lo, bars[i].low);
+        hi = std::max(hi, bars[i].high);
+    }
+    out.swing_low  = lo;
+    out.swing_high = hi;
+    out.ok = (out.price > 0 && lo > 0 && hi > 0 && hi >= lo);
+    return out;
+}
+
 // ── 高周期趋势快照（趋势状态机）───────────────────────────────────────────────
 TradingClient::TrendSnapshot TradingClient::fetch_trend(
         const std::string& sym, const std::string& interval,

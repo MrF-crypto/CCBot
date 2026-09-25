@@ -76,6 +76,12 @@ struct SarBot {
     bool    dc_ok   = false;
     double  dc_up   = 0;
     double  dc_dn   = 0;
+    // 裸K线模式的快照
+    bool    bar_ok      = false;
+    bool    bar_bullish = false;
+    bool    bar_bearish = false;
+    double  swing_low   = 0;
+    double  swing_high  = 0;
     std::chrono::steady_clock::time_point sig_time{};
     int64_t bar_open_ms = 0;       // 最新信号快照所属K线的开盘时间
     // tick 里已经把上面那根算进冷却的K线。两者分开是因为 update_signal 与 tick
@@ -134,6 +140,15 @@ public:
     // 应用层拉到K线后喂入信号快照（ATR + 唐奇安通道 + 当前K线开盘时间）
     void update_signal(const std::string& bot_id, double atr, double atr_pct,
                        bool dc_ok, double dc_up, double dc_dn, int64_t bar_open_ms);
+    // 裸K线模式的快照（与 update_signal 分开：两种模式要的数据不同，
+    // 合成一个大函数会让调用方被迫为用不到的参数填占位值）
+    void update_bars(const std::string& bot_id, bool bullish, bool bearish,
+                     double swing_low, double swing_high, int64_t bar_open_ms);
+
+    // 该多久拉一次信号（秒）。短周期必须拉得更密：3m 的K线若 60 秒才查一次，
+    // 最坏情况要等 60 秒才发现它收盘了——那是整根K线的 1/3，入场点会明显漂移。
+    // 取周期的 1/4 并夹在 [15, 60] 秒之间
+    static int signal_period_sec(const std::string& interval);
 
     // 由价格流每 tick 调用
     void tick(const std::string& symbol, double price);
@@ -171,9 +186,12 @@ private:
     void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
     void log(const std::string& msg) const;
 
-    // 计算下单数量。Notional 用固定名义；RiskBased 按 ATR 反推并受 budget 封顶。
-    // atr 传 0 时 RiskBased 无法计算，返回 0（调用方据此跳过下单）
-    double plan_qty(const SarConfig& cfg, double price, double atr) const;
+    // 计算下单数量。Notional 用固定名义；RiskBased 用【真实止损距离】反推
+    // 并受 budget 封顶。
+    // ⚠ 用 stop_price 而不是 k×ATR：裸K线模式的止损是摆动低点，和 ATR 无关。
+    //   拿 ATR 去算那个模式的仓位，算出来的"单次愿亏"是假的
+    // stop_price<=0 或与 price 重合时无法计算，返回 0（调用方跳过下单）
+    double plan_qty(const SarConfig& cfg, double price, double stop_price) const;
 
     std::shared_ptr<ITradingClient> client_;
     std::shared_ptr<ThreadPool>     pool_;

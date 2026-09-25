@@ -2554,11 +2554,17 @@ void MainWindow::onTick() {
     // ── SAR 信号拉取（ATR + 唐奇安通道），每 20 个 tick 约 60 秒 ───────────────
     // 止损线的推进【不靠这个】：它在每个 tick 用实时价推进，只有 ATR 的数值
     // 来自这里。所以这一批慢一点不影响保护，只影响新仓位的入场判定
-    if (sar_engine_ && !sarSigBusy_.load() &&
-        ((slowTickCount_ % 20) == 1 || sarSigForce_.exchange(false))) {
+    if (sar_engine_ && !sarSigBusy_.load()) {
+        // 每个 bot 按自己周期该有的节奏拉：4h 的每 60 秒一次就够，3m 的要 45 秒
+        // 一次才不会错过收盘。tick 是 3 秒一拍，所以除以 3 换算成拍数
+        const bool forced = sarSigForce_.exchange(false);
         std::vector<SarBot> need;
-        for (const auto& b : sar_engine_->get_bots())
-            if (b.state == SarBot::State::Running) need.push_back(b);
+        for (const auto& b : sar_engine_->get_bots()) {
+            if (b.state != SarBot::State::Running) continue;
+            const int ticks = std::max(1,
+                SarEngine::signal_period_sec(b.cfg.interval) / 3);
+            if (forced || (slowTickCount_ % ticks) == 1) need.push_back(b);
+        }
         if (!need.empty()) {
             sarSigBusy_.store(true);
             run_async([this, need]() {
@@ -2569,6 +2575,23 @@ void MainWindow::onTick() {
                 int okn = 0;
                 for (const auto& b : need) {
                     if (!client_ || !sar_engine_) break;
+                    if (b.cfg.rule.mode == sar::Mode::BarPattern) {
+                        auto bp = client_->fetch_bar_pattern(
+                            b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
+                        if (!bp.ok) { failed << QString::fromStdString(b.cfg.symbol); continue; }
+                        ++okn;
+                        sar_engine_->update_bars(b.bot_id, bp.bullish, bp.bearish,
+                                                 bp.swing_low, bp.swing_high,
+                                                 bp.bar_open_ms);
+                        // ATR 照样喂：裸K线模式的止损不用它，但等风险下单的
+                        // 显示、金字塔间距、ATR 列都还要
+                        const double a = client_->fetch_atr(b.cfg.symbol, b.cfg.interval,
+                                                            b.cfg.rule.atr_period);
+                        if (a > 0 && bp.price > 0)
+                            sar_engine_->update_signal(b.bot_id, a, a / bp.price * 100.0,
+                                                       false, 0, 0, bp.bar_open_ms);
+                        continue;
+                    }
                     auto snap = client_->fetch_sar_signal(
                         b.cfg.symbol, b.cfg.interval,
                         b.cfg.rule.donchian_period, b.cfg.rule.atr_period);

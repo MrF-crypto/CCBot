@@ -431,8 +431,29 @@ void MainWindow::openSarDialog(const std::string& symbol) {
     lev->setValue(c.leverage);
     form->addRow("杠杆", lev);
 
+    // 入场/止损算法：两套成套的组合，不是可以混搭的两个旋钮
+    auto* modeBox = new QComboBox();
+    modeBox->addItem("唐奇安突破 + ATR 止损", (int)sar::Mode::Donchian);
+    modeBox->addItem("裸K线 + 摆动止损",       (int)sar::Mode::BarPattern);
+    modeBox->setCurrentIndex(c.rule.mode == sar::Mode::BarPattern ? 1 : 0);
+    modeBox->setToolTip(
+        "唐奇安突破：价格创 N 根新高/新低入场，止损用 k×ATR 的棘轮线。海龟原版。\n\n"
+        "裸K线：刚收盘那根是阳线就做多、阴线就做空；止损用【它之前 N 根】的\n"
+        "最低价（做多）/ 最高价（做空），窗口随K线右移，棘轮只朝有利方向。\n"
+        "入场只在K线收盘那一拍判定，不看盘中。");
+    form->addRow("入场/止损算法", modeBox);
+
+    auto* swingEdit = new QSpinBox();
+    swingEdit->setRange(1, 50);
+    swingEdit->setValue(c.rule.swing_bars);
+    swingEdit->setToolTip(
+        "止损用最近几根的最低/最高价。信号根【不算】在内。\n\n"
+        "⚠ 这个数直接决定持仓时长和交易频率：随机游走下平均持仓约 N+1 根。\n"
+        "N=3 ⇒ 4 根就被打掉一次。配短周期时交易次数会非常高。");
+    form->addRow("摆动止损根数", swingEdit);
+
     auto* itv = new QComboBox();
-    itv->addItems({"15m", "1h", "4h", "12h", "1d"});
+    itv->addItems({"3m", "5m", "15m", "30m", "1h", "4h", "12h", "1d"});
     itv->setCurrentText(QString::fromStdString(c.interval));
     itv->setToolTip("信号K线周期。周期越短信号越多，假突破也越多。");
     form->addRow("信号周期", itv);
@@ -540,6 +561,8 @@ void MainWindow::openSarDialog(const std::string& symbol) {
     c.rule.reverse_needs_signal = revSig->isChecked();
     c.rule.max_consecutive_reverses = maxRev->value();
     c.rule.cooldown_bars   = cd->value();
+    c.rule.mode       = (sar::Mode)modeBox->currentData().toInt();
+    c.rule.swing_bars = swingEdit->value();
     c.size_mode = (SarConfig::SizeMode)sizeMode->currentData().toInt();
     c.risk_usdt = riskEdit->value();
     c.rule.pyramid_max_adds = pyrMax->value();
@@ -639,6 +662,8 @@ void MainWindow::save_sar_bots() {
         o["risk_usdt"]       = b.cfg.risk_usdt;
         o["pyramid_max_adds"] = b.cfg.rule.pyramid_max_adds;
         o["pyramid_step_atr"] = b.cfg.rule.pyramid_step_atr;
+        o["sar_mode"]        = (int)b.cfg.rule.mode;
+        o["swing_bars"]      = b.cfg.rule.swing_bars;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
         o["state"]           = (int)b.state;
         // ── 运行时状态 ──
@@ -706,6 +731,8 @@ void MainWindow::load_and_restore_sar() {
         b.cfg.risk_usdt = o["risk_usdt"].toDouble(0);
         b.cfg.rule.pyramid_max_adds = o["pyramid_max_adds"].toInt(0);
         b.cfg.rule.pyramid_step_atr = o["pyramid_step_atr"].toDouble(0.5);
+        b.cfg.rule.mode = (sar::Mode)o["sar_mode"].toInt(0);
+        b.cfg.rule.swing_bars = o["swing_bars"].toInt(3);
         b.cfg.signal_max_age_sec   = o["signal_max_age_sec"].toInt(900);
         b.state = (SarBot::State)o["state"].toInt(0);
 
