@@ -450,6 +450,8 @@ struct SarFormWidgets {
     QSpinBox*       cooldown = nullptr;
     QSpinBox*       pyrMax   = nullptr;
     QDoubleSpinBox* pyrStep  = nullptr;
+    QCheckBox*      disStop  = nullptr;
+    QDoubleSpinBox* disBuf   = nullptr;
     SarConfig       base;      // 弹窗没有控件的字段（signal_max_age_sec 等）从这里继承
 };
 
@@ -476,6 +478,7 @@ std::shared_ptr<SarFormWidgets> MainWindow::buildSarForm(QVBoxLayout* into,
     auto* posForm  = mkGroup("仓位与杠杆", "#58a6ff");
     auto* sigForm  = mkGroup("入场与出场", "#a371f7");
     auto* revForm  = mkGroup("反手与加仓", "#3fb950");
+    auto* riskForm = mkGroup("进程外保护", "#f85149");
 
     // ── 仓位与杠杆 ──────────────────────────────────────────────────────────
     // ⚠ 仓位算法排在最前面：它决定了下面两个框各自的含义（名义价值 vs 名义上限），
@@ -669,6 +672,42 @@ std::shared_ptr<SarFormWidgets> MainWindow::buildSarForm(QVBoxLayout* into,
                 stepW, [stepW](int v) { stepW->setEnabled(v > 0); });
     }
 
+    // ── 进程外保护 ──────────────────────────────────────────────────────────
+    w->disStop = new QCheckBox("在交易所挂灾难止损单（强烈建议开启）");
+    w->disStop->setChecked(c.use_disaster_stop);
+    w->disStop->setToolTip(
+        "把棘轮止损线镜像成交易所上的一张 STOP_MARKET + closePosition 单。\n\n"
+        "为什么 SAR 比 DCA 更需要它：DCA 的保护是「名义 ≤ 权益 ⇒ 不可强平」，那是个\n"
+        "不依赖任何订单存在的数学不变量，进程死了仓位也扛得住；而趋势 SAR 的全部\n"
+        "保护就是那条活在【本进程里】的止损线。程序崩了、断电了、窗口被误关了，\n"
+        "这个仓位就是完全裸奔且没有任何底。\n\n"
+        "对 SAR 也不存在 DCA 那边「会把浮亏变实亏」的纠结——止损本来就是这套策略的\n"
+        "计划内动作，镜像到交易所只是让计划在进程死后仍然执行。");
+    riskForm->addRow(w->disStop);
+
+    w->disBuf = new QDoubleSpinBox();
+    w->disBuf->setRange(0.1, 20.0);
+    w->disBuf->setSingleStep(0.1);
+    w->disBuf->setDecimals(2);
+    w->disBuf->setValue(c.disaster_stop_buffer_pct);
+    w->disBuf->setToolTip(
+        "挂单价 = 止损线再往外扩这么多%（多头往下、空头往上）。\n\n"
+        "⚠ 不能填 0。交易所用连续的标记价触发，而本地是每 3 秒采样一次——挂在\n"
+        "止损线【上】的话交易所几乎总会先触发，于是主出场路径从「本地平仓」变成\n"
+        "「交易所平掉、本地靠对账才发现」，而对账发现外部平仓会【停掉 bot】。\n"
+        "等于把一次正常的止损出场变成需要人工介入的事件。\n\n"
+        "留出缓冲之后：正常情况本地先平并撤掉这张单，只有进程真的不在了，\n"
+        "价格才会继续走到这张单上。1% 对常态 ATR 2% 的品种是合适的起点。");
+    riskForm->addRow("外扩缓冲 %", w->disBuf);
+    {
+        auto* h = new QLabel(
+            "止损线每根K线都可能棘轮上移，但这张单只在线移动超过 0.5% 时才重挂——"
+            "逐次撤挂会吃光限流额度，而它的职责只是「进程死了兜住」，不需要贴着本地线走。");
+        h->setWordWrap(true);
+        h->setStyleSheet("color:#8b949e;font-size:10px;");
+        riskForm->addRow(h);
+    }
+
     return w;
 }
 
@@ -694,6 +733,8 @@ bool MainWindow::collectSarForm(const std::shared_ptr<SarFormWidgets>& w, SarCon
     out.rule.cooldown_bars            = w->cooldown->value();
     out.rule.pyramid_max_adds         = w->pyrMax->value();
     out.rule.pyramid_step_atr         = w->pyrStep->value();
+    out.use_disaster_stop             = w->disStop->isChecked();
+    out.disaster_stop_buffer_pct      = w->disBuf->value();
 
     if (out.size_mode == SarConfig::SizeMode::RiskBased && out.risk_usdt <= 0) {
         QMessageBox::warning(this, "缺少参数",
@@ -797,6 +838,12 @@ void MainWindow::save_sar_bots() {
         o["sar_mode"]        = (int)b.cfg.rule.mode;
         o["swing_bars"]      = b.cfg.rule.swing_bars;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
+        o["use_disaster_stop"]  = b.cfg.use_disaster_stop;
+        o["disaster_stop_buffer_pct"] = b.cfg.disaster_stop_buffer_pct;
+        // 单号必须跨重启存活：不存的话重启后会遗留一张触发价对不上的
+        // 孤儿单，而 closePosition 同方向只能有一张，新的挂不上去
+        o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
+        o["disaster_stop_price"] = b.disaster_stop_price;
         o["state"]           = (int)b.state;
         // ── 运行时状态 ──
         // Qt 的 QJsonValue(double) 是全精度往返，不像 ostringstream 会截到 6 位。
@@ -866,6 +913,11 @@ void MainWindow::load_and_restore_sar() {
         b.cfg.rule.mode = (sar::Mode)o["sar_mode"].toInt(0);
         b.cfg.rule.swing_bars = o["swing_bars"].toInt(3);
         b.cfg.signal_max_age_sec   = o["signal_max_age_sec"].toInt(900);
+        b.cfg.use_disaster_stop    = o["use_disaster_stop"].toBool(false);
+        b.cfg.disaster_stop_buffer_pct =
+            o["disaster_stop_buffer_pct"].toDouble(1.0);
+        b.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
+        b.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         b.state = (SarBot::State)o["state"].toInt(0);
 
         const int pos = o["pos"].toInt((int)sar::Pos::Flat);

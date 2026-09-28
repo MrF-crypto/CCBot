@@ -317,7 +317,7 @@ void SarEngine::tick(const std::string& symbol, double price) {
     //   写入冷却），它假定给出的动作【一定会被执行】。如果某天允许同品种多个
     //   bot 而这里还是单槽，被挤掉的那个 bot 会带着已改写的状态等下一个 tick，
     //   再次判定时走的是另一条分支——动作就错了。到那时这里必须改成向量派发
-    std::string to_close, close_reason, to_open, to_add;
+    std::string to_close, close_reason, to_open, to_add, to_ds_sync;
     sar::Pos reverse_to = sar::Pos::Flat, open_dir = sar::Pos::Flat;
 
     {
@@ -365,6 +365,13 @@ void SarEngine::tick(const std::string& symbol, double price) {
                 b.last_decision = d.str();
             }
 
+            // 交易所侧灾难止损：持仓中且线动了就同步一次。
+            // 这里只记一个待办，真正的撤挂在锁外派发——place/cancel 都是 HTTP，
+            // 持着 mtx_ 做网络 IO 会把整个引擎卡住
+            if (b.cfg.use_disaster_stop && b.st.pos != sar::Pos::Flat &&
+                b.qty > 0 && b.st.stop > 0 && !b.ds_syncing && to_ds_sync.empty())
+                to_ds_sync = b.bot_id;
+
             switch (v.action) {
             case sar::Action::Hold:
                 break;
@@ -405,6 +412,15 @@ void SarEngine::tick(const std::string& symbol, double price) {
     if (!to_close.empty()) submit_close(to_close, close_reason, reverse_to);
     if (!to_open.empty())  submit_open (to_open,  open_dir, false);
     if (!to_add.empty())   submit_add  (to_add);
+    // 灾难止损的同步放在最后：要平仓/反手的那一拍不该再去改这张单——
+    // submit_close 会把它撤掉，这里再挂一张就成了孤儿单
+    if (!to_ds_sync.empty() && to_close.empty())
+        host_.submit([this, id = to_ds_sync]() {
+            try { sync_disaster_stop(id); }
+            catch (const std::exception& e) {
+                log("⚠ 灾难止损同步异常: " + std::string(e.what()));
+            } catch (...) { log("⚠ 灾难止损同步未知异常"); }
+        });
 }
 
 void SarEngine::clear_pending_after_throw(const std::string& id, const std::string& what) {
@@ -446,6 +462,7 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
                 log("⚠ " + cfg.symbol + " 杠杆设置失败（目标 " +
                     std::to_string(cfg.leverage) + "x），按交易所原有杠杆开仓");
 
+            bool need_ds_sync = false;   // 成交后要不要挂灾难止损（派发在锁外）
             const double qty = plan_qty(cfg, price, init_stop);
             // 没有止损线就不开仓——这条对两种模式都成立，只是缺的东西不同
             // （唐奇安缺 ATR，裸K线缺摆动低点）
@@ -466,6 +483,10 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
 
             auto r = client_->place_market_order(cfg.symbol, side_of(dir, false), qty, false);
 
+            // ⚠ 这个锁必须【显式加一层作用域】：底下要在成交后同步交易所侧灾难
+            //   止损，而那是 HTTP。持着 mtx_ 做网络 IO 会把整个引擎卡住几百毫秒
+            //   （recursive_mutex 不死锁，但 tick / get_bots / 对账全在等它）
+            {
             std::lock_guard<std::recursive_mutex> lk(mtx_);
             auto it = bots_.find(id);
             if (it == bots_.end()) return;
@@ -493,6 +514,9 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
                    << "（距离 " << fmt(std::fabs(fill - b.st.stop) / fill * 100.0, 2) << "%）";
                 log(ss.str());
                 b.last_action = std::string("持") + sar::pos_name(dir) + "@" + fmt(fill, 2);
+                // 开仓成交即挂灾难止损，不等下一个 tick——那中间的 3 秒是没有
+                // 任何进程外保护的窗口，而新开的仓位恰恰最可能立刻遇到急跌
+                need_ds_sync = b.cfg.use_disaster_stop;
             } else if (r.uncertain) {
                 // 开仓状态不明：可能已成交而本地没记录。盲目重试会变双倍仓位——
                 // 停掉等人工核对。这和 reduceOnly 平仓不同，开仓【不幂等】
@@ -504,6 +528,8 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
                 b.last_action = "开仓失败";
                 log(cfg.symbol + " 开仓失败: " + r.error);
             }
+            }   // ← mtx_ 在此释放，下面才敢做 HTTP
+            if (need_ds_sync) sync_disaster_stop(id);
         } catch (const std::exception& e) {
             clear_pending_after_throw(id, "submit_open 异常: " + std::string(e.what()));
         } catch (...) {
@@ -604,6 +630,96 @@ void SarEngine::submit_add(const std::string& id) {
     });
 }
 
+// ── 交易所侧灾难止损单 ───────────────────────────────────────────────────────
+// 止损线每 tick 都可能棘轮上移。逐次撤挂会把限流额度吃光，而这张单的职责只是
+// "进程死了兜住"，不需要贴着本地线走——线移动超过这个比例才重挂。
+// 取 0.5%：常态 ATR 2% 的品种上，缓冲 1% 加这个阈值，交易所单最坏落后本地线 1.5%，
+// 而它只在进程已经不在了的时候才会被用到
+static constexpr double kDsResyncPct = 0.005;
+
+void SarEngine::sync_disaster_stop(const std::string& bot_id) {
+    std::string sym, side, old_id;
+    double target = 0, old_price = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        auto it = bots_.find(bot_id);
+        if (it == bots_.end()) return;
+        auto& b = it->second;
+        if (!b.cfg.use_disaster_stop) return;
+        if (b.st.pos == sar::Pos::Flat || b.qty <= 0 || b.st.stop <= 0) return;
+        if (b.ds_syncing) return;   // 已有一次在途，跳过是安全的：线还在动，下一拍再来
+        b.ds_syncing = true;
+
+        const bool is_long = (b.st.pos == sar::Pos::Long);
+        // 挂在止损线【之外】：多头往下、空头往上。缓冲的理由见 SarConfig 的注释——
+        // 挂在线上会让交易所抢在本地之前触发，把正常止损变成"外部平仓 → 停 bot"
+        const double buf = std::max(0.0, b.cfg.disaster_stop_buffer_pct) / 100.0;
+        target = is_long ? b.st.stop * (1.0 - buf) : b.st.stop * (1.0 + buf);
+        sym    = b.cfg.symbol;
+        // 平多要 SELL、平空要 BUY。place_disaster_stop 的入参是【持仓方向】，
+        // 由 TradingClient 内部换成平仓方向——这里传持仓方向，别自己反
+        side   = is_long ? "BUY" : "SELL";
+        old_id    = b.disaster_stop_id;
+        old_price = b.disaster_stop_price;
+    }
+
+    // 下面有多个提前返回点，标记必须每条路径都清掉——漏一条这个 bot 的灾难止损
+    // 就永久不再同步（比并发挂两张更糟：静默失去保护）。交给析构，不靠人记
+    struct SyncFlagGuard {
+        SarEngine* self; const std::string& id;
+        ~SyncFlagGuard() {
+            std::lock_guard<std::recursive_mutex> lk(self->mtx_);
+            auto it = self->bots_.find(id);
+            if (it != self->bots_.end()) it->second.ds_syncing = false;
+        }
+    } flag_guard{this, bot_id};
+
+    if (!(target > 0)) return;
+
+    // 线没移动够就不动它：撤挂之间有个没有保护的空窗，而且白耗限流
+    if (!old_id.empty() && old_price > 0 &&
+        std::fabs(target - old_price) / old_price < kDsResyncPct) return;
+
+    // 只能先撤后挂：closePosition 单同一方向只允许存在一张，币安会拒掉第二张。
+    // 空窗无法避免，所以上面那道阈值要够大
+    if (!old_id.empty()) client_->cancel_disaster_stop(sym, old_id);
+
+    const std::string new_id = client_->place_disaster_stop(sym, target, side);
+
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(bot_id);
+    if (it == bots_.end()) return;
+    if (new_id.empty()) {
+        // 挂单失败【必须让人看见】：此刻这个仓位没有任何进程外保护
+        it->second.disaster_stop_id.clear();
+        it->second.disaster_stop_price = 0;
+        log("⚠ " + sym + " 交易所侧灾难止损单挂单失败——该仓位当前没有进程外保护，"
+            "止损线下次移动时会自动重试");
+        return;
+    }
+    it->second.disaster_stop_id    = new_id;
+    it->second.disaster_stop_price = target;
+    log(sym + " 交易所侧灾难止损已挂 @" + fmt(target) +
+        "（止损线 " + fmt(it->second.st.stop) + " 外扩 " +
+        fmt(it->second.cfg.disaster_stop_buffer_pct, 2) + "%，进程死了也在）");
+}
+
+void SarEngine::cancel_disaster_stop(const std::string& bot_id) {
+    std::string sym, id;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        auto it = bots_.find(bot_id);
+        if (it == bots_.end() || it->second.disaster_stop_id.empty()) return;
+        sym = it->second.cfg.symbol;
+        id  = it->second.disaster_stop_id;
+        // 先就地清掉，再去撤。反了的话撤单这几百毫秒里如果又派发一次 sync，
+        // 会拿着同一个已撤单号再撤一次
+        it->second.disaster_stop_id.clear();
+        it->second.disaster_stop_price = 0;
+    }
+    client_->cancel_disaster_stop(sym, id);
+}
+
 void SarEngine::submit_close(const std::string& id, const std::string& reason,
                              sar::Pos reverse_to) {
     host_.submit([this, id, reason, reverse_to]() {
@@ -659,6 +775,12 @@ void SarEngine::submit_close(const std::string& id, const std::string& reason,
 
             SarTrade tr;
             bool emit_trade = false;
+            // 要不要撤掉交易所侧那张单。真正的撤单在锁外做——它是 HTTP，
+            // 持着 mtx_ 发请求会把 tick / get_bots / 对账全卡住
+            bool need_ds_cancel = false;
+            // -2022（交易所侧已无仓位）那条路本该直接 return，但撤单必须在锁外，
+            // 所以改成标记 + 跳过后续，出锁之后统一处理
+            bool ds_only_cancel = false;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
@@ -668,6 +790,7 @@ void SarEngine::submit_close(const std::string& id, const std::string& reason,
                 if (external_gone) {
                     // reduceOnly 被拒 = 交易所侧已无仓位（手动平过/被强平）。
                     // 本地留着幽灵仓会每 tick 重试一次 -2022，无限循环
+                    need_ds_cancel = !b.disaster_stop_id.empty();
                     sar::on_closed(b.st);
                     b.qty = 0;
                     b.pending = false;
@@ -675,8 +798,9 @@ void SarEngine::submit_close(const std::string& id, const std::string& reason,
                     b.last_action = "⚠ 交易所侧已无仓位，已停止待核对";
                     log("⚠ " + cfg.symbol + " 平仓被拒(-2022)：交易所侧已无该仓位，"
                         "已清空本地状态并停止，请核对后手动恢复");
-                    return;
+                    ds_only_cancel = true;   // 不能在这里 return：撤单要在锁外
                 }
+                if (!ds_only_cancel) {
                 if (!closed_ok) {
                     // 含 uncertain：reduceOnly 天然幂等，若实际已平，下个 tick
                     // 重试会被交易所拒绝并走上面的 -2022 分支。重试是安全的
@@ -704,6 +828,9 @@ void SarEngine::submit_close(const std::string& id, const std::string& reason,
                 b.realized_pnl += pnl;
                 ++b.trade_count;
                 if (pnl > 0) ++b.win_count;
+                // 仓位已清空，撤掉交易所侧那张单。不撤的话它会留在挂单列表里，
+                // 而 closePosition 单同方向只能有一张——下一轮开仓再挂会被拒
+                need_ds_cancel = !b.disaster_stop_id.empty();
                 sar::on_closed(b.st);
                 b.qty = 0;
 
@@ -720,7 +847,12 @@ void SarEngine::submit_close(const std::string& id, const std::string& reason,
                 }
                 // reverse_to != Flat 时【保持 pending=true】，紧接着开反向，
                 // 整段不放开，别的 tick 插不进来
-            }
+                }   // ← if (!ds_only_cancel)
+            }       // ← mtx_ 在此释放
+            // 撤单放在锁外。ds_only_cancel 时后面的反手/回调一律跳过——
+            // 仓位在交易所侧已经没了，没有可平的也没有可反的
+            if (need_ds_cancel) cancel_disaster_stop(id);
+            if (ds_only_cancel) return;
             if (emit_trade && trade_cb_) trade_cb_(tr);
 
             if (reverse_to != sar::Pos::Flat) {

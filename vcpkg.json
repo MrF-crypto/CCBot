@@ -1,6 +1,6 @@
 {
   "name": "ccg-monitor",
-  "version": "4.6.2",
+  "version": "4.7.0",
   "description": "TradingBot — Binance USDT-M 永续合约的网格DCA / 趋势SAR 双策略交易程序（含 headless 版）",
   "dependencies": [
     "ixwebsocket",

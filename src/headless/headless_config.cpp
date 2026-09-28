@@ -214,6 +214,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "donchian_period", "atr_period", "atr_mult",
         "allow_reverse", "reverse_needs_signal",
         "max_consecutive_reverses", "cooldown_bars", "signal_max_age_sec",
+        "use_disaster_stop", "disaster_stop_buffer_pct",
         "size_mode", "risk_usdt", "pyramid_max_adds", "pyramid_step_atr",
         "mode", "swing_bars",
     };
@@ -240,6 +241,17 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
             c.interval    = get_str(so, "interval", c.interval);
             c.signal_max_age_sec = (int)get_num(so, "signal_max_age_sec",
                                                 c.signal_max_age_sec);
+            // 交易所侧灾难止损：SAR 唯一的进程外保护，强烈建议开
+            c.use_disaster_stop = get_bool(so, "use_disaster_stop", c.use_disaster_stop);
+            c.disaster_stop_buffer_pct = get_num(so, "disaster_stop_buffer_pct",
+                                                 c.disaster_stop_buffer_pct);
+            if (c.use_disaster_stop && c.disaster_stop_buffer_pct <= 0) {
+                // 缓冲为 0 会让交易所抢在本地之前触发，把正常止损变成"外部平仓
+                // → 停 bot"。这是一个静默改变行为的配置错误，必须拦
+                err = c.symbol + ": disaster_stop_buffer_pct 必须大于 0"
+                      "（挂在止损线上会让交易所抢先触发，正常出场会变成需要人工介入的事件）";
+                return false;
+            }
 
             c.rule.donchian_period = (int)get_num(so, "donchian_period",
                                                   c.rule.donchian_period);

@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 4.6.2 LANGUAGES CXX)
+project(TradingBot VERSION 4.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,7 +25,35 @@ set(CMAKE_AUTORCC ON)
 #   vcpkg 依赖和 Qt 生成的 moc 代码一起纳入，它们的警告我们既管不了也不该管。
 option(CCBOT_WERROR "把编译警告当作错误（CI 门禁用）" OFF)
 
+# ── Sanitizer ─────────────────────────────────────────────────────────────────
+# CCBOT_SANITIZE=address / thread / undefined / address+undefined（分号或加号分隔）
+#
+# 为什么这是本项目最该补的一项验证：ccg_engine.cpp 有 34 处 mutex/atomic、
+# sar_engine.cpp 27 处，而并发缺陷是所有缺陷里唯一会"看起来一切正常，直到某天
+# 对不上账"的一类——单元测试全绿也证明不了它不存在。TSan 能证明。
+#
+# address 与 thread 互斥，必须分两次构建（编译器会直接拒绝同时给）。
+# undefined 可以搭着 address 一起。
+#
+# ⚠ vcpkg 的依赖不带 instrumentation，所以 sanitizer 看不进 simdjson/curl 内部。
+#   这不影响目的：要查的并发原语全在我们自己的引擎里，而那些测试用的是 FakeClient，
+#   根本不碰网络库。
+set(CCBOT_SANITIZE "" CACHE STRING "sanitizer：address / thread / undefined，可加号连接")
+
+function(ccbot_sanitize tgt)
+    if(CCBOT_SANITIZE STREQUAL "" OR MSVC)
+        return()
+    endif()
+    string(REPLACE "+" "," _san "${CCBOT_SANITIZE}")
+    target_compile_options(${tgt} PRIVATE
+        -fsanitize=${_san}
+        -fno-omit-frame-pointer   # 没有它栈回溯只剩地址，报告等于没有
+        -g)
+    target_link_options(${tgt} PRIVATE -fsanitize=${_san})
+endfunction()
+
 function(ccbot_harden tgt)
+    ccbot_sanitize(${tgt})
     if(MSVC)
         target_compile_options(${tgt} PRIVATE /W4 /permissive- /utf-8
             # C4100 未引用的形参：接口实现里大量方法只用部分参数（ITradingClient

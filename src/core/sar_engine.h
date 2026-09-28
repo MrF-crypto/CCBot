@@ -55,6 +55,28 @@ struct SarConfig {
     // 数据新鲜度上限：超过这个时长的指标快照不参与【开新仓】判定。
     // 已持仓的止损线不受影响（沿用最后一条有效线），见 sar::step
     int         signal_max_age_sec = 900;
+
+    // ── 交易所侧灾难止损（默认关）────────────────────────────────────────────
+    // 把棘轮止损线镜像成交易所上的一张 STOP_MARKET + closePosition 单。
+    //
+    // 为什么 SAR 比 DCA 更需要它：DCA 的保护是「名义 ≤ 权益 ⇒ 不可强平」，那是个
+    // 【不依赖任何订单存在】的数学不变量，进程死了仓位也扛得住；而 SAR 的全部保护
+    // 就是那条活在进程里的止损线。程序崩了、断电了、窗口被误关了，DCA 的仓位在扛
+    // 浮亏，SAR 的仓位是【完全裸奔且没有任何底】。
+    //
+    // 对 SAR 也不存在 DCA 那边"会把浮亏变成实亏、所以属于策略取向"的纠结——
+    // 止损本来就是这套策略的计划内动作，镜像到交易所只是让计划在进程死后仍然执行。
+    bool   use_disaster_stop = false;
+
+    // 挂单价 = 止损线【再外扩】这么多%（多头往下、空头往上）。
+    //
+    // ⚠ 缓冲不能是 0。交易所用连续的标记价触发，而本地是每 3 秒采样一次——挂在
+    //   止损线【上】的话交易所几乎总会先触发，于是主出场路径从"本地 reduceOnly
+    //   平仓"变成"交易所平掉、本地靠对账才发现"，而对账发现外部平仓会【停掉 bot】。
+    //   等于把一个正常的止损出场变成一次需要人工介入的事件。
+    //   留出缓冲之后：正常情况本地先平（并撤掉这张单），只有进程真的不在了
+    //   价格才会继续走到这张单上。
+    double disaster_stop_buffer_pct = 1.0;
 };
 
 struct SarBot {
@@ -88,6 +110,15 @@ struct SarBot {
     // 在不同线程按不同节奏跑：只有 tick 能安全地递减冷却，而它必须知道
     // "这根K线我数过没有"——否则同一根K线内的每个 tick 都会扣一次
     int64_t last_counted_bar_ms = 0;
+
+    // ── 交易所侧灾难止损单的运行时状态 ──────────────────────────────────────
+    // order_id 落盘，重启后先撤旧单再按当前止损线重挂——否则会遗留一张触发价
+    // 对不上的孤儿单，而它是 closePosition 单，下次想挂新的会被币安拒
+    std::string disaster_stop_id;
+    double      disaster_stop_price = 0;
+    // 同一 bot 的同步串行化。止损线每 tick 都可能棘轮上移，没有这个标记会并发
+    // 派发多次撤挂，第二张被拒的同时把第一张的单号误清掉
+    bool        ds_syncing = false;
 
     double realized_pnl = 0;
     int    trade_count  = 0;
@@ -178,6 +209,13 @@ public:
     void set_pending_for_test(const std::string& bot_id, bool v);
 
 private:
+    // ── 交易所侧灾难止损单的挂/改/撤（在线程池里跑，内部不持 mtx_ 做 HTTP）──
+    // sync 会在【止损线移动够多】或【刚开仓】时被派发。移动阈值见实现里的
+    // kDsResyncPct：棘轮每 tick 都可能推一点，逐次撤挂会把限流额度吃光，而这张单
+    // 的职责只是"进程死了兜住"，不需要贴着本地线走
+    void sync_disaster_stop  (const std::string& bot_id);
+    void cancel_disaster_stop(const std::string& bot_id);
+
     // 平仓（可选紧接着反手）。两笔单在同一任务里顺序执行，全程持 pending
     void submit_close(const std::string& bot_id, const std::string& reason,
                       sar::Pos reverse_to);

@@ -77,6 +77,10 @@ void save_sar_state(const std::string& path, const std::vector<SarBot>& bots) {
            << "\"peak\":"        << b.st.peak << ","
            << "\"stop\":"        << b.st.stop << ","
            << "\"consec_reverses\":" << b.st.consec_reverses << ","
+           // 单号必须跨重启存活：遗留一张触发价对不上的孤儿单会让
+           // 下次挂新单被拒（closePosition 同方向只能有一张）
+           << "\"disaster_stop_id\":\"" << b.disaster_stop_id << "\","
+           << "\"disaster_stop_price\":" << b.disaster_stop_price << ","
            << "\"cooldown_left\":"   << b.st.cooldown_left << ","
            << "\"adds_done\":"      << b.st.adds_done << ","
            << "\"last_add_price\":" << b.st.last_add_price << ","
@@ -149,6 +153,8 @@ std::vector<SarBot> load_sar_state(const std::string& path,
         b.st.peak            = get_num(o, "peak", 0);
         b.st.stop            = get_num(o, "stop", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
+        b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
+        b.disaster_stop_price = get_num(o, "disaster_stop_price", 0);
         b.st.cooldown_left   = (int)get_num(o, "cooldown_left", 0);
         b.st.adds_done       = (int)get_num(o, "adds_done", 0);
         b.st.last_add_price  = get_num(o, "last_add_price", 0);

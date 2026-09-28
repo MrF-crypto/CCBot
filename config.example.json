@@ -58,7 +58,9 @@
       "reverse_needs_signal": true,
       "max_consecutive_reverses": 2,
       "cooldown_bars": 3,
-      "signal_max_age_sec": 900
+      "signal_max_age_sec": 900,
+      "use_disaster_stop": true,
+      "disaster_stop_buffer_pct": 1.0
     }
   ]
 }

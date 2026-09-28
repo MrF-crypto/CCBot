@@ -1,0 +1,134 @@
+# Sanitizer 门禁。
+#
+# 为什么值得单独一条流水线：本项目 ccg_engine.cpp 有 34 处 mutex/atomic、
+# sar_engine.cpp 27 处，而并发缺陷是所有缺陷里唯一会"看起来一切正常、单元测试
+# 全绿，直到某天对不上账"的一类。15 套测试证明不了它不存在，TSan 能。
+#
+# 只跑 Linux（1× 计费倍率）。本仓库是私有仓库、macOS runner 10× 倍率，
+# 每月提交预算有限——最严的那道门禁要放在最便宜的平台上。
+#
+# 分两个 job 而不是一个：address 与 thread 互斥（编译器直接拒绝同时给），
+# 必须各编一次。并行跑，墙钟时间不叠加。
+name: sanitize
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_TAG: '2026.07.29'
+
+jobs:
+  sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false      # 一个挂了另一个也要跑完，两份报告一起看
+      matrix:
+        include:
+          # ASan+UBSan：越界、use-after-free、未定义行为。全部 15 套都跑
+          - san: address+undefined
+            name: ASan+UBSan
+            suites: all
+          # TSan：数据竞争。只跑真正并发的那几套——其余是纯函数测试，
+          # 跑它们只是烧时间。ccg_price_tests 不跑：它碰 book_ticker_stream，
+          # 而 ixwebsocket 未 instrumentation，噪音大于价值
+          - san: thread
+            name: TSan
+            suites: ccg_stress_tests ccg_pool_tests ccg_sar_engine_tests ccg_risk_tests ccg_order_tests
+
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # apt 在 GitHub runner 上会偶发挂死（不是报错，是卡住）。同 build-linux：
+      # 用 timeout 主动砍掉再由外层循环重试，挂死的进程不会自己退出
+      - name: Install build tools
+        timeout-minutes: 15
+        run: |
+          set -e
+          ok=0
+          for i in 1 2 3; do
+            if timeout 240 sudo apt-get update -qq && \
+               timeout 480 sudo apt-get install -y ninja-build pkg-config \
+                            autoconf autoconf-archive automake libtool; then
+              ok=1; break
+            fi
+            echo "── apt 第 $i 次超时或失败，15 秒后重试 ──"
+            sudo killall apt-get dpkg 2>/dev/null || true
+            sudo dpkg --configure -a || true
+            sleep 15
+          done
+          [ "$ok" = "1" ] || { echo "apt 三次均失败"; exit 1; }
+
+      - name: Set up vcpkg
+        run: |
+          git clone --depth 1 --branch "$VCPKG_TAG" https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      # 与 build-linux 共用同一个缓存键：依赖本身不带 sanitizer（只有我们自己的
+      # 目标带），所以产物完全一样，没必要编两遍
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-linux-
+
+      # RelWithDebInfo 而不是 Release：sanitizer 的报告没有符号等于没有报告，
+      # 而 Debug 太慢（TSan 本身已经是 5~15 倍减速）
+      - name: Configure
+        run: |
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCCBOT_SANITIZE="${{ matrix.san }}" \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-linux
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Save vcpkg binary cache (even on failure)
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+
+      # halt_on_error=1 + exitcode=1：sanitizer 默认对某些类别只打印不退出，
+      # 那样 CI 会绿着过去而报告躺在日志里没人看——必须让它真的失败。
+      # detect_stack_use_after_return 是 ASan 默认关的一项，而"返回后还引用栈上
+      # 对象"正是异步回调最容易犯的错，本项目到处是 run_async + lambda 捕获
+      - name: Run suites under ${{ matrix.name }}
+        env:
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1:detect_stack_use_after_return=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: |
+          set -e
+          if [ "${{ matrix.suites }}" = "all" ]; then
+            SUITES="ccg_indicator_tests ccg_key_store_tests ccg_risk_tests
+                    ccg_funding_tests ccg_rate_tests ccg_order_tests
+                    ccg_stress_tests ccg_sar_tests ccg_sar_engine_tests
+                    ccg_sar_state_tests ccg_persist_tests ccg_config_tests
+                    ccg_price_tests ccg_timesync_tests ccg_pool_tests"
+          else
+            SUITES="${{ matrix.suites }}"
+          fi
+          fail=0
+          for t in $SUITES; do
+            echo "──────── $t ────────"
+            if ! ./build/$t; then
+              echo "❌ $t 在 ${{ matrix.name }} 下失败"
+              fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || { echo "${{ matrix.name }} 发现问题，见上方报告"; exit 1; }
+          echo "✅ ${{ matrix.name }} 全部通过"

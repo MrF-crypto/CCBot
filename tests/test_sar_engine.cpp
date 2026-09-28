@@ -58,6 +58,33 @@ public:
         if (qty_step <= 0) return q;
         return std::floor(q / qty_step) * qty_step;
     }
+
+    // ── 交易所侧灾难止损单 ──────────────────────────────────────────────────
+    struct StopCall { std::string kind; double price; std::string id; };
+    std::vector<StopCall> stop_log;
+    bool   ds_place_fails = false;
+    int    ds_seq = 0;
+    std::string place_disaster_stop(const std::string&, double stop_price,
+                                    const std::string&) override {
+        if (ds_place_fails) { stop_log.push_back({"place_fail", stop_price, ""}); return ""; }
+        std::string id = "DS" + std::to_string(++ds_seq);
+        stop_log.push_back({"place", stop_price, id});
+        return id;
+    }
+    bool cancel_disaster_stop(const std::string&, const std::string& id) override {
+        stop_log.push_back({"cancel", 0, id});
+        return true;
+    }
+    int ds_count(const std::string& kind) const {
+        int n = 0;
+        for (const auto& c : stop_log) if (c.kind == kind) ++n;
+        return n;
+    }
+    double ds_last_price() const {
+        for (auto it = stop_log.rbegin(); it != stop_log.rend(); ++it)
+            if (it->kind == "place") return it->price;
+        return 0;
+    }
     bool set_leverage(const std::string&, int) override {
         ++leverage_calls;
         return leverage_ok;
@@ -724,6 +751,111 @@ int main() {
             {"TESTUSDT",   1, q0,  110.0},
         };
         check(eng.reconcile_positions(ex).empty(), "不相关品种的仓位不得影响本 bot");
+    }
+
+    // ═══ 交易所侧灾难止损（v4.7.0）════════════════════════════════════════════
+    // 它是 SAR 唯一的进程外保护：本地止损线活在进程里，程序崩了就什么都不剩。
+    // 这一整套里最容易写错、且错了看不出来的是【缓冲方向】——挂反了的话交易所会
+    // 抢在本地之前触发，把正常止损变成"外部平仓 → 对账停 bot"
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        cfg.disaster_stop_buffer_pct = 1.0;
+        auto id = eng.add_bot(cfg);
+
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);       // 开多，止损线 = 110 - 3*2 = 104
+
+        check(cli->ds_count("place") == 1, "开仓成交即挂灾难止损（不等下一个 tick）");
+        // 多头：挂在止损线【下方】。104 × (1-1%) = 102.96
+        check(std::fabs(cli->ds_last_price() - 102.96) < 1e-9,
+              "  多头挂单价 = 止损线 × (1−缓冲) = 102.96");
+        check(cli->ds_last_price() < eng.get_bots()[0].st.stop,
+              "  ⚠ 必须【低于】本地止损线——高于的话交易所会抢先触发，"
+              "正常止损会变成外部平仓并停 bot");
+    }
+
+    // ── 棘轮小幅移动不重挂：否则每 tick 一次撤挂会吃光限流额度 ──────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        const int after_open = cli->ds_count("place");
+
+        // 价格小涨 → 极值推高一点 → 止损线上移一点（远小于 0.5% 阈值）
+        eng.tick("TESTUSDT", 110.2);
+        check(cli->ds_count("place") == after_open,
+              "止损线小幅移动不得重挂（阈值内）");
+
+        // 大涨 → 止损线上移超过阈值 → 应该撤旧挂新
+        eng.tick("TESTUSDT", 125.0);       // 极值 125 ⇒ 线 = 125-6 = 119
+        check(cli->ds_count("place") == after_open + 1, "线移动超阈值应重挂一次");
+        check(cli->ds_count("cancel") >= 1, "  重挂前必须先撤旧单（closePosition 同向只能一张）");
+        check(std::fabs(cli->ds_last_price() - 119.0 * 0.99) < 1e-9,
+              "  新挂单价跟着新止损线走");
+    }
+
+    // ── 平仓后必须撤单：不撤会留在挂单列表里，下一轮开仓再挂被币安拒 ─────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        cfg.rule.allow_reverse = false;        // 只平不反手，便于观察
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        const int cancels_before = cli->ds_count("cancel");
+
+        cli->fill_price = 104.0;
+        eng.tick("TESTUSDT", 104.0);       // 触线平仓
+        check(eng.get_bots()[0].st.pos == sar::Pos::Flat, "已平仓");
+        check(cli->ds_count("cancel") == cancels_before + 1, "平仓后必须撤掉灾难止损单");
+        check(eng.get_bots()[0].disaster_stop_id.empty(), "  本地单号必须清掉");
+    }
+
+    // ── 挂单失败必须留痕，且下次线移动会重试 ────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        auto id = eng.add_bot(cfg);
+        cli->ds_place_fails = true;
+
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(cli->ds_count("place_fail") == 1, "挂单失败应被记录");
+        check(eng.get_bots()[0].disaster_stop_id.empty(),
+              "  失败时不得留下假单号（否则下次会拿它去撤一张不存在的单）");
+        check(eng.get_bots()[0].st.pos == sar::Pos::Long,
+              "  ⚠ 挂单失败【不影响持仓】：本地止损线照常守着，只是少了进程外保护");
+
+        cli->ds_place_fails = false;
+        eng.tick("TESTUSDT", 125.0);       // 线大幅上移 → 重试
+        check(cli->ds_count("place") == 1, "线移动时应自动重试挂单");
+    }
+
+    // ── 没开开关就一个请求都不发 ────────────────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto id = eng.add_bot(mk_cfg());   // use_disaster_stop 默认 false
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        eng.tick("TESTUSDT", 125.0);
+        check(cli->stop_log.empty(), "未开启时全程不得有任何挂单/撤单调用");
     }
 
     if (g_fail == 0) {
