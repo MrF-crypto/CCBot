@@ -323,10 +323,6 @@ int main(int argc, char** argv) {
         engine->resync_disaster_stops();
     }
 
-    // 24h 涨幅的 REST 兜底缓存（全市场一次取回，90 秒有效期）
-    std::unordered_map<std::string, double> chg24_rest;
-    int64_t chg24_rest_ms = 0;
-
     BookTickerStream ticker(cfg.testnet);
     // 订阅被拒等服务端消息此前静默丢弃：VPS 上没有界面，这类问题只能靠日志发现
     ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
@@ -345,7 +341,6 @@ int main(int argc, char** argv) {
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     std::atomic<bool> ind_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
     std::atomic<bool> sar_sig_busy{false};
-    std::atomic<bool> dca_atr_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
     // 数据池要同时承载价格 REST 兜底、日线/趋势、1h 指标三类批次，2 个线程在
@@ -419,36 +414,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ── 1b) 24h 滚动涨幅：优先读 @ticker 推送缓存（零请求），
-        //     推送流不可用时回落到全市场 REST 快照。
-        //     这条数据原本是全系统【唯一没有兜底】的：WS 一断，高位拦截在
-        //     strict 下永久拦死，一单也开不出来
-        {
-            bool need_rest_chg = false;
-            for (const auto& b : engine->get_bots()) {
-                if (b.state == CcgBot::State::Stopped) continue;
-                if (b.cfg.htf_24h_chg_max <= 0) continue;
-                double pct = 0;
-                bool ok = ticker.change_24h(b.cfg.symbol, pct);
-                if (!ok) {
-                    auto it = chg24_rest.find(b.cfg.symbol);
-                    if (it != chg24_rest.end() &&
-                        BookTickerStream::now_ms() - chg24_rest_ms < 90000) {
-                        pct = it->second; ok = true;
-                    } else {
-                        need_rest_chg = true;
-                    }
-                }
-                engine->update_24h_change(b.bot_id, ok, pct);
-            }
-            // 全市场一次取回（权重 40），不是逐品种——品种一多逐个查
-            // 既费往返又费权重。同步调用即可：90 秒才会真正触发一次
-            if (need_rest_chg) {
-                auto m = client->fetch_all_24h_changes();
-                if (!m.empty()) { chg24_rest = std::move(m); chg24_rest_ms = BookTickerStream::now_ms(); }
-            }
-        }
-
         // ── 1c) 心跳文件（dead-man's switch）：每 tick 写入当前时间戳。
         //     外部看门狗（systemd WatchdogSec / cron）检查这个文件的年龄就能发现
         //     "进程还在但循环卡住"——这是日志和进程存活检查都发现不了的故障
@@ -458,27 +423,6 @@ int main(int argc, char** argv) {
                 hf << std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count()
                    << " tick=" << tick_n << " bots=" << bots.size() << "\n";
-            }
-        }
-
-        // ── 1b2) DCA 的 ATR 移动止损：只为勾了开关的 bot 拉 ATR ──────────────
-        // 没勾的一次请求都不发。ATR 对普通网格毫无意义
-        if (!dca_atr_busy.load() && (tick_n % 20) == 5) {
-            std::vector<CcgBot> need;
-            for (const auto& b : bots)
-                if (b.cfg.use_atr_trail && b.state != CcgBot::State::Stopped)
-                    need.push_back(b);
-            if (!need.empty()) {
-                dca_atr_busy.store(true);
-                fetch_pool->submit([client, engine, need, &dca_atr_busy]() {
-                    for (const auto& b : need) {
-                        const double a = client->fetch_atr(b.cfg.symbol,
-                                                           b.cfg.atr_trail_interval,
-                                                           b.cfg.atr_trail_period);
-                        if (a > 0) engine->update_atr(b.bot_id, a);
-                    }
-                    dca_atr_busy.store(false);
-                });
             }
         }
 
@@ -534,9 +478,11 @@ int main(int argc, char** argv) {
         if (!ind_busy.load()) {
             std::vector<CcgBot> need;
             for (const auto& b : bots)
+                // v4.6.0 起指标【只服务首单信号】——补仓和止盈不再看布林带，
+                // 所以已有仓位的 bot 不必再拉
                 if (b.state == CcgBot::State::Running &&
-                    ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
-                     b.cfg.dynamic_band_mode))
+                    b.entries.empty() &&
+                    b.cfg.entry_mode == CcgConfig::EntryMode::Indicator)
                     need.push_back(b);
             if (!need.empty()) {
                 ind_busy.store(true);
@@ -547,9 +493,6 @@ int main(int argc, char** argv) {
                                                               b.cfg.rsi_period);
                         if (!snap.ok) continue;
                         engine->update_indicator(b.bot_id, snap.boll_lb, snap.boll_ub, snap.rsi);
-                        // 复用：指标拉的就是 1h 带，正好是多周期梯子的第0档
-                        if (b.cfg.mtf_ladder && b.cfg.kline_interval == "1h")
-                            engine->update_mtf_band(b.bot_id, 0, snap.boll_lb, snap.boll_ub);
                     }
                     ind_busy.store(false);
                 });
@@ -559,20 +502,16 @@ int main(int argc, char** argv) {
         // ── 3) SR雷达重算（每约15分钟，异步）；触区检查每tick本地做（零开销）──
         // ── 4) 趋势状态机 + v3.0日线%B（每约5分钟，异步同班车）────────────────
         if ((tick_n - 1) % 100 == 0 && !trend_busy.load()) {
-            std::vector<CcgBot> need, htf_need, mtf_need;
+            std::vector<CcgBot> need, htf_need;
             for (const auto& b : bots) {
                 if (b.state == CcgBot::State::Stopped) continue;
                 if (b.cfg.use_trend_filter) need.push_back(b);
                 // %B 对所有非停止 bot 持续保鲜（立即开仓/冷却重进的首仓才赶得上数据）
-                // 涨幅拦截与 %B 同源，任一开启都要拉这份高周期数据
-                if (b.cfg.use_htf_filter ||
-                    b.cfg.htf_24h_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
-                    htf_need.push_back(b);
-                if (b.cfg.mtf_ladder)     mtf_need.push_back(b);
+                if (b.cfg.use_htf_filter) htf_need.push_back(b);
             }
-            if (!need.empty() || !htf_need.empty() || !mtf_need.empty()) {
+            if (!need.empty() || !htf_need.empty()) {
                 trend_busy.store(true);
-                fetch_pool->submit([client, engine, need, htf_need, mtf_need, &trend_busy]() {
+                fetch_pool->submit([client, engine, need, htf_need, &trend_busy]() {
                     for (const auto& b : need) {
                         auto t = client->fetch_trend(b.cfg.symbol, b.cfg.trend_interval,
                                                       b.cfg.trend_ema_period);
@@ -583,30 +522,7 @@ int main(int argc, char** argv) {
                                                               20, 2.0, 14);
                         if (!snap.ok) continue;
                         double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
-                        engine->update_htf(b.bot_id, pb, snap.chg_ok, snap.chg_7);
-                        // 复用：宏观层拉的就是日线带，正好是第3档
-                        if (b.cfg.mtf_ladder && b.cfg.htf_interval == "1d")
-                            engine->update_mtf_band(b.bot_id, 3, snap.boll_lb, snap.boll_ub);
-                    }
-                    // 多周期梯子还差 4h / 12h 两档（1h 和 1d 上面顺带喂了）。
-                    // 每个开了该模式的 bot 只多 2 个公开接口请求
-                    for (const auto& b : mtf_need) {
-                        const char* tf[2] = {"4h", "12h"};
-                        for (int ti = 1; ti <= 2; ++ti) {
-                            auto ms = client->fetch_indicators(b.cfg.symbol, tf[ti-1],
-                                                               b.cfg.boll_period, b.cfg.boll_mult, 14);
-                            if (ms.ok) engine->update_mtf_band(b.bot_id, ti, ms.boll_lb, ms.boll_ub);
-                        }
-                        if (b.cfg.kline_interval != "1h") {
-                            auto ms = client->fetch_indicators(b.cfg.symbol, "1h",
-                                                               b.cfg.boll_period, b.cfg.boll_mult, 14);
-                            if (ms.ok) engine->update_mtf_band(b.bot_id, 0, ms.boll_lb, ms.boll_ub);
-                        }
-                        if (b.cfg.htf_interval != "1d") {
-                            auto ms = client->fetch_indicators(b.cfg.symbol, "1d",
-                                                               b.cfg.boll_period, b.cfg.boll_mult, 14);
-                            if (ms.ok) engine->update_mtf_band(b.bot_id, 3, ms.boll_lb, ms.boll_ub);
-                        }
+                        engine->update_htf(b.bot_id, pb);
                     }
                     trend_busy.store(false);
                 });

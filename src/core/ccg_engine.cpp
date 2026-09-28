@@ -28,75 +28,6 @@ static bool trend_active_bearish(const CcgBot& bot, std::chrono::steady_clock::t
            (now - bot.trend_time) < kTrendStale;
 }
 
-// ── 多周期梯子 ───────────────────────────────────────────────────────────────
-// 四档固定 1h / 4h / 12h / 1d。各档新鲜度阈值不同：高周期的带算得晚一点无所谓，
-// 低周期的带过几分钟就偏旧了
-static constexpr std::chrono::seconds kMtfStale[4] = {
-    std::chrono::seconds(300),    // 1h
-    std::chrono::seconds(900),    // 4h
-    std::chrono::seconds(1800),   // 12h
-    std::chrono::seconds(3600),   // 1d
-};
-static const char* kMtfName[4] = { "1h", "4h", "12h", "1d" };
-
-// 各档层数分配。手动填 "3,2,2,1" 优先；空则按 3:2:2:1 权重铺到 max_entries。
-// 层数不足 4 时从最深的档往前砍——深档是"罕见事件才解锁"的保险层，
-// 层数紧张时优先保证浅层有子弹
-std::array<int,4> CcgEngine::mtf_tier_alloc(const CcgConfig& cfg) {
-    const int n = std::max(1, std::min(cfg.max_entries, kMaxLayers));
-    std::array<int,4> out{0,0,0,0};
-
-    // ① 手动指定
-    if (!cfg.mtf_tier_layers.empty()) {
-        int idx = 0, cur = 0; bool has = false;
-        for (char ch : cfg.mtf_tier_layers) {
-            if (ch >= '0' && ch <= '9') { cur = cur * 10 + (ch - '0'); has = true; }
-            else if (has) { if (idx < 4) out[idx++] = cur; cur = 0; has = false; }
-        }
-        if (has && idx < 4) out[idx++] = cur;
-        int sum = out[0] + out[1] + out[2] + out[3];
-        if (sum > 0) {
-            // 与 max_entries 对不齐时以 max_entries 为准，从最深档裁剪/补足
-            for (int t = 3; t >= 0 && sum > n; --t) {
-                int cut = std::min(out[t], sum - n);
-                out[t] -= cut; sum -= cut;
-            }
-            if (sum < n) out[0] += (n - sum);
-            return out;
-        }
-    }
-
-    // ② 按 3:2:2:1 权重铺满
-    static constexpr int wgt[4] = {3, 2, 2, 1};
-    const int wsum = 8;
-    int used = 0;
-    for (int t = 0; t < 4; ++t) { out[t] = n * wgt[t] / wsum; used += out[t]; }
-    for (int t = 0; t < 4 && used < n; ++t) { ++out[t]; ++used; }   // 余数补给浅档
-
-    // ③ 层数不足以铺满四档时，从最深的档往前砍
-    for (int t = 3; t >= 1; --t) {
-        if (out[0] + out[1] + out[2] + out[3] <= n && out[t] > 0) break;
-    }
-    for (int t = 3; t >= 0; --t) {
-        if (out[t] == 0) continue;
-        int total = out[0] + out[1] + out[2] + out[3];
-        if (total <= n) break;
-        int cut = std::min(out[t], total - n);
-        out[t] -= cut;
-    }
-    return out;
-}
-
-// 第 slot 个槽位（0-based）归属哪一档
-static int mtf_tier_of_slot(const std::array<int,4>& alloc, int slot) {
-    int acc = 0;
-    for (int t = 0; t < 4; ++t) {
-        acc += alloc[t];
-        if (slot < acc) return t;
-    }
-    return 3;   // 超出分配（配置与层数对不齐）时归最深档，宁严勿松
-}
-
 // ── 加仓比例序列（最多 kMaxLayers 层）────────────────────────────────────────
 // 按需生成而不是查固定表：层数上限从 10 提到 50 后，写死的表会静默截断预算分配。
 // ⚠ 指数型曲线（倍投/三倍/斐波/卢卡斯）在深层数下权重爆炸，首仓分到的预算会
@@ -290,13 +221,8 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.cooldown_secs  = new_cfg.cooldown_secs;
     cfg.reentry_drawdown_pct = new_cfg.reentry_drawdown_pct;
     cfg.reentry_memory_days  = new_cfg.reentry_memory_days;
-    cfg.stop_loss_pct  = new_cfg.stop_loss_pct;
     cfg.use_disaster_stop = new_cfg.use_disaster_stop;
     cfg.disaster_stop_pct = new_cfg.disaster_stop_pct;
-    cfg.use_atr_trail      = new_cfg.use_atr_trail;
-    cfg.atr_trail_mult     = new_cfg.atr_trail_mult;
-    cfg.atr_trail_period   = new_cfg.atr_trail_period;
-    cfg.atr_trail_interval = new_cfg.atr_trail_interval;
     cfg.entry_mode     = new_cfg.entry_mode;
     cfg.kline_interval = new_cfg.kline_interval;
     cfg.boll_period    = new_cfg.boll_period;
@@ -306,43 +232,21 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.rsi_threshold  = new_cfg.rsi_threshold;
     cfg.rsi_confirm_mode = new_cfg.rsi_confirm_mode;
     cfg.rsi_oversold_th  = new_cfg.rsi_oversold_th;
-    cfg.dynamic_band_mode = new_cfg.dynamic_band_mode;
-    cfg.dyn_interval_mult = new_cfg.dyn_interval_mult;
-    cfg.dyn_fixed_interval = new_cfg.dyn_fixed_interval;
-    cfg.dca_require_band   = new_cfg.dca_require_band;
-    cfg.dyn_interval_growth = new_cfg.dyn_interval_growth;
-    cfg.mtf_ladder         = new_cfg.mtf_ladder;
-    cfg.mtf_tier_layers    = new_cfg.mtf_tier_layers;
-    cfg.mtf_k              = new_cfg.mtf_k;
-    cfg.mtf_min_gap_pct    = new_cfg.mtf_min_gap_pct;
-    cfg.min_profit_floor  = new_cfg.min_profit_floor;
-    cfg.floor_decay       = new_cfg.floor_decay;
-    cfg.tp_floor_only     = new_cfg.tp_floor_only;
-    cfg.tp_fixed_profit   = new_cfg.tp_fixed_profit;
-    cfg.fixed_trail_tp    = new_cfg.fixed_trail_tp;
-    cfg.fixed_trail_entry = new_cfg.fixed_trail_entry;
-    cfg.first_entry_bounce_pct = new_cfg.first_entry_bounce_pct;
     cfg.use_trend_filter  = new_cfg.use_trend_filter;
     cfg.trend_interval    = new_cfg.trend_interval;
     cfg.trend_ema_period  = new_cfg.trend_ema_period;
     cfg.use_htf_filter      = new_cfg.use_htf_filter;
     cfg.htf_interval        = new_cfg.htf_interval;
     cfg.htf_pos_max         = new_cfg.htf_pos_max;
-    cfg.htf_24h_chg_max     = new_cfg.htf_24h_chg_max;
-    cfg.htf_week_chg_max    = new_cfg.htf_week_chg_max;
     return true;
 }
 
-void CcgEngine::update_htf(const std::string& bot_id, double pct_b,
-                           bool chg_ok, double week_chg) {
+void CcgEngine::update_htf(const std::string& bot_id, double pct_b) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
     if (it == bots_.end()) return;
     it->second.htf_ok    = (pct_b >= -0.5);   // decision::pct_b 非法时返回 -1
     it->second.htf_pct_b = pct_b;
-    // 7日涨幅与 %B 同源同一次拉取，但历史不足 8 根时算不出来，单独一个 ok 标志
-    it->second.htf_chg_ok   = chg_ok;
-    it->second.htf_week_chg = week_chg;
     it->second.htf_time  = host_.now_steady();
 }
 
@@ -356,25 +260,6 @@ void CcgEngine::clear_pending_after_throw(const std::string& bot_id, const std::
     it->second.pending = false;
     it->second.inflight_margin = 0;
 }
-
-void CcgEngine::update_atr(const std::string& bot_id, double atr) {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    auto it = bots_.find(bot_id);
-    if (it == bots_.end()) return;
-    if (!(atr > 0) || !std::isfinite(atr)) return;   // 非法值不覆盖上一条有效 ATR
-    it->second.atr_value = atr;
-    it->second.atr_time  = host_.now_steady();
-}
-
-void CcgEngine::update_24h_change(const std::string& bot_id, bool ok, double pct) {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    auto it = bots_.find(bot_id);
-    if (it == bots_.end()) return;
-    it->second.h24_ok   = ok;
-    it->second.h24_chg  = pct;
-    it->second.h24_time = host_.now_steady();
-}
-
 
 void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -401,10 +286,6 @@ void CcgEngine::update_trend(const std::string& bot_id, bool bearish) {
 
 void CcgEngine::set_max_total_margin(double usdt) {
     max_total_margin_.store(std::max(0.0, usdt));
-}
-
-void CcgEngine::set_market_bearish(bool bearish) {
-    market_bearish_.store(bearish);
 }
 
 double CcgEngine::max_total_margin() const {
@@ -671,15 +552,6 @@ std::vector<std::string> CcgEngine::reconcile_positions(
     return issues;
 }
 
-void CcgEngine::update_mtf_band(const std::string& bot_id, int tier, double lb, double ub) {
-    if (tier < 0 || tier > 3 || lb <= 0 || ub <= lb) return;
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    auto it = bots_.find(bot_id);
-    if (it == bots_.end()) return;
-    auto& b = it->second.mtf_band[tier];
-    b.lb = lb; b.ub = ub; b.t = host_.now_steady();
-}
-
 void CcgEngine::update_indicator(const std::string& bot_id, double boll_lb, double boll_ub, double rsi) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(bot_id);
@@ -749,161 +621,31 @@ std::vector<CcgBot> CcgEngine::get_bots() const {
     return out;
 }
 
-// ── 本 tick 生效的策略参数（在 tick 持锁中调用）───────────────────────────────
-CcgEngine::EffParams CcgEngine::eff_params(const CcgBot& bot) const {
-    EffParams p;
-    p.interval_pct = bot.cfg.interval_pct;
-    p.trail_entry  = bot.cfg.trail_entry;
-    p.trail_tp     = bot.cfg.trail_tp;
-    p.dyn   = false;
-    p.fresh = true;
-    if (!bot.cfg.dynamic_band_mode) return p;
-
-    double W = dynparams::band_width_pct(bot.ind_boll_lb, bot.ind_boll_ub);
-    if (!bot.ind_ok || W <= 0) {
-        // 动态模式已开但还没有任何可用指标数据：参数保持配置值，标记数据过期
-        p.dyn   = true;
-        p.fresh = false;
-        return p;
-    }
-    p.dyn          = true;
-    p.fresh        = (host_.now_steady() - bot.ind_time) < kIndStale;
-    p.interval_pct = bot.cfg.dyn_fixed_interval > 0
-                     ? bot.cfg.dyn_fixed_interval
-                     : dynparams::interval_pct(W, bot.cfg.dyn_interval_mult);
-    p.trail_entry  = dynparams::trail_entry_pct(W);
-    p.trail_tp     = dynparams::trail_tp_pct(W);
-    if (bot.cfg.fixed_trail_tp > 0)    p.trail_tp    = bot.cfg.fixed_trail_tp;
-    if (bot.cfg.fixed_trail_entry > 0) p.trail_entry = bot.cfg.fixed_trail_entry;
-    return p;
-}
-
-// 趋势空头态：补仓间隔放大（静态/动态模式都适用），在 eff_params 之上叠加
+// 趋势空头态：补仓间隔放大。这是唯一还会改写配置间隔的东西——
+// v4.6.0 移除动态W之后，间隔/追踪建仓/止盈追踪三个参数直接就是配置值，
+// 不再需要多一层间接
 static double apply_trend_interval(const CcgBot& bot, double interval_pct,
                                    std::chrono::steady_clock::time_point now) {
     return trend_active_bearish(bot, now) ? interval_pct * kBearIntervalMult : interval_pct;
-}
-
-// 梯度间隔：越深的层要求跌得越多。见 dyn_interval_growth 的说明。
-// entries.size() 是【已有】层数，所以下一笔是第 size()+1 层，倍数用 size()
-static double apply_layer_growth(const CcgBot& bot, double interval_pct) {
-    if (bot.cfg.dyn_interval_growth <= 0) return interval_pct;
-    return interval_pct * (1.0 + bot.cfg.dyn_interval_growth * (double)bot.entries.size());
 }
 
 // ── 追踪变量更新（在 tick 持锁中调用）────────────────────────────────────────
 void CcgEngine::update_tracking(CcgBot& bot, double price) {
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
 
-    if (bot.entries.empty()) {
-        // 空仓即解除武装。这里是【唯一】的复位点——entries.clear() 散落在六处
-        // （止盈/止损/冷却重启/对账/认领/手动），在每一处都记得重置 atr_* 是
-        // 做不到的。漏掉的后果不是"不保护"，是【错误保护】：上一轮的止损线
-        // 被原样套到新开的仓位上，旧线若高于新开仓价，下一个 tick 就把它平掉
-        if (bot.atr_armed) {
-            bot.atr_armed = false;
-            bot.atr_peak = bot.atr_stop = 0;
-        }
-        return;
-    }
-
-    // ── ATR 移动止损：武装与棘轮推进 ─────────────────────────────────────────
-    // 武装条件是【勾选 + 有仓位 + 拿到 ATR】三者齐备。缺 ATR 时不武装：
-    // 没有止损线却冻结梯子，等于既不补仓也不保护，是三种状态里最差的一种
-    if (bot.cfg.use_atr_trail) {
-        // ATR 新鲜度。拉取每分钟一轮，超过 10 分钟没更新说明拉取批次死了
-        // （网络/限流）。过期的 ATR 不用来【推线】——沿用上一条线，和 SAR 侧
-        // "数据断流不撤保护"同一语义。但【武装】不看新鲜度：能拿到过一个
-        // ATR 就武装，否则拉取批次一抖梯子就解冻了
-        const bool atr_fresh = bot.atr_value > 0 &&
-            (host_.now_steady() - bot.atr_time) <= std::chrono::minutes(10);
-
-        if (!bot.atr_armed && bot.atr_value > 0) {
-            bot.atr_armed = true;
-            bot.atr_peak  = price;
-            bot.atr_stop  = is_long ? price - bot.cfg.atr_trail_mult * bot.atr_value
-                                    : price + bot.cfg.atr_trail_mult * bot.atr_value;
-            std::ostringstream ss;
-            ss << bot.cfg.symbol << " ATR移动止损已武装 @" << price
-               << " 止损线=" << bot.atr_stop
-               << "（梯子已冻结，不再补仓；第" << bot.entries.size() << "层为最终层）";
-            log(ss.str());
-        }
-        if (bot.atr_armed) {
-            bot.atr_peak = is_long ? std::max(bot.atr_peak, price)
-                                   : std::min(bot.atr_peak, price);
-            // ATR 断流/过期时沿用上一条线，绝不因为数据没到就撤掉保护
-            if (atr_fresh) {
-                const double cand = is_long
-                    ? bot.atr_peak - bot.cfg.atr_trail_mult * bot.atr_value
-                    : bot.atr_peak + bot.cfg.atr_trail_mult * bot.atr_value;
-                bot.atr_stop = is_long ? std::max(bot.atr_stop, cand)   // 棘轮
-                                       : std::min(bot.atr_stop, cand);
-            }
-        }
-    } else if (bot.atr_armed) {
-        // 运行中取消勾选：解除武装，梯子恢复补仓
-        bot.atr_armed = false;
-        bot.atr_peak = bot.atr_stop = 0;
-        log(bot.cfg.symbol + " ATR移动止损已解除，梯子恢复补仓");
-    }
-
-    const EffParams eff = eff_params(bot);
-    const double eff_interval = apply_layer_growth(
-        bot, apply_trend_interval(bot, eff.interval_pct, host_.now_steady()));
+    if (bot.entries.empty()) return;
 
     // ── DCA 间隔追踪 ──────────────────────────────────────────────────────────
-    double interval_th = bot.last_entry_price *
+    // 标准网格：相对上一笔成交价跌够固定间隔就武装追踪建仓。
+    // 趋势过滤的"空头态间隔×1.5"叠在这上面（见 apply_trend_interval）
+    const double eff_interval =
+        apply_trend_interval(bot, bot.cfg.interval_pct, host_.now_steady());
+    const double interval_th = bot.last_entry_price *
         (is_long ? (1.0 - eff_interval / 100.0)
                  : (1.0 + eff_interval / 100.0));
 
     if (!bot.interval_hit) {
-        bool triggered = is_long ? (price <= interval_th) : (price >= interval_th);
-        if (bot.cfg.mtf_ladder) {
-            // ── 多周期梯子：接管间距推导（止盈那半完全不动）──────────────────
-            // 第 i 槽必须先跌破【它所属档位】的布林下轨，且相对上一笔成交价
-            // 再跌够最小间距。两个条件都满足才武装追踪建仓。
-            const auto alloc = mtf_tier_alloc(bot.cfg);
-            const int  tier  = mtf_tier_of_slot(alloc, (int)bot.entries.size());
-            const auto& tb   = bot.mtf_band[tier];
-            const auto  age  = host_.now_steady() - tb.t;
-
-            // 该档带数据不新鲜就冻结——宁可错过不可乱买（与动态W同原则）
-            bool ok = (tb.lb > 0 && tb.ub > tb.lb && age < kMtfStale[tier]);
-
-            // ① 跌破该档下轨（实时价判定，与动态W一致；追踪建仓那步本身防抖）
-            if (ok) ok = is_long ? (price <= tb.lb) : (price >= tb.ub);
-
-            // ② 最小间距 = max(k × 该档带宽, 兜底地板)。
-            //    瀑布是高波动事件，带子撑开时地板跟着撑开，正好挡住"四档同时
-            //    触发、整个梯子打在崩盘顶部"——这是纯固定百分比挡不住的
-            if (ok) {
-                const double mb = (tb.ub + tb.lb) * 0.5;
-                const double bandw = (mb > 0) ? (tb.ub - tb.lb) / mb * 100.0 : 0.0;
-                double gap = std::max(bot.cfg.mtf_k * bandw,
-                                      bot.cfg.mtf_min_gap_pct);
-                // 趋势过滤的"空头态间隔×1.5"必须同样作用在梯子的间距上。
-                // 此前这里直接用 gap 覆盖了 triggered，而 ×1.5 是烘焙在 interval_th
-                // 里的——等于开了多周期梯子，趋势过滤的补仓那一半就【静默失效】了。
-                // 趋势过滤是个独立勾选项，用户会以为它还在工作；两个功能各自都对，
-                // 组合起来其中一个悄悄不算数，是最难发现的那类缺陷
-                gap = apply_trend_interval(bot, gap, host_.now_steady());
-                const double gap_th = bot.last_entry_price *
-                    (is_long ? (1.0 - gap / 100.0) : (1.0 + gap / 100.0));
-                ok = is_long ? (price <= gap_th) : (price >= gap_th);
-            }
-            triggered = ok;
-        } else if (eff.dyn) {
-            // 动态W模式：补仓锚定布林带——除了跌够动态间隔，价格还必须在带外
-            // （多：≤下轨；空：≥上轨），即"当前统计意义上的超卖/超买位"才武装补仓。
-            // 指标数据过期时冻结武装（fresh=false），宁可错过不可乱买
-            if (bot.cfg.dca_require_band) {
-                bool band_cond = eff.fresh &&
-                    (is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub));
-                triggered = triggered && band_cond;
-            }
-        }
-        if (triggered) {
+        if (is_long ? (price <= interval_th) : (price >= interval_th)) {
             bot.interval_hit = true;
             bot.dca_extreme  = price;
         }
@@ -914,51 +656,15 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
     }
 
     // ── 止盈追踪 ──────────────────────────────────────────────────────────────
+    // 均价 ± tp_pct 触发追踪，之后按 trail_tp 的回撤出场（见 should_close）
     if (bot.avg_price > 0) {
-        bool tp_hit;
-        if (eff.dyn) {
-            // 动态W模式：止盈锚定上轨（多）/下轨（空）+ 保底利润双条件。
-            // 保底条款必须有：下跌趋势里上轨可能低于均价（高位库存拖的），
-            // 只看"触上轨"会亏着平仓；保底保证每轮至少覆盖手续费+微利
-            // 保底利润可随层数递减：满层时首要目标是脱身而非赚够（见 floor_decay）
-            double eff_floor = bot.cfg.min_profit_floor;
-            if (bot.cfg.floor_decay > 0 && bot.cfg.max_entries > 1) {
-                const double prog = (double)(std::max<size_t>(1, bot.entries.size()) - 1)
-                                    / (double)(bot.cfg.max_entries - 1);
-                eff_floor *= std::max(0.0, 1.0 - bot.cfg.floor_decay * std::min(1.0, prog));
-            }
-            double floor_th = bot.avg_price *
-                (is_long ? (1.0 + eff_floor / 100.0)
-                         : (1.0 - eff_floor / 100.0));
-            double target = is_long ? bot.ind_boll_ub : bot.ind_boll_lb;
-            // tp_floor_only：不等上轨，盈利达标即可激活（"够本就跑"）
-            bool band_cond = eff.fresh &&
-                (bot.cfg.tp_floor_only ||
-                 (is_long ? (price >= target) : (price <= target)));
-            // 路径B：够到固定利润线就收割，不等上轨（与路径A 是【或】关系）
-            bool fixed_cond = false;
-            if (bot.cfg.tp_fixed_profit > 0 && bot.avg_price > 0 && eff.fresh) {
-                double fx = bot.avg_price *
-                    (is_long ? (1.0 + bot.cfg.tp_fixed_profit / 100.0)
-                             : (1.0 - bot.cfg.tp_fixed_profit / 100.0));
-                fixed_cond = is_long ? (price >= fx) : (price <= fx);
-            }
-            tp_hit = (band_cond &&
-                      (is_long ? (price >= floor_th) : (price <= floor_th)))
-                     || fixed_cond;
-            if (tp_hit && !bot.tp_reached) bot.tp_anchor = target;
-        } else {
-            double tp_th = bot.avg_price *
-                (is_long ? (1.0 + bot.cfg.tp_pct / 100.0)
-                         : (1.0 - bot.cfg.tp_pct / 100.0));
-            tp_hit = is_long ? (price >= tp_th) : (price <= tp_th);
-        }
+        const double tp_th = bot.avg_price *
+            (is_long ? (1.0 + bot.cfg.tp_pct / 100.0)
+                     : (1.0 - bot.cfg.tp_pct / 100.0));
+        const bool tp_hit = is_long ? (price >= tp_th) : (price <= tp_th);
         if (!bot.tp_reached && tp_hit) {
             bot.tp_reached = true;
             bot.tp_extreme = price;
-            if (eff.dyn) {
-                log(bot.cfg.symbol + " 止盈追踪激活 @" + std::to_string(price));
-            }
         }
         if (bot.tp_reached) {
             bot.tp_extreme = is_long ? std::max(bot.tp_extreme, price)
@@ -968,32 +674,12 @@ void CcgEngine::update_tracking(CcgBot& bot, double price) {
 }
 
 bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
-    // ATR 移动止损已武装 = 梯子冻结。这是该功能的定义本身：
-    // 止损线总比补仓位更近，两者并存会让梯子永远只有第一层
-    if (bot.atr_armed) return false;
     if ((int)bot.entries.size() >= bot.cfg.max_entries) return false;
     if (!bot.interval_hit) return false;
     if (bot.tp_reached)    return false;  // 达到止盈时不加仓
 
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-    double trail_entry = eff_params(bot).trail_entry;
-
-    // 多周期梯子：反弹比例必须跟着【当前槽位所属档位】的带宽走。
-    // 否则深层档位会失效——1d 档的带宽约是 1h 的 5 倍，用 1h 推出来的反弹比例
-    // 去等一个日线级别的反转，随便一个小反弹就把仓位打进去了，"追踪建仓"形同虚设
-    if (bot.cfg.mtf_ladder) {
-        const auto alloc = mtf_tier_alloc(bot.cfg);
-        const int  tier  = mtf_tier_of_slot(alloc, (int)bot.entries.size());
-        const auto& tb   = bot.mtf_band[tier];
-        const double mb  = (tb.ub + tb.lb) * 0.5;
-        if (mb > 0 && tb.ub > tb.lb) {
-            const double bandw = (tb.ub - tb.lb) / mb * 100.0;
-            // 用梯子专用的夹逼上限。共用 trail_entry_pct 的话，4h/12h/1d 三档会
-            // 全部撞在 0.4% 的上限上变成同一个值，本函数上面那段注释想避免的
-            // "小反弹就把深层打进去"照样发生——见 mtf_trail_entry_pct 的说明
-            trail_entry = dynparams::mtf_trail_entry_pct(bandw);
-        }
-    }
+    const double trail_entry = bot.cfg.trail_entry;
 
     double bounce_th = bot.dca_extreme *
         (is_long ? (1.0 + trail_entry / 100.0)
@@ -1001,66 +687,15 @@ bool CcgEngine::should_enter(const CcgBot& bot, double price) const {
     return is_long ? (price >= bounce_th) : (price <= bounce_th);
 }
 
-// 补仓侧闸门：只作用于"深层"补仓（占资金大头且必然在暴跌中触发的那几层）。
-// 数据缺失一律放行——补仓闸门是减仓保护而非入场许可，断数据时卡住补仓会让
-// 已有仓位失去摊薄能力，风险方向反而更糟
-bool CcgEngine::dca_gate_blocked(const CcgBot& bot,
-                                 std::chrono::steady_clock::time_point now) const {
-    const int from = bot.cfg.dca_gate_from_layer;
-    if (from <= 0) return false;
-    // entries.size() 是已有层数，下一笔是第 size()+1 层
-    if ((int)bot.entries.size() + 1 < from) return false;
-
-    if (bot.cfg.dca_gate_trend && trend_active_bearish(bot, now)) return true;
-    if (bot.cfg.dca_gate_htf_min > 0) {
-        bool htf_fresh = bot.htf_ok && (now - bot.htf_time) < std::chrono::minutes(30);
-        if (htf_fresh && bot.htf_pct_b < bot.cfg.dca_gate_htf_min) return true;
-    }
-    return false;
-}
-
 bool CcgEngine::should_close(const CcgBot& bot, double price) const {
     if (bot.entries.empty()) return false;
-    // 武装后由 ATR 线独占出场。常规追踪止盈的触发距离（动态模式 0.2~0.6%）
-    // 比 k×ATR（通常 6~10%）小一个量级，并存的结果是 ATR 线永远轮不到触发
-    if (bot.atr_armed)       return false;
     if (!bot.tp_reached)     return false;
 
     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-    const EffParams eff = eff_params(bot);
-    double trail_th = bot.tp_extreme *
-        (is_long ? (1.0 - eff.trail_tp / 100.0)
-                 : (1.0 + eff.trail_tp / 100.0));
-    // 动态模式的"保底利润"必须贯穿到平仓端：极值刚过激活线就回落时，纯追踪
-    // 阈值可能低于保底线（把赢单拖成亏单）——平仓线不得劣于保底线
-    if (eff.dyn && bot.avg_price > 0) {
-        double floor_th = bot.avg_price *
-            (is_long ? (1.0 + bot.cfg.min_profit_floor / 100.0)
-                     : (1.0 - bot.cfg.min_profit_floor / 100.0));
-        trail_th = is_long ? std::max(trail_th, floor_th)
-                           : std::min(trail_th, floor_th);
-    }
+    const double trail_th = bot.tp_extreme *
+        (is_long ? (1.0 - bot.cfg.trail_tp / 100.0)
+                 : (1.0 + bot.cfg.trail_tp / 100.0));
     return is_long ? (price <= trail_th) : (price >= trail_th);
-}
-
-bool CcgEngine::should_atr_trail_close(const CcgBot& bot, double price) const {
-    if (!bot.atr_armed)      return false;
-    if (bot.entries.empty()) return false;
-    if (bot.atr_stop <= 0)   return false;
-    const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-    return is_long ? (price <= bot.atr_stop) : (price >= bot.atr_stop);
-}
-
-bool CcgEngine::should_stop_loss(const CcgBot& bot, double price) const {
-    if (bot.entries.empty())       return false;
-    if (bot.cfg.stop_loss_pct <= 0) return false;
-    if (bot.avg_price <= 0)        return false;
-
-    const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-    double sl_th = bot.avg_price *
-        (is_long ? (1.0 - bot.cfg.stop_loss_pct / 100.0)
-                 : (1.0 + bot.cfg.stop_loss_pct / 100.0));
-    return is_long ? (price <= sl_th) : (price >= sl_th);
 }
 
 // ── 主 tick（由 UI 定时器每 3 秒调用）────────────────────────────────────────
@@ -1116,7 +751,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 bot.avg_price = bot.total_qty = bot.total_cost = 0;
                 bot.interval_hit = bot.tp_reached = false;
                 bot.ind_dipped  = false;   // 新一轮等待信号，探底状态清零重新累积
-                bot.band_broken = false; bot.band_extreme = 0;   // 首仓追踪基准同样清零
                 bot.last_entry_price = price;
                 bot.dca_extreme = price;
                 bot.tp_extreme  = price;
@@ -1141,35 +775,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 if (bot.cfg.entry_mode == CcgConfig::EntryMode::Indicator) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
                     bool priceCond = is_long ? (price <= bot.ind_boll_lb) : (price >= bot.ind_boll_ub);
-                    // 首仓追踪建仓：破轨后记极值，自极值反弹够比例才开——等企稳不接刀。
-                    // ⚠ 反弹条件是【叠加】在超卖区之上的，不是替换：价格必须仍在中轨
-                    // 下方才算数。否则破轨一次就永久放行，价格涨到上轨附近照样开仓，
-                    // 等于把下轨过滤器整个关掉（曾经的实现缺陷，实测会让开仓数翻2.6倍）
-                    if (bot.cfg.first_entry_bounce_pct > 0) {
-                        const double mid = (bot.ind_boll_lb + bot.ind_boll_ub) * 0.5;
-                        // 价格已回到中轨另一侧仍未触发 → 本轮超卖结束，解除武装重新等
-                        if (is_long ? (price > mid) : (price < mid)) {
-                            bot.band_broken = false;
-                            bot.band_extreme = 0;
-                        }
-                        if (priceCond) {
-                            bot.band_broken = true;
-                            bot.band_extreme = (bot.band_extreme <= 0)
-                                ? price
-                                : (is_long ? std::min(bot.band_extreme, price)
-                                           : std::max(bot.band_extreme, price));
-                        }
-                        if (bot.band_broken && bot.band_extreme > 0) {
-                            double bth = bot.band_extreme *
-                                (is_long ? (1.0 + bot.cfg.first_entry_bounce_pct / 100.0)
-                                         : (1.0 - bot.cfg.first_entry_bounce_pct / 100.0));
-                            // 反弹达标 且 仍在中轨下方（超卖区内）才开
-                            priceCond = (is_long ? (price >= bth && price <= mid)
-                                                 : (price <= bth && price >= mid));
-                        } else {
-                            priceCond = false;
-                        }
-                    }
                     bool rsiCond = true;
                     if (bot.cfg.use_rsi_filter) {
                         bool snapshotHit = is_long ? (bot.ind_rsi >= bot.cfg.rsi_threshold)
@@ -1189,17 +794,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     if (bot.last_action != "空头趋势，暂停开首仓") {
                         bot.last_action = "空头趋势，暂停开首仓";
                         log(bot.cfg.symbol + " 处于高周期空头态，暂停开新首仓（趋势恢复后自动放行）");
-                    }
-                }
-
-                // 周期熊市总开关：BTC级别判定为熊市时全场暂停开新首仓。
-                // 只拦【新首仓】——已有仓位的补仓/止盈/止损一律不受影响，否则
-                // 等于在熊市里既不让摊薄也不让离场，是最糟的组合
-                if (can_enter && bot.cfg.use_cycle_bear_switch && market_bearish_.load()) {
-                    can_enter = false;
-                    if (bot.last_action != "周期熊市，全场暂停开首仓") {
-                        bot.last_action = "周期熊市，全场暂停开首仓";
-                        log(bot.cfg.symbol + " 周期熊市态，暂停开新首仓（BTC日线级别，转牛后自动放行）");
                     }
                 }
 
@@ -1244,13 +838,10 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                 }
 
                 // 首仓的宏观许可层。
-                // 三个判据平级独立，任一开启才走判定；全关则完全不参与
-                // （不判定、不记录，也不空跑去刷日志）
-                // 两条涨幅不受 use_htf_filter 约束：可以只用涨幅、不用 %B
-                const bool gates_on = bot.cfg.use_htf_filter ||
-                                      bot.cfg.htf_24h_chg_max  > 0 ||
-                                      bot.cfg.htf_week_chg_max > 0 ||
-                                      bot.cfg.htf_24h_chg_max  > 0;
+                // 宏观许可（日线%B）。关掉就完全不参与判定，也不空跑去刷日志。
+                // v4.6.0 移除了 24h/近7日涨幅两条闸门——README 自己记着"无实证依据"，
+                // 默认也一直是关的，只剩 %B 这一条有 walk-forward 支持
+                const bool gates_on = bot.cfg.use_htf_filter;
                 std::string decision_snap;
                 if (can_enter && gates_on) {
                     const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
@@ -1266,35 +857,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     din.htf_ok      = bot.htf_ok && htf_fresh_30m;
                     din.htf_pct_b   = bot.htf_pct_b;
                     din.htf_pos_max = bot.cfg.htf_pos_max;
-                    // 7日涨幅与 %B 同源同鲜度，但多一个"历史够不够 8 根"的条件。
-                    // 算不出来时把 htf_ok 一并压掉——strict 模式下等价于"数据没到不开仓"，
-                    // 而不是当成"涨幅 0"放行（新上市品种正是最该拦的那一类）
-                    if (bot.cfg.htf_week_chg_max > 0) {
-                        din.htf_ok = din.htf_ok && bot.htf_chg_ok;
-                        din.week_chg_pct = bot.htf_week_chg;
-                        din.week_chg_max = bot.cfg.htf_week_chg_max;
-                    }
-                    // 24h 涨幅来自 @ticker 推送流，与日线K线不同源，就绪状态【单独】判。
-                    // v4.0.11 之前这里写的是 din.htf_ok = din.htf_ok && h24_fresh ——
-                    // 24h 拿不到时把 %B 的标志一起压掉，日志显示 "%B=缺失✗" 并提示
-                    // "新上市品种需等日线21根历史"，而 %B 其实好好的，缺的是那条 WS 流。
-                    // 排查时被引向完全错误的方向
-                    if (bot.cfg.htf_24h_chg_max > 0) {
-                        din.day_chg_ok  = bot.h24_ok &&
-                            (snow - bot.h24_time) < std::chrono::minutes(5);
-                        din.day_chg_pct = bot.h24_chg;
-                        din.day_chg_max = bot.cfg.htf_24h_chg_max;
-                    }
-                    // 预期止盈距离：动态模式=到上轨的距离（那就是利润目标）；静态=止盈%
-                    double tp_dist;
-                    if (bot.cfg.dynamic_band_mode && bot.ind_ok &&
-                        (is_long ? bot.ind_boll_ub > price : bot.ind_boll_lb < price) &&
-                        (is_long ? bot.ind_boll_ub - price : price - bot.ind_boll_lb) > 0) {
-                        tp_dist = is_long ? (bot.ind_boll_ub - price) : (price - bot.ind_boll_lb);
-                    } else {
-                        tp_dist = price * std::max(bot.cfg.dynamic_band_mode ? 1.0
-                                                                             : bot.cfg.tp_pct, 0.1) / 100.0;
-                    }
                     auto verdict  = decision::evaluate(din);
                     decision_snap = decision::summarize(din, verdict);
                     // 每次判定都刷新（不管放行还是拦截），界面据此显示实时判据。
@@ -1368,13 +930,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         log("[决策] " + bot.cfg.symbol + " 首仓派发 @" +
                             std::to_string(price) + " | " + decision_snap);
                 }
-            } else if (should_stop_loss(bot, price)) {
-                // 硬止损优先于一切追踪出场
-                do_close.push_back({id, "硬止损"});
-                bot.pending = true;
-            } else if (should_atr_trail_close(bot, price)) {
-                do_close.push_back({id, "ATR移动止损"});
-                bot.pending = true;
             } else if (should_close(bot, price)) {
                 do_close.push_back({id, "追踪止盈"});
                 bot.pending = true;
@@ -1399,13 +954,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                         bot.last_action = why;
                         log(bot.cfg.symbol + " " + why + "（$" +
                             std::to_string((int)cap_d) + "）");
-                    }
-                } else if (dca_gate_blocked(bot, host_.now_steady())) {
-                    std::string why = "第" + std::to_string(bot.entries.size() + 1) +
-                                      "层补仓被闸门拦下（深层资金保护）";
-                    if (bot.last_action != why) {
-                        bot.last_action = why;
-                        log(bot.cfg.symbol + " " + why);
                     }
                 } else {
                     do_entry.push_back(id);

@@ -346,13 +346,8 @@ void MainWindow::save_bots() {
         o["cooldown_secs"]= c.cooldown_secs;
         o["reentry_drawdown_pct"] = c.reentry_drawdown_pct;
         o["reentry_memory_days"]  = c.reentry_memory_days;
-        o["stop_loss_pct"]= c.stop_loss_pct;
         o["use_disaster_stop"] = c.use_disaster_stop;
         o["disaster_stop_pct"] = c.disaster_stop_pct;
-        o["use_atr_trail"]      = c.use_atr_trail;
-        o["atr_trail_mult"]     = c.atr_trail_mult;
-        o["atr_trail_period"]   = c.atr_trail_period;
-        o["atr_trail_interval"] = QString::fromStdString(c.atr_trail_interval);
 
         o["entry_mode"]     = (int)c.entry_mode;
         o["kline_interval"] = QString::fromStdString(c.kline_interval);
@@ -363,21 +358,12 @@ void MainWindow::save_bots() {
         o["rsi_threshold"]  = c.rsi_threshold;
         o["rsi_confirm_mode"] = (int)c.rsi_confirm_mode;
         o["rsi_oversold_th"]  = c.rsi_oversold_th;
-        o["dynamic_band_mode"] = c.dynamic_band_mode;
-        o["min_profit_floor"]  = c.min_profit_floor;
-        o["dyn_fixed_interval"] = c.dyn_fixed_interval;
-        o["mtf_ladder"]        = c.mtf_ladder;
-        o["mtf_tier_layers"]   = QString::fromStdString(c.mtf_tier_layers);
-        o["mtf_k"]             = c.mtf_k;
-        o["mtf_min_gap_pct"]   = c.mtf_min_gap_pct;
         o["use_trend_filter"]  = c.use_trend_filter;
         o["trend_interval"]    = QString::fromStdString(c.trend_interval);
         o["trend_ema_period"]  = c.trend_ema_period;
         o["use_htf_filter"]      = c.use_htf_filter;
         o["htf_interval"]        = QString::fromStdString(c.htf_interval);
         o["htf_pos_max"]         = c.htf_pos_max;
-        o["htf_24h_chg_max"]     = c.htf_24h_chg_max;
-        o["htf_week_chg_max"]    = c.htf_week_chg_max;
 
         // 持仓/状态快照 —— 没有这些字段的话，App 重启后本地均价/持仓量会从零重新累积，
         // 跟交易所实际仓位脱节（这正是均价跟交易所对不上的根因之一）
@@ -393,11 +379,6 @@ void MainWindow::save_bots() {
         o["tp_reached"]        = b.tp_reached;
         o["ind_dipped"]        = b.ind_dipped;
         o["tp_extreme"]        = b.tp_extreme;
-        // 武装状态与止损线必须跨重启存活：丢了的话重启后梯子会解冻继续补仓，
-        // 而用户以为自己已经切成"持有并追踪"了
-        o["atr_armed"]         = b.atr_armed;
-        o["atr_peak"]          = b.atr_peak;
-        o["atr_stop"]          = b.atr_stop;
         o["realized_pnl"]      = b.realized_pnl;
         o["cycle_count"]       = b.cycle_count;
         // 满层健康度：随 bot 落盘，重启后继续累加（口径=自创建以来）
@@ -462,13 +443,8 @@ void MainWindow::load_and_restore_bots() {
         // 悄悄加了一道闸门（同 v4.0.6 固定间隔、v4.0.7 涨幅拦截的处理）
         c.reentry_drawdown_pct = o["reentry_drawdown_pct"].toDouble(0.0);
         c.reentry_memory_days  = o["reentry_memory_days"].toInt(30);
-        c.stop_loss_pct= o["stop_loss_pct"].toDouble(0.0);
         c.use_disaster_stop = o["use_disaster_stop"].toBool(false);
         c.disaster_stop_pct = o["disaster_stop_pct"].toDouble(30.0);
-        c.use_atr_trail      = o["use_atr_trail"].toBool(false);
-        c.atr_trail_mult     = o["atr_trail_mult"].toDouble(3.0);
-        c.atr_trail_period   = o["atr_trail_period"].toInt(14);
-        c.atr_trail_interval = o["atr_trail_interval"].toString("4h").toStdString();
 
         c.entry_mode     = (CcgConfig::EntryMode)o["entry_mode"].toInt(1);
         c.kline_interval = o["kline_interval"].toString("1h").toStdString();
@@ -479,29 +455,19 @@ void MainWindow::load_and_restore_bots() {
         c.rsi_threshold  = o["rsi_threshold"].toDouble(30.0);
         c.rsi_confirm_mode = (CcgConfig::RsiConfirmMode)o["rsi_confirm_mode"].toInt(1);
         c.rsi_oversold_th  = o["rsi_oversold_th"].toDouble(25.0);
-        c.dynamic_band_mode = o["dynamic_band_mode"].toBool(true);
-        c.min_profit_floor  = o["min_profit_floor"].toDouble(3.5);
-        // 兜底 0（自适应）而不是建议值 6：老版本存的配置里没有这个字段，
-        // 兜底成 6 等于在用户不知情时把正在跑的策略换掉（间距 0.9%→6%）
-        c.dyn_fixed_interval = o["dyn_fixed_interval"].toDouble(0.0);
-        c.mtf_ladder        = o["mtf_ladder"].toBool(false);
-        c.mtf_tier_layers   = o["mtf_tier_layers"].toString().toStdString();
-        c.mtf_k             = o["mtf_k"].toDouble(0.5);
-        c.mtf_min_gap_pct   = o["mtf_min_gap_pct"].toDouble(2.0);
+        // ── v4.6.0 迁移：动态W模式移除后，补仓间距的唯一来源是 interval_pct ──
+        // 老配置里 dyn_fixed_interval>0 时，它【就是】当时实际生效的间距
+        // （eff_params 里 p.interval_pct = dyn_fixed_interval），所以搬过来才是
+        // 行为不变。丢掉它会让一个跑着 6% 的 bot 悄悄变回 8%——对正深套的仓位
+        // 就是下一次补仓位置整个挪了
+        const double old_fixed_iv = o["dyn_fixed_interval"].toDouble(0.0);
+        if (old_fixed_iv > 0) c.interval_pct = old_fixed_iv;
         c.use_trend_filter  = o["use_trend_filter"].toBool(true);
         c.trend_interval    = o["trend_interval"].toString("4h").toStdString();
         c.trend_ema_period  = o["trend_ema_period"].toInt(200);
         c.use_htf_filter      = o["use_htf_filter"].toBool(true);
         c.htf_interval        = o["htf_interval"].toString("1d").toStdString();
         c.htf_pos_max         = o["htf_pos_max"].toDouble(0.60);
-        // 兜底 0 而非某个"建议值"：老 bots.json 里没有这两个键，兜成非零
-        // 等于在用户不知情时给正在跑的策略加了两道闸门（同 v4.0.6 固定间隔的处理）
-        // v4.0.9 改名 + 改口径（今日涨幅 → 24h滚动涨幅）。老键兜底读回来：
-        // 两者都是"拦涨太急"，阈值量级相当，丢掉用户填过的值比口径微调更糟
-        c.htf_24h_chg_max     = o.contains("htf_24h_chg_max")
-                              ? o["htf_24h_chg_max"].toDouble(0.0)
-                              : o["htf_day_chg_max"].toDouble(0.0);
-        c.htf_week_chg_max    = o["htf_week_chg_max"].toDouble(0.0);
         // v3.8 迁移：老配置只有 smart_gates 总开关，为 false 时拦截完全不参与，
         // 升级后必须保持——否则老 bot 会突然开始拦截。
         // v4.0.16 移除结构层后，需要迁移的只剩 %B 这一条
@@ -523,15 +489,6 @@ void MainWindow::load_and_restore_bots() {
         bot.tp_reached        = o["tp_reached"].toBool();
         bot.ind_dipped        = o["ind_dipped"].toBool(false);
         bot.tp_extreme        = o["tp_extreme"].toDouble();
-        bot.atr_armed         = o["atr_armed"].toBool(false);
-        bot.atr_peak          = o["atr_peak"].toDouble(0);
-        bot.atr_stop          = o["atr_stop"].toDouble(0);
-        // 半截状态：武装了却没有止损线 ⇒ 梯子冻结却毫无保护。
-        // 当成未武装，下一个 tick 拿到 ATR 后重新定线
-        if (bot.atr_armed && bot.atr_stop <= 0) {
-            bot.atr_armed = false;
-            bot.atr_peak = bot.atr_stop = 0;
-        }
         bot.realized_pnl      = o["realized_pnl"].toDouble();
         bot.cycle_count       = o["cycle_count"].toInt();
         bot.full_layer_secs   = (int64_t)o["full_layer_secs"].toDouble();
@@ -1399,41 +1356,6 @@ void MainWindow::onConnect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 多周期梯子：补齐 4h / 12h 两档的布林带。
-// 1h 和 1d 两档由指标拉取和宏观%B拉取顺带喂了（它们本来就在拉那两个周期的带），
-// 所以这里每个 bot 只多 2 个公开接口请求——限流治理还没做，能省则省。
-// ─────────────────────────────────────────────────────────────────────────────
-void MainWindow::refreshMtfBands() {
-    if (!client_ || !engine_) return;
-    if (mtfFetchBusy_.exchange(true)) return;
-
-    struct Need { std::string bot_id, symbol; int tier; std::string interval; int period; double mult; };
-    std::vector<Need> needs;
-    for (const auto& b : engine_->get_bots()) {
-        if (!b.cfg.mtf_ladder || b.state == CcgBot::State::Stopped) continue;
-        needs.push_back({b.bot_id, b.cfg.symbol, 1, "4h",  b.cfg.boll_period, b.cfg.boll_mult});
-        needs.push_back({b.bot_id, b.cfg.symbol, 2, "12h", b.cfg.boll_period, b.cfg.boll_mult});
-        // 指标/宏观用的不是 1h / 1d 时，那两档也得自己拉
-        if (b.cfg.kline_interval != "1h")
-            needs.push_back({b.bot_id, b.cfg.symbol, 0, "1h", b.cfg.boll_period, b.cfg.boll_mult});
-        if (b.cfg.htf_interval != "1d")
-            needs.push_back({b.bot_id, b.cfg.symbol, 3, "1d", b.cfg.boll_period, b.cfg.boll_mult});
-    }
-    if (needs.empty()) { mtfFetchBusy_.store(false); return; }
-
-    run_async([this, needs]() {
-        for (const auto& n : needs) {
-            auto snap = client_->fetch_indicators(n.symbol, n.interval, n.period, n.mult, 14);
-            if (!snap.ok) continue;
-            QMetaObject::invokeMethod(this, [this, n, snap]() {
-                if (engine_) engine_->update_mtf_band(n.bot_id, n.tier, snap.boll_lb, snap.boll_ub);
-            }, Qt::QueuedConnection);
-        }
-        mtfFetchBusy_.store(false);
-    });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // 资金费账本刷新。
 // 这是【账本】不是风控：只记录和展示持有成本，不参与任何交易决策。
 // 永续合约每 8 小时结算一次资金费，这笔钱是真实划走的现金——价格涨回来也拿不回，
@@ -1853,13 +1775,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto* budgetEdit   = mkEdit ("预算USDT:",      prefill ? prefill->cfg.budget_usdt  : 3000.0);
     auto* levEdit      = mkEditI("杠杆:",          prefill ? prefill->cfg.leverage     : 3);
     auto* maxEntEdit   = mkEditI("最大层:",        prefill ? prefill->cfg.max_entries  : 10);
-    auto* intervalEdit = mkEdit ("间隔%:",         prefill ? prefill->cfg.interval_pct : 8.0);
+    auto* intervalEdit = mkEdit ("补仓间隔%:",     prefill ? prefill->cfg.interval_pct : 6.0);
     auto* trailEntEdit = mkEdit ("追踪建仓%:",     prefill ? prefill->cfg.trail_entry  : 1.0);
     auto* tpEdit       = mkEdit ("止盈%:",         prefill ? prefill->cfg.tp_pct       : 5.0);
     auto* trailTpEdit  = mkEdit ("止盈追踪%:",     prefill ? prefill->cfg.trail_tp     : 2.0);
     auto* cooldownEdit = mkEditI("冷却(s):",       prefill ? prefill->cfg.cooldown_secs: 300);
-    auto* stopLossEdit = mkEditIn(riskForm, "本地止损%(0=禁用):",
-                                  prefill ? prefill->cfg.stop_loss_pct : 0.0);
     auto* disStopBox = new QCheckBox("在交易所挂灾难止损单（进程外保护）");
     disStopBox->setChecked(prefill ? prefill->cfg.use_disaster_stop : false);
     addCheck(riskForm, disStopBox);
@@ -1872,7 +1792,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     {
         QString t =
             "在【交易所】挂一张 STOP_MARKET 单（均价下方该比例处），程序崩溃/断电/"
-            "误关窗口后它依然生效——这是唯一的进程外保护。上面那个\"止损%\"只活在本进程里。\n"
+            "误关窗口后它依然生效——这是【唯一】的进程外保护：追踪止盈活在本进程里，\n"
+            "程序不在了它就什么都不剩。\n"
             "⚠ 它会把浮亏变成实亏。如果你的策略是「套住就长线持有、只要不归零就等」，"
             "那这个功能与你的取向冲突，保持不勾选即可（默认就是不勾）。\n"
             "⚠ 勾选的话只防瀑布，不参与常规止盈：网格天然要吃深度回撤，设太紧会在正常"
@@ -1880,46 +1801,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         addHint(riskForm, t);
     }
 
-    // ── ATR 移动止损（勾选即冻结梯子）───────────────────────────────────────
-    auto* atrTrailBox = new QCheckBox("ATR 移动止损（勾选后不再补仓）");
-    atrTrailBox->setChecked(prefill ? prefill->cfg.use_atr_trail : false);
-    addCheck(riskForm, atrTrailBox);
-    auto* atrKEdit    = new QLineEdit(QString::number(
-                            prefill ? prefill->cfg.atr_trail_mult : 3.0));
-    auto* atrPerEdit  = new QLineEdit(QString::number(
-                            prefill ? prefill->cfg.atr_trail_period : 14));
-    auto* atrItvCombo = new QComboBox();
-    atrItvCombo->addItems({"15m", "1h", "4h", "12h", "1d"});
-    atrItvCombo->setCurrentText(QString::fromStdString(
-        prefill ? prefill->cfg.atr_trail_interval : std::string("4h")));
-    addSub(riskForm, "ATR 倍数 k", atrKEdit);
-    addSub(riskForm, "ATR 周期", atrPerEdit);
-    addSub(riskForm, "ATR K线周期", atrItvCombo);
-    for (QWidget* w : {(QWidget*)atrKEdit, (QWidget*)atrPerEdit, (QWidget*)atrItvCombo}) {
-        w->setEnabled(atrTrailBox->isChecked());
-        connect(atrTrailBox, &QCheckBox::toggled, w, &QWidget::setEnabled);
-    }
-    {
-        QString t =
-            "把这个 bot 从「网格」切换成「持有并追踪」：\n"
-            "· 【不再补仓】——已有的层保留，但不会再加新的\n"
-            "· 止损线 = 持仓期最高价 − k×ATR，棘轮，只上移不下移\n"
-            "· 常规追踪止盈停用（它的触发距离比 k×ATR 小一个量级，"
-            "并存的话 ATR 线永远轮不到触发）；硬止损与交易所灾难止损照常\n"
-            "\n"
-            "为什么必须冻结梯子：止损线和补仓位都在现价下方，而止损线总是更近"
-            "（k×ATR 通常 6~10%，补仓间隔 6%，且止损线会随新高上移、补仓位不动）。"
-            "两者并存的结果是价格一跌先打止损，梯子永远只有第一层。\n"
-            "\n"
-            "两种用法：\n"
-            "① 已经套着的仓位反弹回来了，勾上它锁住这波回升，不用等上轨；\n"
-            "② 空仓时就勾上，首仓开出来直接进入追踪模式，永远只有一层"
-            "——相当于「DCA 的入场闸门 + 趋势跟随的出场」。\n"
-            "\n"
-            "⚠ 如果勾选时仓位正深套，止损线会落在现价下方 k×ATR 处，"
-            "那是一个真实的亏损出场价。与「套住长持不止损」的取向直接冲突。";
-        addHint(riskForm, t);
-    }
 
     auto* autoRestartBox = new QCheckBox("自动重启");
     autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
@@ -1949,72 +1830,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         prefill ? (prefill->cfg.entry_mode == CcgConfig::EntryMode::Indicator ? 1 : 0) : 1);
     sigForm->addRow("首单模式:", entryModeBox);
 
-    // ── 动态W模式（v2.3）───────────────────────────────────────────────────────
-    auto* dynBandBox = new QCheckBox("动态W模式（补仓锚定下轨/止盈锚定上轨/间距自适应带宽）");
-    dynBandBox->setChecked(prefill ? prefill->cfg.dynamic_band_mode : true);
-    dynBandBox->setToolTip(
-        "开启后间隔%/追踪%不再用上面的固定值，改为按实时布林带宽W自动推导：\n"
-        "间隔=W/3、追踪止盈=0.15W、追踪建仓=0.1W（各有上下限夹逼）。\n"
-        "补仓要求价格在带外（多:≤下轨），止盈要求触及对侧轨道且盈利≥保底利润。\n"
-        "带子随趋势移动时梯子跟着走，均价贴着下轨，带内震荡即可完成周期。");
-    addCheck(dcaForm, dynBandBox);
-    auto* floorEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.min_profit_floor : 3.5));
-    addSub(dcaForm, "保底利润%（动态模式）", floorEdit);
-
-    // 固定补仓间隔：此前只有回测命令行能设，实盘够不着——而 walk-forward 证明
-    // 它全面优于 W/3 自适应推导。不通到界面等于把最好的配置锁在回测里
-    auto* fixIvEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.dyn_fixed_interval : 0.0));
-    fixIvEdit->setPlaceholderText("0 = 用 W/3 自适应；建议填 6");
-    fixIvEdit->setToolTip(
-        "只替换动态W的【间距推导】，结构锚定完全保留——\n"
-        "补仓仍要求价格在下轨外，止盈仍要求触及上轨且盈利≥保底利润。\n\n"
-        "⚠ 实证建议填 6。8品种 × 8个滚动窗口 = 64 个纯样本外测试段：\n"
-        "  固定 6%   总净利  70620   盈利 56/64   满层中位  0.0%   ← 最优\n"
-        "  固定 5%   总净利  67289   盈利 52/64   满层中位  0.7%\n"
-        "  固定 4%   总净利  53826   盈利 49/64   满层中位  1.2%\n"
-        "  固定 3%   总净利 −35616   盈利 38/64   满层中位 22.4%   ← 样本外净亏\n"
-        "而 W/3 推导出的间隔中位仅 0.90%，满层中位高达 84.5%，\n"
-        "5 个品种里 0 个能打平其最优固定间隔。\n\n"
-        "满层＝弹药耗尽、失去摊薄能力，是驱动回撤与资金费的枢纽变量：\n"
-        "满层<10% 的品种 22/22 盈利，>75% 的 0/6 盈利（中位亏 16854U）。\n"
-        "填 6 之后实测平均只用 1.5 层、满层率 0.0%——子弹根本用不完。");
-    addSub(dcaForm, "固定补仓间隔%（0=自适应，建议 6）", fixIvEdit);
-
-    // ── 多周期梯子（v3.7 实验，默认关）────────────────────────────────────────
-    auto* mtfBox = new QCheckBox("多周期梯子（补仓档位锚定 1h/4h/12h/1d 下轨，越深的层要求越极端）");
-    mtfBox->setChecked(prefill ? prefill->cfg.mtf_ladder : false);
-    mtfBox->setToolTip(
-        "把补仓间距的来源从固定参数换成市场结构：梯子是 N 个有序槽位，\n"
-        "第 i 槽必须先跌破【它所属档位】那个周期的布林下轨，才武装追踪建仓。\n"
-        "带宽大致按 √T 缩放，所以 1h→4h→12h→1d 的间距天然递增，\n"
-        "浅回调只消耗第一档，深层弹药留给真正的大跌。\n\n"
-        "⚠ 实验功能，尚未经过完整回测验证。BTC 2021 单年的初步对照里它输给\n"
-        "现行动态W（收益/回撤 0.69 vs 3.08）——原因是补仓变克制之后，拉均价\n"
-        "的能力被削弱，仓位摊薄不下去。它的论点在持续阴跌里才成立，需要实盘\n"
-        "或完整回测积累数据。开启前请明白这一点。\n"
-        "只接管补仓间距，止盈那半（触上轨+保底利润）完全不变。");
-    addCheck(dcaForm, mtfBox);
-
-    auto* mtfTiersEdit = new QLineEdit(prefill ? QString::fromStdString(prefill->cfg.mtf_tier_layers) : "");
-    mtfTiersEdit->setPlaceholderText("留空=按 3:2:2:1 权重自动分配");
-    addSub(dcaForm, "各档层数 (1h,4h,12h,1d)", mtfTiersEdit);
-    auto* mtfKEdit   = new QLineEdit(QString::number(prefill ? prefill->cfg.mtf_k : 0.5));
-    addSub(dcaForm, "最小间距系数 k（×该档带宽）", mtfKEdit);
-    auto* mtfGapEdit = new QLineEdit(QString::number(prefill ? prefill->cfg.mtf_min_gap_pct : 2.0));
-    addSub(dcaForm, "最小间距兜底%", mtfGapEdit);
-    addHint(dcaForm,
-        "最小间距 = max(k × 该档带宽, 兜底%)，相对上一笔成交价。前者自适应——"
-        "瀑布本身是高波动事件，带子撑开时地板跟着撑开，挡住「四档同时触发、"
-        "整个梯子打在崩盘顶部」；后者防止带数据异常时失去地板。");
-    auto syncMtfUi = [mtfBox, mtfTiersEdit, mtfKEdit, mtfGapEdit]() {
-        const bool on = mtfBox->isChecked();
-        mtfTiersEdit->setEnabled(on);
-        mtfKEdit->setEnabled(on);
-        mtfGapEdit->setEnabled(on);
-    };
-    syncMtfUi();
-    connect(mtfBox, &QCheckBox::toggled, &dlg, [syncMtfUi](bool) { syncMtfUi(); });
-
     // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
     auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
     trendBox->setChecked(prefill ? prefill->cfg.use_trend_filter : true);
@@ -2038,13 +1853,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                        "%B = 价格在日线布林带中的相对位置，0=下轨 1=上轨。");
     addCheck(gateForm, htfBox);
 
-    addHint(gateForm, "下面三条平级独立，全部关闭 = 宏观许可层完全不参与。"
+    addHint(gateForm, "关闭 = 宏观许可层完全不参与。"
                       "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
     auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
-    auto* dayChgEdit   = mkEditIn(gateForm, "24h涨幅拦截%（0=关）:",
-                                  prefill ? prefill->cfg.htf_24h_chg_max : 0.0);
-    auto* weekChgEdit  = mkEditIn(gateForm, "近7日涨幅拦截%（0=关）:",
-                                  prefill ? prefill->cfg.htf_week_chg_max : 0.0);
     addHint(gateForm,
             "涨幅与 %B 的口径不同：\n"
             "%B 问「价格在波动区间的什么位置」，涨幅问「最近涨得多急」。\n"
@@ -2118,8 +1929,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     auto previewDipped = std::make_shared<bool>(false);
 
     auto refreshIndPreview = [=]() {
-        // 指标模式或动态W模式任一开启都需要预览（动态模式即使首单是"立即开仓"也依赖轨道数据）
-        if (!client_ || (entryModeBox->currentIndex() != 1 && !dynBandBox->isChecked())) return;
+        // 只有"指标信号"首单模式才需要预览——v4.6.0 起补仓和止盈不再看布林带
+        if (!client_ || entryModeBox->currentIndex() != 1) return;
         bool ok;
         int    bp   = bollPeriodEdit->text().toInt(&ok); if (!ok || bp <= 1) bp = 20;
         double bm   = bollMultEdit->text().toDouble(&ok); if (!ok || bm <= 0) bm = 2.0;
@@ -2167,13 +1978,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     connect(indPreviewTimer, &QTimer::timeout, &dlg, refreshIndPreview);
 
     auto updateIndVisible = [=]() {
-        bool show = entryModeBox->currentIndex() == 1 || dynBandBox->isChecked();
+        bool show = (entryModeBox->currentIndex() == 1);
         indBox->setVisible(show);
         if (show) { indPreviewTimer->start(); refreshIndPreview(); }
         else        indPreviewTimer->stop();
     };
     connect(entryModeBox, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, updateIndVisible);
-    connect(dynBandBox,   &QCheckBox::toggled,                                 &dlg, updateIndVisible);
     connect(bollPeriodEdit, &QLineEdit::editingFinished, &dlg, refreshIndPreview);
     connect(bollMultEdit,   &QLineEdit::editingFinished, &dlg, refreshIndPreview);
     connect(rsiPeriodEdit,  &QLineEdit::editingFinished, &dlg, refreshIndPreview);
@@ -2310,8 +2120,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         double sumMargin = 0, sumLoss = 0, sumQty = 0, sumUnreal = 0;
         bool   haveLoss  = livePrice > 0;
 
-        // 动态W模式下间隔/追踪/止盈是运行时按实时带宽算出来的，写死一个数字是骗人的
-        const bool dynMode = dynBandBox->isChecked();
+        const bool dynMode = false;     // v4.6.0 起参数全是固定值，不再有"动态"列
         const QString dynTxt = "动态";
         double tpPct    = tpEdit->text().toDouble();
         double tpTrail  = trailTpEdit->text().toDouble();
@@ -2439,7 +2248,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     // 否则改了止盈参数预览还停在旧值上
     connect(tpEdit,      &QLineEdit::textChanged, &dlg, refreshTier);
     connect(trailTpEdit, &QLineEdit::textChanged, &dlg, refreshTier);
-    connect(dynBandBox,  &QCheckBox::toggled,     &dlg, [refreshTier](bool) { refreshTier(); });
     refreshTier();
 
     if (longBot && shortBot) {
@@ -2532,15 +2340,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.cooldown_secs = to_i(cooldownEdit,  300);
     cfg.reentry_drawdown_pct = to_d(reentryDdEdit,  0.0);
     cfg.reentry_memory_days  = to_i(reentryDayEdit, 30);
-    cfg.stop_loss_pct = to_d(stopLossEdit,  0.0);
     cfg.use_disaster_stop = disStopBox->isChecked();
     cfg.disaster_stop_pct = to_d(disStopEdit, 30.0);
-    cfg.use_atr_trail      = atrTrailBox->isChecked();
-    cfg.atr_trail_mult     = to_d(atrKEdit, 3.0);
-    cfg.atr_trail_period   = (int)to_d(atrPerEdit, 14);
-    cfg.atr_trail_interval = atrItvCombo->currentText().toStdString();
-    if (cfg.atr_trail_mult <= 0)   cfg.atr_trail_mult   = 3.0;
-    if (cfg.atr_trail_period < 2)  cfg.atr_trail_period = 14;
 
     cfg.entry_mode     = (entryModeBox->currentIndex() == 1)
                         ? CcgConfig::EntryMode::Indicator : CcgConfig::EntryMode::Immediate;
@@ -2554,18 +2355,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                           ? CcgConfig::RsiConfirmMode::CrossFromOversold
                           : CcgConfig::RsiConfirmMode::Snapshot;
     cfg.rsi_oversold_th  = to_d(rsiOversoldEdit, 25.0);
-    cfg.dynamic_band_mode = dynBandBox->isChecked();
-    cfg.min_profit_floor  = to_d(floorEdit, 3.5);
-    cfg.dyn_fixed_interval = to_d(fixIvEdit, 0.0);
-    cfg.mtf_ladder        = mtfBox->isChecked();
-    cfg.mtf_tier_layers   = mtfTiersEdit->text().trimmed().toStdString();
-    cfg.mtf_k             = to_d(mtfKEdit,   0.5);
-    cfg.mtf_min_gap_pct   = to_d(mtfGapEdit, 2.0);
     cfg.use_trend_filter  = trendBox->isChecked();
     cfg.use_htf_filter      = htfBox->isChecked();
     cfg.htf_pos_max         = to_d(htfMaxEdit,   0.60);
-    cfg.htf_24h_chg_max     = to_d(dayChgEdit,   0.0);
-    cfg.htf_week_chg_max    = to_d(weekChgEdit,  0.0);
 
     QString symQ = QString::fromStdString(symbol);
     auto apply_one = [&](CcgConfig::Direction dir, const CcgBot* existing) {
@@ -2821,39 +2613,14 @@ void MainWindow::onTick() {
         }
     }
 
-    // ── DCA 的 ATR 移动止损：只为勾了这个开关的 bot 拉 ATR ───────────────────
-    // 每 20 个 tick 约 60 秒。没勾的 bot 一次请求都不发——ATR 对普通网格
-    // 毫无意义，v4.1.2 刚把它从 DCA 的公共批次里整条拆掉，别又加回去
-    if ((slowTickCount_ % 20) == 5 && !dcaAtrBusy_.load()) {
-        std::vector<CcgBot> need;
-        for (const auto& b : bots)
-            if (b.cfg.use_atr_trail && b.state != CcgBot::State::Stopped)
-                need.push_back(b);
-        if (!need.empty()) {
-            dcaAtrBusy_.store(true);
-            run_async([this, need]() {
-                for (const auto& b : need) {
-                    if (!client_ || !engine_) break;
-                    const double a = client_->fetch_atr(b.cfg.symbol,
-                                                        b.cfg.atr_trail_interval,
-                                                        b.cfg.atr_trail_period);
-                    if (a > 0) engine_->update_atr(b.bot_id, a);
-                }
-                dcaAtrBusy_.store(false);
-                QMetaObject::invokeMethod(this, [this]() { refreshBotTable(); },
-                                          Qt::QueuedConnection);
-            });
-        }
-    }
-
     // 指标拉取（公开接口，不占用签名限流）：
     //  - 指标信号首单：等待 BOLL/RSI 信号的 bot（运行中+还没开首仓+指标模式）
-    //  - 动态W模式：持仓中也要持续拉取——补仓锚定下轨/止盈锚定上轨都依赖实时轨道
+    //  v4.6.0 起指标【只服务首单信号】——补仓和止盈不再看布林带，所以已有仓位
+    //  的 bot 不必再拉，请求量随之下降
     std::vector<CcgBot> ind_wait;
     for (const auto& b : bots)
-        if (b.state == CcgBot::State::Running &&
-            ((b.entries.empty() && b.cfg.entry_mode == CcgConfig::EntryMode::Indicator) ||
-             b.cfg.dynamic_band_mode))
+        if (b.state == CcgBot::State::Running && b.entries.empty() &&
+            b.cfg.entry_mode == CcgConfig::EntryMode::Indicator)
             ind_wait.push_back(b);
     if (!ind_wait.empty() && client_ && !indFetchBusy_.load()) {
         indFetchBusy_.store(true);
@@ -2863,12 +2630,8 @@ void MainWindow::onTick() {
                                                        b.cfg.boll_period, b.cfg.boll_mult,
                                                        b.cfg.rsi_period);
                 if (!snap.ok) continue;
-                const bool tier0 = b.cfg.mtf_ladder && b.cfg.kline_interval == "1h";
-                QMetaObject::invokeMethod(this, [this, bid = b.bot_id, snap, tier0]() {
-                    if (!engine_) return;
-                    engine_->update_indicator(bid, snap.boll_lb, snap.boll_ub, snap.rsi);
-                    // 复用：指标拉的就是 1h 带，正好是多周期梯子的第0档，不必再拉一次
-                    if (tier0) engine_->update_mtf_band(bid, 0, snap.boll_lb, snap.boll_ub);
+                QMetaObject::invokeMethod(this, [this, bid = b.bot_id, snap]() {
+                    if (engine_) engine_->update_indicator(bid, snap.boll_lb, snap.boll_ub, snap.rsi);
                 }, Qt::QueuedConnection);
             }
             indFetchBusy_.store(false);
@@ -2879,7 +2642,7 @@ void MainWindow::onTick() {
 
     // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
-    if (fundTickCount_++ % 100 == 0) { refreshFunding(); refreshMtfBands(); }
+    if (fundTickCount_++ % 100 == 0) refreshFunding();
 
     // 成交明细的延迟落盘：save_trades 做了去抖，被压下的写在这里补上
     if (tradesDirty_) save_trades(true);
@@ -2975,9 +2738,9 @@ void MainWindow::onTick() {
     // 所以每个 tick 都喂，不必搭 5 分钟那班车。@ticker 每秒推一次，
     // 让引擎拿到的始终是最新值
     if (ticker_) {
-        // 不再受「24h涨幅拦截」开关约束：这份数据现在也是界面上的一列，
-        // 闸门关着的 bot 同样要显示。成本几乎为零——@ticker 本就已订阅，
-        // REST 兜底是全市场一次取回（权重 40，90 秒一次），与品种数无关
+        // v4.6.0 起 24h 涨幅【只用于显示】那一列——涨幅拦截闸门已移除。
+        // 成本几乎为零：@ticker 本就已订阅，REST 兜底是全市场一次取回
+        // （权重 40，90 秒一次），与品种数无关
         bool need_rest_chg = false;
         for (const auto& b : bots) {
             if (b.state == CcgBot::State::Stopped) continue;
@@ -2985,9 +2748,6 @@ void MainWindow::onTick() {
             bool stale = false;
             const bool ok = chg24Of(b.cfg.symbol, pct, stale);
             if (stale) need_rest_chg = true;
-            // 只有开了闸门的才喂给引擎；其余仅供显示
-            if (b.cfg.htf_24h_chg_max > 0)
-                engine_->update_24h_change(b.bot_id, ok, pct);
         }
         // 一次 REST 拿回全市场（权重 40），不是逐品种——47 个品种逐个查是
         // 47 次往返，而全取只要 1 次，权重也更省
@@ -3015,10 +2775,7 @@ void MainWindow::onTick() {
             // %B 对所有非停止 bot 持续保鲜（不限"等首仓中"）：立即开仓模式点继续
             // 3秒内就下单、冷却结束当tick就重进——只给等待中的bot拉的话，这些
             // 首仓永远赶不上数据，%B恒为"缺失(放行)"
-            // 涨幅拦截与 %B 同源，任一开启都要拉这份高周期数据
-            if (b.cfg.use_htf_filter ||
-                b.cfg.htf_24h_chg_max > 0 || b.cfg.htf_week_chg_max > 0)
-                htf_bots.push_back(b);
+            if (b.cfg.use_htf_filter) htf_bots.push_back(b);
         }
         if ((!trend_bots.empty() || !htf_bots.empty()) && !trendFetchBusy_.load()) {
             trendFetchBusy_.store(true);
@@ -3037,12 +2794,8 @@ void MainWindow::onTick() {
                                                            20, 2.0, 14);
                     if (!snap.ok) continue;
                     double pb = decision::pct_b(snap.price, snap.boll_lb, snap.boll_ub);
-                    const bool tier3 = b.cfg.mtf_ladder && b.cfg.htf_interval == "1d";
-                    QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb, snap, tier3]() {
-                        if (!engine_) return;
-                        engine_->update_htf(bid, pb, snap.chg_ok, snap.chg_7);
-                        // 复用：宏观层拉的就是日线带，正好是第3档
-                        if (tier3) engine_->update_mtf_band(bid, 3, snap.boll_lb, snap.boll_ub);
+                    QMetaObject::invokeMethod(this, [this, bid = b.bot_id, pb]() {
+                        if (engine_) engine_->update_htf(bid, pb);
                     }, Qt::QueuedConnection);
                 }
                 // ATR 观测日志曾经在这里（v4.0.18 加、v4.1.2 删）。
@@ -3380,21 +3133,6 @@ void MainWindow::refreshPositions() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Bot 表格刷新
 // ─────────────────────────────────────────────────────────────────────────────
-// 动态W模式下"保底达标"只是必要条件：还要价格触及上轨才会激活追踪止盈。
-// 只显示"已达标"会让人以为马上就要平仓了
-static QString bot_tp_hint(const CcgBot& b, bool floor_ok) {
-    if (b.ind_boll_ub <= 0)
-        return QStringLiteral("上轨数据未就绪");
-    const bool is_long = (b.cfg.direction != CcgConfig::Direction::Short);
-    const double band = is_long ? b.ind_boll_ub : b.ind_boll_lb;
-    const bool touched = is_long ? (b.current_price >= band) : (b.current_price <= band);
-    if (touched && floor_ok) return QStringLiteral("上轨已触及 + 保底达标 → 追踪止盈已可激活");
-    if (!floor_ok)           return QString("还需价格涨到 %1 才够保底").arg(
-                                    b.avg_price * (1.0 + b.cfg.min_profit_floor / 100.0), 0, 'f', 4);
-    return QString("保底已达标，但还需触及%1轨 %2")
-           .arg(is_long ? "上" : "下").arg(band, 0, 'f', 4);
-}
-
 void MainWindow::refreshBotTable() {
     if (!engine_) { botTable_->setRowCount(0); return; }
 
@@ -3586,7 +3324,7 @@ void MainWindow::refreshBotTable() {
                         signal_tip += "\n宏观判据：" + QString::fromStdString(b.last_decision);
                 }
             } else {
-                state_s = b.cfg.dynamic_band_mode ? "运行中·动态W" : "运行中";
+                state_s = "运行中";
                 state_c = QColor("#3fb950");
             }
             ++running; break;
@@ -3645,33 +3383,7 @@ void MainWindow::refreshBotTable() {
             } else {
                 tip += "\n\n健康：回测中满层<10% 的品种 22/22 盈利。";
             }
-            // 梯子被 ATR 移动止损冻结时，层进度必须一眼看出来——否则用户会
-            // 盯着"3/10"等第 4 层，而它永远不会来
-            if (b.atr_armed) {
-                it->setText(layers + "🔒");
-                it->setForeground(QColor("#d29922"));
-                QString atip = QString("ATR 移动止损已武装，梯子已冻结——不会再补仓。\n"
-                                       "当前第 %1 层即最终层。\n\n止损线 $%2")
-                                   .arg(b.entries.size())
-                                   .arg(b.atr_stop, 0, 'f', 6);
-                if (b.current_price > 0 && b.atr_stop > 0) {
-                    const double d = std::fabs(b.current_price - b.atr_stop)
-                                     / b.current_price * 100.0;
-                    atip += QString("（距现价 %1%）").arg(d, 0, 'f', 2);
-                }
-                if (b.avg_price > 0 && b.atr_stop > 0) {
-                    const bool is_long = (b.cfg.direction == CcgConfig::Direction::Long);
-                    const double pnl_pct = (b.atr_stop - b.avg_price) / b.avg_price
-                                           * 100.0 * (is_long ? 1.0 : -1.0);
-                    // 把"现在被打掉是赚是亏"直接摆出来。深套时勾选这个功能
-                    // 会把浮亏变成实亏，这个数是唯一能提前看见它的地方
-                    atip += QString("\n触发时相对均价 %1%2%")
-                                .arg(pnl_pct >= 0 ? "+" : "").arg(pnl_pct, 0, 'f', 2);
-                }
-                it->setToolTip(atip);
-            } else {
-                it->setToolTip(tip);
-            }
+            it->setToolTip(tip);
             botTable_->setItem(i, 4, it);
         }
         // 均价 + 资金费修正后的回本价（悬停）。放在均价上是有道理的：回本价本质
@@ -3718,23 +3430,14 @@ void MainWindow::refreshBotTable() {
             const bool is_long = (b.cfg.direction != CcgConfig::Direction::Short);
             double gain = (is_long ? (b.current_price / b.avg_price - 1.0)
                                    : (1.0 - b.current_price / b.avg_price)) * 100.0;
-            const double floor_pct = b.cfg.min_profit_floor;
             QString tip = QString("浮动盈亏 $%1\n保证金 $%2\n收益率 %3%4%（已按 %5x 杠杆放大）\n\n"
                                   "── 止盈实际看的是价格涨幅 ──\n价格涨幅 %6%7%")
                 .arg(unreal, 0, 'f', 2).arg(margin, 0, 'f', 2)
                 .arg(roi >= 0 ? "+" : "").arg(roi, 0, 'f', 1).arg(b.cfg.leverage)
                 .arg(gain >= 0 ? "+" : "").arg(gain, 0, 'f', 2);
-            if (b.cfg.dynamic_band_mode) {
-                tip += QString("（保底线 %1%，%2）")
-                    .arg(floor_pct, 0, 'f', 1)
-                    .arg(gain >= floor_pct ? "已达标" : "未达标");
-                // 达标只是必要条件：动态W下还要触上轨才激活追踪止盈
-                tip += QString("\n%1").arg(bot_tp_hint(b, gain >= floor_pct));
-            } else {
-                tip += QString("（止盈线 %1%，%2）")
-                    .arg(b.cfg.tp_pct, 0, 'f', 1)
-                    .arg(gain >= b.cfg.tp_pct ? "已达标" : "未达标");
-            }
+            tip += QString("（止盈线 %1%，%2）")
+                .arg(b.cfg.tp_pct, 0, 'f', 1)
+                .arg(gain >= b.cfg.tp_pct ? "已达标" : "未达标");
             roi_item->setToolTip(tip);
         }
         botTable_->setItem(i, 11, roi_item);

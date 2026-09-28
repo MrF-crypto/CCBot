@@ -98,11 +98,29 @@ std::vector<std::string> SarEngine::reconcile_positions(
         // 在途的跳过：订单可能已在交易所生效而本地还没入账，此刻比对必然误判
         if (b.pending) continue;
 
-        const ExchangePos* ex = nullptr;
-        for (const auto& e : exchange)
-            if (e.symbol == b.cfg.symbol && e.qty > 0) { ex = &e; break; }
-
         const bool local_has = (b.st.pos != sar::Pos::Flat && b.qty > 0);
+        const int  local_dir = (b.st.pos == sar::Pos::Long) ? 1 : -1;
+
+        // ⚠ 必须按【品种 + 方向】配对，不能只按品种取第一条命中。
+        //
+        // 调用方传进来的快照是从 pos_cache_ 摊平来的，而那是一个以
+        // symbol+"_L"/"_S" 为键的 unordered_map——双向持仓模式下同一个品种会有
+        // 两条记录（多腿一条、空腿一条），而 unordered_map 的遍历顺序是不确定的。
+        // 只按品种取第一条，拿到的可能是【反向】那条，于是本地持多、比到交易所
+        // 的空腿，报成"方向不一致"并停掉 bot——而 bot 一停，那笔仓位就真的没人
+        // 管了：止损线不再推进、触线不再平仓。一次误判换来一个裸敞口。
+        //
+        // 实盘日志里的 "SAR对账: ZECUSDT 本地方向(多)与交易所(空)不一致" 就是这条。
+        // CcgEngine::reconcile_positions 一直是按 (品种, 方向) 配对的，这里漏了。
+        const ExchangePos* same = nullptr;   // 与本地同向的那条
+        const ExchangePos* opp  = nullptr;   // 反向的那条（真正的方向冲突才看它）
+        for (const auto& e : exchange) {
+            if (e.symbol != b.cfg.symbol || !(e.qty > 0)) continue;
+            if (!local_has) { if (!same) same = &e; continue; }   // 空仓：任一条都算"交易所有仓"
+            if (e.direction == local_dir) { if (!same) same = &e; }
+            else                          { if (!opp)  opp  = &e; }
+        }
+        const ExchangePos* ex = same;
 
         if (!local_has && !ex) continue;               // 两边都空，一致
 
@@ -118,6 +136,17 @@ std::vector<std::string> SarEngine::reconcile_positions(
         }
 
         if (local_has && !ex) {
+            // 同向的那条没有。若反向【有】仓，那是真正的方向冲突——本地以为持多、
+            // 交易所实际持空，任何自动收敛都是在猜，停下来让人看。
+            // 反向也没有，才是"外部已平/被强平"
+            if (opp) {
+                issues.push_back(b.cfg.symbol + " 本地方向(" + sar::pos_name(b.st.pos) +
+                                 ")与交易所(" + (opp->direction > 0 ? "多" : "空") +
+                                 " " + fmt(opp->qty, 8) + ")不一致，已停止该bot");
+                b.state = SarBot::State::Stopped;
+                b.last_action = "⚠ 方向不一致，已停止";
+                continue;
+            }
             issues.push_back(b.cfg.symbol + " 本地有仓位但交易所没有（外部已平/被强平），"
                              "已清空本地状态并停止该bot");
             sar::on_closed(b.st);
@@ -127,18 +156,9 @@ std::vector<std::string> SarEngine::reconcile_positions(
             continue;
         }
 
-        // 两边都有：先看方向，再看数量
-        const int local_dir = (b.st.pos == sar::Pos::Long) ? 1 : -1;
-        if (local_dir != ex->direction) {
-            // 方向都对不上，任何自动收敛都是在猜。停下来让人看
-            issues.push_back(b.cfg.symbol + " 本地方向(" + sar::pos_name(b.st.pos) +
-                             ")与交易所(" + (ex->direction > 0 ? "多" : "空") +
-                             ")不一致，已停止该bot");
-            b.state = SarBot::State::Stopped;
-            b.last_action = "⚠ 方向不一致，已停止";
-            continue;
-        }
-
+        // 走到这里 ex 必然与本地同向（配对时就是按方向挑的），只剩数量要比。
+        // 双向模式下反向腿可能同时存在，那是另一套东西开的（同品种只允许一套策略，
+        // 所以不是本引擎的仓），不在这里管——它由 DCA 侧的孤儿仓核查或人工处理
         const double diff = b.qty - ex->qty;
         if (diff > 1e-12) {
             issues.push_back(b.cfg.symbol + " 外部部分平仓：本地 " + fmt(b.qty, 8) +

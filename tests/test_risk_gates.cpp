@@ -99,7 +99,6 @@ static CcgConfig base_cfg() {
     c.leverage     = 1;                            // 保证金 = 名义价值，心算直观
     c.max_entries  = 4;                            // 每层 250U
     c.entry_mode   = CcgConfig::EntryMode::Immediate;
-    c.dynamic_band_mode = false;                   // 用固定间隔，不依赖布林带数据
     c.interval_pct = 10.0;
     c.trail_entry  = 1.0;
     c.tp_pct       = 5.0;
@@ -236,120 +235,6 @@ static void test_place_failure_is_loud() {
           "失败后本地不记单号（下次仓位变化会自动重试）");
 }
 
-
-// ── 用例5：多周期梯子的档位分配 ──────────────────────────────────────────────
-// 分配逻辑边界很多（手动/权重/层数不足/求和对不齐），而它决定"第几层用哪个
-// 周期的下轨"——错一位整个梯子的间距就全错了
-static void test_mtf_alloc() {
-    std::printf("\n── 用例5：多周期梯子档位分配 ──\n");
-    auto A = [](int n, const char* spec) {
-        CcgConfig c; c.max_entries = n; c.mtf_tier_layers = spec;
-        return CcgEngine::mtf_tier_alloc(c);
-    };
-    auto eq = [](std::array<int,4> g, int a, int b, int c, int d, const std::string& what) {
-        bool ok = (g[0]==a && g[1]==b && g[2]==c && g[3]==d);
-        std::printf("%s  %s (期望 %d/%d/%d/%d，实际 %d/%d/%d/%d)\n",
-            ok?"[ OK ]":"[FAIL]", what.c_str(), a,b,c,d, g[0],g[1],g[2],g[3]);
-        if (!ok) ++g_fail;
-    };
-
-    eq(A(8, "3,2,2,1"), 3,2,2,1, "手动 3/2/2/1");
-    eq(A(8, ""),        3,2,2,1, "空 → 按 3:2:2:1 权重（8层正好整除）");
-    eq(A(8, "2,2,2,2"), 2,2,2,2, "手动 2/2/2/2");
-    eq(A(8, "4,2,1,1"), 4,2,1,1, "手动 4/2/1/1");
-
-    // 求和与 max_entries 对不齐：以 max_entries 为准，从最深档裁剪/补足
-    eq(A(8, "3,3,3,3"), 3,3,2,0, "手动求和12>8 → 从最深档往前砍");
-    eq(A(8, "1,1,1,1"), 5,1,1,1, "手动求和4<8 → 差额补给浅档");
-
-    // 层数不足以铺满四档
-    eq(A(3, ""),        2,1,0,0, "3层 → 只用 1h 和 4h（深档砍掉）");
-    eq(A(1, ""),        1,0,0,0, "1层 → 只有首仓，全在 1h 档");
-    eq(A(2, ""),        1,1,0,0, "2层");
-
-    // 大层数
-    auto g16 = A(16, "");
-    int sum16 = g16[0]+g16[1]+g16[2]+g16[3];
-    std::printf("%s  16层按权重求和=16 (实际 %d：%d/%d/%d/%d)\n",
-        sum16==16?"[ OK ]":"[FAIL]", sum16, g16[0],g16[1],g16[2],g16[3]);
-    if (sum16 != 16) ++g_fail;
-
-    // 任何配置下总和都必须等于 max_entries——否则会出现"有槽位却没有档位归属"
-    for (int n : {1,2,3,5,8,13,20,50}) {
-        auto g = A(n, "");
-        int sum = g[0]+g[1]+g[2]+g[3];
-        if (sum != n) { std::printf("[FAIL]  %d层求和=%d\n", n, sum); ++g_fail; }
-    }
-    std::printf("[ OK ]  1~50 层的权重分配求和恒等于层数\n");
-}
-
-// ── 用例：首仓后瞬间砸穿全部四档下轨再反弹，到底补几层？────────────────────
-// 这是实盘里最容易误解的一个场景。直觉上"跌破了日线下轨，深层该解锁了"，
-// 但梯子是【按槽位顺序】走的：下一层归哪一档只取决于当前有几层持仓，
-// 与"价格砸穿了多少条下轨"无关。而且每成交一层，间距基准就重置到新成交价。
-// 结论应当是：一次 V 形急跌急拉只补【一层】，且是下一个槽位那一层。
-static void test_v_crash_fills_one_layer() {
-    std::printf("\n── 用例：V形急跌砸穿四档下轨后反弹 ──\n");
-    int64_t vnow = 1'700'000'000'000LL;
-    auto fc  = std::make_shared<FakeClient>();
-    CcgEngine eng(fc, make_host(vnow));
-
-    CcgConfig c = base_cfg();
-    c.strat_type      = CcgConfig::StratType::Flat;   // 每层等额，便于核对
-    c.budget_usdt     = 8000.0;                       // 8 层 × 1000U
-    c.max_entries     = 8;
-    c.mtf_ladder      = true;
-    c.mtf_tier_layers = "5,1,1,1";
-    c.mtf_k           = 0.3333;
-    c.mtf_min_gap_pct = 0.3;
-    auto id = eng.add_bot(c);
-
-    // 四档带子（1h 带宽 2.5%，其余按 √T 缩放），中轨都在 100000
-    eng.update_mtf_band(id, 0,  98750.0, 101250.0);   // 1h   W=2.50%
-    eng.update_mtf_band(id, 1,  97500.0, 102500.0);   // 4h   W=5.00%
-    eng.update_mtf_band(id, 2,  95670.0, 104330.0);   // 12h  W=8.66%
-    eng.update_mtf_band(id, 3,  93875.0, 106125.0);   // 1d   W=12.25%
-
-    fc->next_fill_price = 100000.0;
-    eng.tick("BTCUSDT", 100000.0);                    // 首仓
-    check(eng.get_bots()[0].entries.size() == 1, "首仓已建立");
-
-    // 瞬间砸到 81500 —— 低于【全部四档】下轨（含日线 93875）
-    fc->next_fill_price = 81500.0;
-    vnow += 3000; eng.tick("BTCUSDT", 81500.0);
-    {
-        auto b = eng.get_bots()[0];
-        check(b.entries.size() == 1,
-              "砸穿四档下轨的那一刻【不下单】——只是武装并记录最低点");
-        check(std::fabs(b.dca_extreme - 81500.0) < 1e-6, "  最低点已记为 81500");
-    }
-
-    // 反弹到 83000（自最低点 +1.84%，超过 1h 档要求的 0.25%）
-    fc->next_fill_price = 83000.0;
-    vnow += 3000; eng.tick("BTCUSDT", 83000.0);
-    {
-        auto b = eng.get_bots()[0];
-        check(b.entries.size() == 2, "反弹达标 → 补【一】层");
-        check(b.entries.back().price > 82000.0,
-              "  成交价是【检测到反弹那一刻的价格】(83000)，不是最低点也不是最低点+0.25%");
-    }
-
-    // 继续反弹：不该再补。下一槽位仍归 1h 档，且间距基准已重置到 83000，
-    // 需要再跌破 83000×(1-0.833%)=82309 才可能武装——价格在往上走
-    for (double p : {85000.0, 88000.0, 92000.0, 95000.0}) {
-        fc->next_fill_price = p; vnow += 3000; eng.tick("BTCUSDT", p);
-    }
-    check(eng.get_bots()[0].entries.size() == 2,
-          "一路反弹回去不再补仓——V形只吃到一层，深层弹药原封不动");
-
-    // 再砸一次到 80000：这次相对 83000 跌够了，且仍在 1h 下轨外 → 可以武装
-    fc->next_fill_price = 80000.0; vnow += 3000; eng.tick("BTCUSDT", 80000.0);
-    fc->next_fill_price = 81000.0; vnow += 3000; eng.tick("BTCUSDT", 81000.0);
-    check(eng.get_bots()[0].entries.size() == 3,
-          "第二次下跌+反弹才补到第3层——每层都要各自的一轮「跌够+止跌」");
-
-    check(fc->market_orders == 3, "全程只发了 3 笔订单（首仓 + 2 次补仓）");
-}
 
 // ── 用例：账户级并发持仓上限 ─────────────────────────────────────────────────
 // 全市场扫描场景的必需闸门。它与保证金上限管的是不同的事：保证金上限管
@@ -756,7 +641,8 @@ static void test_reentry_price_memory() {
         check(eng.get_bots()[0].last_tp_price == 0.0, "  过期后记忆被清零");
     }
 
-    // ③ 只记追踪止盈：硬止损出场不该锁死重入（那等于把亏损凝固）
+    // ③ 未出场时不该有记忆：v4.6.0 移除本地硬止损后，唯一的出场路径是追踪止盈，
+    //    没走到止盈就不该留下重入价
     {
         int64_t vnow = 1'700'000'000'000LL;
         auto fc = std::make_shared<FakeClient>();
@@ -764,15 +650,14 @@ static void test_reentry_price_memory() {
         CcgConfig c = base_cfg();
         c.auto_restart = true; c.cooldown_secs = 60;
         c.reentry_drawdown_pct = 15.0;
-        c.stop_loss_pct = 10.0;             // 跌 10% 硬止损
         eng.add_bot(c);
 
         fc->next_fill_price = 100.0;
         eng.tick("BTCUSDT", 100.0);
         fc->next_fill_price = 88.0;
-        vnow += 3000; eng.tick("BTCUSDT", 88.0);   // 跌破 90 → 硬止损
+        vnow += 3000; eng.tick("BTCUSDT", 88.0);   // 只是浮亏，不出场
         check(eng.get_bots()[0].last_tp_price == 0.0,
-              "硬止损出场【不】记价（记了等于把亏损凝固）");
+              "没走到止盈就不该记重入价");
     }
 
     // ④ 0 = 关：记忆照记，但不拦
@@ -794,107 +679,14 @@ static void test_reentry_price_memory() {
     }
 }
 
-// ── 宏观涨幅拦截（v4.0.7）────────────────────────────────────────────────────
-// decision::evaluate 是纯函数，直接喂值验证，不用起引擎。
-// 覆盖四件事：阈值方向、做空镜像、0=关、以及"算不出涨幅"在 strict 下不被
-// 当成"涨幅为0"放行——最后这条是最容易写错的（新上市品种正是最该拦的一类）
-static void test_htf_change_gates() {
-    auto base = []() {
-        decision::Inputs in;
-        in.is_long = true;  in.strict = true;
-        in.use_htf = false;                 // 只测涨幅，把 %B 关掉
-        in.htf_ok  = true;
-        in.day_chg_ok = true;               // 24h 数据就绪（来源独立于 htf_ok）
-        return in;
-    };
-
-    // 阈值方向：超过拦，没超过放行
-    { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 6.2;
-      auto v = decision::evaluate(in);
-      check(v.day_chg_block && !v.pass(), "24h涨6.2% > 阈值5% → 拦截"); }
-    { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 4.9;
-      auto v = decision::evaluate(in);
-      check(!v.day_chg_block && v.pass(), "24h涨4.9% < 阈值5% → 放行"); }
-
-    // 边界：恰好等于阈值不拦（用 > 而非 >=）
-    { auto in = base(); in.day_chg_max = 5.0; in.day_chg_pct = 5.0;
-      check(decision::evaluate(in).pass(), "24h涨恰好等于阈值 → 放行"); }
-
-    // 7日与日线互不干扰
-    { auto in = base(); in.week_chg_max = 20.0; in.week_chg_pct = 25.0;
-      in.day_chg_max = 5.0; in.day_chg_pct = 1.0;
-      auto v = decision::evaluate(in);
-      check(v.week_chg_block && !v.day_chg_block, "7日过热但24h正常 → 只有7日那条拦"); }
-
-    // 做空镜像：拦的是跌幅
-    { auto in = base(); in.is_long = false; in.day_chg_max = 5.0; in.day_chg_pct = -6.2;
-      check(decision::evaluate(in).day_chg_block, "做空：24h跌6.2% → 拦截"); }
-    { auto in = base(); in.is_long = false; in.day_chg_max = 5.0; in.day_chg_pct = 6.2;
-      check(decision::evaluate(in).pass(), "做空：24h涨6.2% 不该拦（镜像方向）"); }
-
-    // 0 = 关：涨幅再离谱也放行
-    { auto in = base(); in.day_chg_max = 0; in.day_chg_pct = 99.0;
-      in.week_chg_max = 0; in.week_chg_pct = 300.0;
-      check(decision::evaluate(in).pass(), "阈值 0 = 关闭，涨幅99%/300% 也放行"); }
-
-    // 数据缺失：strict 下必须拦，且不能被当成"涨幅为0"。
-    // 注意用的是 day_chg_ok 而不是 htf_ok——v4.0.11 起两条数据线的就绪状态分开
-    { auto in = base(); in.day_chg_ok = false; in.day_chg_max = 5.0; in.day_chg_pct = 0;
-      auto v = decision::evaluate(in);
-      check(v.data_block && !v.pass(), "24h算不出 + strict → 拦截（不当成涨幅0放行）"); }
-    // 非 strict（影子）下只标注不拦
-    { auto in = base(); in.strict = false; in.day_chg_ok = false; in.day_chg_max = 5.0;
-      auto v = decision::evaluate(in);
-      check(v.day_chg_missing && v.pass(), "24h算不出 + 非strict → 只标注不拦"); }
-
-    // 全部闸门都关时不该因为数据缺失而拦（use_chg=false 走不进那个分支）
-    { auto in = base(); in.htf_ok = false;   // 三个阈值全 0
-      check(decision::evaluate(in).pass(), "涨幅与%B全关 → 数据缺失也放行"); }
-
-    // %B 与涨幅正交：%B 正常但涨幅过热，仍要拦
-    { auto in = base(); in.use_htf = true; in.htf_pct_b = 0.30; in.htf_pos_max = 0.60;
-      in.day_chg_max = 5.0; in.day_chg_pct = 8.0;
-      auto v = decision::evaluate(in);
-      check(!v.htf_block && v.day_chg_block && !v.pass(),
-            "%B=0.30 未越界但24h涨8% → 涨幅那条独立拦住"); }
-
-    // ── 两条数据线的就绪状态必须【互不拖累】────────────────────────────────
-    // v4.0.11 之前 24h 与 %B 共用 htf_ok：@ticker 推送流没到时，日志会报
-    // "%B=缺失✗" 并提示"新上市品种需等日线21根历史"，而 %B 其实好好的。
-    // 排查方向被完全带偏——用户对着一条根本没问题的数据线查了半天
-    { auto in = base(); in.use_htf = true; in.htf_ok = true;      // 日线K线正常
-      in.htf_pct_b = 0.30; in.htf_pos_max = 0.60;
-      in.day_chg_max = 5.0; in.day_chg_ok = false;                 // 唯独 24h 没到
-      auto v = decision::evaluate(in);
-      check(v.day_chg_missing && !v.htf_missing,
-            "24h 推送流没到 → 只标 24h 缺失，不冤枉 %B"); 
-      check(v.data_block && !v.pass(), "  strict 下仍然拦截（数据没到不开仓）");
-      const auto txt = decision::summarize(in, v);
-      check(txt.find("%B=0.30") != std::string::npos,
-            "  摘要里 %B 显示真实值而非\"缺失\": " + txt);
-      check(txt.find("24h涨") != std::string::npos &&
-            txt.find("推送流未到") != std::string::npos,
-            "  摘要点名是推送流没到"); }
-
-    // 反过来：日线K线没到，不该冤枉 24h
-    { auto in = base(); in.use_htf = true; in.htf_ok = false;
-      in.day_chg_max = 5.0; in.day_chg_ok = true; in.day_chg_pct = 1.0;
-      auto v = decision::evaluate(in);
-      check(v.htf_missing && !v.day_chg_missing,
-            "日线K线没到 → 只标 %B 缺失，不冤枉 24h"); }
-}
-
 int main() {
     test_reentry_price_memory();
-    test_htf_change_gates();
     test_dca_margin_cap();
     test_adopted_position_survives_cooldown();
-    test_v_crash_fills_one_layer();
     test_max_open_positions();
     test_disaster_stop_lifecycle();
     test_disabled_by_default();
     test_place_failure_is_loud();
-    test_mtf_alloc();
     test_adopt_reconstructs_levels();
     test_periodic_reconcile();
     test_cross_engine_not_orphan();

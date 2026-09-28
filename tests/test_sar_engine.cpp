@@ -582,6 +582,150 @@ int main() {
               "  加仓基准价应为新仓成交价");
     }
 
+    // ═══ 对账 ═══════════════════════════════════════════════════════════════
+    // 这一整段以前没有任何测试（ExchangePos 在 tests/ 里一次都没出现过），
+    // 而它是 SAR 里最危险的一段：判错就停 bot，而 bot 一停那笔仓位就没人管了。
+    using EP = SarEngine::ExchangePos;
+
+    // 建一个持多的 bot，返回 (引擎, id)。多个用例要用，提出来
+    auto mk_long_bot = [](std::shared_ptr<FakeClient> cli, SarEngine& eng) {
+        auto id = eng.add_bot(mk_cfg());
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        return id;
+    };
+
+    // ── 回归：双向模式下反向腿不得被误判成"方向不一致" ──────────────────────
+    // 实盘日志里的 "SAR对账: ZECUSDT 本地方向(多)与交易所(空)不一致，已停止该bot"
+    // 就是这条：快照里同品种有多空两条（pos_cache_ 以 symbol+"_L"/"_S" 为键），
+    // 而原来的配对只按品种取【第一条命中】，unordered_map 顺序不定，取到空腿就
+    // 报冲突。同向那条明明在，数量也对
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+        const double q = eng.get_bots()[0].qty;
+
+        // 反向腿【排在前面】，正是会触发误判的顺序
+        std::vector<EP> ex = {
+            {"TESTUSDT", -1, 5.0, 120.0},   // 空腿（别的东西开的）
+            {"TESTUSDT",  1, q,   110.0},   // 我们自己的多腿
+        };
+        auto issues = eng.reconcile_positions(ex);
+        check(issues.empty(), "同向腿存在且数量一致时，反向腿不得报成方向不一致");
+        check(eng.get_bots()[0].state == SarBot::State::Running,
+              "  bot 必须继续运行——误停等于把仓位变成裸敞口");
+        check(eng.get_bots()[0].st.pos == sar::Pos::Long, "  仓位状态不得被改动");
+    }
+
+    // ── 真正的方向冲突仍必须停 bot（修完不能把这条一起放过去）────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+
+        std::vector<EP> ex = { {"TESTUSDT", -1, 5.0, 120.0} };   // 只有反向
+        auto issues = eng.reconcile_positions(ex);
+        check(issues.size() == 1, "本地持多而交易所只有空仓，必须报一条");
+        check(issues[0].find("方向") != std::string::npos, "  应判为方向不一致");
+        check(eng.get_bots()[0].state == SarBot::State::Stopped, "  必须停止该bot");
+        check(eng.get_bots()[0].st.pos == sar::Pos::Long,
+              "  方向冲突时不清本地状态：清了就没有证据可核对");
+    }
+
+    // ── 外部已平：两边都没有同向仓，也没有反向仓 ────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+
+        auto issues = eng.reconcile_positions({});   // 交易所空空
+        check(issues.size() == 1, "本地有仓交易所没有，应报一条");
+        check(issues[0].find("外部已平") != std::string::npos, "  应判为外部已平");
+        check(eng.get_bots()[0].st.pos == sar::Pos::Flat, "  应清空本地仓位");
+        check(eng.get_bots()[0].qty == 0, "  数量应归零");
+        check(eng.get_bots()[0].state == SarBot::State::Stopped,
+              "  应停止：分不清是人工平的还是被强平的，续跑是往坑里跳");
+    }
+
+    // ── 孤儿仓：本地空仓而交易所有仓，必须停 ────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        eng.add_bot(mk_cfg());                        // 加了但没开仓
+
+        std::vector<EP> ex = { {"TESTUSDT", 1, 3.0, 100.0} };
+        auto issues = eng.reconcile_positions(ex);
+        check(issues.size() == 1, "本地空仓而交易所有仓，应报一条");
+        check(issues[0].find("孤儿") != std::string::npos ||
+              issues[0].find("本地无跟踪") != std::string::npos, "  应判为孤儿仓");
+        check(eng.get_bots()[0].state == SarBot::State::Stopped,
+              "  必须停止：不停的话下一个信号会再开一笔，净敞口翻倍");
+    }
+
+    // ── 外部部分平仓：收敛数量，但保留开仓价与止损线 ────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+        const double q0   = eng.get_bots()[0].qty;
+        const double stop = eng.get_bots()[0].st.stop;
+
+        std::vector<EP> ex = { {"TESTUSDT", 1, q0 / 2, 110.0} };
+        auto issues = eng.reconcile_positions(ex);
+        check(issues.size() == 1, "外部部分平仓应报一条");
+        auto b = eng.get_bots()[0];
+        check(std::fabs(b.qty - q0 / 2) < 1e-12, "  数量应收敛到交易所值");
+        check(std::fabs(b.st.stop - stop) < 1e-12, "  止损线必须保留：它仍然成立");
+        check(b.state == SarBot::State::Running, "  部分平仓不该停 bot");
+    }
+
+    // ── 交易所多于本地：只告警，不动本地状态 ────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+        const double q0 = eng.get_bots()[0].qty;
+
+        std::vector<EP> ex = { {"TESTUSDT", 1, q0 * 2, 110.0} };
+        auto issues = eng.reconcile_positions(ex);
+        check(issues.size() == 1, "交易所多于本地应报一条");
+        auto b = eng.get_bots()[0];
+        check(std::fabs(b.qty - q0) < 1e-12,
+              "  本地数量不得改动：按交易所接管等于让止损线去管一笔不是自己开的仓");
+        check(b.state == SarBot::State::Running, "  仅告警，不停 bot");
+    }
+
+    // ── 在途的 bot 一律跳过 ─────────────────────────────────────────────────
+    // 订单可能已在交易所生效而本地还没入账，此刻比对必然误判——而误判方向恰好
+    // 最坏：正在平仓的会被当成"外部已平"
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto id = mk_long_bot(cli, eng);
+        eng.set_pending_for_test(id, true);
+
+        auto issues = eng.reconcile_positions({});   // 交易所看起来空
+        check(issues.empty(), "pending 的 bot 必须跳过对账");
+        check(eng.get_bots()[0].st.pos == sar::Pos::Long, "  仓位不得被清空");
+        check(eng.get_bots()[0].state == SarBot::State::Running, "  不得被停止");
+    }
+
+    // ── 别的品种的仓位与本 bot 无关 ─────────────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+        const double q0 = eng.get_bots()[0].qty;
+
+        std::vector<EP> ex = {
+            {"OTHERUSDT", -1, 9.0, 50.0},
+            {"TESTUSDT",   1, q0,  110.0},
+        };
+        check(eng.reconcile_positions(ex).empty(), "不相关品种的仓位不得影响本 bot");
+    }
+
     if (g_fail == 0) {
         std::printf("OK: SAR 引擎订单路径测试全部通过\n");
         return 0;

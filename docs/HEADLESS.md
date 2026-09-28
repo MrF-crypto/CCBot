@@ -47,26 +47,29 @@ cmake --build build --config Release --target ccbot_headless
 | `symbol` | 品种 | 如 `BTCUSDT` |
 | `direction` | 方向 | `long` / `short` / `both` |
 | `strat_type` | 策略 | `flat` `martingale` `mart_plus` `triple` `square` `fibonacci` `lucas` `linear` |
-| `budget_usdt` `leverage` `max_entries` `interval_pct` `trail_entry` `tp_pct` `trail_tp` `auto_restart` `cooldown_secs` `stop_loss_pct` | 基础网格参数 | 同名，数值/布尔 |
+| `budget_usdt` `leverage` `max_entries` `trail_entry` `tp_pct` `trail_tp` `auto_restart` `cooldown_secs` | 基础网格参数 | 同名，数值/布尔 |
+| `interval_pct` | 补仓间隔% | 相对上一笔成交价。默认 **6** —— 8品种×8个滚动窗口=64个纯样本外测试段里 6% 全面优于 5%/4%，3% 是净负的 |
 | `entry_mode` | 首单模式 | `immediate`（默认，立即开首仓）/ `indicator`（等BOLL+RSI信号） |
 | `kline_interval` `boll_period` `boll_mult` `use_rsi_filter` `rsi_period` `rsi_threshold` | 指标信号参数 | 同GUI |
 | `rsi_confirm_mode` | RSI确认方式 | `snapshot`（瞬时快照）/ `cross`（反转确认：先探底再回穿阈值） |
 | `rsi_oversold_th` | 探底阈值 | 仅 `cross` 模式用 |
-| `dynamic_band_mode` | 动态W模式 (v2.3+) | `true` 时补仓锚定下轨、止盈锚定上轨，间隔/追踪参数由实时布林带宽 W 自动推导（间隔=W/3、追踪止盈=0.15W、追踪建仓=0.1W，带上下限夹逼），配置里的 `interval_pct`/`tp_pct`/`trail_*` 固定值不再生效 |
-| `min_profit_floor` | 保底利润% | 仅动态W模式用：止盈激活除了触及上轨，还要求盈利≥此值（默认0.3，覆盖手续费+微利，防止上轨低于均价时亏着平仓） |
 | `use_trend_filter` | 趋势过滤 (v2.5+) | `true` 时用高周期趋势判定空头态（价格在EMA之下且中轨明显下拐）：空头态暂停开新首仓、补仓间隔自动×1.5。趋势数据缺失时过滤自动失效不卡交易 |
 | `trend_interval` / `trend_ema_period` | 趋势参数 | 默认 `4h` / `200`，一般不用改 |
-| `dyn_fixed_interval` | 固定补仓间隔% | `0`=用 W/3 自适应。**建议填 6**：8品种×8个滚动窗口=64个纯样本外测试段里，6% 总净利 +70620（56/64 盈利），而 W/3 推出的间距中位仅 0.90%、满层率 84.5% |
 | `use_htf_filter` / `htf_pos_max` | 高位拦截（日线%B） | `true` + 阈值（默认 `0.60`）。价格在日线布林带中的相对位置高于阈值就不开新首仓，做空镜像 |
 | `htf_interval` | 高位判定周期 | 默认 `1d` |
-| `htf_24h_chg_max` | 24h涨幅拦截% | `0`=关。币安界面上那个 24 小时**滚动**涨幅（不是「今日涨幅」——后者每天 UTC 0 点归零，而 UTC 0 点是北京早 8 点，闸门会在那里瞎掉） |
-| `htf_week_chg_max` | 近7日涨幅拦截% | `0`=关。相对 7 根日线前的收盘，滚动口径 |
 | `reentry_drawdown_pct` | 止盈后重开需回撤% | `0`=关。多头要求现价 ≤ 上次止盈价×(1−此值)，空头镜像。**只记追踪止盈**，止损/手动平仓不记 |
 | `reentry_memory_days` | 上述记忆的过期天数 | 默认 `30`，`0`=永不过期。必须有过期——一个再也回不去的价位会把 bot 永久锁死 |
 | `use_disaster_stop` / `disaster_stop_pct` | 交易所侧灾难止损单 | 默认关。在**交易所**挂 `STOP_MARKET + closePosition`，程序崩了它依然生效——唯一的进程外保护。⚠ 它会把浮亏变成实亏，与「套住长持」的取向冲突 |
-| `use_atr_trail` | **ATR 移动止损（勾选即冻结梯子）** | `true` 时这个 bot 从「网格」切换成「持有并追踪」：**不再补仓**，已有的层保留；止损线 = 持仓期极值 ∓ k×ATR，棘轮只朝有利方向移动；常规追踪止盈停用（它的触发距离比 k×ATR 小一个量级，并存等于 ATR 线永远轮不到触发），硬止损与交易所灾难止损照常 |
-| `atr_trail_mult` | 止损距离倍数 k | 默认 `3.0`。止损距离 = k × ATR |
-| `atr_trail_period` / `atr_trail_interval` | ATR 参数 | 默认 `14` / `4h` |
+
+> **v4.6.0 移除的键**：`dynamic_band_mode` `min_profit_floor` `floor_decay` `dyn_fixed_interval`
+> `dyn_interval_mult` `dyn_interval_growth` `dca_require_band` `mtf_ladder` `mtf_tier_layers`
+> `mtf_k` `mtf_min_gap_pct` `tp_floor_only` `tp_fixed_profit` `fixed_trail_tp` `fixed_trail_entry`
+> `use_atr_trail` `atr_trail_*` `stop_loss_pct` `htf_24h_chg_max` `htf_week_chg_max`
+> `first_entry_bounce_pct` `use_cycle_bear_switch` `dca_gate_*`
+>
+> 老配置里留着它们不会报错（会进"未知键"提示），但不再有任何作用。
+> 其中 `dyn_fixed_interval` 会被**自动迁移**成 `interval_pct`——它原本就是实际生效的间距。
+> 为什么删、以及哪些是被实测证伪的，见 [NEGATIVE_RESULTS.md](NEGATIVE_RESULTS.md)。
 ## SAR 趋势跟随策略（`sar_bots`）
 
 和 `bots`（DCA 网格）是**两套并列的策略**，可以只配一套，也可以同时配不同品种。

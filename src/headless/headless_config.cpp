@@ -93,21 +93,8 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.cooldown_secs = (int)get_num(bo, "cooldown_secs", c.cooldown_secs);
     c.reentry_drawdown_pct = get_num(bo, "reentry_drawdown_pct", c.reentry_drawdown_pct);
     c.reentry_memory_days  = (int)get_num(bo, "reentry_memory_days", c.reentry_memory_days);
-    c.stop_loss_pct = get_num(bo, "stop_loss_pct", c.stop_loss_pct);
     c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
     c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
-    c.use_atr_trail      = get_bool(bo, "use_atr_trail", c.use_atr_trail);
-    c.atr_trail_mult     = get_num(bo, "atr_trail_mult", c.atr_trail_mult);
-    c.atr_trail_period   = (int)get_num(bo, "atr_trail_period", c.atr_trail_period);
-    c.atr_trail_interval = get_str(bo, "atr_trail_interval", c.atr_trail_interval);
-    if (c.use_atr_trail && c.atr_trail_mult <= 0) {
-        err = c.symbol + ": atr_trail_mult 必须大于0（它是止损距离的倍数）";
-        return false;
-    }
-    if (c.use_atr_trail && c.atr_trail_period < 2) {
-        err = c.symbol + ": atr_trail_period 至少为2";
-        return false;
-    }
     // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
     // 而使用者以为仓位已经有进程外保护了
     if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
@@ -123,31 +110,12 @@ static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
     c.rsi_threshold   = get_num(bo, "rsi_threshold", c.rsi_threshold);
     c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "cross"));
     c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", c.rsi_oversold_th);
-    c.dynamic_band_mode = get_bool(bo, "dynamic_band_mode", c.dynamic_band_mode);
-    c.min_profit_floor  = get_num(bo, "min_profit_floor", c.min_profit_floor);
-    // 固定补仓间隔（0=用 W/3 自适应）。walk-forward 证明固定值全面更优，
-    // 而此前它只有回测命令行能设
-    c.dyn_fixed_interval = get_num(bo, "dyn_fixed_interval", c.dyn_fixed_interval);
-    // ── 快进快出三件套 ────────────────────────────────────────────────
-    // 引擎里早就有，但此前只有回测命令行能设——GUI 和 headless 都没暴露。
-    // 全市场超卖扫描要的正是这套：不等上轨、够本就跑、回调不随带宽放大
-    c.tp_floor_only     = get_bool(bo, "tp_floor_only",   c.tp_floor_only);
-    c.tp_fixed_profit   = get_num (bo, "tp_fixed_profit", c.tp_fixed_profit);
-    c.fixed_trail_tp    = get_num (bo, "fixed_trail_tp",  c.fixed_trail_tp);
-    c.mtf_ladder        = get_bool(bo, "mtf_ladder", c.mtf_ladder);
-    c.mtf_tier_layers   = get_str(bo, "mtf_tier_layers", c.mtf_tier_layers);
-    c.mtf_k             = get_num(bo, "mtf_k", c.mtf_k);
-    c.mtf_min_gap_pct   = get_num(bo, "mtf_min_gap_pct", c.mtf_min_gap_pct);
     c.use_trend_filter  = get_bool(bo, "use_trend_filter", c.use_trend_filter);
     c.trend_interval    = get_str(bo, "trend_interval", c.trend_interval);
     c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", c.trend_ema_period);
     c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
     c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
     c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
-    // 老键 htf_day_chg_max 兜底（v4.0.9 改名 + 从今日涨幅改为 24h 滚动涨幅）
-    c.htf_24h_chg_max     = get_num(bo, "htf_day_chg_max", c.htf_24h_chg_max);
-    c.htf_24h_chg_max     = get_num(bo, "htf_24h_chg_max", c.htf_24h_chg_max);
-    c.htf_week_chg_max    = get_num(bo, "htf_week_chg_max", c.htf_week_chg_max);
     // v3.8 迁移：老配置的 smart_gates 总开关为 false 时拦截完全不参与，
     // 升级后必须保持——否则老配置会突然开始拦截。
     // v4.0.16 移除结构层后，需要迁移的只剩 %B 这一条
@@ -208,23 +176,18 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     simdjson::dom::array bots;
     const bool has_bots = (root["bots"].get(bots) == simdjson::SUCCESS);
 
-    // 已知的 bot 配置键：拼错键名会静默落回默认值（比如 stop_loss_pct 拼错 = 没有止损），
+    // 已知的 bot 配置键：拼错键名会静默落回默认值（比如 interval_pct 拼错 = 间距变默认值），
     // 所以未知键必须显式告警
     static const std::set<std::string> known_keys = {
         "symbol", "direction", "strat_type", "budget_usdt", "leverage", "max_entries",
         "interval_pct", "trail_entry", "tp_pct", "trail_tp", "auto_restart",
         "cooldown_secs", "reentry_drawdown_pct", "reentry_memory_days",
-        "stop_loss_pct", "use_disaster_stop", "disaster_stop_pct",
-        "use_atr_trail", "atr_trail_mult", "atr_trail_period", "atr_trail_interval",
+        "use_disaster_stop", "disaster_stop_pct",
         "entry_mode", "kline_interval",
         "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
-        "rsi_confirm_mode", "rsi_oversold_th", "dynamic_band_mode", "min_profit_floor",
-        "dyn_fixed_interval",
-        "tp_floor_only", "tp_fixed_profit", "fixed_trail_tp",
-        "mtf_ladder", "mtf_tier_layers", "mtf_k", "mtf_min_gap_pct",
-        "use_trend_filter", "trend_interval", "trend_ema_period",
+        "rsi_confirm_mode", "rsi_oversold_th", "use_trend_filter", "trend_interval", "trend_ema_period",
         "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max",
-        "htf_day_chg_max", "htf_24h_chg_max", "htf_week_chg_max", "use_sr_gate",
+        "use_sr_gate",
     };
 
     if (has_bots) for (auto elem : bots) {

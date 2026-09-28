@@ -128,7 +128,6 @@ private:
     // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
     void refreshFunding();
-    void refreshMtfBands();   // 多周期梯子的 4h/12h 档带值（1h/1d 由别处顺带喂）
     void refreshStats();
     void openTradeHistoryDialog();
     // 品种精度信息缓存未命中时，去后台线程取一次，绝不在 GUI 线程同步阻塞等待
@@ -271,7 +270,6 @@ private:
     std::atomic<bool> accFetchBusy_{false};
     std::atomic<bool> posFetchBusy_{false};
     std::atomic<bool> fundFetchBusy_{false};
-    std::atomic<bool> mtfFetchBusy_{false};
     // SAR 信号拉取（ATR + 唐奇安）。与指标批次分开：周期不同（60秒 vs 5分钟），
     // 而且 SAR 的 bot 集合与 DCA 的完全没有交集
     std::atomic<bool> sarSigBusy_{false};
@@ -283,7 +281,6 @@ private:
     // 拉取每分钟一轮，而一个拼错的品种会永远失败——不去重就是每小时 60 条
     // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
     std::set<std::string> sarSigFailed_;
-    std::atomic<bool> dcaAtrBusy_{false};   // DCA 的 ATR 移动止损拉取守卫
 
     // ── 日志 ──
     QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的

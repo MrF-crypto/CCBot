@@ -265,8 +265,6 @@ static bool concurrency_stress(unsigned seed, int rounds) {
                 eng.update_indicator(id, mid - w, mid + w, 100.0 * u(rng));
                 eng.update_trend(id, u(rng) < 0.5);
                 eng.update_htf(id, u(rng));
-                for (int t = 0; t < 4; ++t)
-                    eng.update_mtf_band(id, t, mid - w * (t + 1), mid + w * (t + 1));
             }
         }
     };
@@ -416,7 +414,6 @@ static CcgConfig base_cfg(const std::string& sym) {
     c.max_entries     = 6;
     c.leverage        = 5;
     c.entry_mode      = CcgConfig::EntryMode::Immediate;
-    c.dynamic_band_mode = false;      // 用静态参数，行情脚本才好控制
     c.interval_pct    = 5.0;
     c.trail_entry     = 0.5;
     c.tp_pct          = 3.0;

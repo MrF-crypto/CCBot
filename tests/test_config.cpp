@@ -76,7 +76,6 @@ int main() {
         eqd(g.trail_tp,     d.trail_tp,     "trail_tp");
         eq(g.auto_restart,  d.auto_restart,  "auto_restart");
         eq((int)g.cooldown_secs, (int)d.cooldown_secs, "cooldown_secs");
-        eqd(g.stop_loss_pct, d.stop_loss_pct, "stop_loss_pct");
         eq(g.use_disaster_stop, d.use_disaster_stop, "use_disaster_stop");
         eqd(g.disaster_stop_pct, d.disaster_stop_pct, "disaster_stop_pct");
         eq(g.entry_mode,    d.entry_mode,    "entry_mode");
@@ -88,13 +87,6 @@ int main() {
         eqd(g.rsi_threshold, d.rsi_threshold, "rsi_threshold");
         eq(g.rsi_confirm_mode, d.rsi_confirm_mode, "rsi_confirm_mode");
         eqd(g.rsi_oversold_th, d.rsi_oversold_th, "rsi_oversold_th");
-        eq(g.dynamic_band_mode, d.dynamic_band_mode, "dynamic_band_mode");
-        eqd(g.min_profit_floor, d.min_profit_floor, "min_profit_floor（与层数强耦合，必须成对）");
-        eqd(g.dyn_fixed_interval, d.dyn_fixed_interval, "dyn_fixed_interval 缺字段时继承默认");
-        eq(g.mtf_ladder,    d.mtf_ladder,    "mtf_ladder");
-        eq(g.mtf_tier_layers, d.mtf_tier_layers, "mtf_tier_layers");
-        eqd(g.mtf_k,        d.mtf_k,        "mtf_k");
-        eqd(g.mtf_min_gap_pct, d.mtf_min_gap_pct, "mtf_min_gap_pct");
         eq(g.use_trend_filter, d.use_trend_filter, "use_trend_filter");
         eq(g.trend_interval, d.trend_interval, "trend_interval");
         eq((int)g.trend_ema_period, (int)d.trend_ema_period, "trend_ema_period");
@@ -110,8 +102,7 @@ int main() {
             "{\"api_key\":\"k\",\"api_secret\":\"s\",\"bots\":[{"
             "\"symbol\":\"ETHUSDT\",\"direction\":\"short\",\"strat_type\":\"flat\","
             "\"max_entries\":3,\"leverage\":10,\"budget_usdt\":777.5,"
-            "\"min_profit_floor\":4.25,\"dyn_fixed_interval\":6.0,"
-            "\"mtf_ladder\":true,\"mtf_tier_layers\":\"5,1,1,1\","
+            "\"interval_pct\":6.0,\"trail_entry\":0.4,\"tp_pct\":3.5,"
             "\"entry_mode\":\"immediate\",\"use_trend_filter\":false}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "带显式值的配置能解析: " + err);
@@ -123,10 +114,9 @@ int main() {
             eq((int)g.max_entries, 3, "max_entries=3");
             eq((int)g.leverage, 10, "leverage=10");
             eqd(g.budget_usdt, 777.5, "budget_usdt=777.5");
-            eqd(g.min_profit_floor, 4.25, "min_profit_floor=4.25");
-            eqd(g.dyn_fixed_interval, 6.0, "dyn_fixed_interval=6.0（显式值生效）");
-            eq(g.mtf_ladder, true, "mtf_ladder=true");
-            eq(g.mtf_tier_layers, std::string("5,1,1,1"), "mtf_tier_layers");
+            eqd(g.interval_pct, 6.0, "interval_pct=6.0（显式值生效）");
+            eqd(g.trail_entry,  0.4, "trail_entry=0.4");
+            eqd(g.tp_pct,       3.5, "tp_pct=3.5");
             eq(g.entry_mode, CcgConfig::EntryMode::Immediate, "entry_mode=immediate");
             eq(g.use_trend_filter, false, "use_trend_filter=false");
         }

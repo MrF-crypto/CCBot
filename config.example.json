@@ -18,13 +18,12 @@
       "budget_usdt": 3000,
       "leverage": 3,
       "max_entries": 8,
-      "interval_pct": 8,
+      "interval_pct": 6,
       "trail_entry": 1,
       "tp_pct": 5,
       "trail_tp": 2,
       "auto_restart": true,
       "cooldown_secs": 300,
-      "stop_loss_pct": 0,
 
       "entry_mode": "indicator",
       "kline_interval": "1h",
@@ -36,10 +35,6 @@
       "rsi_confirm_mode": "cross",
       "rsi_oversold_th": 25,
 
-      "dynamic_band_mode": true,
-      "min_profit_floor": 2.0,
-      "dyn_fixed_interval": 6.0,
-
       "use_trend_filter": true,
       "trend_interval": "4h",
       "trend_ema_period": 200,
@@ -47,8 +42,6 @@
       "use_htf_filter": true,
       "htf_interval": "1d",
       "htf_pos_max": 0.60,
-      "htf_24h_chg_max": 15,
-      "htf_week_chg_max": 30,
 
       "reentry_drawdown_pct": 0,
       "reentry_memory_days": 30
