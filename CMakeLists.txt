@@ -70,6 +70,14 @@ function(ccbot_harden tgt)
             -Wcast-align -Wunused -Woverloaded-virtual
             -Wdouble-promotion    # float→double 隐式提升：价格计算里混用会丢精度
             -Wformat=2
+            # ⚠ -Wformat=2 隐含 -Wformat-nonliteral，而它会在【simdjson 的头文件里】
+            #   触发（simdjson.h 内部用非字面量格式串）。
+            #   这暴露了"只给自有目标加 flag"并不足够：第三方【头文件】被包含进我们的
+            #   翻译单元时，警告照样算在我们头上。理想解是把依赖的 include 目录标成
+            #   SYSTEM，但 find_package 导入目标的 include 属性不总是好改。
+            #   保留 -Wformat=2 的其余部分（-Wformat-security 才是真正有价值的那条：
+            #   它能抓住 printf(用户输入) 这类），只关掉会在别人头文件里响的这一条。
+            -Wno-format-nonliteral
             -Wno-unused-parameter)
         if(CCBOT_WERROR)
             target_compile_options(${tgt} PRIVATE -Werror)

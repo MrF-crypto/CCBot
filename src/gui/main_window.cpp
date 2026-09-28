@@ -1924,7 +1924,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     // 反转确认模式的预览需要跨轮记住"是否已经探底过"，弹窗开着期间本地累积
     auto previewDipped = std::make_shared<bool>(false);
 
-    auto refreshIndPreview = [=]() {
+    auto refreshIndPreview = [=, this]() {
         // 只有"指标信号"首单模式才需要预览——v4.6.0 起补仓和止盈不再看布林带
         if (!client_ || entryModeBox->currentIndex() != 1) return;
         bool ok;
@@ -1973,7 +1973,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     indPreviewTimer->setInterval(4000);
     connect(indPreviewTimer, &QTimer::timeout, &dlg, refreshIndPreview);
 
-    auto updateIndVisible = [=]() {
+    auto updateIndVisible = [=, this]() {
         bool show = (entryModeBox->currentIndex() == 1);
         indBox->setVisible(show);
         if (show) { indPreviewTimer->start(); refreshIndPreview(); }
@@ -2073,7 +2073,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     dv->addWidget(tierSummary);
 
     // symbol 按值捕获，livePrice 每次刷新时重新读取（弹窗开着的时候价格可能会变）
-    auto refreshTier = [=]() {
+    auto refreshTier = [=, this]() {
         bool ok;
         double budget = budgetEdit->text().toDouble(&ok);   if (!ok || budget <= 0) budget = 3000.0;
         int    maxEnt = maxEntEdit->text().toInt(&ok);      if (!ok || maxEnt <= 0) maxEnt = 6;
@@ -2820,8 +2820,8 @@ void MainWindow::onTick() {
                 // 把余量摆出来，不用等它出问题才发现
                 const qint64 el = QDateTime::currentMSecsSinceEpoch() - batch_t0;
                 const int reqs = (int)trend_bots.size() + (int)htf_bots.size();
-                const qint64 kWindowMs = 300000;
-                QMetaObject::invokeMethod(this, [this, el, reqs, kWindowMs]() {
+                constexpr qint64 kWindowMs = 300000;
+                QMetaObject::invokeMethod(this, [this, el, reqs]() {
                     if (el * 2 >= kWindowMs)
                         log(QString("⚠ 日线/趋势批次耗时 %1 秒（%2 次请求），"
                                     "已超过 %3 秒窗口的一半——再慢就会整轮被跳过，"
