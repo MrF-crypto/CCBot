@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 4.6.1 LANGUAGES CXX)
+project(TradingBot VERSION 4.6.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,42 @@ set(CCBOT_VERSION_DEF CCBOT_VERSION="${PROJECT_VERSION}")
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
+
+# ── 警告门禁 ──────────────────────────────────────────────────────────────────
+# 在此之前本项目【一个警告开关都没开】——三个编译器只兑现了"能编过"这一层保证，
+# 而默认警告等级恰好放过未初始化读取、符号比较、窄化转换这一类会亏钱的东西。
+# 对一个跑真钱、几十处 mutex/atomic、跨三平台的 C++20 项目，这是最大的单点缺口。
+#
+# CCBOT_WERROR=ON 时警告升级为错误（CI 用）。本地开发默认只警告不拦，
+# 否则改一行代码撞上一个陈旧警告就编不过，反而会让人把整个开关关掉。
+#
+# ⚠ 只作用于【我们自己的目标】，不用 add_compile_options 全局加——那会把
+#   vcpkg 依赖和 Qt 生成的 moc 代码一起纳入，它们的警告我们既管不了也不该管。
+option(CCBOT_WERROR "把编译警告当作错误（CI 门禁用）" OFF)
+
+function(ccbot_harden tgt)
+    if(MSVC)
+        target_compile_options(${tgt} PRIVATE /W4 /permissive- /utf-8
+            # C4100 未引用的形参：接口实现里大量方法只用部分参数（ITradingClient
+            # 的默认空实现就是），逐个加 (void) 是噪音换噪音
+            /wd4100)
+        if(CCBOT_WERROR)
+            target_compile_options(${tgt} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${tgt} PRIVATE
+            -Wall -Wextra
+            -Wshadow              # 局部变量遮蔽外层——本仓库改过好几次同名变量
+            -Wnon-virtual-dtor    # ITradingClient 这类多态基类
+            -Wcast-align -Wunused -Woverloaded-virtual
+            -Wdouble-promotion    # float→double 隐式提升：价格计算里混用会丢精度
+            -Wformat=2
+            -Wno-unused-parameter)
+        if(CCBOT_WERROR)
+            target_compile_options(${tgt} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
 
 find_package(ixwebsocket CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
@@ -285,3 +321,22 @@ elseif(APPLE)
     target_link_libraries(ccg_key_store_tests PRIVATE
         "-framework Security" "-framework CoreFoundation")
 endif()
+
+# ── 给所有【我们自己的】目标加上警告门禁 ──────────────────────────────────────
+# 放在文件末尾统一施加，而不是在每个 add_executable 后面各写一遍：
+# 加目标时忘记跟一行是必然会发生的，而"忘了"的表现是那个目标静默失去警告保护。
+# 列表里的目标必须存在，否则 ccbot_harden 会报错——这正是想要的：
+# 删了目标忘了从这里摘掉，构建就会响
+set(CCBOT_OWN_TARGETS
+    ccbot_headless ladder_depth
+    ccg_indicator_tests ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests
+    ccg_risk_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
+    ccg_rate_tests ccg_timesync_tests ccg_price_tests ccg_config_tests
+    ccg_persist_tests ccg_stress_tests ccg_key_store_tests
+)
+if(WIN32 OR APPLE)
+    list(APPEND CCBOT_OWN_TARGETS TradingBot)
+endif()
+foreach(t ${CCBOT_OWN_TARGETS})
+    ccbot_harden(${t})
+endforeach()

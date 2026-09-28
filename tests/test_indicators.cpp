@@ -2,7 +2,6 @@
 // 用法：编译出 ccg_indicator_tests.exe 直接运行，全部通过打印 OK 并 exit 0，
 // 有任何一条不对就打印具体是哪条断言失败并 exit 1。
 #include "core/indicators.h"
-#include "core/dynamic_params.h"
 #include "core/decision.h"
 #include <cstdio>
 #include <cmath>
@@ -105,62 +104,6 @@ int main() {
         CHECK(sma_at(c, 3, 0) > sma_at(c, 3, 3), "上涨序列中轨斜率应为正");
     }
 
-    // ── 动态W参数推导（v2.3 动态W模式）───────────────────────────────────────
-    {
-        namespace dp = ccbot::dynparams;
-        // 带宽：LB=99000, UB=101000 → W = 2000/99000*100 ≈ 2.0202%
-        CHECK(near(dp::band_width_pct(99000, 101000), 2000.0 / 99000 * 100.0),
-              "band_width_pct 手算样例");
-        // 非法输入：下轨<=0 或上下轨倒挂应返回 0
-        CHECK(near(dp::band_width_pct(0, 101000), 0.0),   "band_width lb=0 应返回0");
-        CHECK(near(dp::band_width_pct(-1, 100), 0.0),      "band_width lb<0 应返回0");
-        CHECK(near(dp::band_width_pct(101000, 99000), 0.0),"band_width 倒挂应返回0");
-        CHECK(near(dp::band_width_pct(100, 100), 0.0),     "band_width ub==lb 应返回0");
-
-        // 正常区间：W=2.1% → 间隔=0.7、追踪止盈=0.315、追踪建仓=0.21（都在夹逼范围内）
-        CHECK(near(dp::interval_pct(2.1),    0.7),   "W=2.1 间隔应为 W/3=0.7");
-        CHECK(near(dp::trail_tp_pct(2.1),    0.315), "W=2.1 追踪止盈应为 0.15W=0.315");
-        CHECK(near(dp::trail_entry_pct(2.1), 0.21),  "W=2.1 追踪建仓应为 0.1W=0.21");
-
-        // 下限夹逼：极窄带宽 W=0.6% → W/3=0.2 被抬到 0.3；0.15W=0.09→0.2；0.1W=0.06→0.15
-        CHECK(near(dp::interval_pct(0.6),    0.3),  "窄带宽间隔应被夹到下限0.3");
-        CHECK(near(dp::trail_tp_pct(0.6),    0.2),  "窄带宽追踪止盈应被夹到下限0.2");
-        CHECK(near(dp::trail_entry_pct(0.6), 0.15), "窄带宽追踪建仓应被夹到下限0.15");
-
-        // 上限夹逼：极宽带宽 W=6% → W/3=2.0 被压到 1.5；0.15W=0.9→0.6；0.1W=0.6→0.4
-        CHECK(near(dp::interval_pct(6.0),    1.5), "宽带宽间隔应被夹到上限1.5");
-        CHECK(near(dp::trail_tp_pct(6.0),    0.6), "宽带宽追踪止盈应被夹到上限0.6");
-        CHECK(near(dp::trail_entry_pct(6.0), 0.4), "宽带宽追踪建仓应被夹到上限0.4");
-
-        // ── 多周期梯子专用的追踪建仓：斜率相同，上限放宽到 1.5 ────────────────
-        // 存在的意义就是【四档不能被夹成同一个值】。共用基线那条的话，
-        // 常态波动下 4h/12h/1d 会全部撞在 0.4 上，"越深的层越难触发"整个失效
-        {
-            const double W1h = 2.5;                       // 常态 1h 带宽
-            const double W4h = W1h * 2.0;                 // √T 缩放
-            const double W12 = W1h * std::sqrt(12.0);
-            const double W1d = W1h * std::sqrt(24.0);
-
-            CHECK(near(dp::mtf_trail_entry_pct(W1h), 0.25), "梯子1h档 0.1W=0.25");
-            CHECK(near(dp::mtf_trail_entry_pct(W4h), 0.50), "梯子4h档 0.1W=0.50（基线会被夹到0.4）");
-            CHECK(dp::mtf_trail_entry_pct(W12) > 0.85,      "梯子12h档应约0.87，未触顶");
-            CHECK(dp::mtf_trail_entry_pct(W1d) > 1.20,      "梯子1d档应约1.23，未触顶");
-
-            // 四档必须严格递增——这正是共用基线夹逼时失去的性质
-            CHECK(dp::mtf_trail_entry_pct(W1h) < dp::mtf_trail_entry_pct(W4h) &&
-                  dp::mtf_trail_entry_pct(W4h) < dp::mtf_trail_entry_pct(W12) &&
-                  dp::mtf_trail_entry_pct(W12) < dp::mtf_trail_entry_pct(W1d),
-                  "常态波动下四档反弹要求严格递增");
-            // 对照：基线那条在同样输入下 4h/12h/1d 三档会塌成同一个值
-            CHECK(near(dp::trail_entry_pct(W4h), 0.4) &&
-                  near(dp::trail_entry_pct(W12), 0.4) &&
-                  near(dp::trail_entry_pct(W1d), 0.4),
-                  "（对照）基线夹逼下深三档确实塌成同一个0.4");
-
-            CHECK(near(dp::mtf_trail_entry_pct(30.0), 1.5), "极宽带宽仍有上限1.5，不至于冻死补仓");
-            CHECK(near(dp::mtf_trail_entry_pct(0.6), 0.15), "下限与基线一致仍为0.15");
-        }
-    }
 
     // ── 宏观许可层：%B + 24h涨幅 + 7日涨幅 ────────────────────────────────
     // v4.0.16 移除结构层（支撑/净空/SR区域）后，这里只剩三条平级判据

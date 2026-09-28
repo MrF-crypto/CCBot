@@ -228,8 +228,11 @@ void MainWindow::migrate_appdata_if_needed() {
         else all_ok = false;
     }
     if (all_ok) {
+        // 标记文件建不出来（目录只读/磁盘满）必须说出来：它是"迁移已完成"的唯一
+        // 凭据，建不上的话每次启动都会把整个旧目录重新拷一遍，而用户看不到原因
         QFile marker(dst + "/.migrated");
-        marker.open(QIODevice::WriteOnly);
+        if (!marker.open(QIODevice::WriteOnly))
+            log("迁移完成标记写入失败，下次启动会重复迁移一次（不影响数据）", "WARN");
     } else {
         log("旧数据目录部分文件迁移失败，下次启动将重试剩余文件", "WARN");
     }
@@ -2103,7 +2106,8 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         }
         double finalPrice = (n > 0) ? predPrice[n-1] : 0.0;
 
-        auto mkc = [](const QString& s, const QColor& c, int align = Qt::AlignCenter) {
+        auto mkc = [](const QString& s, const QColor& c,
+                  Qt::Alignment align = Qt::AlignCenter) {
             auto* it = new QTableWidgetItem(s);
             it->setTextAlignment(align);
             it->setForeground(c);
@@ -2734,13 +2738,26 @@ void MainWindow::onTick() {
         // v4.6.0 起 24h 涨幅【只用于显示】那一列——涨幅拦截闸门已移除。
         // 成本几乎为零：@ticker 本就已订阅，REST 兜底是全市场一次取回
         // （权重 40，90 秒一次），与品种数无关
+        //
+        // ⚠ 这里【不能筛掉 Stopped】。它服务的是"表格那一列要有数"，而表格显示
+        //   所有行，不只运行中的。原先筛了 Stopped，后果是：刚添加的品种默认就是
+        //   停止的，若此刻 WS 还没首包（或断流），这个循环一个都不进、兜底永不触发，
+        //   24h 涨跌 一直空着而且看不出为什么——而"加了品种还没开启"恰恰是最常见的状态。
+        //   喂价给引擎那条路才该筛状态（见下面的 syms），两件事必须分开
         bool need_rest_chg = false;
         for (const auto& b : bots) {
-            if (b.state == CcgBot::State::Stopped) continue;
             double pct = 0;
             bool stale = false;
-            const bool ok = chg24Of(b.cfg.symbol, pct, stale);
+            chg24Of(b.cfg.symbol, pct, stale);
             if (stale) need_rest_chg = true;
+        }
+        if (sar_engine_) {
+            for (const auto& b : sar_engine_->get_bots()) {
+                double pct = 0;
+                bool stale = false;
+                chg24Of(b.cfg.symbol, pct, stale);
+                if (stale) need_rest_chg = true;
+            }
         }
         // 一次 REST 拿回全市场（权重 40），不是逐品种——47 个品种逐个查是
         // 47 次往返，而全取只要 1 次，权重也更省
@@ -2817,28 +2834,40 @@ void MainWindow::onTick() {
         }
     }
 
-    std::set<std::string> syms;
-    for (const auto& b : bots)
-        if (b.state != CcgBot::State::Stopped)
-            syms.insert(b.cfg.symbol);
+    // ── 两个品种集合，刻意分开 ────────────────────────────────────────────────
+    //   engine_syms —— 要【喂价给引擎】的：必须筛掉 Stopped，停止的 bot 不该产生
+    //                  任何决策
+    //   disp_syms   —— 表格那几列要【显示】的：所有行都要，不看状态
+    // 原先只有一个集合，两件事绑在一起，后果是：全部 bot 都停止时 disp 也空了，
+    // markPrice 的 REST 兜底整条路径不执行 → 标记价/延迟一直是 "--"。
+    // 而"添加了品种还没开启"正好就是全停状态
+    std::set<std::string> engine_syms, disp_syms, sar_syms;
+    for (const auto& b : bots) {
+        disp_syms.insert(b.cfg.symbol);
+        if (b.state != CcgBot::State::Stopped) engine_syms.insert(b.cfg.symbol);
+    }
     // SAR 的品种与 DCA 没有交集（同品种被两套接管是被拒绝的），必须单独收集，
-    // 否则只配了 SAR 时上面的 syms 是空的，价格永远喂不到 SAR 引擎
-    std::set<std::string> sar_syms;
+    // 否则只配了 SAR 时上面的集合是空的，价格永远喂不到 SAR 引擎
     if (sar_engine_) {
-        for (const auto& b : sar_engine_->get_bots())
+        for (const auto& b : sar_engine_->get_bots()) {
+            disp_syms.insert(b.cfg.symbol);
             if (b.state != SarBot::State::Stopped) {
                 sar_syms.insert(b.cfg.symbol);
-                syms.insert(b.cfg.symbol);
+                engine_syms.insert(b.cfg.symbol);
             }
+        }
     }
-    if (syms.empty()) { refreshBotTable(); return; }
+    if (disp_syms.empty()) { refreshBotTable(); return; }
 
     std::set<std::string> need_rest;
-    for (const auto& sym : syms) {
+    for (const auto& sym : disp_syms) {
         double ws_price = ticker_ ? ticker_->mark_price(sym) : 0.0;
         if (ws_price > 0) {
-            engine_->tick(sym, ws_price);
-            if (sar_engine_ && sar_syms.count(sym)) sar_engine_->tick(sym, ws_price);
+            // 只有运行中的才驱动引擎；停止的品种拿到价格仅供界面显示
+            if (engine_syms.count(sym)) {
+                engine_->tick(sym, ws_price);
+                if (sar_engine_ && sar_syms.count(sym)) sar_engine_->tick(sym, ws_price);
+            }
         } else {
             need_rest.insert(sym);
         }
@@ -2854,14 +2883,18 @@ void MainWindow::onTick() {
     // 品种数越多雪崩得越快，恰恰是最需要它撑住的时候
     if (restFetchBusy_.exchange(true)) { refreshBotTable(); return; }
 
-    run_async([this, need_rest = std::move(need_rest), sar_syms]() {
+    run_async([this, need_rest = std::move(need_rest), engine_syms, sar_syms]() {
         for (const auto& sym : need_rest) {
             double price = client_->fetch_mark_price(sym);
             if (price > 0) {
-                engine_->tick(sym, price);
-                // 只喂 SAR 自己的品种：喂全部会让 SAR 引擎对每个 DCA 品种都取一次
-                // 锁、空转一遍——47 个品种的 REST 兜底轮里就是 47 次无谓的锁竞争
-                if (sar_engine_ && sar_syms.count(sym)) sar_engine_->tick(sym, price);
+                // 同上：只有运行中的才驱动引擎。停止的品种走到这里是为了让
+                // 标记价那一列有数
+                if (engine_syms.count(sym)) {
+                    engine_->tick(sym, price);
+                    // 只喂 SAR 自己的品种：喂全部会让 SAR 引擎对每个 DCA 品种都取
+                    // 一次锁、空转一遍——47 个品种的兜底轮里就是 47 次无谓的锁竞争
+                    if (sar_engine_ && sar_syms.count(sym)) sar_engine_->tick(sym, price);
+                }
                 // 写回缓存：界面那一列读的是缓存，不写回就会出现
                 // "引擎有价在跑、标记价列却一直空着"
                 if (ticker_) ticker_->set_mark_price(sym, price);
@@ -2986,7 +3019,8 @@ void MainWindow::refreshLiveQuotes() {
     const auto rows = buildRows(bots, sar_bots);
     if ((int)rows.size() != botTable_->rowCount()) return;  // 行数变化时交给下次完整刷新
 
-    auto mkc = [](const QString& s, const QColor& c, int align = Qt::AlignCenter) {
+    auto mkc = [](const QString& s, const QColor& c,
+                  Qt::Alignment align = Qt::AlignCenter) {
         auto* it = new QTableWidgetItem(s);
         it->setTextAlignment(align);
         it->setForeground(c);
@@ -3148,7 +3182,8 @@ void MainWindow::refreshBotTable() {
     double& total_unreal = rt.unreal;
     double& total_real   = rt.real;
 
-    auto mkc = [](const QString& s, const QColor& c, int align = Qt::AlignCenter) {
+    auto mkc = [](const QString& s, const QColor& c,
+                  Qt::Alignment align = Qt::AlignCenter) {
         auto* it = new QTableWidgetItem(s);
         it->setTextAlignment(align);
         it->setForeground(c);

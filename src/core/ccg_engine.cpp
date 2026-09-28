@@ -1,6 +1,5 @@
 #include "core/ccg_engine.h"
 #include "core/decision.h"
-#include "core/dynamic_params.h"
 // 引擎只依赖 ITradingClient 接口（在 ccg_engine.h 里），不再直接依赖具体的
 // TradingClient/curl——单元测试因此可以只编译引擎+FakeClient，无需网络库
 #include "core/thread_pool.h"

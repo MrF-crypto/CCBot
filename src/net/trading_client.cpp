@@ -925,11 +925,6 @@ void TradingClient::delete_listen_key(const std::string& key) {
 }
 
 // ── LOT_SIZE / 价格精度缓存 ───────────────────────────────────────────────────
-static double parse_step(const std::string& s) {
-    if (s.empty()) return 0.001;
-    try { return std::stod(s); } catch (...) { return 0.001; }
-}
-
 bool TradingClient::try_get_symbol_info(const std::string& sym, SymbolInfo& out) const {
     std::lock_guard<std::mutex> lk(sym_mtx_);
     auto it = sym_cache_.find(sym);

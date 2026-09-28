@@ -9,7 +9,6 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
-#include <array>
 #include <set>
 
 namespace ccbot {
