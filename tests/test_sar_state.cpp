@@ -90,6 +90,26 @@ int main() {
         }
     }
 
+    // ── 交易所侧灾难止损单号往返（v4.7.0）────────────────────────────────────
+    // 单号丢了的后果不是"少一层保护"，而是【下一次挂不上】：币安对同一方向只允许
+    // 存在一张 closePosition 单，重启后那张旧单还在交易所挂着，新的会被直接拒。
+    // 于是 bot 看起来正常运行，实际再也没有进程外保护——而且触发价还停在旧止损线上
+    {
+        auto b = mk_bot("ETHUSDT", sar::Pos::Long, 3100.5, 3250.25, 3012.125, 1.5);
+        b.disaster_stop_id    = "4821993077";
+        b.disaster_stop_price = 2981.99375;
+
+        save_sar_state(path, {b});
+        auto got = load_sar_state(path, {mk_cfg("ETHUSDT")});
+        check(got.size() == 1, "灾难止损：读回 1 个 bot");
+        if (got.size() == 1) {
+            check(got[0].disaster_stop_id == "4821993077",
+                  "  单号必须原样往返（丢了重启后新单会被交易所拒）");
+            check(got[0].disaster_stop_price == b.disaster_stop_price,
+                  "  触发价逐位无损（判断要不要重挂时要和新止损线比）");
+        }
+    }
+
     // ── 金字塔状态往返 ───────────────────────────────────────────────────────
     // adds_done 丢了会让重启后【多加几档】（引擎以为一档都没加过）；
     // last_add_price 丢了会让下一档的间距从 0 量起，立刻再加一档
