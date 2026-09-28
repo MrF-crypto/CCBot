@@ -1973,7 +1973,10 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     indPreviewTimer->setInterval(4000);
     connect(indPreviewTimer, &QTimer::timeout, &dlg, refreshIndPreview);
 
-    auto updateIndVisible = [=, this]() {
+    // 这个 lambda 不碰任何成员，所以【不能】写成 [=, this]——显式捕获一个用不到的
+    // this 会被 -Wunused-lambda-capture 拦下。上面两个要 [=, this] 是因为它们真的
+    // 用了 client_ / ticker_
+    auto updateIndVisible = [=]() {
         bool show = (entryModeBox->currentIndex() == 1);
         indBox->setVisible(show);
         if (show) { indPreviewTimer->start(); refreshIndPreview(); }
