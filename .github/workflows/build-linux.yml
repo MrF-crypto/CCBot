@@ -76,8 +76,11 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux
 
+      # -k 0 = 一个目标失败也把其余编完。-Werror 开了之后这很要紧：
+      # 默认行为是首个 TU 报错就停，于是一轮 CI 只能暴露一个错误，修一个再推一轮。
+      # 编完再报能一次拿全清单
       - name: Build
-        run: cmake --build build 2>&1 | tee build.log
+        run: cmake --build build -- -k 0 2>&1 | tee build.log
 
       # 警告清单。v4.7.1 起 -DCCBOT_WERROR=ON，警告已经是【硬门禁】——有警告的话
       # 上面那步 Build 就直接失败了，走不到这里。

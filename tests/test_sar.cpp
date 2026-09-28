@@ -247,8 +247,8 @@ int main() {
         }
 
         // ── 初始止损 = 摆动低点，不是 ATR ────────────────────────────────────
+        // initial_stop 是纯函数，不读也不写 State——所以这里不需要 State
         {
-            State st;
             Inputs in = bar(100, true, false, 94, 106, true);
             const double s0 = initial_stop(Pos::Long, 100, bc, in);
             CHECK(near(s0, 94.0), "多头初始止损 = 前 N 根最低价");
