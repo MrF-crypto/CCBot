@@ -10,9 +10,9 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QSplitter>
-#include <QTabWidget>
 #include <QMessageBox>
 #include <QScrollArea>
+#include <QStackedWidget>
 #include <QDateTime>
 #include <QColor>
 #include <QJsonDocument>
@@ -1095,19 +1095,33 @@ void MainWindow::buildUi() {
             tv->addLayout(row);
         }
 
-        auto* monLbl = new QLabel("实盘监控  (右键品种进行策略配置)");
+        auto* monLbl = new QLabel(
+            "实盘监控  (右键品种进行策略配置 —— 可选 网格 DCA 或 趋势 SAR)");
         monLbl->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding:2px 0;");
         tv->addWidget(monLbl);
 
-        // Bot 表格 — 15 列。
+        // Bot 表格 — 16 列，DCA 与 SAR 共用。
         // 资金费不进这张表：它是【账户级慢变量】（8小时才结算一次），而这张表是
         // 每3秒刷新的【逐品种实时行】。混在一起既挤掉实时数据的宽度，也不符合它
         // 的性质——账户合计放顶部栏，逐品种细节放"均价"列的悬停提示
+        //
+        // ⚠ 三个列头是【跨策略复用】的，含义随行的策略而变（见 fillSarRow）：
+        //     层进度    DCA=已开层数/总层数      SAR=金字塔档数
+        //     均价      DCA=持仓均价             SAR=开仓价
+        //     强平/止损 DCA=强平价               SAR=追踪止损线
+        //   前两个两边同义，直接沿用原名；第三个不同义，所以列头必须改，
+        //   否则 SAR 行会把止损线显示成"强平价"——那是会让人误判风险的假话
         botTable_ = new QTableWidget(0, 16);
         botTable_->setHorizontalHeaderLabels(
             {"#","品种","方向","策略","层进度",
-             "均价","标记价","24h涨跌","延迟","浮动P&L","保证金","收益率","强平价",
+             "均价","标记价","24h涨跌","延迟","浮动P&L","保证金","收益率","强平/止损",
              "已实现","状态","操作"});
+        botTable_->horizontalHeaderItem(12)->setToolTip(
+            "网格 DCA 行：强平价（名义仓位 ≤ 权益时显示 --，数学上不可强平）\n"
+            "趋势 SAR 行：追踪止损线（越过成本价后转绿 = 这笔已锁定盈利）");
+        botTable_->horizontalHeaderItem(4)->setToolTip(
+            "网格 DCA 行：已开层数 / 总层数\n"
+            "趋势 SAR 行：金字塔档数（未开启顺势加仓时显示 —）");
         auto* hdr = botTable_->horizontalHeader();
         hdr->setSectionResizeMode(QHeaderView::Stretch);
         // 列索引在 v4.0.15 插入「24h涨跌」后整体后移：延迟 7→8、状态 13→14、操作 14→15
@@ -1130,14 +1144,16 @@ void MainWindow::buildUi() {
                 this, &MainWindow::onWatchlistContextMenu);
         tv->addWidget(botTable_, 1);
 
-        // ── 两套策略分标签页 ────────────────────────────────────────────────
-        // 不并排也不上下堆：两张表的列语义完全不同（DCA 有层进度/均价/强平价，
-        // SAR 有止损线/距离/反手数），挤在一个视野里只会让两边都读不清。
-        // 同一时刻你关心的也只是其中一套
-        auto* tabs = new QTabWidget();
-        tabs->addTab(tw, "网格 DCA");
-        tabs->addTab(buildSarTab(), "趋势 SAR");
-        vSplit->addWidget(tabs);
+        // ── 两套策略同表 ────────────────────────────────────────────────────
+        // v4.5.0 之前这里是两个标签页，理由是"两张表的列语义完全不同，挤在一个
+        // 视野里只会让两边都读不清"。改成同表之后那个问题靠三件事化解：
+        //   ① 16 列里有 9 列本就同义（品种/标记价/24h/延迟/浮动P&L/保证金/
+        //      收益率/已实现/状态），跨策略直接复用
+        //   ② 3 列语义相近，复用列位并改列头（见上面的表格构造）
+        //   ③ SAR 独有的 ATR 数据灯、胜率、连续反手、决策文字全部收进悬停
+        // 换来的是：一个品种只能有一套策略，这件事从 4 处手写检查变成配置弹窗里
+        // 单选框的天然性质，再也不可能从某个入口绕过去
+        vSplit->addWidget(tw);
     }
 
     // ── 底部日志区 ─────────────────────────────────────────────────────────────
@@ -1276,7 +1292,7 @@ void MainWindow::onConnect() {
             sar_engine_->set_log_cb([this](const std::string& msg) {
                 QMetaObject::invokeMethod(this, [this, msg]() {
                     log(QString::fromStdString(msg));
-                    refreshSarTable();
+                    refreshBotTable();
                     save_sar_bots();
                 }, Qt::QueuedConnection);
             });
@@ -1595,6 +1611,18 @@ void MainWindow::onAddWatchSymbol() {
             return;
         }
     }
+    // ⚠ SAR 也要查。两套策略同表之后这个加品种框是【唯一】入口，漏查的话
+    //   给一个已归 SAR 的品种再建一个 DCA bot，就等于两套策略同时接管同一个
+    //   交易所仓位——它们会互相平掉对方的单。这道检查是"一个品种一套策略"这个
+    //   不变量在界面上的最后一个缺口
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots())
+            if (b.cfg.symbol == symbol) {
+                log(QString::fromStdString(symbol) +
+                    " 已经在列表里了（当前由趋势 SAR 接管，右键该行可改策略）", "WARN");
+                return;
+            }
+    }
 
     CcgConfig cfg;              // 全部用默认参数，具体配置留给右键弹窗
     cfg.symbol = symbol;
@@ -1629,21 +1657,6 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
 // 策略配置弹窗：新建或编辑一个品种的 bot，保存后回到监控页面
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::openStrategyDialog(const std::string& symbol) {
-    // 同品种已被 SAR 接管则拒绝。两个引擎会在同一个交易所仓位上互相拆台：
-    // SAR 的 reduceOnly 平仓会平掉 DCA 的层，而 DCA 的补仓会让 SAR 的
-    // 开仓价基准失效、止损线管着一个不是自己开的仓位。
-    // openSarDialog 里有对称的一道——两边都要有，否则从任一侧都能绕过去
-    if (sar_engine_) {
-        for (const auto& b : sar_engine_->get_bots())
-            if (b.cfg.symbol == symbol && b.state != SarBot::State::Stopped) {
-                QMessageBox::warning(this, "品种冲突",
-                    QString::fromStdString(symbol) +
-                    " 已经由趋势 SAR 策略接管。\n\n"
-                    "两套策略会在同一个交易所仓位上互相平掉对方的单，必须二选一。");
-                return;
-            }
-    }
-
     auto bots = engine_ ? engine_->get_bots() : std::vector<CcgBot>{};
     const CcgBot* longBot = nullptr;
     const CcgBot* shortBot = nullptr;
@@ -1653,6 +1666,27 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         else                                                longBot  = &b;
     }
     const CcgBot* prefill = longBot ? longBot : shortBot;
+
+    // ── 这个品种现在归谁管 ──────────────────────────────────────────────────
+    // 同品种只能有一套策略：两个引擎会在同一个交易所仓位上互相拆台——SAR 的
+    // reduceOnly 平仓会平掉 DCA 的层，而 DCA 的补仓会让 SAR 的开仓价基准失效、
+    // 止损线管着一个不是自己开的仓位。
+    // v4.5.0 之前这条靠 4 处手写检查（两个弹窗各一处、SAR 表格里一处、headless
+    // 一处）；现在它是下面那个单选框的天然性质——一个品种只有一行，一行只能选
+    // 一套策略，从界面上已经不存在"两套同时接管"这个状态了。headless 那一处
+    // 仍然保留：它读的是手写 JSON，用户完全可以在两个数组里都写同一个品种
+    auto sar_bots = sar_engine_ ? sar_engine_->get_bots() : std::vector<SarBot>{};
+    const SarBot* sarBot = nullptr;
+    for (const auto& b : sar_bots)
+        if (b.cfg.symbol == symbol) { sarBot = &b; break; }
+
+    // 当前持仓：决定策略能不能切。带仓切换 = 让另一套引擎去接管一笔不是它开的
+    // 仓位——SAR 会拿摆动低点当止损线守着一个按 DCA 分层建起来的仓，同时 DCA
+    // 的层数记录被整个丢弃。这条必须从界面上堵死，不能只靠提示
+    const bool dcaHasPos = (longBot  && !longBot->entries.empty()) ||
+                           (shortBot && !shortBot->entries.empty());
+    const bool sarHasPos = sarBot && sarBot->st.pos != sar::Pos::Flat && sarBot->qty > 0;
+    const bool lockStrategy = dcaHasPos || sarHasPos;
 
     QDialog dlg(this);
     dlg.setWindowTitle(QString("策略配置 - %1").arg(QString::fromStdString(symbol)));
@@ -1672,8 +1706,70 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     scroll->setWidget(canvas);
     outer->addWidget(scroll, 1);
 
+    // ── 策略选择 ────────────────────────────────────────────────────────────
+    // 放在最顶上、滚动区之内：它决定了下面整片表单的含义，必须是第一个看到的东西
+    auto* stratPick = new QComboBox();
+    stratPick->addItem("网格 DCA　—— 分层摊薄，不止损，名义≤权益⇒不可强平", 0);
+    stratPick->addItem("趋势 SAR　—— 单仓位，每笔必止损，追踪止损出场",      1);
+    stratPick->setCurrentIndex(sarBot ? 1 : 0);
+    {
+        auto* pickBox = new QGroupBox("策略");
+        pickBox->setStyleSheet("QGroupBox{color:#f0883e;font-size:11px;font-weight:bold;"
+                               "border:1px solid #21262d;border-radius:4px;"
+                               "margin-top:8px;padding:10px 12px 8px;}"
+                               "QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px;}");
+        auto* pf = new QVBoxLayout(pickBox);
+        pf->setSpacing(6);
+        pf->addWidget(stratPick);
+        auto* pickHint = new QLabel();
+        pickHint->setWordWrap(true);
+        pickHint->setStyleSheet("color:#8b949e;font-size:10px;");
+        if (lockStrategy) {
+            stratPick->setEnabled(false);
+            pickHint->setStyleSheet("color:#d29922;font-size:10px;");
+            pickHint->setText(
+                "⚠ 该品种当前有持仓，策略已锁定。切换策略等于让另一套引擎去接管一笔"
+                "不是它开的仓位：SAR 会拿摆动低点当止损线去守一个按 DCA 分层建起来的仓，"
+                "而 DCA 的层数记录会被整个丢弃。请先平仓，再切换策略。"
+                "（参数本身仍可在下面修改，各引擎自己的限制照旧生效）");
+        } else {
+            pickHint->setText(
+                "一个品种只能选一套策略——两套会在同一个交易所仓位上互相平掉对方的单。"
+                "切换会删掉旧策略的 bot 再建新的；当前无持仓，所以切换是安全的。");
+        }
+        pf->addWidget(pickHint);
+        dv->addWidget(pickBox);
+    }
+
+    // 两套策略各占一页，用 QStackedWidget 切换。不用标签页：标签页看起来像
+    // "两套都在跑、只是在看其中一套"，而这里的语义是【二选一】
+    auto* pages   = new QStackedWidget();
+    auto* dcaPage = new QWidget();
+    auto* dcaLay  = new QVBoxLayout(dcaPage);
+    dcaLay->setContentsMargins(0, 0, 0, 0);
+    dcaLay->setSpacing(14);
+    auto* sarPage = new QWidget();
+    auto* sarLay  = new QVBoxLayout(sarPage);
+    sarLay->setContentsMargins(0, 0, 0, 0);
+    sarLay->setSpacing(14);
+    pages->addWidget(dcaPage);   // index 0
+    pages->addWidget(sarPage);   // index 1
+    dv->addWidget(pages);
+    pages->setCurrentIndex(stratPick->currentIndex());
+    connect(stratPick, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            pages, [pages](int i) { pages->setCurrentIndex(i); });
+
+    // SAR 那一页整片由 sar_panel.cpp 构建（那 30 多个控件不该在这里再写一遍）
+    SarConfig sarCfg;
+    sarCfg.symbol = symbol;
+    if (sarBot) sarCfg = sarBot->cfg;
+    auto sarForm = buildSarForm(sarLay, sarCfg);
+    sarLay->addStretch(1);
+
     // 分组工厂：所有分组共用同一套外观与对齐，避免出现"一半分组一半裸表单"
-    // 这种两套组织方式并存的情况（改版前正是如此）
+    // 这种两套组织方式并存的情况（改版前正是如此）。
+    // ⚠ 加到 dcaLay 而不是 dv——否则 DCA 的分组会跑到策略分页【外面】，
+    //   切到 SAR 时它们还留在屏幕上
     auto mkGroup = [&](const QString& title, const QString& color) {
         auto* box = new QGroupBox(title);
         box->setStyleSheet(QString("QGroupBox{color:%1;font-size:11px;font-weight:bold;"
@@ -1685,7 +1781,7 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         f->setSpacing(7);
         f->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
         f->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
-        dv->addWidget(box);
+        dcaLay->addWidget(box);
         return f;
     };
     // 灰字说明统一样式，并且统一挂在所属分组的末尾——改版前它们散落在中间
@@ -1737,7 +1833,11 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
                            "平方","斐波那契","卢卡斯","递增"})
         stratBox->addItem(s);
     stratBox->setCurrentIndex(prefill ? (int)prefill->cfg.strat_type : 7);   // 默认递增（实证最优）
-    form->addRow("策略:", stratBox);
+    // ⚠ 这一项原先叫「策略」。v4.5.0 顶部加了真正的策略选择（DCA/SAR）之后，
+    //   同一个弹窗里出现两个「策略」会直接把人搞混，所以改名为它真正的含义。
+    //   只改显示文字——落盘的 JSON 键仍是 strat_type，一个字都不能动，否则
+    //   老 bots.json 读回来会退化成默认值，等于在用户不知情时换掉正在跑的策略
+    form->addRow("加仓曲线:", stratBox);
 
     // 带目标分组的版本（旧版写死往 form 里塞，所有参数因此只能待在同一张扁平表里）
     auto mkEditIn = [&](QFormLayout* f, const QString& label, double val) {
@@ -2346,8 +2446,9 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         auto* warnLbl = new QLabel("该品种多/空两个方向都在运行中，保存会同时更新两边的参数");
         warnLbl->setWordWrap(true);
         warnLbl->setStyleSheet("color:#d29922;font-size:11px;");
-        dv->addWidget(warnLbl);
+        dcaLay->addWidget(warnLbl);
     }
+    dcaLay->addStretch(1);
 
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
     // 按钮固定在滚动区外：内容一长，放在里面会被滚出可视范围
@@ -2362,6 +2463,51 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     if (!engine_) {
         log("请先点击【连接】", "WARN");
         return;
+    }
+
+    // ── 选了趋势 SAR：交给 SAR 那一套落地，DCA 的表单一个字都不读 ────────────
+    const bool wantSar = (stratPick->currentIndex() == 1);
+    if (wantSar) {
+        SarConfig sc;
+        if (!collectSarForm(sarForm, sc)) return;   // 表单级校验没过，状态没动
+        sc.symbol = symbol;
+
+        // 从 DCA 切过来：先确认旧 bot 都没持仓，再删。顺序很重要——
+        // applySarConfig 里还会校验品种是否存在等，若先删了 DCA 再校验失败，
+        // 这个品种就变成"两套都没有"的空行了
+        if ((longBot || shortBot) && !lockStrategy) {
+            if (!confirmDanger("切换策略",
+                    QString::fromStdString(symbol) +
+                    " 当前是网格 DCA（无持仓）。\n\n"
+                    "切换到趋势 SAR 会删除现有的 DCA bot 及其全部参数，"
+                    "改由 SAR 接管这个品种。",
+                    "切换到 SAR")) return;
+        }
+        if (!applySarConfig(sc, sarBot)) return;
+
+        // SAR 建成了才删 DCA：这两步之间若失败，宁可短暂"两套都在"（对账会
+        // 告警、且都没持仓所以不会互相平单），也不要出现"一套都没有"
+        if (longBot)  engine_->remove_bot(longBot->bot_id);
+        if (shortBot) engine_->remove_bot(shortBot->bot_id);
+        if (longBot || shortBot) {
+            log(QString::fromStdString(symbol) + " 已由网格 DCA 切换为趋势 SAR", "OK");
+            save_bots();
+            refreshBotTable();
+        }
+        return;
+    }
+
+    // ── 选了网格 DCA：若原先是 SAR，先把 SAR 的 bot 让出来 ──────────────────
+    if (sarBot && !lockStrategy) {
+        if (!confirmDanger("切换策略",
+                QString::fromStdString(symbol) +
+                " 当前是趋势 SAR（无持仓）。\n\n"
+                "切换到网格 DCA 会删除现有的 SAR bot 及其全部参数，"
+                "改由 DCA 接管这个品种。",
+                "切换到 DCA")) return;
+        sar_engine_->remove_bot(sarBot->bot_id);
+        save_sar_bots();
+        log(QString::fromStdString(symbol) + " 已由趋势 SAR 切换为网格 DCA", "OK");
     }
 
     auto to_d = [](QLineEdit* e, double def) {
@@ -2493,18 +2639,35 @@ void MainWindow::onStopAll() {
         if (b.state != CcgBot::State::Stopped) ++running;
         if (b.total_qty > 0) ++withPos;
     }
+    // SAR 也要算进去、也要真的停掉。
+    // ⚠ 这里漏掉 SAR 不只是数字不准：下面会关掉 tick 定时器，而【两个引擎都靠
+    //   它驱动】。只停 DCA 的话，SAR 的 bot 在界面上仍显示"运行中"，实际却再也
+    //   收不到价格——追踪止损线永远不会被触发，仓位静默裸奔。这正是单行的
+    //   【继续】按钮里那道"定时器没开就拉起来"守卫在防的同一件事
+    int sar_running = 0, sar_pos = 0;
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots()) {
+            if (b.state != SarBot::State::Stopped) ++sar_running;
+            if (b.st.pos != sar::Pos::Flat && b.qty > 0) ++sar_pos;
+        }
+    }
     if (!confirmDanger("确认全部停止",
-            QString("将停止 %1 个运行中的 Bot，并关闭 Tick 定时器。\n\n"
-                    "持仓【不会】被平掉，但止盈、止损、补仓全部暂停——"
-                    "当前有 %2 个品种持仓，停止期间它们不再受任何本地策略管理。\n\n"
-                    "确定要停止吗？").arg(running).arg(withPos),
+            QString("将停止 %1 个运行中的 Bot（网格 DCA %2 + 趋势 SAR %3），"
+                    "并关闭 Tick 定时器。\n\n"
+                    "持仓【不会】被平掉，但止盈、止损、补仓、追踪止损全部暂停——"
+                    "当前有 %4 个品种持仓，停止期间它们不再受任何本地策略管理。\n\n"
+                    "确定要停止吗？")
+                .arg(running + sar_running).arg(running).arg(sar_running)
+                .arg(withPos + sar_pos),
             "全部停止")) return;
 
     engine_->stop_all();
+    if (sar_engine_) sar_engine_->stop_all();
     tick_timer_->stop();
     log("所有Bot已停止，Tick定时器已关闭", "WARN");
     refreshBotTable();
     save_bots();
+    if (sar_engine_) save_sar_bots();
 }
 
 void MainWindow::onClearStopped() {
@@ -2514,6 +2677,15 @@ void MainWindow::onClearStopped() {
         if (b.state != CcgBot::State::Stopped) continue;
         ++n;
         if (b.total_qty > 0) ++withPos;
+    }
+    // 两套策略同表之后这个按钮必须对两边都生效：表格里看不出行属于哪个引擎，
+    // 只清 DCA 会让停掉的 SAR 行清不掉，而用户看到的就是"这个按钮有时候不管用"
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots()) {
+            if (b.state != SarBot::State::Stopped) continue;
+            ++n;
+            if (b.qty > 0) ++withPos;
+        }
     }
     if (n == 0) { log("没有已停止的 Bot 可清除"); return; }
 
@@ -2533,11 +2705,23 @@ void MainWindow::onClearStopped() {
             engine_->remove_bot(b.bot_id);
             ++done;
         }
-    // 全部删完之后再统一退订：边删边退会误判"还有别的 bot 在用"
+    int sar_done = 0;
+    if (sar_engine_) {
+        for (const auto& b : sar_engine_->get_bots())
+            if (b.state == SarBot::State::Stopped) {
+                touched.insert(b.cfg.symbol);
+                sar_engine_->remove_bot(b.bot_id);
+                ++done;
+                ++sar_done;
+            }
+    }
+    // 全部删完之后再统一退订：边删边退会误判"还有别的 bot 在用"。
+    // unsubscribeIfUnused 本来就查两个引擎，所以两边都删完再调是对的
     for (const auto& s : touched) unsubscribeIfUnused(s);
     if (done > 0) log(QString("已清除 %1 个已停止Bot").arg(done), withPos > 0 ? "WARN" : "INFO");
     refreshBotTable();
     save_bots();
+    if (sar_done > 0) save_sar_bots();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2631,7 +2815,7 @@ void MainWindow::onTick() {
                                 .arg(fresh.join(", ")).arg(okn), "WARN");
                     if (!healed.isEmpty())
                         log(QString("SAR 信号已恢复：%1").arg(healed.join(", ")), "OK");
-                    refreshSarTable();
+                    refreshBotTable();
                 }, Qt::QueuedConnection);
             });
         }
@@ -2780,7 +2964,7 @@ void MainWindow::onTick() {
                 for (const auto& i : sissues)
                     log("SAR对账: " + QString::fromStdString(i), "WARN");
                 save_sar_bots();
-                refreshSarTable();
+                refreshBotTable();
                 sendAlert(QString("[TradingBot] SAR 对账发现 %1 处不一致，详见日志")
                           .arg(sissues.size()));
             }
@@ -2901,7 +3085,7 @@ void MainWindow::onTick() {
                 syms.insert(b.cfg.symbol);
             }
     }
-    if (syms.empty()) { refreshBotTable(); refreshSarTable(); return; }
+    if (syms.empty()) { refreshBotTable(); return; }
 
     std::set<std::string> need_rest;
     for (const auto& sym : syms) {
@@ -2914,7 +3098,7 @@ void MainWindow::onTick() {
         }
     }
 
-    if (need_rest.empty()) { refreshBotTable(); refreshSarTable(); return; }
+    if (need_rest.empty()) { refreshBotTable(); return; }
 
     // 防重入：这一批是【串行】遍历所有缺价的品种，47 个品种要跑几十秒，
     // 而引擎 tick 是 3 秒一次。没有这道闸的话每 3 秒就再投递一批，
@@ -2940,7 +3124,6 @@ void MainWindow::onTick() {
         restFetchBusy_.store(false);
         QMetaObject::invokeMethod(this, [this]() {
             refreshBotTable();
-            refreshSarTable();
         }, Qt::QueuedConnection);
     });
 }
@@ -3048,8 +3231,14 @@ static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, doub
 void MainWindow::refreshLiveQuotes() {
     if (!botTable_ || !engine_ || !ticker_) return;
 
-    auto bots = engine_->get_bots();
-    if ((int)bots.size() != botTable_->rowCount()) return;  // 行数变化时交给下次完整刷新
+    // ⚠ 必须按【合并后的行】算，不能只数 DCA 的 bot：两套策略同表之后
+    //   rowCount 永远 ≥ DCA bot 数，只要存在一个 SAR bot 下面那道行数校验就会
+    //   每次直接 return。表现是不报错、不崩，只是标记价从 100ms 刷新悄悄退化成
+    //   3 秒——最难发现的那一类故障
+    auto bots     = engine_->get_bots();
+    auto sar_bots = sar_engine_ ? sar_engine_->get_bots() : std::vector<SarBot>{};
+    const auto rows = buildRows(bots, sar_bots);
+    if ((int)rows.size() != botTable_->rowCount()) return;  // 行数变化时交给下次完整刷新
 
     auto mkc = [](const QString& s, const QColor& c, int align = Qt::AlignCenter) {
         auto* it = new QTableWidgetItem(s);
@@ -3060,10 +3249,12 @@ void MainWindow::refreshLiveQuotes() {
 
     int64_t now_ms = BookTickerStream::now_ms();
 
-    for (int i = 0; i < (int)bots.size(); ++i) {
-        const auto& b = bots[i];
-        auto tick = ticker_->get(b.cfg.symbol);
-        const double tick_size = tickSizeOf(b.cfg.symbol);
+    // 这三列（标记价/24h涨跌/延迟）全是【品种级】数据，两套策略完全同义，
+    // 所以这里不需要按策略分支——只要拿到行对应的品种就够了
+    for (int i = 0; i < (int)rows.size(); ++i) {
+        const std::string& sym = rows[i].symbol;
+        auto tick = ticker_->get(sym);
+        const double tick_size = tickSizeOf(sym);
         botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
         {
             // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，
@@ -3072,7 +3263,7 @@ void MainWindow::refreshLiveQuotes() {
             // 的 pct(0) 拷进参数，chg24Of 之后才执行，于是永远显示 +0.00%。
             // 引擎侧走的是另一条分支所以数据是对的，只有界面错，极难对上号
             double pct = 0; bool stale = false;
-            const bool has = chg24Of(b.cfg.symbol, pct, stale);
+            const bool has = chg24Of(sym, pct, stale);
             botTable_->setItem(i, 7, make_chg24_cell(has, pct));
         }
 
@@ -3207,13 +3398,24 @@ static QString bot_tp_hint(const CcgBot& b, bool floor_ok) {
 void MainWindow::refreshBotTable() {
     if (!engine_) { botTable_->setRowCount(0); return; }
 
-    auto bots = engine_->get_bots();
-    botTable_->setRowCount((int)bots.size());
-    // 行数变了就把键表整体作废——行与 bot 的对应关系已经错位
-    if (opRowKeys_.size() != bots.size()) opRowKeys_.assign(bots.size(), QString());
+    // 两套策略同表。两个 vector 必须【活到本函数结束】——rows 里存的是指向
+    // 它们元素的裸指针
+    auto bots     = engine_->get_bots();
+    auto sar_bots = sar_engine_ ? sar_engine_->get_bots() : std::vector<SarBot>{};
+    const auto rows = buildRows(bots, sar_bots);
 
-    int running = 0, cooling = 0, stopped = 0;
-    double total_unreal = 0, total_real = 0;
+    botTable_->setRowCount((int)rows.size());
+    // 行数变了就把键表整体作废——行与 bot 的对应关系已经错位
+    if (opRowKeys_.size() != rows.size()) opRowKeys_.assign(rows.size(), QString());
+
+    // 汇总累加器。下面 DCA 那一大段代码直接对这几个名字做 ++ 和 +=，所以这里
+    // 用引用别名接出来，让 fillSarRow 能往同一份数据里加，而不必把那段代码改一遍
+    RowTotals rt;
+    int&    running      = rt.running;
+    int&    cooling      = rt.cooling;
+    int&    stopped      = rt.stopped;
+    double& total_unreal = rt.unreal;
+    double& total_real   = rt.real;
 
     auto mkc = [](const QString& s, const QColor& c, int align = Qt::AlignCenter) {
         auto* it = new QTableWidgetItem(s);
@@ -3233,8 +3435,47 @@ void MainWindow::refreshBotTable() {
 
     int64_t now_ms = BookTickerStream::now_ms();
 
-    for (int i = 0; i < (int)bots.size(); ++i) {
-        const auto& b = bots[i];
+    for (int i = 0; i < (int)rows.size(); ++i) {
+        // ── 品种级列（6 标记价 / 7 24h涨跌 / 8 延迟）────────────────────────
+        // 这三列和策略无关，所以在分派之前就填掉，两种行共用一份代码。
+        // refreshLiveQuotes 每 100ms 会再刷一遍同样的三列，口径必须一致——
+        // 原先这段长在 DCA 的填充体里，SAR 行分派出去就拿不到它
+        const std::string& sym = rows[i].symbol;
+        const auto   tick      = ticker_ ? ticker_->get(sym) : BookTickerStream::Tick{};
+        const double tick_size = tickSizeOf(sym);
+        {
+            botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
+            // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，等于在一个
+            // 表达式内既通过引用【写】pct 又【读】pct，而 C++ 的函数实参求值顺序是
+            // 【未指定】的——MSVC 从右往左，先把还是初始值的 pct(0) 拷进参数，
+            // chg24Of 之后才执行，于是永远显示 +0.00%。引擎侧走的是另一条分支所以
+            // 数据是对的，只有界面错，极难对上号
+            double pct = 0; bool stale = false;
+            const bool has = chg24Of(sym, pct, stale);
+            botTable_->setItem(i, 7, make_chg24_cell(has, pct));
+
+            // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
+            // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
+            // 这一格显示绿色，引擎却已经在走 REST 兜底。健康指示器指错了对象，
+            // 这也是标记价那次故障全程没有任何征兆的原因
+            const int64_t latency = (tick.mark_ms > 0) ? (now_ms - tick.mark_ms) : -1;
+            // 阈值按 markPrice@1s 的节奏定：正常包龄在 0~1000ms 之间均匀分布，
+            // 用旧的 100/500ms 会一直显示红色。超过 3 秒说明丢了两三包，
+            // 超过 kStaleMs(10s) 引擎就当它断流转 REST 了
+            const QColor lat_c = (latency < 0)    ? QColor("#484f58")
+                               : (latency < 1500) ? QColor("#3fb950")
+                               : (latency < 3000) ? QColor("#d29922")
+                                                  : QColor("#f85149");
+            botTable_->setItem(i, 8,
+                mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
+        }
+
+        // SAR 行走另一套填充。它同样要往 rt 里加汇总，所以必须在 continue 之前
+        if (rows[i].kind == BotRow::Kind::Sar) {
+            fillSarRow(i, *rows[i].sar, rt);
+            continue;
+        }
+        const auto& b = *rows[i].dca;
 
         // 优先用交易所真实持仓（entry_price/unrealized_pnl/notional）展示，保证跟 App 里的数字
         // 完全一致；本地 entries/avg_price 只用于策略自身的加仓层级判断，不再是展示的准头
@@ -3455,35 +3696,6 @@ void MainWindow::refreshBotTable() {
         }
         botTable_->setItem(i, 5,  avg_item);
 
-        // 最新成交价 + 延迟：来自 WebSocket aggTrade 流，独立于策略引擎的 tick 价格
-        auto tick = ticker_ ? ticker_->get(b.cfg.symbol) : BookTickerStream::Tick{};
-        const double tick_size = tickSizeOf(b.cfg.symbol);
-        botTable_->setItem(i, 6,  make_mark_cell(tick, tick_size));
-        {
-            // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，
-            // 等于在一个表达式内既通过引用【写】pct 又【读】pct，而 C++ 的
-            // 函数实参求值顺序是【未指定】的——MSVC 从右往左，先把还是初始值
-            // 的 pct(0) 拷进参数，chg24Of 之后才执行，于是永远显示 +0.00%。
-            // 引擎侧走的是另一条分支所以数据是对的，只有界面错，极难对上号
-            double pct = 0; bool stale = false;
-            const bool has = chg24Of(b.cfg.symbol, pct, stale);
-            botTable_->setItem(i, 7, make_chg24_cell(has, pct));
-        }
-
-        // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
-        // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
-        // 这一格显示绿色，引擎却已经在走 REST 兜底。健康指示器指错了对象，
-        // 这也是标记价那次故障全程没有任何征兆的原因
-        int64_t latency = (tick.mark_ms > 0) ? (now_ms - tick.mark_ms) : -1;
-        // 阈值按 markPrice@1s 的节奏定：正常包龄在 0~1000ms 之间均匀分布，
-        // 用旧的 100/500ms 会一直显示红色。超过 3 秒说明丢了两三包，
-        // 超过 kStaleMs(10s) 引擎就当它断流转 REST 了
-        QColor lat_c = (latency < 0)    ? QColor("#484f58")
-                     : (latency < 1500) ? QColor("#3fb950")
-                     : (latency < 3000) ? QColor("#d29922")
-                                        : QColor("#f85149");
-        botTable_->setItem(i, 8,  mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
-
         botTable_->setItem(i, 9,  mkc(unr_s, unreal >= 0       ? QColor("#3fb950") : QColor("#f85149")));
 
         // 保证金 / 收益率：优先用交易所真实名义价值/杠杆算，没有真实持仓时退回本地估算
@@ -3567,12 +3779,18 @@ void MainWindow::refreshBotTable() {
         // 现在按"影响按钮外观/行为的状态"做键，键没变就原样留着不动。
         std::string bid  = b.bot_id;
         bool        is_stopped = (b.state == CcgBot::State::Stopped);
-        const QString opKey = QString("%1|%2|%3")
+        // 键里必须带策略标记：同一个行号从 DCA 换成 SAR（或反过来）时，按钮组
+        // 要整套重建，否则会留着上一套策略的按钮去操作一个已经不存在的 bot
+        const QString opKey = QString("dca|%1|%2|%3")
             .arg(QString::fromStdString(bid))
             .arg(is_stopped ? 1 : 0)
             .arg(b.entries.empty() ? 0 : 1);   // 平仓按钮的可用性只取决于有没有持仓
+        // ⚠ 这里查的必须是【操作列 15】。v4.0.15 插入「24h涨跌」后各列后移，
+        //   这个判断漏改，一直在查 14（状态列）——而状态列放的是 QTableWidgetItem，
+        //   cellWidget 恒为 nullptr，于是整个条件恒假，按钮照旧每 3 秒全量重建，
+        //   它本来要修的"点击被刷新吞掉"从未真正修好
         if (i < (int)opRowKeys_.size() && opRowKeys_[i] == opKey
-            && botTable_->cellWidget(i, 14) != nullptr) {
+            && botTable_->cellWidget(i, 15) != nullptr) {
             continue;   // 本行按钮无需变动，跳过重建（后面没有别的列了）
         }
 

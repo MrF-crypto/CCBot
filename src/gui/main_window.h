@@ -19,6 +19,10 @@
 #include <vector>
 #include <set>
 
+// 只在成员函数签名里出现，前向声明即可——不为一个指针类型把整个 QtWidgets
+// 头拖进每个包含 main_window.h 的翻译单元
+class QVBoxLayout;
+
 #include "core/ccg_engine.h"
 #include "core/sar_engine.h"
 #include "core/funding_ledger.h"
@@ -38,6 +42,39 @@ inline constexpr int    kLogMaxLines   = 3000;    // 日志框保留行数
 inline constexpr size_t kMaxTrades     = 20000;   // 内存/落盘保留的成交记录条数
 inline constexpr int    kTradeSaveMinMs = 3000;   // 成交落盘的最小间隔（合并密集平仓）
 
+// ── 一张表容纳两套策略 ───────────────────────────────────────────────────────
+// v4.5.0 起 DCA 与 SAR 合并进同一张监控表（原先是两个标签页）。合并只发生在
+// 【界面层】：两个引擎各自照原样持有自己的 bot、各自落盘自己的文件，这里只是把
+// 两边的 bot 排成一个行序列给表格用。
+//
+// 这么做的代价是列语义要跨策略复用（层进度↔金字塔档数、均价↔开仓价、
+// 强平价↔止损线）；换来的是"一个品种一套策略"从【4 处手写检查】变成配置弹窗里
+// 单选框的天然性质。
+struct BotRow {
+    enum class Kind { Dca, Sar };
+    Kind        kind = Kind::Dca;
+    std::string bot_id;
+    std::string symbol;
+    // 排序键：先品种字典序，再 _B(0) < _L(1) < _S(2) < SAR(3)。
+    // 前三档刻意和 CcgEngine 的 bot_id 后缀字典序一致——DCA 的 bot 装在
+    // std::map 里本来就是这个顺序，所以现有用户看到的行序一行都不会变
+    int         sort_key = 0;
+    const CcgBot* dca = nullptr;   // kind==Dca 时有效
+    const SarBot* sar = nullptr;   // kind==Sar 时有效
+};
+
+// 表格底部汇总行的累加器。两种行都要往里加，所以提成一个结构体传引用——
+// 否则 fillSarRow 要么返回一个五元组，要么把汇总算两遍
+struct RowTotals {
+    int    running = 0, cooling = 0, stopped = 0;
+    double unreal  = 0, real    = 0;
+};
+
+// SAR 配置表单的控件集合。定义在 sar_panel.cpp —— main_window.cpp 只需要能
+// 持有并传递它，不需要知道里面有哪些控件（那是 30 多个指针，摊到头文件里
+// 只会让每次改一个 spinbox 都触发全量重编）
+struct SarFormWidgets;
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -53,7 +90,6 @@ private slots:
     void onClearStopped();
     void onTick();
     void refreshBotTable();
-    void refreshSarTable();
     void refreshLiveQuotes();
     void refreshPositions();
     void onWatchlistContextMenu(const QPoint& pos);
@@ -67,15 +103,24 @@ private:
     void log(const QString& msg, const QString& level = "INFO");
     void run_async(std::function<void()> fn);
 
-    // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）
+    // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）。
+    // 弹窗顶部可选策略：网格 DCA / 趋势 SAR，下面的表单整片切换
     void openStrategyDialog(const std::string& symbol);
 
-    // ── SAR 趋势跟随（与 DCA 并列的第二套策略，界面上是第二个标签页）────────
-    // 品种右键 → SAR 策略配置弹窗（新建或编辑已存在的都走这里）
-    QWidget* buildSarTab();
-    void openSarDialog(const std::string& symbol);
-    void onSarContextMenu(const QPoint& pos);
-    void onAddSarSymbol();
+    // 两个引擎的 bot 合成一个行序列。vector 由【调用方持有】——BotRow 里存的是
+    // 裸指针，若在这里构造临时 vector 再返回，指针立刻悬空
+    std::vector<BotRow> buildRows(const std::vector<CcgBot>& dca,
+                                  const std::vector<SarBot>& sar) const;
+
+    // ── SAR 趋势跟随（与 DCA 并列的第二套策略，现已同表显示）────────────────
+    // 把一行填成 SAR 行。列位复用 DCA 的 16 列，语义映射见函数体里的对照表
+    void fillSarRow(int row, const SarBot& b, RowTotals& t);
+    // SAR 表单的构建与回读。拆成两半是为了让 openStrategyDialog 能把表单嵌进
+    // 自己的分页里，而不用把 30 多个控件的构造逻辑复制一份
+    std::shared_ptr<SarFormWidgets> buildSarForm(QVBoxLayout* into, const SarConfig& c);
+    bool collectSarForm(const std::shared_ptr<SarFormWidgets>& w, SarConfig& out);
+    // 校验 + 落地（建/改 bot、订阅行情、落盘）。返回 false = 已向用户报错且未改动
+    bool applySarConfig(SarConfig c, const SarBot* existing);
     std::string sar_cfg_path()   const;   // 配置与运行时状态同一个文件
     void save_sar_bots();          // 配置 + 运行时状态一起落盘
     void load_and_restore_sar();
@@ -170,12 +215,8 @@ private:
     QLineEdit*    addSymbolEdit_   = nullptr;
 
     // ── 实盘监控表（右键品种 → 策略配置弹窗）──
+    // DCA 与 SAR 同表。行序由 buildRows() 决定，与两个引擎的 bot 一一对应
     QTableWidget* botTable_    = nullptr;
-    // ── SAR 表 ──
-    QTableWidget* sarTable_     = nullptr;
-    QLabel*       sarSummary_   = nullptr;
-    QLineEdit*    addSarEdit_   = nullptr;
-    std::vector<QString> sarOpRowKeys_;   // 操作列重建键，同 opRowKeys_
     QLabel*       summaryLabel_ = nullptr;
     // 操作列按钮的重建键：键没变就不重建控件（避免点击被刷新吞掉）
     std::vector<QString> opRowKeys_;

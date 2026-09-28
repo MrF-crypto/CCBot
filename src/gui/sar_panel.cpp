@@ -1,45 +1,36 @@
-// MainWindow 的 SAR 标签页：构建、刷新、配置弹窗、持久化。
+// MainWindow 的 SAR 部分：行序、同表行填充、配置表单、落地、持久化。
 //
 // 单独一个翻译单元，不塞进 main_window.cpp——那个文件已经 3800+ 行，
-// 而且是本项目历史上几乎每一个 GUI bug 的出处。SAR 的界面代码与 DCA 的
-// 完全没有共享状态，没有理由再往里堆。
+// 而且是本项目历史上几乎每一个 GUI bug 的出处。
+//
+// v4.5.0 起 SAR 不再有自己的标签页和表格，与 DCA 共用 botTable_ 的 16 列。
+// 合并只发生在【界面层】：两个引擎各自照原样持有自己的 bot、各自落盘自己的
+// 文件（bots.json / sar_bots.json），这里只负责把 SAR 的 bot 画进那张表。
 #include "gui/main_window.h"
 
 #include <QCheckBox>
 #include <QComboBox>
-#include <QDialog>
-#include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFile>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
-#include <QHeaderView>
-#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
-#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSaveFile>
-#include <QScrollArea>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <cmath>
 
 namespace ccg {
 
 namespace {
-
-// 表格列。和 DCA 那张表刻意不对齐：SAR 没有层、没有均价、没有强平价
-// （名义仓位远小于权益，强平价没有意义），而止损线和它离现价多远才是全部
-enum SarCol {
-    C_IDX = 0, C_SYM, C_DIR, C_STATE, C_ATR, C_ENTRY, C_MARK,
-    C_STOP, C_DIST, C_UPNL, C_REAL, C_WIN, C_REV, C_DECISION, C_OP,
-    C_COUNT
-};
 
 QTableWidgetItem* mk(const QString& text, const QString& color = QString()) {
     auto* it = new QTableWidgetItem(text);
@@ -56,523 +47,668 @@ QString fmt_px(double v) {
     return QString::number(v, 'f', prec);
 }
 
+// 两位小数带正负号，用于盈亏列
+QString fmt_signed(double v) {
+    return QString("%1%2").arg(v >= 0 ? "+" : "").arg(v, 0, 'f', 2);
+}
+
+const char* kGreen = "#3fb950";
+const char* kRed   = "#f85149";
+const char* kGrey  = "#8b949e";
+const char* kAmber = "#d29922";
+const char* kBlue  = "#58a6ff";
+
+QString pnl_color(double v) {
+    return v > 0 ? kGreen : v < 0 ? kRed : kGrey;
+}
+
 } // namespace
 
-QWidget* MainWindow::buildSarTab() {
-    auto* w  = new QWidget();
-    auto* v  = new QVBoxLayout(w);
-    v->setSpacing(4);
+// ─────────────────────────────────────────────────────────────────────────────
+// 行序
+// ─────────────────────────────────────────────────────────────────────────────
+// 排序键刻意让 DCA 的行序【一行都不变】：CcgEngine 的 bot_id 形如
+// "BTCUSDT_L_3"，装在 std::map 里本来就是按 (品种字典序, 后缀 _B<_L<_S) 排的。
+// 这里用同一个口径，再把 SAR 排在同品种 DCA 之后（sort_key=3）——同一个品种只
+// 可能属于一套策略，所以这一档实际上永远不会和前三档同时出现，写成 3 只是为了
+// 让"万一真出现了"的顺序也是确定的，而不是取决于哈希或插入顺序。
+std::vector<BotRow> MainWindow::buildRows(const std::vector<CcgBot>& dca,
+                                          const std::vector<SarBot>& sar) const {
+    std::vector<BotRow> rows;
+    rows.reserve(dca.size() + sar.size());
 
-    // 加品种行
-    {
-        auto* row = new QHBoxLayout();
-        addSarEdit_ = new QLineEdit();
-        addSarEdit_->setPlaceholderText("品种代码，如 BTCUSDT");
-        addSarEdit_->setMaximumWidth(200);
-        connect(addSarEdit_, &QLineEdit::returnPressed, this, &MainWindow::onAddSarSymbol);
-        row->addWidget(addSarEdit_);
-
-        auto* btnAdd = new QPushButton("添加 SAR 品种");
-        btnAdd->setStyleSheet("QPushButton{padding:3px 10px;}");
-        connect(btnAdd, &QPushButton::clicked, this, &MainWindow::onAddSarSymbol);
-        row->addWidget(btnAdd);
-        row->addStretch(1);
-        v->addLayout(row);
+    for (const auto& b : dca) {
+        BotRow r;
+        r.kind     = BotRow::Kind::Dca;
+        r.bot_id   = b.bot_id;
+        r.symbol   = b.cfg.symbol;
+        r.sort_key = (b.cfg.direction == CcgConfig::Direction::Both)  ? 0
+                   : (b.cfg.direction == CcgConfig::Direction::Long)  ? 1
+                                                                      : 2;
+        r.dca      = &b;
+        rows.push_back(r);
+    }
+    for (const auto& b : sar) {
+        BotRow r;
+        r.kind     = BotRow::Kind::Sar;
+        r.bot_id   = b.bot_id;
+        r.symbol   = b.cfg.symbol;
+        r.sort_key = 3;
+        r.sar      = &b;
+        rows.push_back(r);
     }
 
-    sarSummary_ = new QLabel("运行中: 0   持仓: 0   |   浮动: $0.00   已实现: $0.00");
-    sarSummary_->setStyleSheet(
-        "QLabel{color:#8b949e;font-size:11px;padding:4px 8px;"
-        "background:#161b22;border:1px solid #21262d;border-radius:3px;}");
-    v->addWidget(sarSummary_);
-
-    auto* hint = new QLabel(
-        "趋势跟随 + 止损反转  (右键品种进行策略配置)　"
-        "—— 唐奇安通道突破入场，ATR 追踪止损出场，无固定止盈");
-    hint->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding:2px 0;");
-    v->addWidget(hint);
-
-    sarTable_ = new QTableWidget(0, C_COUNT);
-    sarTable_->setHorizontalHeaderLabels(
-        {"#", "品种", "方向", "状态", "ATR", "开仓价", "标记价",
-         "止损线", "距离", "浮动P&L", "已实现", "胜率", "反手", "决策", "操作"});
-    auto* hdr = sarTable_->horizontalHeader();
-    hdr->setSectionResizeMode(QHeaderView::Stretch);
-    for (int c : {C_IDX, C_DIR, C_ATR, C_DIST, C_WIN, C_REV})
-        hdr->setSectionResizeMode(c, QHeaderView::Fixed);
-    hdr->resizeSection(C_IDX, 26);
-    hdr->resizeSection(C_DIR, 44);
-    hdr->resizeSection(C_ATR, 62);
-    hdr->resizeSection(C_DIST, 60);
-    hdr->resizeSection(C_WIN, 64);
-    hdr->resizeSection(C_REV, 44);
-    hdr->setSectionResizeMode(C_DECISION, QHeaderView::Stretch);
-    hdr->setSectionResizeMode(C_OP, QHeaderView::Fixed);
-    hdr->resizeSection(C_OP, 150);
-
-    sarTable_->verticalHeader()->setVisible(false);
-    sarTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    sarTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    sarTable_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    sarTable_->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(sarTable_, &QTableWidget::customContextMenuRequested,
-            this, &MainWindow::onSarContextMenu);
-    v->addWidget(sarTable_, 1);
-
-    return w;
+    // stable_sort 而不是 sort：同品种同 sort_key（只可能是同品种两个 _L，不该
+    // 发生但引擎不禁止）时保持引擎给出的原顺序，避免行在两次刷新间无故换位——
+    // 换位会让正在点的按钮跑到别的 bot 上
+    std::stable_sort(rows.begin(), rows.end(), [](const BotRow& a, const BotRow& b) {
+        if (a.symbol != b.symbol) return a.symbol < b.symbol;
+        return a.sort_key < b.sort_key;
+    });
+    return rows;
 }
 
-void MainWindow::refreshSarTable() {
-    if (!sarTable_) return;
-    if (!sar_engine_) {
-        sarTable_->setRowCount(0);
-        sarOpRowKeys_.clear();
+// ─────────────────────────────────────────────────────────────────────────────
+// SAR 行填充
+// ─────────────────────────────────────────────────────────────────────────────
+// 列位复用 DCA 的 16 列。对照表（6/7/8 由调用方在分派前统一填好，这里不碰）：
+//
+//   列          DCA 的含义        SAR 放什么            同义?
+//   ──────────────────────────────────────────────────────────────────────────
+//   2 方向      配置(多/空/双向)  运行时持仓方向        ✗ 语义不同
+//   3 策略      加仓曲线          SAR·模式名            ✗ 改为"策略·参数"
+//   4 层进度    已开层/总层       金字塔档数            ≈
+//   5 均价      持仓均价          开仓价                ✓
+//   9 浮动P&L   同                同                    ✓
+//  10 保证金    同                同                    ✓
+//  11 收益率    同                同                    ✓
+//  12 强平/止损 强平价            追踪止损线            ✗ 列头已改名
+//  13 已实现    同                同                    ✓
+//  14 状态      同                同                    ✓
+//
+// SAR 独有的 ATR 数据灯、胜率、连续反手、决策文字没有对应列位，全部收进悬停：
+// ATR 灯 → 状态列，胜率与反手 → 已实现列，决策文字 → 状态列。
+void MainWindow::fillSarRow(int row, const SarBot& b, RowTotals& t) {
+    const bool is_long = (b.st.pos == sar::Pos::Long);
+    const bool has_pos = (b.st.pos != sar::Pos::Flat && b.qty > 0);
+    const bool stopped = (b.state == SarBot::State::Stopped);
+
+    double upnl = 0;
+    if (has_pos && b.current_price > 0)
+        upnl = (b.current_price - b.st.entry_price) * b.qty * (is_long ? 1.0 : -1.0);
+
+    // 汇总。DCA 那边的三分法是 运行中/冷却中/已停止，这里对齐同一口径：
+    // SAR 的 State 只有 Running/Stopped，"冷却"体现在 cooldown_left 上
+    t.unreal += upnl;
+    t.real   += b.realized_pnl;
+    if (stopped)                     ++t.stopped;
+    else if (b.st.cooldown_left > 0) ++t.cooling;
+    else                             ++t.running;
+
+    // ── 0 # ──
+    botTable_->setItem(row, 0, mk(QString::number(row + 1), kGrey));
+
+    // ── 1 品种 ──
+    botTable_->setItem(row, 1, mk(QString::fromStdString(b.cfg.symbol)));
+
+    // ── 2 方向 ──
+    // ⚠ 与 DCA 不同义。DCA 那列是【配置】（你选的多/空/双向），SAR 的配置里
+    //   根本没有方向——两个方向都由信号决定，所以这里只能显示【当前持仓方向】。
+    //   空仓时显示"空仓"而不是"—"，好让这个差别在界面上看得出来
+    auto* dir_it = mk(has_pos ? (is_long ? "多" : "空") : "空仓",
+                      has_pos ? (is_long ? kGreen : kRed) : kGrey);
+    dir_it->setToolTip("趋势 SAR 没有方向配置：上破做多、下破做空由信号决定。\n"
+                       "这一格显示的是【当前持仓方向】，不是配置。");
+    botTable_->setItem(row, 2, dir_it);
+
+    // ── 3 策略 ──
+    const bool bar_mode = (b.cfg.rule.mode == sar::Mode::BarPattern);
+    auto* strat_it = mk(bar_mode ? "SAR·裸K线" : "SAR·唐奇安", kBlue);
+    {
+        QString tip = QString("趋势 SAR —— %1\n信号周期 %2\n")
+                          .arg(bar_mode ? "裸K线入场 + 摆动止损"
+                                        : "唐奇安突破入场 + ATR 追踪止损")
+                          .arg(QString::fromStdString(b.cfg.interval));
+        if (bar_mode)
+            tip += QString("摆动止损根数 N=%1（信号根不算在内）\n")
+                       .arg(b.cfg.rule.swing_bars);
+        else
+            tip += QString("通道周期 %1 / ATR 周期 %2 / k=%3\n")
+                       .arg(b.cfg.rule.donchian_period)
+                       .arg(b.cfg.rule.atr_period)
+                       .arg(b.cfg.rule.atr_mult, 0, 'f', 1);
+        tip += (b.cfg.size_mode == SarConfig::SizeMode::RiskBased)
+                   ? QString("仓位：按 ATR 等风险，单次愿亏 %1U（名义上限 %2U）\n")
+                         .arg(b.cfg.risk_usdt, 0, 'f', 2).arg(b.cfg.budget_usdt, 0, 'f', 0)
+                   : QString("仓位：固定名义 %1U\n").arg(b.cfg.budget_usdt, 0, 'f', 0);
+        tip += QString("杠杆 %1x　反手：%2")
+                   .arg(b.cfg.leverage)
+                   .arg(!b.cfg.rule.allow_reverse ? "关闭"
+                        : b.cfg.rule.reverse_needs_signal ? "需反向信号" : "无条件");
+        strat_it->setToolTip(tip);
+    }
+    botTable_->setItem(row, 3, strat_it);
+
+    // ── 4 层进度 → 金字塔档数 ──
+    // 持 3 档和持 1 档的敞口差 3 倍，不显示的话看不出这个仓位到底压了多重
+    QString tier = "—";
+    if (has_pos && b.cfg.rule.pyramid_max_adds > 0)
+        tier = QString("%1/%2").arg(b.st.adds_done + 1)
+                               .arg(b.cfg.rule.pyramid_max_adds + 1);
+    else if (has_pos)
+        tier = "1";
+    // 加到 2 档以上就标黄：敞口已经不是首档那一份了，值得看见
+    auto* tier_it = mk(tier, (has_pos && b.st.adds_done > 0) ? kAmber : kGrey);
+    if (has_pos && b.cfg.rule.pyramid_max_adds > 0)
+        tier_it->setToolTip(QString("金字塔加仓：已到第 %1 档（首档 + %2 次加仓），"
+                                    "最多 %3 档\n每朝有利方向走 %4×ATR 加一档")
+                                .arg(b.st.adds_done + 1).arg(b.st.adds_done)
+                                .arg(b.cfg.rule.pyramid_max_adds + 1)
+                                .arg(b.cfg.rule.pyramid_step_atr, 0, 'f', 2));
+    else
+        tier_it->setToolTip("趋势 SAR 没有分层摊薄。这一格显示金字塔【顺势】加仓的档数，\n"
+                            "方向与 DCA 的补仓相反：DCA 是跌了加，这里是涨了加。\n"
+                            "未开启顺势加仓时显示 —。");
+    botTable_->setItem(row, 4, tier_it);
+
+    // ── 5 均价 → 开仓价 ──
+    auto* entry_it = mk(has_pos ? fmt_px(b.st.entry_price) : "—");
+    if (has_pos)
+        entry_it->setToolTip(b.st.adds_done > 0
+            ? "开仓价（已按数量加权的均价——加过仓，所以不是首档的成交价）"
+            : "开仓价");
+    botTable_->setItem(row, 5, entry_it);
+
+    // ── 9 浮动P&L ──
+    botTable_->setItem(row, 9,
+        mk(has_pos ? fmt_signed(upnl) : "—", pnl_color(upnl)));
+
+    // ── 10 保证金 / 11 收益率 ──
+    double margin = 0, roe = 0;
+    if (has_pos && b.current_price > 0 && b.cfg.leverage > 0) {
+        margin = b.current_price * b.qty / b.cfg.leverage;
+        if (margin > 0) roe = upnl / margin * 100.0;
+    }
+    botTable_->setItem(row, 10,
+        mk(margin > 0 ? QString("$%1").arg(margin, 0, 'f', 2) : "—", kGrey));
+    auto* roe_it = mk(margin > 0 ? QString("%1%").arg(roe, 0, 'f', 2) : "—",
+                      pnl_color(margin > 0 ? roe : 0));
+    if (margin > 0)
+        roe_it->setToolTip(QString("浮动盈亏 $%1 / 保证金 $%2（已按 %3x 杠杆放大）\n\n"
+                                   "趋势 SAR 没有固定止盈：收益全来自少数跑得很远的单子，\n"
+                                   "所以这个数没有「该止盈了」的阈值，只看止损线跟到哪。")
+                              .arg(upnl, 0, 'f', 2).arg(margin, 0, 'f', 2)
+                              .arg(b.cfg.leverage));
+    botTable_->setItem(row, 11, roe_it);
+
+    // ── 12 强平/止损 → 追踪止损线 ──
+    // 这是持仓时最该盯的一格：止损线越过成本价 = 这笔已锁定盈利，转绿。
+    // 距离（现价离线还有多远，也就是"现在被打掉会亏/赚多少"）放悬停
+    QString stop_s = "—";
+    QString stop_c = kAmber;
+    QString stop_tip;
+    if (has_pos && b.st.stop > 0) {
+        const bool locked = is_long ? (b.st.stop >= b.st.entry_price)
+                                    : (b.st.stop <= b.st.entry_price);
+        stop_s = fmt_px(b.st.stop);
+        stop_c = locked ? kGreen : kAmber;
+        stop_tip = QString("追踪止损线 %1（棘轮，只朝有利方向移动）\n").arg(stop_s);
+        if (b.current_price > 0) {
+            const double d = std::fabs(b.current_price - b.st.stop) / b.current_price * 100.0;
+            stop_tip += QString("距离 %1%　—— 现在被打掉就按这条线出场\n")
+                            .arg(d, 0, 'f', 2);
+        }
+        stop_tip += locked
+            ? "✓ 线已越过成本价：这笔已锁定盈利，最坏情况也是赚"
+            : "线还在成本价的亏损侧：被打掉是亏损出场，可能触发反手";
+    } else if (!has_pos) {
+        stop_tip = "空仓时没有止损线——没有仓位就没有保护。\n"
+                   "这一列对 DCA 行显示强平价，对 SAR 行显示追踪止损线。";
+    }
+    auto* stop_it = mk(stop_s, stop_c);
+    stop_it->setToolTip(stop_tip);
+    botTable_->setItem(row, 12, stop_it);
+
+    // ── 13 已实现（悬停带胜率与连续反手）──
+    auto* real_it = mk(fmt_signed(b.realized_pnl), pnl_color(b.realized_pnl));
+    {
+        QString tip = QString("已实现盈亏 %1U\n").arg(fmt_signed(b.realized_pnl));
+        // 胜率：趋势跟随天然只有 30~40%，低不代表策略坏了。分子分母都摆出来，
+        // 免得只看一个百分比就急着改参数
+        if (b.trade_count > 0)
+            tip += QString("胜率 %1/%2（%3%）—— 趋势跟随天然只有 30~40%，"
+                           "低不代表策略坏了\n")
+                       .arg(b.win_count).arg(b.trade_count)
+                       .arg(100.0 * b.win_count / b.trade_count, 0, 'f', 0);
+        else
+            tip += "尚无成交\n";
+        tip += QString("连续反手 %1/%2")
+                   .arg(b.st.consec_reverses).arg(b.cfg.rule.max_consecutive_reverses);
+        if (b.st.consec_reverses >= b.cfg.rule.max_consecutive_reverses &&
+            b.cfg.rule.max_consecutive_reverses > 0)
+            tip += "（已到上限，下次亏损出场将转冷却）";
+        else if (b.st.consec_reverses >= 2)
+            tip += "　⚠ 连续反手本身就是「现在是震荡市」的信号";
+        real_it->setToolTip(tip);
+    }
+    botTable_->setItem(row, 13, real_it);
+
+    // ── 14 状态（悬停带决策文字 + ATR 数据灯）──
+    QString st_s = stopped        ? "已停止"
+                 : b.pending      ? "下单中"
+                 : has_pos        ? "持仓中"
+                 : (b.st.cooldown_left > 0)
+                       ? QString("冷却%1根").arg(b.st.cooldown_left)
+                       : "等信号";
+    QString st_c = stopped ? kRed : has_pos ? kBlue : kGrey;
+
+    // ATR 数据灯：原先是独立一列，合表后并进状态列。
+    // ⚠ 这盏灯的含义【随模式而变】——裸K线模式的止损是摆动低点，与 ATR 无关，
+    //   没有 ATR 照样开仓（引擎侧 data_ready 对这个模式只看K线）。原先那一列的
+    //   提示写死"没有 ATR 就没有止损线、引擎不会开新仓"，在裸K线模式下是假话
+    const bool data_missing = bar_mode ? !b.bar_ok : !(b.atr_pct > 0);
+    if (data_missing && !stopped) {
+        st_s += " ⚠";
+        st_c  = kAmber;
+    }
+    auto* st_it = mk(st_s, st_c);
+    {
+        QString tip = QString::fromStdString(b.last_decision);
+        if (tip.isEmpty()) tip = "尚未产生决策";
+        tip += "\n\n";
+        if (!b.last_action.empty())
+            tip += QString("最近动作：%1\n").arg(QString::fromStdString(b.last_action));
+        if (data_missing) {
+            tip += bar_mode
+                ? "⚠ 摆动窗口未就绪：K 线还没拉到，算不出止损线，引擎不会开新仓。\n"
+                  "（裸K线模式不需要 ATR，所以 ATR 缺失不影响它）\n"
+                : "⚠ 尚未拉到 K 线：没有 ATR 就没有止损线，引擎不会开新仓。\n";
+            tip += "刚添加的品种最多等一个信号周期；持续如此请看日志里的"
+                   "「SAR 信号拉取失败」告警";
+        } else if (b.atr_pct > 0) {
+            tip += QString("%1 周期 ATR = %2%（跨品种可比口径）")
+                       .arg(QString::fromStdString(b.cfg.interval))
+                       .arg(b.atr_pct, 0, 'f', 2);
+            // k×ATR 只在唐奇安模式下【就是】止损距离；裸K线模式的止损是摆动
+            // 低点，把 k×ATR 说成止损距离是假数
+            if (!bar_mode)
+                tip += QString("\n当前 k=%1 ⇒ 止损距离约 %2%")
+                           .arg(b.cfg.rule.atr_mult, 0, 'f', 1)
+                           .arg(b.atr_pct * b.cfg.rule.atr_mult, 0, 'f', 1);
+        }
+        st_it->setToolTip(tip);
+    }
+    botTable_->setItem(row, 14, st_it);
+
+    // ── 15 操作 ──
+    // 键没变就不重建控件，否则每 3 秒重建一次会把点击吞掉。
+    // 键里必须带 "sar|" 前缀：同一个行号从 DCA 换成 SAR 时按钮组要整套重建
+    const QString opKey = QString("sar|%1|%2|%3|%4")
+                              .arg(QString::fromStdString(b.bot_id))
+                              .arg((int)b.state).arg(has_pos).arg(b.pending);
+    if (row < (int)opRowKeys_.size() && opRowKeys_[row] == opKey
+        && botTable_->cellWidget(row, 15) != nullptr) {
         return;
     }
+    if (row < (int)opRowKeys_.size()) opRowKeys_[row] = opKey;
 
-    auto bots = sar_engine_->get_bots();
-    if ((int)bots.size() != sarTable_->rowCount()) {
-        sarTable_->setRowCount((int)bots.size());
-        sarOpRowKeys_.assign(bots.size(), QString());
-    }
+    auto* opw = new QWidget();
+    auto* opl = new QHBoxLayout(opw);
+    opl->setContentsMargins(3, 1, 3, 1);
+    opl->setSpacing(4);
+    const std::string id  = b.bot_id;
+    const QString     sym = QString::fromStdString(b.cfg.symbol);
 
-    int running = 0, holding = 0;
-    double total_upnl = 0, total_real = 0;
-
-    for (int i = 0; i < (int)bots.size(); ++i) {
-        const auto& b = bots[i];
-        const bool is_long = (b.st.pos == sar::Pos::Long);
-        const bool has_pos = (b.st.pos != sar::Pos::Flat && b.qty > 0);
-        if (b.state == SarBot::State::Running) ++running;
-        if (has_pos) ++holding;
-
-        double upnl = 0;
-        if (has_pos && b.current_price > 0)
-            upnl = (b.current_price - b.st.entry_price) * b.qty * (is_long ? 1.0 : -1.0);
-        total_upnl += upnl;
-        total_real += b.realized_pnl;
-
-        sarTable_->setItem(i, C_IDX, mk(QString::number(i + 1)));
-        sarTable_->setItem(i, C_SYM, mk(QString::fromStdString(b.cfg.symbol)));
-        // 方向列带上金字塔档数：持 3 档和持 1 档的敞口差 3 倍，
-        // 不显示的话你看不出这个仓位到底压了多重
-        QString dir_txt = has_pos ? (is_long ? "多" : "空") : "—";
-        if (has_pos && b.cfg.rule.pyramid_max_adds > 0)
-            dir_txt += QString("×%1").arg(b.st.adds_done + 1);
-        auto* dir_it = mk(dir_txt,
-                          has_pos ? (is_long ? "#3fb950" : "#f85149") : "#8b949e");
-        if (has_pos && b.cfg.rule.pyramid_max_adds > 0)
-            dir_it->setToolTip(QString("已加到 %1/%2 档（首档 + %3 次加仓）")
-                                   .arg(b.st.adds_done + 1)
-                                   .arg(b.cfg.rule.pyramid_max_adds + 1)
-                                   .arg(b.st.adds_done));
-        sarTable_->setItem(i, C_DIR, dir_it);
-
-        QString st = (b.state == SarBot::State::Stopped) ? "已停止"
-                   : b.pending                            ? "下单中"
-                   : has_pos                              ? "持仓中"
-                   : (b.st.cooldown_left > 0)             ? "冷却中"
-                                                          : "等信号";
-        sarTable_->setItem(i, C_STATE,
-            mk(st, b.state == SarBot::State::Stopped ? "#f85149"
-                 : has_pos                           ? "#58a6ff" : "#8b949e"));
-
-        // ATR 列同时是"信号到没到"的指示灯：显示 — 就是这个品种的 K 线没拉到，
-        // 而没有 ATR 就没有止损线，引擎绝不会开新仓。这一列存在的全部理由，
-        // 就是让"等信号"和"拉不到数据"在界面上长得不一样
-        auto* atr_it = mk(b.atr_pct > 0 ? QString::number(b.atr_pct, 'f', 2) + "%" : "—",
-                          b.atr_pct > 0 ? "#8b949e" : "#f85149");
-        if (b.atr_pct > 0) {
-            atr_it->setToolTip(
-                QString("%1 周期 ATR = %2%（跨品种可比口径）\n"
-                        "当前 k=%3 ⇒ 止损距离约 %4%")
-                    .arg(QString::fromStdString(b.cfg.interval))
-                    .arg(b.atr_pct, 0, 'f', 2)
-                    .arg(b.cfg.rule.atr_mult, 0, 'f', 1)
-                    .arg(b.atr_pct * b.cfg.rule.atr_mult, 0, 'f', 1));
-        } else {
-            atr_it->setToolTip("尚未拉到 K 线数据。没有 ATR 就没有止损线，"
-                               "引擎不会开新仓。\n"
-                               "刚添加的品种最多等 60 秒；持续显示 — 请看日志里的"
-                               "「SAR 信号拉取失败」告警");
-        }
-        sarTable_->setItem(i, C_ATR, atr_it);
-
-        sarTable_->setItem(i, C_ENTRY, mk(has_pos ? fmt_px(b.st.entry_price) : "—"));
-        sarTable_->setItem(i, C_MARK,  mk(fmt_px(b.current_price)));
-        sarTable_->setItem(i, C_STOP,  mk(has_pos ? fmt_px(b.st.stop) : "—", "#d29922"));
-
-        // 距离：现价离止损线还有多远。这是持仓时最该盯的一个数——
-        // 它就是"现在被打掉会亏/赚多少"
-        QString dist = "—";
-        QString dist_col = "#8b949e";
-        if (has_pos && b.current_price > 0 && b.st.stop > 0) {
-            const double d = std::fabs(b.current_price - b.st.stop) / b.current_price * 100.0;
-            dist = QString::number(d, 'f', 2) + "%";
-            // 止损线已经越过成本价 = 这笔单子已经锁定盈利，绿色标出来
-            const bool locked = is_long ? (b.st.stop >= b.st.entry_price)
-                                        : (b.st.stop <= b.st.entry_price);
-            dist_col = locked ? "#3fb950" : "#8b949e";
-        }
-        sarTable_->setItem(i, C_DIST, mk(dist, dist_col));
-
-        sarTable_->setItem(i, C_UPNL,
-            mk(has_pos ? QString("%1%2").arg(upnl >= 0 ? "+" : "").arg(upnl, 0, 'f', 2) : "—",
-               upnl > 0 ? "#3fb950" : upnl < 0 ? "#f85149" : "#8b949e"));
-        sarTable_->setItem(i, C_REAL,
-            mk(QString("%1%2").arg(b.realized_pnl >= 0 ? "+" : "").arg(b.realized_pnl, 0, 'f', 2),
-               b.realized_pnl > 0 ? "#3fb950" : b.realized_pnl < 0 ? "#f85149" : "#8b949e"));
-
-        // 胜率：趋势跟随天然只有 30~40%，低不代表策略坏了。把分子分母都摆出来，
-        // 免得只看一个百分比就急着改参数
-        QString win = "—";
-        if (b.trade_count > 0)
-            win = QString("%1/%2").arg(b.win_count).arg(b.trade_count);
-        sarTable_->setItem(i, C_WIN, mk(win));
-        sarTable_->setItem(i, C_REV,
-            mk(b.st.consec_reverses > 0 ? QString::number(b.st.consec_reverses) : "—",
-               b.st.consec_reverses >= 2 ? "#d29922" : "#8b949e"));
-
-        auto* dec = mk(QString::fromStdString(b.last_decision));
-        dec->setTextAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        dec->setToolTip(QString::fromStdString(b.last_action));
-        sarTable_->setItem(i, C_DECISION, dec);
-
-        // 操作列：键没变就不重建控件，否则每 3 秒重建一次会把点击吞掉
-        const QString key = QString("%1|%2|%3|%4")
-                                .arg(QString::fromStdString(b.bot_id))
-                                .arg((int)b.state).arg(has_pos).arg(b.pending);
-        if (i < (int)sarOpRowKeys_.size() && sarOpRowKeys_[i] == key) continue;
-        if (i < (int)sarOpRowKeys_.size()) sarOpRowKeys_[i] = key;
-
-        auto* opw = new QWidget();
-        auto* opl = new QHBoxLayout(opw);
-        opl->setContentsMargins(2, 0, 2, 0);
-        opl->setSpacing(3);
-        const std::string id = b.bot_id;
-
-        if (b.state == SarBot::State::Running) {
-            auto* bp = new QPushButton("暂停");
-            bp->setStyleSheet("QPushButton{padding:1px 6px;font-size:11px;}");
-            connect(bp, &QPushButton::clicked, this, [this, id]() {
-                if (sar_engine_) { sar_engine_->stop_bot(id); refreshSarTable(); save_sar_bots(); }
-            });
-            opl->addWidget(bp);
-        } else {
-            auto* br = new QPushButton("恢复");
-            br->setStyleSheet("QPushButton{padding:1px 6px;font-size:11px;color:#3fb950;}");
-            connect(br, &QPushButton::clicked, this, [this, id]() {
-                if (sar_engine_) { sar_engine_->resume_bot(id); refreshSarTable(); save_sar_bots(); }
-            });
-            opl->addWidget(br);
-        }
-
-        if (has_pos && !b.pending) {
-            auto* bc = new QPushButton("平仓");
-            bc->setStyleSheet("QPushButton{padding:1px 6px;font-size:11px;color:#d29922;}");
-            const QString sym = QString::fromStdString(b.cfg.symbol);
-            connect(bc, &QPushButton::clicked, this, [this, id, sym]() {
-                if (!sar_engine_) return;
-                if (!confirmDanger("确认平仓", sym + " 将以市价立即平掉当前 SAR 仓位。",
-                                   "平仓")) return;
-                sar_engine_->close_bot(id);
-            });
-            opl->addWidget(bc);
-        }
-
-        auto* bd = new QPushButton("删除");
-        bd->setStyleSheet("QPushButton{padding:1px 6px;font-size:11px;color:#f85149;}");
-        const QString sym = QString::fromStdString(b.cfg.symbol);
-        const bool pos_warn = has_pos;
-        connect(bd, &QPushButton::clicked, this, [this, id, sym, pos_warn]() {
+    if (!stopped) {
+        auto* bp = new QPushButton("停止");
+        bp->setFixedHeight(20);
+        bp->setStyleSheet("QPushButton{background:#3d1a1a;color:#f85149;"
+                          "font-size:11px;padding:0 6px;}");
+        connect(bp, &QPushButton::clicked, this, [this, id]() {
             if (!sar_engine_) return;
-            // 有持仓时删除 = 交易所上留下一笔【没有止损线守着】的裸仓位。
-            // 必须说清楚，不能只问"确定删除吗"
-            const QString body = pos_warn
-                ? sym + " 当前有持仓。删除后程序不再跟踪它，"
-                        "交易所上的仓位会失去追踪止损的保护，需要你手动处理。"
-                : sym + " 将从 SAR 列表中移除。";
-            if (!confirmDanger("确认删除", body, "删除")) return;
-            sar_engine_->remove_bot(id);
-            unsubscribeIfUnused(sym.toStdString());
-            refreshSarTable();
+            sar_engine_->stop_bot(id);
+            refreshBotTable();
             save_sar_bots();
         });
-        opl->addWidget(bd);
-        opl->addStretch(1);
-        sarTable_->setCellWidget(i, C_OP, opw);
+        opl->addWidget(bp);
+    } else {
+        auto* br = new QPushButton("继续");
+        br->setFixedHeight(20);
+        br->setStyleSheet("QPushButton{background:#1a3d1a;color:#3fb950;"
+                          "font-size:11px;padding:0 6px;}");
+        connect(br, &QPushButton::clicked, this, [this, id]() {
+            if (!sar_engine_) return;
+            sar_engine_->resume_bot(id);
+            // 「全部停止」会关掉 tick 定时器——单个 bot 恢复时必须把它拉起来，
+            // 否则 bot 显示"运行中"但引擎永远不被驱动，止损线永远不会触发
+            if (tick_timer_ && !tick_timer_->isActive()) {
+                tick_timer_->start();
+                log("Tick 定时器已重新启动");
+            }
+            sarSigForce_.store(true);   // 下一拍立刻拉信号，不干等一个周期
+            refreshBotTable();
+            save_sar_bots();
+        });
+        opl->addWidget(br);
     }
 
-    if (sarSummary_) {
-        sarSummary_->setText(
-            QString("运行中: %1   持仓: %2   |   浮动: %3$%4   已实现: %5$%6")
-                .arg(running).arg(holding)
-                .arg(total_upnl >= 0 ? "+" : "").arg(std::fabs(total_upnl), 0, 'f', 2)
-                .arg(total_real >= 0 ? "+" : "").arg(std::fabs(total_real), 0, 'f', 2));
-    }
-}
-
-void MainWindow::onAddSarSymbol() {
-    if (!addSarEdit_) return;
-    QString raw = addSarEdit_->text().trimmed().toUpper();
-    addSarEdit_->clear();
-    if (raw.isEmpty()) return;
-
-    // 与 DCA 的加品种框同款补全：只输代币符号即可，默认 USDT 永续。
-    // 不补全的话 "BTC" 会被原样拿去请求 K 线——币安合约没有这个交易对，
-    // 于是永远拉不到数据、永远"等信号"，而界面上看不出任何异常
-    if (raw.endsWith("USDT")) raw.chop(4);
-    if (raw.isEmpty()) return;
-    openSarDialog((raw + "USDT").toStdString());
-}
-
-void MainWindow::onSarContextMenu(const QPoint& pos) {
-    if (!sarTable_ || !sar_engine_) return;
-    auto* item = sarTable_->itemAt(pos);
-    if (!item) return;
-    const int row = item->row();
-    auto bots = sar_engine_->get_bots();
-    if (row < 0 || row >= (int)bots.size()) return;
-
-    QMenu menu(this);
-    auto* act = menu.addAction("策略配置…");
-    if (menu.exec(sarTable_->viewport()->mapToGlobal(pos)) == act)
-        openSarDialog(bots[row].cfg.symbol);
-}
-
-void MainWindow::openSarDialog(const std::string& symbol) {
-    if (!sar_engine_) {
-        QMessageBox::information(this, "未连接", "请先连接交易所后再配置 SAR 策略。");
-        return;
+    if (has_pos && !b.pending) {
+        auto* bc = new QPushButton("平仓");
+        bc->setFixedHeight(20);
+        bc->setStyleSheet("QPushButton{color:#d29922;font-size:11px;padding:0 6px;}");
+        connect(bc, &QPushButton::clicked, this, [this, id, sym]() {
+            if (!sar_engine_) return;
+            if (!confirmDanger("确认平仓",
+                               sym + " 将以市价立即平掉当前 SAR 仓位。", "平仓")) return;
+            sar_engine_->close_bot(id);
+        });
+        opl->addWidget(bc);
     }
 
-    // 已存在同品种则是编辑，否则是新建
-    const SarBot* existing = nullptr;
-    auto bots = sar_engine_->get_bots();
-    for (const auto& b : bots)
-        if (b.cfg.symbol == symbol) { existing = &b; break; }
+    auto* bd = new QPushButton("删除");
+    bd->setFixedHeight(20);
+    bd->setStyleSheet("QPushButton{color:#f85149;font-size:11px;padding:0 6px;}");
+    connect(bd, &QPushButton::clicked, this, [this, id, sym, has_pos]() {
+        if (!sar_engine_) return;
+        // 有持仓时删除 = 交易所上留下一笔【没有止损线守着】的裸仓位。
+        // 必须说清楚，不能只问"确定删除吗"
+        const QString body = has_pos
+            ? sym + " 当前有持仓。删除后程序不再跟踪它，"
+                    "交易所上的仓位会失去追踪止损的保护，需要你手动处理。"
+            : sym + " 将从监控列表中移除。";
+        if (!confirmDanger("确认删除", body, "删除")) return;
+        sar_engine_->remove_bot(id);
+        unsubscribeIfUnused(sym.toStdString());
+        refreshBotTable();
+        save_sar_bots();
+    });
+    opl->addWidget(bd);
+    opl->addStretch(1);
+    botTable_->setCellWidget(row, 15, opw);
+}
 
-    SarConfig c;
-    c.symbol = symbol;
-    if (existing) c = existing->cfg;
+// ─────────────────────────────────────────────────────────────────────────────
+// SAR 配置表单
+// ─────────────────────────────────────────────────────────────────────────────
+// 拆成"构建"和"回读"两半，是为了让 openStrategyDialog 能把整张表单嵌进自己的
+// 策略分页里，而不必把这 30 多个控件的构造逻辑复制一份。
+// 结构体定义留在本 .cpp——头文件里只有前向声明，改一个 spinbox 不会触发全量重编。
+struct SarFormWidgets {
+    QComboBox*      sizeMode = nullptr;
+    QDoubleSpinBox* budget   = nullptr;
+    QDoubleSpinBox* risk     = nullptr;
+    QSpinBox*       lev      = nullptr;
+    QComboBox*      mode     = nullptr;
+    QSpinBox*       swing    = nullptr;
+    QComboBox*      interval = nullptr;
+    QSpinBox*       dcPeriod = nullptr;
+    QSpinBox*       atrPeriod = nullptr;
+    QDoubleSpinBox* k        = nullptr;
+    QCheckBox*      rev      = nullptr;
+    QCheckBox*      revSig   = nullptr;
+    QSpinBox*       maxRev   = nullptr;
+    QSpinBox*       cooldown = nullptr;
+    QSpinBox*       pyrMax   = nullptr;
+    QDoubleSpinBox* pyrStep  = nullptr;
+    SarConfig       base;      // 弹窗没有控件的字段（signal_max_age_sec 等）从这里继承
+};
 
-    QDialog dlg(this);
-    dlg.setWindowTitle(QString("SAR 策略配置 — %1").arg(QString::fromStdString(symbol)));
-    dlg.setMinimumWidth(480);
-    dlg.resize(520, 700);
+std::shared_ptr<SarFormWidgets> MainWindow::buildSarForm(QVBoxLayout* into,
+                                                          const SarConfig& c) {
+    auto w = std::make_shared<SarFormWidgets>();
+    w->base = c;
 
-    // 滚动区 + 固定在底部的按钮。参数长到一屏放不下时，没有滚动区会把
-    // "创建/保存"顶出屏幕外——DCA 的弹窗当初就是因为这个才改的，这里别重犯
-    auto* outer = new QVBoxLayout(&dlg);
-    outer->setContentsMargins(0, 0, 0, 0);
-    auto* scroll = new QScrollArea();
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    auto* inner = new QWidget();
-    auto* form = new QFormLayout(inner);
-    scroll->setWidget(inner);
-    outer->addWidget(scroll, 1);
+    // 分组工厂。和 DCA 那边同款外观，否则同一个弹窗里切两套策略会像两个程序
+    auto mkGroup = [into](const QString& title, const QString& color) {
+        auto* box = new QGroupBox(title);
+        box->setStyleSheet(QString("QGroupBox{color:%1;font-size:11px;font-weight:bold;"
+                                   "border:1px solid #21262d;border-radius:4px;"
+                                   "margin-top:8px;padding:10px 10px 6px 10px;}"
+                                   "QGroupBox::title{subcontrol-origin:margin;left:8px;"
+                                   "padding:0 4px;}").arg(color));
+        auto* f = new QFormLayout(box);
+        f->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        f->setSpacing(6);
+        into->addWidget(box);
+        return f;
+    };
 
+    auto* posForm  = mkGroup("仓位与杠杆", "#58a6ff");
+    auto* sigForm  = mkGroup("入场与出场", "#a371f7");
+    auto* revForm  = mkGroup("反手与加仓", "#3fb950");
+
+    // ── 仓位与杠杆 ──────────────────────────────────────────────────────────
     // ⚠ 仓位算法排在最前面：它决定了下面两个框各自的含义（名义价值 vs 名义上限），
     //   放在后面的话用户会先填完再发现填错了地方
-    auto* sizeMode = new QComboBox();
-    sizeMode->addItem("固定名义", (int)SarConfig::SizeMode::Notional);
-    sizeMode->addItem("按 ATR 等风险", (int)SarConfig::SizeMode::RiskBased);
-    sizeMode->setCurrentIndex(c.size_mode == SarConfig::SizeMode::RiskBased ? 1 : 0);
-    sizeMode->setToolTip(
+    w->sizeMode = new QComboBox();
+    w->sizeMode->addItem("固定名义", (int)SarConfig::SizeMode::Notional);
+    w->sizeMode->addItem("按 ATR 等风险", (int)SarConfig::SizeMode::RiskBased);
+    w->sizeMode->setCurrentIndex(c.size_mode == SarConfig::SizeMode::RiskBased ? 1 : 0);
+    w->sizeMode->setToolTip(
         "固定名义：每笔都是同样的名义价值。\n"
         "等风险：名义 = 单次愿亏 / (k×ATR%)，每笔止损亏的钱固定。\n\n"
         "为什么需要等风险：同一份名义，在 4h ATR 1.6% 的 LTC 和 5.3% 的 COTI 上，"
         "单次止损亏的钱差 3.3 倍。固定名义 = 风险全压在高波动那几个品种上，"
         "而「铺开品种分散风险」就此失效。这是海龟的「单位」概念。");
-    form->addRow("仓位算法", sizeMode);
+    posForm->addRow("仓位算法", w->sizeMode);
 
-    auto* budget = new QDoubleSpinBox();
-    budget->setRange(10, 10'000'000);
-    budget->setDecimals(2);
-    budget->setValue(c.budget_usdt);
-    budget->setToolTip("固定名义模式：每笔仓位的名义价值。\n"
-                       "等风险模式：名义价值的【上限】（ATR 极小时兜住公式算出的天量仓位）。");
+    w->budget = new QDoubleSpinBox();
+    w->budget->setRange(10, 10'000'000);
+    w->budget->setDecimals(2);
+    w->budget->setValue(c.budget_usdt);
+    w->budget->setToolTip("固定名义模式：每笔仓位的名义价值。\n"
+                          "等风险模式：名义价值的【上限】"
+                          "（ATR 极小时兜住公式算出的天量仓位）。");
     auto* budgetLabel = new QLabel();
-    form->addRow(budgetLabel, budget);
+    posForm->addRow(budgetLabel, w->budget);
 
-    auto* riskEdit = new QDoubleSpinBox();
-    riskEdit->setRange(0, 1'000'000);
-    riskEdit->setDecimals(2);
-    riskEdit->setValue(c.risk_usdt);
+    w->risk = new QDoubleSpinBox();
+    w->risk->setRange(0, 1'000'000);
+    w->risk->setDecimals(2);
+    w->risk->setValue(c.risk_usdt);
     // 值为 0（= 最小值）时显示这行字而不是"0.00"。此前它是一个灰掉的"0"，
     // 看起来像"这个功能坏了"，而真实原因只是仓位算法还没切过去
-    riskEdit->setSpecialValueText("未设置");
-    riskEdit->setToolTip("单次止损愿意亏多少钱（USDT）。仅「按 ATR 等风险」模式使用。\n"
-                         "账户 10000U、每次探测愿亏 1% ⇒ 填 100。");
+    w->risk->setSpecialValueText("未设置");
+    w->risk->setToolTip("单次止损愿意亏多少钱（USDT）。仅「按 ATR 等风险」模式使用。\n"
+                        "账户 10000U、每次探测愿亏 1% ⇒ 填 100。");
     auto* riskLabel = new QLabel();
-    form->addRow(riskLabel, riskEdit);
+    posForm->addRow(riskLabel, w->risk);
 
     // 两个框的标签和可用性都跟着算法走。写成 lambda 是因为初始化和切换时
     // 要做完全相同的事——分开写必然有一天只改一处
-    auto syncSizeMode = [budget, budgetLabel, riskEdit, riskLabel](int idx) {
+    auto* riskEdit = w->risk;
+    auto* budgetBox = w->budget;
+    auto syncSizeMode = [budgetBox, budgetLabel, riskEdit, riskLabel](int idx) {
         const bool risk = (idx == 1);
         budgetLabel->setText(risk ? "　名义上限 (USDT)" : "　仓位名义价值 (USDT)");
         riskLabel->setText(risk ? "　单次愿亏 (USDT)"
                                 : "　单次愿亏（切到「按 ATR 等风险」后可填）");
         riskLabel->setEnabled(risk);
         riskEdit->setEnabled(risk);
-        if (risk && riskEdit->value() <= 0) {
-            riskEdit->setFocus();
-            riskEdit->selectAll();
-        }
+        (void)budgetBox;
     };
-    syncSizeMode(sizeMode->currentIndex());
-    connect(sizeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+    syncSizeMode(w->sizeMode->currentIndex());
+    connect(w->sizeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
             riskEdit, [syncSizeMode](int i) { syncSizeMode(i); });
 
-    auto* lev = new QSpinBox();
-    lev->setRange(1, 125);
-    lev->setValue(c.leverage);
-    form->addRow("杠杆", lev);
+    w->lev = new QSpinBox();
+    w->lev->setRange(1, 125);
+    w->lev->setValue(c.leverage);
+    posForm->addRow("杠杆", w->lev);
 
+    // ── 入场与出场 ──────────────────────────────────────────────────────────
     // 入场/止损算法：两套成套的组合，不是可以混搭的两个旋钮
-    auto* modeBox = new QComboBox();
-    modeBox->addItem("唐奇安突破 + ATR 止损", (int)sar::Mode::Donchian);
-    modeBox->addItem("裸K线 + 摆动止损",       (int)sar::Mode::BarPattern);
-    modeBox->setCurrentIndex(c.rule.mode == sar::Mode::BarPattern ? 1 : 0);
-    modeBox->setToolTip(
+    w->mode = new QComboBox();
+    w->mode->addItem("唐奇安突破 + ATR 止损", (int)sar::Mode::Donchian);
+    w->mode->addItem("裸K线 + 摆动止损",       (int)sar::Mode::BarPattern);
+    w->mode->setCurrentIndex(c.rule.mode == sar::Mode::BarPattern ? 1 : 0);
+    w->mode->setToolTip(
         "唐奇安突破：价格创 N 根新高/新低入场，止损用 k×ATR 的棘轮线。海龟原版。\n\n"
         "裸K线：刚收盘那根是阳线就做多、阴线就做空；止损用【它之前 N 根】的\n"
         "最低价（做多）/ 最高价（做空），窗口随K线右移，棘轮只朝有利方向。\n"
         "入场只在K线收盘那一拍判定，不看盘中。");
-    form->addRow("入场/止损算法", modeBox);
+    sigForm->addRow("入场/止损算法", w->mode);
 
-    auto* swingEdit = new QSpinBox();
-    swingEdit->setRange(1, 50);
-    swingEdit->setValue(c.rule.swing_bars);
-    swingEdit->setToolTip(
+    w->swing = new QSpinBox();
+    w->swing->setRange(1, 50);
+    w->swing->setValue(c.rule.swing_bars);
+    w->swing->setToolTip(
         "止损用最近几根的最低/最高价。信号根【不算】在内。\n\n"
         "⚠ 这个数直接决定持仓时长和交易频率：随机游走下平均持仓约 N+1 根。\n"
         "N=3 ⇒ 4 根就被打掉一次。配短周期时交易次数会非常高。");
-    form->addRow("摆动止损根数", swingEdit);
+    sigForm->addRow("摆动止损根数", w->swing);
 
-    auto* itv = new QComboBox();
-    itv->addItems({"3m", "5m", "15m", "30m", "1h", "4h", "12h", "1d"});
-    itv->setCurrentText(QString::fromStdString(c.interval));
-    itv->setToolTip("信号K线周期。周期越短信号越多，假突破也越多。");
-    form->addRow("信号周期", itv);
+    w->interval = new QComboBox();
+    w->interval->addItems({"3m", "5m", "15m", "30m", "1h", "4h", "12h", "1d"});
+    w->interval->setCurrentText(QString::fromStdString(c.interval));
+    w->interval->setToolTip("信号K线周期。周期越短信号越多，假突破也越多。");
+    sigForm->addRow("信号周期", w->interval);
 
-    auto* dcp = new QSpinBox();
-    dcp->setRange(2, 200);
-    dcp->setValue(c.rule.donchian_period);
-    dcp->setToolTip("唐奇安通道周期（海龟原版 20）。\n"
-                    "上破 N 根最高 → 做多，下破 N 根最低 → 做空。\n"
-                    "通道只由已收盘K线构成，当前这根去撞它。");
-    form->addRow("通道周期", dcp);
+    w->dcPeriod = new QSpinBox();
+    w->dcPeriod->setRange(2, 200);
+    w->dcPeriod->setValue(c.rule.donchian_period);
+    w->dcPeriod->setToolTip("唐奇安通道周期（海龟原版 20）。\n"
+                            "上破 N 根最高 → 做多，下破 N 根最低 → 做空。\n"
+                            "通道只由已收盘K线构成，当前这根去撞它。");
+    sigForm->addRow("通道周期", w->dcPeriod);
 
-    auto* atrp = new QSpinBox();
-    atrp->setRange(2, 100);
-    atrp->setValue(c.rule.atr_period);
-    form->addRow("ATR 周期", atrp);
+    w->atrPeriod = new QSpinBox();
+    w->atrPeriod->setRange(2, 100);
+    w->atrPeriod->setValue(c.rule.atr_period);
+    sigForm->addRow("ATR 周期", w->atrPeriod);
 
-    auto* k = new QDoubleSpinBox();
-    k->setRange(0.5, 20.0);
-    k->setSingleStep(0.5);
-    k->setDecimals(1);
-    k->setValue(c.rule.atr_mult);
-    k->setToolTip("止损距离 = k × ATR（Chandelier Exit）。\n"
-                  "棘轮，只朝有利方向移动，绝不回退。\n"
-                  "k 越小假突破越多，越大回吐越多。经典值 2.5~3.5。\n"
-                  "表格里的 ATR 列悬停可看当前 k 对应的实际止损距离%。");
-    form->addRow("ATR 倍数 k", k);
+    w->k = new QDoubleSpinBox();
+    w->k->setRange(0.5, 20.0);
+    w->k->setSingleStep(0.5);
+    w->k->setDecimals(1);
+    w->k->setValue(c.rule.atr_mult);
+    w->k->setToolTip("止损距离 = k × ATR（Chandelier Exit）。\n"
+                     "棘轮，只朝有利方向移动，绝不回退。\n"
+                     "k 越小假突破越多，越大回吐越多。经典值 2.5~3.5。\n"
+                     "表格「状态」列悬停可看当前 k 对应的实际止损距离%。");
+    sigForm->addRow("ATR 倍数 k", w->k);
 
-    auto* rev = new QCheckBox("亏损止损后反向入场");
-    rev->setChecked(c.rule.allow_reverse);
-    rev->setToolTip("盈利出场【永不】反手——力竭不等于反转。这一项只管亏损出场。");
-    form->addRow(rev);
+    // 两种模式各自只用到一部分参数。用不到的灰掉而不是藏起来：藏起来会让弹窗
+    // 高度随模式跳变，而灰掉能让人看见"这个参数在另一种模式下才生效"
+    auto* swingW = w->swing;
+    auto* dcW    = w->dcPeriod;
+    auto* atrW   = w->atrPeriod;
+    auto* kW     = w->k;
+    auto syncMode = [swingW, dcW, atrW, kW](int idx) {
+        const bool bar = (idx == 1);
+        swingW->setEnabled(bar);
+        dcW->setEnabled(!bar);
+        kW->setEnabled(!bar);
+        // ATR 周期在裸K线模式下仍然有用：等风险下单的显示和金字塔加仓都要 ATR
+        atrW->setEnabled(true);
+    };
+    syncMode(w->mode->currentIndex());
+    connect(w->mode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            swingW, [syncMode](int i) { syncMode(i); });
 
-    auto* revSig = new QCheckBox("反手需要反向信号成立（强烈建议保持勾选）");
-    revSig->setChecked(c.rule.reverse_needs_signal);
-    revSig->setToolTip(
+    auto* note = new QLabel(
+        "没有固定止盈，这是设计而非遗漏：趋势跟随胜率天然只有 30~40%，"
+        "收益全来自少数几笔跑得很远的单子。固定止盈会砍断它们，"
+        "而亏损笔大小不变——等于单方面砍掉盈利分布的右尾。");
+    note->setStyleSheet("color:#8b949e;font-size:11px;");
+    note->setWordWrap(true);
+    sigForm->addRow(note);
+
+    // ── 反手与加仓 ──────────────────────────────────────────────────────────
+    w->rev = new QCheckBox("亏损止损后反向入场");
+    w->rev->setChecked(c.rule.allow_reverse);
+    w->rev->setToolTip("盈利出场【永不】反手——力竭不等于反转。这一项只管亏损出场。");
+    revForm->addRow(w->rev);
+
+    w->revSig = new QCheckBox("反手需要反向信号成立（强烈建议保持勾选）");
+    w->revSig->setChecked(c.rule.reverse_needs_signal);
+    w->revSig->setToolTip(
         "不勾 = 无条件反手，在震荡市是绞肉机：\n"
         "亏损止损本就在震荡市最频繁，而无条件反手恰好在那时最激进。\n"
         "开多→跌 k×ATR 止损→反手开空→涨回来 k×ATR 止损→反手开多…\n"
         "ATR 常态 2% 时单次绞杀约 6% 名义，3 倍杠杆即保证金的 18%。");
-    form->addRow(revSig);
+    revForm->addRow(w->revSig);
 
-    auto* maxRev = new QSpinBox();
-    maxRev->setRange(0, 20);
-    maxRev->setValue(c.rule.max_consecutive_reverses);
-    maxRev->setToolTip("连续反手上限，超过即强制冷却。\n"
-                       "真趋势不需要连续反手——连续反手本身就是「现在是震荡市」的信号。");
-    form->addRow("连续反手上限", maxRev);
+    w->maxRev = new QSpinBox();
+    w->maxRev->setRange(0, 20);
+    w->maxRev->setValue(c.rule.max_consecutive_reverses);
+    w->maxRev->setToolTip("连续反手上限，超过即强制冷却。\n"
+                          "真趋势不需要连续反手——连续反手本身就是"
+                          "「现在是震荡市」的信号。");
+    revForm->addRow("连续反手上限", w->maxRev);
 
-    auto* cd = new QSpinBox();
-    cd->setRange(0, 100);
-    cd->setValue(c.rule.cooldown_bars);
-    cd->setToolTip("触顶后冷却多少根【K线】（不是 tick）。");
-    form->addRow("冷却K线数", cd);
+    w->cooldown = new QSpinBox();
+    w->cooldown->setRange(0, 100);
+    w->cooldown->setValue(c.rule.cooldown_bars);
+    w->cooldown->setToolTip("触顶后冷却多少根【K线】（不是 tick）。");
+    revForm->addRow("冷却K线数", w->cooldown);
 
-    auto* pyrMax = new QSpinBox();
-    pyrMax->setRange(0, 10);
-    pyrMax->setValue(c.rule.pyramid_max_adds);
-    pyrMax->setToolTip(
+    w->pyrMax = new QSpinBox();
+    w->pyrMax->setRange(0, 10);
+    w->pyrMax->setValue(c.rule.pyramid_max_adds);
+    w->pyrMax->setToolTip(
         "金字塔加仓档数（0=关）。探测仓开出来后，每朝有利方向再走若干个 ATR "
         "就加一档。\n\n"
         "它回答的是「怎么低成本试出单边大行情」：错了只亏第一档，对了越骑越重。\n"
         "与 DCA 的补仓方向【相反】——DCA 是跌了加（摊薄），这里是涨了加（顺势）。\n\n"
-        "加仓不额外挪止损线：ATR 棘轮本来就跟着新高走，加仓时线已经在更高位置了。");
-    form->addRow("顺势加仓档数", pyrMax);
+        "加仓不额外挪止损线：棘轮本来就跟着新高走，加仓时线已经在更高位置了。");
+    revForm->addRow("顺势加仓档数", w->pyrMax);
 
-    auto* pyrStep = new QDoubleSpinBox();
-    pyrStep->setRange(0.1, 10.0);
-    pyrStep->setSingleStep(0.1);
-    pyrStep->setDecimals(2);
-    pyrStep->setValue(c.rule.pyramid_step_atr);
-    pyrStep->setToolTip("每走多少个 ATR 加一档（海龟原版 0.5）。\n"
-                        "间距从【上一档的成交价】量起，不是首档——否则越加越密。");
-    form->addRow("加仓间距 (×ATR)", pyrStep);
-    for (QWidget* w : {(QWidget*)pyrStep}) {
-        w->setEnabled(pyrMax->value() > 0);
-        connect(pyrMax, QOverload<int>::of(&QSpinBox::valueChanged),
-                w, [w](int v) { w->setEnabled(v > 0); });
+    w->pyrStep = new QDoubleSpinBox();
+    w->pyrStep->setRange(0.1, 10.0);
+    w->pyrStep->setSingleStep(0.1);
+    w->pyrStep->setDecimals(2);
+    w->pyrStep->setValue(c.rule.pyramid_step_atr);
+    w->pyrStep->setToolTip("每走多少个 ATR 加一档（海龟原版 0.5）。\n"
+                           "间距从【上一档的成交价】量起，不是首档——否则越加越密。");
+    revForm->addRow("加仓间距 (×ATR)", w->pyrStep);
+    {
+        auto* stepW = w->pyrStep;
+        stepW->setEnabled(w->pyrMax->value() > 0);
+        connect(w->pyrMax, QOverload<int>::of(&QSpinBox::valueChanged),
+                stepW, [stepW](int v) { stepW->setEnabled(v > 0); });
     }
 
-    auto* note = new QLabel(
-        "没有固定止盈，这是设计而非遗漏：趋势跟随胜率天然只有 30~40%，\n"
-        "收益全来自少数几笔跑得很远的单子。固定止盈会砍断它们，\n"
-        "而亏损笔大小不变——等于单方面砍掉盈利分布的右尾。");
-    note->setStyleSheet("color:#8b949e;font-size:11px;");
-    note->setWordWrap(true);
-    form->addRow(note);
+    return w;
+}
 
-    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-    bb->button(QDialogButtonBox::Ok)->setText(existing ? "保存修改" : "创建");
-    bb->setContentsMargins(9, 6, 9, 9);
-    outer->addWidget(bb);   // 在滚动区【外面】，永远可见
-    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
-    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+bool MainWindow::collectSarForm(const std::shared_ptr<SarFormWidgets>& w, SarConfig& out) {
+    if (!w) return false;
 
-    if (dlg.exec() != QDialog::Accepted) return;
+    // 从 base 起算：弹窗里没有控件的字段（signal_max_age_sec 等）必须从原配置
+    // 继承，否则手改过 JSON 的值会被静默重置回默认
+    out = w->base;
+    out.budget_usdt = w->budget->value();
+    out.leverage    = w->lev->value();
+    out.interval    = w->interval->currentText().toStdString();
+    out.size_mode   = (SarConfig::SizeMode)w->sizeMode->currentData().toInt();
+    out.risk_usdt   = w->risk->value();
+    out.rule.mode                     = (sar::Mode)w->mode->currentData().toInt();
+    out.rule.swing_bars               = w->swing->value();
+    out.rule.donchian_period          = w->dcPeriod->value();
+    out.rule.atr_period               = w->atrPeriod->value();
+    out.rule.atr_mult                 = w->k->value();
+    out.rule.allow_reverse            = w->rev->isChecked();
+    out.rule.reverse_needs_signal     = w->revSig->isChecked();
+    out.rule.max_consecutive_reverses = w->maxRev->value();
+    out.rule.cooldown_bars            = w->cooldown->value();
+    out.rule.pyramid_max_adds         = w->pyrMax->value();
+    out.rule.pyramid_step_atr         = w->pyrStep->value();
 
-    c.budget_usdt = budget->value();
-    c.leverage    = lev->value();
-    c.interval    = itv->currentText().toStdString();
-    c.rule.donchian_period = dcp->value();
-    c.rule.atr_period      = atrp->value();
-    c.rule.atr_mult        = k->value();
-    c.rule.allow_reverse   = rev->isChecked();
-    c.rule.reverse_needs_signal = revSig->isChecked();
-    c.rule.max_consecutive_reverses = maxRev->value();
-    c.rule.cooldown_bars   = cd->value();
-    c.rule.mode       = (sar::Mode)modeBox->currentData().toInt();
-    c.rule.swing_bars = swingEdit->value();
-    c.size_mode = (SarConfig::SizeMode)sizeMode->currentData().toInt();
-    c.risk_usdt = riskEdit->value();
-    c.rule.pyramid_max_adds = pyrMax->value();
-    c.rule.pyramid_step_atr = pyrStep->value();
-
-    if (c.size_mode == SarConfig::SizeMode::RiskBased && c.risk_usdt <= 0) {
+    if (out.size_mode == SarConfig::SizeMode::RiskBased && out.risk_usdt <= 0) {
         QMessageBox::warning(this, "缺少参数",
             "选择了「按 ATR 等风险」，但没有填「单次愿亏」。\n\n"
-            "这个模式用 单次愿亏 ÷ (k×ATR) 反推仓位，没有它算不出任何数量。");
-        return;
+            "这个模式用 单次愿亏 ÷ 真实止损距离 反推仓位，没有它算不出任何数量。");
+        return false;
+    }
+    return true;
+}
+
+// 校验 + 落地。返回 false = 已经向用户报过错，且【一点状态都没动】
+bool MainWindow::applySarConfig(SarConfig c, const SarBot* existing) {
+    if (!sar_engine_) {
+        QMessageBox::information(this, "未连接", "请先连接交易所后再配置策略。");
+        return false;
     }
 
     if (existing) {
@@ -580,27 +716,12 @@ void MainWindow::openSarDialog(const std::string& symbol) {
         // 提示要说清楚为什么，不能只是"不能改"
         if (existing->st.pos != sar::Pos::Flat) {
             QMessageBox::warning(this, "有持仓，无法修改",
-                QString::fromStdString(symbol) +
+                QString::fromStdString(c.symbol) +
                 " 当前有持仓。改参数会重建止损线基准，"
                 "可能让线瞬间跳到现价另一侧而立刻触发平仓。\n\n"
                 "请先平仓，再修改参数。");
-            return;
+            return false;
         }
-        sar_engine_->remove_bot(existing->bot_id);
-    }
-
-    // 同品种已被 DCA 接管则拒绝：两个引擎会在同一个交易所仓位上互相平掉对方的单
-    if (engine_) {
-        for (const auto& b : engine_->get_bots())
-            if (b.cfg.symbol == symbol && b.state != CcgBot::State::Stopped) {
-                QMessageBox::warning(this, "品种冲突",
-                    QString::fromStdString(symbol) +
-                    " 已经由网格 DCA 策略接管。\n\n"
-                    "两套策略会在同一个交易所仓位上互相平掉对方的单——"
-                    "SAR 的 reduceOnly 平仓会平掉 DCA 的层，反之亦然。\n"
-                    "必须二选一。");
-                return;
-            }
     }
 
     // 品种是否真的存在。补全后缀只能救 "BTC" 这类漏写，救不了拼错的币名——
@@ -614,24 +735,35 @@ void MainWindow::openSarDialog(const std::string& symbol) {
                 " 在币安 USDT-M 合约上不存在。\n\n"
                 "请检查拼写。只需要输入代币符号（如 BTC / ETH / SUI），"
                 "程序会自动补全 USDT 后缀。");
-            return;
+            return false;
         }
     }
+
+    // 校验全过了才动状态：先删旧的再建新的。顺序不能反——add_bot 对同品种
+    // 已存在未停止的 bot 会直接返回空串
+    if (existing) sar_engine_->remove_bot(existing->bot_id);
 
     const auto id = sar_engine_->add_bot(c);
     if (id.empty()) {
         QMessageBox::warning(this, "添加失败", "该品种已存在一个未停止的 SAR bot。");
-        return;
+        return false;
     }
     if (ticker_) ticker_->subscribe(c.symbol);
-    sarSigForce_.store(true);   // 下一个 tick 立刻拉信号，不等满 20 拍
-    log(QString("SAR %1 已配置：通道%2 / ATR%3 / k=%4 / %5")
+    sarSigForce_.store(true);   // 下一个 tick 立刻拉信号，不等满一整轮
+
+    const bool bar_mode = (c.rule.mode == sar::Mode::BarPattern);
+    log(QString("SAR %1 已配置：%2 / %3 / %4")
             .arg(QString::fromStdString(c.symbol))
-            .arg(c.rule.donchian_period).arg(c.rule.atr_period)
-            .arg(c.rule.atr_mult, 0, 'f', 1)
-            .arg(c.rule.reverse_needs_signal ? "反手需信号" : "无条件反手"), "OK");
-    refreshSarTable();
+            .arg(bar_mode ? QString("裸K线 摆动N=%1").arg(c.rule.swing_bars)
+                          : QString("唐奇安%1 ATR%2 k=%3")
+                                .arg(c.rule.donchian_period).arg(c.rule.atr_period)
+                                .arg(c.rule.atr_mult, 0, 'f', 1))
+            .arg(QString::fromStdString(c.interval))
+            .arg(!c.rule.allow_reverse ? "不反手"
+                 : c.rule.reverse_needs_signal ? "反手需信号" : "无条件反手"), "OK");
+    refreshBotTable();
     save_sar_bots();
+    return true;
 }
 
 // ── 持久化 ──────────────────────────────────────────────────────────────────
@@ -786,7 +918,7 @@ void MainWindow::load_and_restore_sar() {
         log(QString("已恢复 %1 个 SAR bot").arg(n), "OK");
         sarSigForce_.store(true);
     }
-    refreshSarTable();
+    refreshBotTable();
 }
 
 } // namespace ccg
