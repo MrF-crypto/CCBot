@@ -41,10 +41,7 @@
 
       "use_htf_filter": true,
       "htf_interval": "1d",
-      "htf_pos_max": 0.60,
-
-      "reentry_drawdown_pct": 0,
-      "reentry_memory_days": 30
+      "htf_pos_max": 0.60
     }
   ],
 

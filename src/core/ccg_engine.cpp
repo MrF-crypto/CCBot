@@ -219,8 +219,6 @@ bool CcgEngine::update_bot_cfg(const std::string& id, const CcgConfig& raw_cfg) 
     cfg.trail_tp       = new_cfg.trail_tp;
     cfg.auto_restart   = new_cfg.auto_restart;
     cfg.cooldown_secs  = new_cfg.cooldown_secs;
-    cfg.reentry_drawdown_pct = new_cfg.reentry_drawdown_pct;
-    cfg.reentry_memory_days  = new_cfg.reentry_memory_days;
     cfg.use_disaster_stop = new_cfg.use_disaster_stop;
     cfg.disaster_stop_pct = new_cfg.disaster_stop_pct;
     cfg.entry_mode     = new_cfg.entry_mode;
@@ -797,46 +795,6 @@ void CcgEngine::tick(const std::string& symbol, double price) {
                     }
                 }
 
-                // 出场价记忆：止盈后不在原地把仓位买回来。
-                // 放在宏观许可层【之前】判——它只读本地状态，比那三条便宜得多，
-                // 而且是唯一不随时间衰减的高位判据（其余全是相对指标，见配置注释）
-                if (can_enter && bot.cfg.reentry_drawdown_pct > 0 && bot.last_tp_price > 0) {
-                    bool expired = false;
-                    if (bot.cfg.reentry_memory_days > 0) {
-                        const auto age = host_.now_wall() - bot.last_tp_time;
-                        expired = age > std::chrono::hours(24 * bot.cfg.reentry_memory_days);
-                    }
-                    if (expired) {
-                        // 记忆作废后彻底清掉，避免每个 tick 都重算这段
-                        bot.last_tp_price = 0;
-                        log(bot.cfg.symbol + " 出场价记忆已过期（" +
-                            std::to_string(bot.cfg.reentry_memory_days) + "天），恢复正常开仓");
-                    } else {
-                        const bool is_long = (bot.cfg.direction == CcgConfig::Direction::Long);
-                        const double k = bot.cfg.reentry_drawdown_pct / 100.0;
-                        // 多头：要求跌回出场价下方够多；空头镜像：要求涨回上方够多
-                        const double need = is_long ? bot.last_tp_price * (1.0 - k)
-                                                    : bot.last_tp_price * (1.0 + k);
-                        if (is_long ? (price > need) : (price < need)) {
-                            can_enter = false;
-                            if (bot.last_action != "距上次止盈价回撤不足，暂不重开") {
-                                bot.last_action = "距上次止盈价回撤不足，暂不重开";
-                                std::ostringstream rs;
-                                rs << bot.cfg.symbol << " 距上次止盈价回撤不足，暂不重开："
-                                   << "上次止盈 $" << std::fixed << std::setprecision(6)
-                                   << bot.last_tp_price
-                                   << "，需" << (is_long ? "≤$" : "≥$") << need
-                                   << "（" << std::setprecision(2)
-                                   << bot.cfg.reentry_drawdown_pct << "%），现价 $"
-                                   << std::setprecision(6) << price;
-                                if (bot.cfg.reentry_memory_days > 0)
-                                    rs << "；记忆 " << bot.cfg.reentry_memory_days << " 天后过期";
-                                log(rs.str());
-                            }
-                        }
-                    }
-                }
-
                 // 首仓的宏观许可层。
                 // 宏观许可（日线%B）。关掉就完全不参与判定，也不空跑去刷日志。
                 // v4.6.0 移除了 24h/近7日涨幅两条闸门——README 自己记着"无实证依据"，
@@ -1257,8 +1215,8 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                                     : client_->place_market_order(cfg.symbol, side, qty, true);
                 if (!r.ok && r.error.find("[-2022]") != std::string::npos) {
                     // reduceOnly被拒 = 交易所侧没有可平的仓位（用户在交易所手动平过/
-                    // 强平过）。本地留着这个幽灵仓位会陷入无限重试（追踪止盈/硬止损
-                    // 每tick再触发-2022），且用户手动平仓也平不掉——按启动对账同款
+                    // 强平过）。本地留着这个幽灵仓位会陷入无限重试（追踪止盈每 tick
+                    // 再触发 -2022），且用户手动平仓也平不掉——按启动对账同款
                     // 策略：清空本地状态并停止该bot，等人工确认后手动"继续"
                     external_gone = true;
                 }
@@ -1401,14 +1359,6 @@ void CcgEngine::submit_close(const std::string& bot_id, const std::string& reaso
                     // 列表里，下一轮开仓时同方向再挂一张会被拒
                     if (!bot.disaster_stop_id.empty())
                         host_.submit([this, bot_id]() { cancel_disaster_stop(bot_id); });
-
-                    // 出场价记忆：只记【追踪止盈】的全量平仓。
-                    // 部分成交那条分支不写——仓位还没清空，谈不上"重新开首仓"。
-                    // 止损/手动平仓不写的理由见 CcgConfig::reentry_drawdown_pct 注释
-                    if (reason == "追踪止盈" && close_price > 0) {
-                        bot.last_tp_price = close_price;
-                        bot.last_tp_time  = host_.now_wall();
-                    }
 
                     bot.entries.clear();
                     bot.total_qty = bot.total_cost = bot.avg_price = 0;

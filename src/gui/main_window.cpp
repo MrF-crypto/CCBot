@@ -344,8 +344,6 @@ void MainWindow::save_bots() {
         o["trail_tp"]     = c.trail_tp;
         o["auto_restart"] = c.auto_restart;
         o["cooldown_secs"]= c.cooldown_secs;
-        o["reentry_drawdown_pct"] = c.reentry_drawdown_pct;
-        o["reentry_memory_days"]  = c.reentry_memory_days;
         o["use_disaster_stop"] = c.use_disaster_stop;
         o["disaster_stop_pct"] = c.disaster_stop_pct;
 
@@ -385,10 +383,6 @@ void MainWindow::save_bots() {
         o["full_layer_secs"]   = (double)b.full_layer_secs;
         o["alive_secs"]        = (double)b.alive_secs;
         o["cooldown_until_ms"] = tp_to_ms(b.cooldown_until);
-        // 出场价记忆随 bot 落盘：不存的话程序一重启记忆就没了，
-        // 而"止盈后别在山顶重开"恰恰是要跨重启生效的
-        o["last_tp_price"]     = b.last_tp_price;
-        o["last_tp_time_ms"]   = tp_to_ms(b.last_tp_time);
         // 交易所侧灾难止损单号：重启后据此撤掉旧单再按当前均价重挂
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
         o["disaster_stop_price"] = b.disaster_stop_price;
@@ -441,8 +435,6 @@ void MainWindow::load_and_restore_bots() {
         c.cooldown_secs= o["cooldown_secs"].toInt(300);
         // 兜底 0=关：老 bots.json 没有这个键，兜成非零等于给正在跑的策略
         // 悄悄加了一道闸门（同 v4.0.6 固定间隔、v4.0.7 涨幅拦截的处理）
-        c.reentry_drawdown_pct = o["reentry_drawdown_pct"].toDouble(0.0);
-        c.reentry_memory_days  = o["reentry_memory_days"].toInt(30);
         c.use_disaster_stop = o["use_disaster_stop"].toBool(false);
         c.disaster_stop_pct = o["disaster_stop_pct"].toDouble(30.0);
 
@@ -494,8 +486,6 @@ void MainWindow::load_and_restore_bots() {
         bot.full_layer_secs   = (int64_t)o["full_layer_secs"].toDouble();
         bot.alive_secs        = (int64_t)o["alive_secs"].toDouble();
         bot.cooldown_until    = ms_to_tp((qint64)o["cooldown_until_ms"].toDouble());
-        bot.last_tp_price     = o["last_tp_price"].toDouble(0.0);
-        bot.last_tp_time      = ms_to_tp((qint64)o["last_tp_time_ms"].toDouble());
         bot.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
         bot.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         for (const auto& ev : o["entries"].toArray()) {
@@ -818,7 +808,9 @@ void MainWindow::openSettingsDialog() {
     webhookEdit->setPlaceholderText("https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>");
     form->addRow("警报 Webhook URL:", webhookEdit);
     auto* webhookHint = new QLabel(
-        "触发硬止损平仓、账户连接失败时会 POST 一条消息过去（{\"text\":\"...\"}）。"
+        "以下事件会 POST 一条消息过去（{\"text\":\"...\"}）：账户连接失败、网络异常、"
+        "对账发现本地与交易所不一致（含【交易所侧灾难止损被触发】——它是本策略唯一的"
+        "止损，触发时本地收不到成交回调，只能由对账发现）。"
         "留空则不发送。支持 Telegram Bot / 企业微信・飞书自定义机器人等接受 JSON text 字段的 webhook。");
     webhookHint->setWordWrap(true);
     webhookHint->setStyleSheet("color:#8b949e;font-size:10px;");
@@ -904,6 +896,20 @@ void MainWindow::sendAlert(const QString& text) {
     run_async([url, text]() {
         send_webhook(url.toStdString(), text.toStdString());
     });
+}
+
+// 把对账不一致拼成【带明细】的告警正文。
+// 只报条数是没用的：收到"发现 1 处不一致"还得去翻日志，而这条不一致可能就是
+// 灾难止损被打掉了。最多列 5 条，超出的折叠成计数——webhook 有长度上限，
+// 而真出大事时前几条已经足够说明性质
+QString MainWindow::alert_text(const QString& what, const std::vector<std::string>& issues) {
+    QString s = QString("[TradingBot] %1 发现 %2 处不一致：").arg(what).arg(issues.size());
+    const int shown = std::min<int>((int)issues.size(), 5);
+    for (int i = 0; i < shown; ++i)
+        s += "\n· " + QString::fromStdString(issues[i]);
+    if ((int)issues.size() > shown)
+        s += QString("\n· …另有 %1 处，详见日志").arg((int)issues.size() - shown);
+    return s;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1280,12 +1286,10 @@ void MainWindow::onConnect() {
                     trades_.push_back(tr);
                     save_trades();
                     refreshStats();
-                    if (tr.reason == "硬止损") {
-                        sendAlert(QString("[TradingBot] %1 触发硬止损平仓 | 均价 $%2 → 平仓 $%3 | 盈亏 %4$%5")
-                            .arg(QString::fromStdString(tr.symbol))
-                            .arg(tr.entry_price, 0, 'f', 4).arg(tr.exit_price, 0, 'f', 4)
-                            .arg(tr.pnl >= 0 ? "+" : "").arg(std::abs(tr.pnl), 0, 'f', 2));
-                    }
+                    // v4.6.0 之前这里还有一条 reason=="硬止损" 的告警分支。本地硬止损
+                    // 移除后它永远不成立，已删。现在唯一的止损是交易所侧灾难止损，
+                    // 它触发时本地收不到成交回调——只能由周期对账发现"交易所已无此
+                    // 仓位"，告警走下面 reconcile 那条路
                 }, Qt::QueuedConnection);
             });
 
@@ -1733,9 +1737,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     // 五个分组一次建好，视觉顺序由这里决定——控件在代码里哪一行创建都不影响它
     // 落在哪个分组，所以下面可以按"逻辑相关"归组，而不必迁就原来的书写顺序
-    auto* form      = mkGroup("基础参数", "#58a6ff");
+    // 四个分组按"一笔交易的生命周期"排：先定仓位怎么摆，再定什么时候开、
+    // 什么时候不开，最后是崩了怎么办。
+    // v4.6.0 删掉动态W与多周期梯子之后，原来的「补仓机制」分组只剩趋势过滤一个
+    // 勾选框，而趋势过滤本来就同时管首仓和补仓——移进「入场拦截」，该组整个撤掉
+    auto* form      = mkGroup("基础参数（仓位怎么摆）", "#58a6ff");
     auto* sigForm   = mkGroup("入场信号（首单怎么开）", "#a371f7");
-    auto* dcaForm   = mkGroup("补仓机制（跌了怎么加）", "#3fb950");
     auto* gateForm  = mkGroup("入场拦截（什么时候不开）", "#d29922");
     auto* riskForm  = mkGroup("风控与出场", "#f85149");
 
@@ -1772,14 +1779,36 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         return mkEditIn(form, label, (double)val);
     };
 
-    auto* budgetEdit   = mkEdit ("预算USDT:",      prefill ? prefill->cfg.budget_usdt  : 3000.0);
-    auto* levEdit      = mkEditI("杠杆:",          prefill ? prefill->cfg.leverage     : 3);
-    auto* maxEntEdit   = mkEditI("最大层:",        prefill ? prefill->cfg.max_entries  : 10);
-    auto* intervalEdit = mkEdit ("补仓间隔%:",     prefill ? prefill->cfg.interval_pct : 6.0);
-    auto* trailEntEdit = mkEdit ("追踪建仓%:",     prefill ? prefill->cfg.trail_entry  : 1.0);
-    auto* tpEdit       = mkEdit ("止盈%:",         prefill ? prefill->cfg.tp_pct       : 5.0);
-    auto* trailTpEdit  = mkEdit ("止盈追踪%:",     prefill ? prefill->cfg.trail_tp     : 2.0);
-    auto* cooldownEdit = mkEditI("冷却(s):",       prefill ? prefill->cfg.cooldown_secs: 300);
+    // 标签一律不带括号说明——括号一长，QFormLayout 的标签列宽由最长者决定，
+    // 整张表会被一个标签撑歪。解释统一进 tooltip
+    auto* budgetEdit   = mkEdit ("预算 USDT:",   prefill ? prefill->cfg.budget_usdt  : 3000.0);
+    auto* levEdit      = mkEditI("杠杆:",        prefill ? prefill->cfg.leverage     : 3);
+    auto* maxEntEdit   = mkEditI("最大层数:",    prefill ? prefill->cfg.max_entries  : 10);
+    auto* intervalEdit = mkEdit ("补仓间隔 %:",  prefill ? prefill->cfg.interval_pct : 6.0);
+    auto* trailEntEdit = mkEdit ("追踪建仓 %:",  prefill ? prefill->cfg.trail_entry  : 1.0);
+    auto* tpEdit       = mkEdit ("止盈 %:",      prefill ? prefill->cfg.tp_pct       : 5.0);
+    auto* trailTpEdit  = mkEdit ("止盈追踪 %:",  prefill ? prefill->cfg.trail_tp     : 2.0);
+    auto* cooldownEdit = mkEditI("冷却秒数:",    prefill ? prefill->cfg.cooldown_secs: 300);
+
+    budgetEdit->setToolTip("这个方向的总预算。所有层加起来不超过它——"
+                           "「层级分配预览」底部的「满层合计」就是它的实际用量。");
+    levEdit->setToolTip("名义仓位 ≤ 权益（即杠杆相对投入 ≤ 1）时，强平价 ≤ 0，"
+                        "数学上不可强平。实证推荐 2。");
+    maxEntEdit->setToolTip("最多补几层。实证 10 层优于 8 层。\n"
+                           "满层 = 弹药耗尽、失去摊薄能力——界面「层进度」列按这个着色。");
+    intervalEdit->setToolTip("相对【上一笔成交价】再跌多少才武装下一层。\n"
+                             "实证 6% 优于 5%/4%，3% 是净负的。");
+    trailEntEdit->setToolTip("跌够间隔后不立刻补：先追踪最低点，自最低点反弹这个比例才下单。\n"
+                             "等企稳，不接飞刀。实证 0.4%，1.0% 在深熊里灾难性。");
+    tpEdit->setToolTip("相对持仓均价涨多少激活止盈追踪。");
+    trailTpEdit->setToolTip("激活后自最高点回落多少就平仓。实证全区间差异仅 2.1%，不敏感。");
+    cooldownEdit->setToolTip("止盈平仓后隔多久才允许重开首仓。");
+    // 自动重启与冷却是一对：前者决定止盈后要不要重开，后者决定隔多久。
+    // 放在一起才读得出这层关系
+    auto* autoRestartBox = new QCheckBox("止盈后自动重开（冷却期满后）");
+    autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
+    addCheck(form, autoRestartBox);
+
     auto* disStopBox = new QCheckBox("在交易所挂灾难止损单（进程外保护）");
     disStopBox->setChecked(prefill ? prefill->cfg.use_disaster_stop : false);
     addCheck(riskForm, disStopBox);
@@ -1801,28 +1830,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         addHint(riskForm, t);
     }
 
-
-    auto* autoRestartBox = new QCheckBox("自动重启");
-    autoRestartBox->setChecked(prefill ? prefill->cfg.auto_restart : true);
-    addCheck(form, autoRestartBox);
-
-    auto* reentryDdEdit = mkEdit ("止盈后重开需回撤%（0=关）:",
-                                  prefill ? prefill->cfg.reentry_drawdown_pct : 0.0);
-    auto* reentryDayEdit = mkEditI("上述记忆过期天数（0=永不）:",
-                                  prefill ? prefill->cfg.reentry_memory_days : 30);
-    addHint(form,
-            "解决的是：币爆拉一波、止盈出场，然后机器人在山顶重新开首仓。\n"
-            "填 15 = 现价必须回到上次止盈价的 85% 以下才准重开（做空镜像）。\n\n"
-            "为什么别的闸门挡不住——它们都是无记忆的相对指标，会衰减到失效：\n"
-            "  日涨幅   1 根日线后归零\n"
-            "  7日涨幅  7 根日线后归零\n"
-            "  日线%B   约 18 根日线后回落到 0.60 以下（均线爬上来了）\n"
-            "币横在高位不动，上面三条最终全部放行。这一条是唯一的绝对参照。\n\n"
-            "只记【追踪止盈】：止损出场说明判断错了，锁死重入等于把亏损凝固；\n"
-            "手动平仓是你的主动决定，不该反过来约束你下一步。\n"
-            "过期天数是必要的——一个再也回不去的价位会把 bot 永久锁死。\n"
-            "记忆随 bot 存盘，程序重启后仍然生效。");
-
     auto* entryModeBox = new QComboBox();
     entryModeBox->addItem("立即开仓（一开监控就开首仓）");
     entryModeBox->addItem("指标信号（BOLL+RSI 满足才开首仓）");
@@ -1830,43 +1837,29 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
         prefill ? (prefill->cfg.entry_mode == CcgConfig::EntryMode::Indicator ? 1 : 0) : 1);
     sigForm->addRow("首单模式:", entryModeBox);
 
-    // ── 趋势过滤（v2.5）──────────────────────────────────────────────────────
-    auto* trendBox = new QCheckBox("趋势过滤（4h EMA200+中轨斜率：空头态暂停新首仓、补仓间隔×1.5）");
+    // ── 入场拦截：两道独立的闸门，都只挡【开新首仓】───────────────────────────
+    // 拆成两个勾选框而不是一个总开关，价值在可归因：拦截发生时能立刻知道是哪一条。
+    // v4.6.0 之前这里还有 24h / 近7日涨幅两条，无实证依据已移除
+    auto* trendBox = new QCheckBox("趋势过滤：4h 空头态暂停开新首仓（补仓间隔同时 ×1.5）");
     trendBox->setChecked(prefill ? prefill->cfg.use_trend_filter : true);
     trendBox->setToolTip(
         "高周期趋势判定：价格在 4h EMA200 之下 且 中轨明显下拐 = 空头态。\n"
-        "空头态期间不开新首仓（不接单边下跌的飞刀），已有仓位补仓间隔放大1.5倍。\n"
-        "趋势数据每5分钟刷新一次；数据缺失时过滤自动失效，不会卡死交易。");
-    addCheck(dcaForm, trendBox);
-    // 多周期梯子接管间距推导后，×1.5 那一半会被整个覆盖掉（不是叠加）——
-    // 不说明的话，同时勾两个的人会以为"空头态补仓更保守"，而那件事不会发生
-    addHint(dcaForm, "⚠ 开启【多周期梯子】后，其中「补仓间隔×1.5」不生效"
-                     "（间距完全由档位带宽推导）；「空头态暂停新首仓」照常生效。");
+        "空头态期间不开新首仓（不接单边下跌的飞刀），已有仓位补仓间隔放大 1.5 倍。\n"
+        "趋势数据每 5 分钟刷新一次；数据缺失时过滤自动失效，不会卡死交易。");
+    addCheck(gateForm, trendBox);
 
-
-    // ── v3.0 宏观许可层 ────────────────────────────────────────────────────────
-    // 三个判据平级独立（v3.8 起不再有"宏观拦截"总开关）。
-    // 拆开的价值在可归因：绑在一起时无法知道拦截来自哪一条
-    auto* htfBox = new QCheckBox("① 高位拦截：日线%B 高于阈值不开新首仓");
+    auto* htfBox = new QCheckBox("高位拦截：日线 %B 高于阈值不开新首仓");
     htfBox->setChecked(prefill ? prefill->cfg.use_htf_filter : true);
     htfBox->setToolTip("大图景已经在高位时不追小回调。\n"
                        "%B = 价格在日线布林带中的相对位置，0=下轨 1=上轨。");
     addCheck(gateForm, htfBox);
-
-    addHint(gateForm, "关闭 = 宏观许可层完全不参与。"
-                      "微观层（1h信号+站稳）与趋势过滤沿用各自开关，不受这里控制。");
-    auto* htfMaxEdit   = mkEditIn(gateForm, "日线%B 拦截阈值:", prefill ? prefill->cfg.htf_pos_max : 0.60);
+    auto* htfMaxEdit = mkEditIn(gateForm, "%B 阈值:",
+                                prefill ? prefill->cfg.htf_pos_max : 0.60);
+    htfMaxEdit->setToolTip("实证：0.60 在 walk-forward 四段里 4/4 段正收益；"
+                           "0.80 只有 2/4 段——拦得太松约等于没拦。");
     addHint(gateForm,
-            "涨幅与 %B 的口径不同：\n"
-            "%B 问「价格在波动区间的什么位置」，涨幅问「最近涨得多急」。\n"
-            "窄幅横盘时 %B 可以贴着上轨而涨幅极小；急涨突破时涨幅很大而 %B 未必越界。\n\n"
-            "「24h」是币安界面上那个 24 小时滚动涨幅（@ticker 推送，无额外请求）。\n"
-            "v4.0.9 之前这里是「今日涨幅」——它每天 UTC 0 点归零，而 UTC 0 点是\n"
-            "北京时间早 8 点：某币 20:00-23:00 拉了 50%，23:30 拦得住，00:30 就放行，\n"
-            "币还在一天前的 1.5 倍位置上。滚动 24h 没有这个盲区。\n\n"
-            "「近7日」同样是滚动口径（相对 7 根日线前的收盘），不是本周 K 线。\n"
-            "做空时镜像：拦的是跌幅。两条独立于上面的①开关，可以只用涨幅不用 %B。\n"
-            "⚠ 这两个阈值没有回测依据，填多少靠手判。");
+            "两条各自独立，都关 = 完全不拦。微观层（1h 信号 + 追踪建仓站稳）"
+            "由「入场信号」那一组控制，不受这里影响。");
 
 
     // ── 指标信号配置（entryModeBox 选"指标信号"时才用得上）──────────────────────
@@ -2338,8 +2331,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     cfg.trail_tp      = to_d(trailTpEdit,   2.0);
     cfg.auto_restart  = autoRestartBox->isChecked();
     cfg.cooldown_secs = to_i(cooldownEdit,  300);
-    cfg.reentry_drawdown_pct = to_d(reentryDdEdit,  0.0);
-    cfg.reentry_memory_days  = to_i(reentryDayEdit, 30);
     cfg.use_disaster_stop = disStopBox->isChecked();
     cfg.disaster_stop_pct = to_d(disStopEdit, 30.0);
 
@@ -2712,8 +2703,11 @@ void MainWindow::onTick() {
             // 再打一遍就是双份。这里只做落盘、刷新和外部告警
             save_bots();          // 收敛后的状态立刻落盘
             refreshBotTable();
-            sendAlert(QString("[TradingBot] 运行中对账发现 %1 处不一致，详见日志")
-                      .arg(issues.size()));
+            // 明细要进告警正文，不能只报个数。v4.6.0 移除本地硬止损之后，
+            // 交易所侧灾难止损是唯一的止损，而它触发时本地【收不到成交回调】——
+            // 它在这里表现为一条"交易所已无此仓位"的对账不一致。只发个数字
+            // 等于止损被打掉了也只收到一句"发现 1 处不一致，详见日志"
+            sendAlert(alert_text("运行中对账", issues));
         }
 
         // SAR 用同一份快照对账，不再单独发一次 fetch_positions
@@ -2728,8 +2722,7 @@ void MainWindow::onTick() {
                     log("SAR对账: " + QString::fromStdString(i), "WARN");
                 save_sar_bots();
                 refreshBotTable();
-                sendAlert(QString("[TradingBot] SAR 对账发现 %1 处不一致，详见日志")
-                          .arg(sissues.size()));
+                sendAlert(alert_text("SAR 对账", sissues));
             }
         }
     }

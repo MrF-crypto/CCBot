@@ -163,6 +163,8 @@ private:
 
     // 关键事件外部提醒（Telegram/企业微信/飞书 webhook 等），后台线程发送，不阻塞 GUI
     void sendAlert(const QString& text);
+    // 对账不一致 → 带明细的告警正文（只报条数等于没报，见函数注释）
+    static QString alert_text(const QString& what, const std::vector<std::string>& issues);
 
     // 后端
     std::shared_ptr<TradingClient>     client_;

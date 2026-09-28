@@ -201,14 +201,9 @@ int main(int argc, char** argv) {
                      << tr.reason << "," << tr.entry_price << "," << tr.exit_price << ","
                      << tr.qty << "," << tr.pnl << "," << tr.layers << "\n";
         }
-        if (tr.reason == "硬止损" && !webhook.empty()) {
-            std::ostringstream alert_msg;
-            alert_msg << "[ccbot] " << tr.symbol << " 触发硬止损平仓 | 均价 $" << tr.entry_price
-                      << " -> 平仓 $" << tr.exit_price << " | 盈亏 " << tr.pnl << "U";
-            std::thread([w = webhook, text = alert_msg.str()]() {
-                send_webhook(w, text);
-            }).detach();
-        }
+        // v4.6.0 之前这里有一条 reason=="硬止损" 的 webhook 告警。本地硬止损移除后
+        // 它永远不成立，已删。现在唯一的止损是交易所侧灾难止损，它触发时本地收不到
+        // 成交回调——只能由周期对账发现"交易所已无此仓位"，告警走那条路（带明细）
     });
 
     // 恢复上次落盘的仓位状态；配置文件里已经删掉的品种/方向落盘状态会被丢弃，

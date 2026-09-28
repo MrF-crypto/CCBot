@@ -57,8 +57,6 @@ cmake --build build --config Release --target ccbot_headless
 | `trend_interval` / `trend_ema_period` | 趋势参数 | 默认 `4h` / `200`，一般不用改 |
 | `use_htf_filter` / `htf_pos_max` | 高位拦截（日线%B） | `true` + 阈值（默认 `0.60`）。价格在日线布林带中的相对位置高于阈值就不开新首仓，做空镜像 |
 | `htf_interval` | 高位判定周期 | 默认 `1d` |
-| `reentry_drawdown_pct` | 止盈后重开需回撤% | `0`=关。多头要求现价 ≤ 上次止盈价×(1−此值)，空头镜像。**只记追踪止盈**，止损/手动平仓不记 |
-| `reentry_memory_days` | 上述记忆的过期天数 | 默认 `30`，`0`=永不过期。必须有过期——一个再也回不去的价位会把 bot 永久锁死 |
 | `use_disaster_stop` / `disaster_stop_pct` | 交易所侧灾难止损单 | 默认关。在**交易所**挂 `STOP_MARKET + closePosition`，程序崩了它依然生效——唯一的进程外保护。⚠ 它会把浮亏变成实亏，与「套住长持」的取向冲突 |
 
 > **v4.6.0 移除的键**：`dynamic_band_mode` `min_profit_floor` `floor_decay` `dyn_fixed_interval`
@@ -66,6 +64,8 @@ cmake --build build --config Release --target ccbot_headless
 > `mtf_k` `mtf_min_gap_pct` `tp_floor_only` `tp_fixed_profit` `fixed_trail_tp` `fixed_trail_entry`
 > `use_atr_trail` `atr_trail_*` `stop_loss_pct` `htf_24h_chg_max` `htf_week_chg_max`
 > `first_entry_bounce_pct` `use_cycle_bear_switch` `dca_gate_*`
+>
+> **v4.6.1 又移除**：`reentry_drawdown_pct` `reentry_memory_days`（出场价记忆）
 >
 > 老配置里留着它们不会报错（会进"未知键"提示），但不再有任何作用。
 > 其中 `dyn_fixed_interval` 会被**自动迁移**成 `interval_pct`——它原本就是实际生效的间距。
