@@ -328,8 +328,16 @@ for %t in (ccg_indicator_tests ccg_key_store_tests ccg_risk_tests ccg_funding_te
 |---|---|
 | [docs/GUIDE.md](docs/GUIDE.md) | 界面与参数详解 |
 | [docs/HEADLESS.md](docs/HEADLESS.md) | 无界面版配置字段与 systemd 部署 |
-| [docs/DYNAMIC_W.md](docs/DYNAMIC_W.md) | 动态W模式的推导与实测 |
+| [docs/NEGATIVE_RESULTS.md](docs/NEGATIVE_RESULTS.md) | **已移除的方向与实测结论**（分三类：实测证伪 / 从未验证 / 论证成立但按取向移除）。加功能前先翻这里 |
 | [docs/BACKTEST.md](docs/BACKTEST.md) | 历史回测结论存档（工具本身已移出仓库） |
+| [docs/DYNAMIC_W.md](docs/DYNAMIC_W.md) | 动态W模式的推导与实测（v4.6.0 已移除，历史存档） |
+
+## 工具
+
+| | |
+|---|---|
+| `tools/ladder_depth` | 梯子深度推演：子弹打光时价格跌了多少、还剩多少保证金没花。回测答不了这个问题——它的风险指标是浮动回撤，而对"套住长持"的策略致命的是强平，不是浮亏 |
+| [`tools/tradingview/bar_swing_stop.pine`](tools/tradingview/bar_swing_stop.pine) | SAR 裸K线模式的 TradingView 镜像。用来**肉眼核对机器人算出的止损线**：鼠标移到任意一根K线，状态栏显示那根当时生效的止损价，图上画红色虚线。两处与引擎必然存在的差异（3 秒采样 vs 整根极值、下单延迟）在文件注释里写明了 |
 
 ---
 

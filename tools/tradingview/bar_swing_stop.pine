@@ -1,0 +1,268 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  裸K线入场 + 摆动移动止损 —— CCBot「SAR / BarPattern」模式的 TradingView 镜像
+//  （对照 v4.4.0 写成；截至 v4.7.1 决策层逻辑未变，镜像仍然准确。
+//    v4.7.0 新增的交易所侧灾难止损不影响这里——它镜像的是决策层，不是下单层）
+//
+//  这不是"另写一版策略"，而是把 src/core/sar_decision.h 的 BarPattern 分支逐条搬到
+//  Pine 上，用来【肉眼核对】机器人算出的止损线。凡是两边口径必然不一致的地方都在
+//  注释里写明白了（搜「⚠ 与引擎的差异」），不做"看起来更合理"的改良。
+//
+//  ── 规格（与 C++ 一致）─────────────────────────────────────────────────────────
+//   入场  刚收盘那根（引擎叫 bar 0）收盘>开盘 ⇒ 做多，收盘<开盘 ⇒ 做空，十字星不开
+//   止损  bar 0 之【前】N 根（引擎编号 1..N）的最低价（多）/ 最高价（空）
+//         —— 信号根自己【不在】窗口里
+//   移动  窗口随K线右移，棘轮只朝有利方向
+//   出场  触线即走。盈利出场不反手（力竭≠反转）；亏损出场按反手规则处理
+//
+//  ── 索引口径（最容易搬错的一处）─────────────────────────────────────────────────
+//  引擎 fetch_bar_pattern()：bars[n-1] = 当前未收盘根
+//                           bars[n-2] = 信号根（bar 0）
+//                           窗口      = 从 bars[n-3] 往前数 N 根
+//  所以站在任意一根 Pine K线 u 上，引擎此刻用的窗口是【以 u-2 结尾的 N 根】，
+//  即 ta.lowest(low, N)[2]。信号根 u-1 自己也被排除在外——这不是 off-by-one，是规格：
+//  信号根若是长下影锤子线，那根下影发生在【入场之前】，没打到我们。
+//
+//  ── 怎么看止损位（本脚本的主要用途）─────────────────────────────────────────────
+//  TradingView 没有鼠标事件 API，「悬停显示数值」的原生机制是十字光标 + 状态栏/数据窗口。
+//  所以这里画了两组线：
+//    ① "止损位" —— 全序列、只进状态栏和数据窗口，不画在图上。鼠标移到哪根K线，
+//       指标标题那一行（以及右侧数据窗口）就显示那根K线【当时生效】的止损价
+//    ② "止损线" —— 画在图上的红色虚线，只负责好看，不占状态栏
+//  打开右侧数据窗口：图表右上角 ⌄ →「数据窗口」，或快捷键 Ctrl+Shift+D / Cmd+Shift+D
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("裸K线摆动止损 · CCBot 镜像", overlay = true, max_labels_count = 500)
+
+// ───────────────────────────── 策略参数（与 sar::Config 同名）──────────────────
+string gS = "策略（对应 sar::Config）"
+N = input.int(3, "摆动窗口 N 根（swing_bars）", minval = 1, maxval = 50, group = gS,
+     tooltip = "止损取【信号根之前】N 根的最低/最高价。N 越小持仓越短：N=3 在随机游走下平均持仓约 4 根，" +
+               "3m 周期约每天 120 笔，手续费拖累是天文数字；15m 约 24 笔。定 N 之前先算一遍手续费。")
+allowLong      = input.bool(true, "阳线做多",  group = gS, inline = "dir")
+allowShort     = input.bool(true, "阴线做空",  group = gS, inline = "dir")
+allowReverse   = input.bool(true, "亏损止损后反手（allow_reverse）", group = gS)
+revNeedsSignal = input.bool(true, "反手需反向信号成立（reverse_needs_signal）", group = gS,
+     tooltip = "关掉它 = 无条件反手。震荡市里亏损止损最频繁，而无条件反手恰好在那时最激进，" +
+               "来回绞杀。保持开启 = 只在趋势真的翻了时反手。")
+maxRev = input.int(2, "连续反手上限（max_consecutive_reverses）", minval = 0, group = gS,
+     tooltip = "真趋势不需要连续反手多次；连续反手本身就是「现在是震荡市」的信号。")
+cdBars = input.int(3, "触顶后冷却K线数（cooldown_bars）", minval = 0, group = gS)
+
+// ───────────────────────────── 显示 ───────────────────────────────────────────
+string gD = "显示"
+lineStyle = input.string("断口虚线", "止损线画法", options = ["断口虚线", "圆点", "实线"], group = gD)
+dashOn    = input.int(2, "虚线：连画几根后断 1 根", minval = 1, maxval = 6, group = gD)
+stopCol   = input.color(color.red, "止损线颜色", group = gD)
+showIdle  = input.bool(false, "空仓时也显示「若此刻入场」的预备止损位", group = gD,
+     tooltip = "空仓时引擎的止损线是 0（没有仓位就没有保护）。打开它可以提前看清下一笔的止损会落在哪。")
+showMarks = input.bool(true,  "入场/出场标记", group = gD)
+showPanel = input.bool(true,  "右上角状态面板", group = gD)
+
+// ═══════════════════════════ 摆动窗口与信号 ════════════════════════════════════
+// 偏移 [2] 的理由见文件头的「索引口径」。注意这两个值在本根K线【开盘时就已确定】，
+// 全部来自 u-2 及更早的K线 —— 所以止损线不会盘中重画，悬停读到的数就是当时生效的数。
+swLo = ta.lowest(low,   N)[2]
+swHi = ta.highest(high, N)[2]
+dataOk = not na(swLo) and not na(swHi) and swLo > 0 and swHi > 0
+
+// 信号根 = 上一根（刚收盘那根）。十字星 close==open ⇒ 两者皆 false，不开仓
+sigBull = close[1] > open[1]
+sigBear = close[1] < open[1]
+
+// ═══════════════════════════ 状态机（sar::step 的搬运）══════════════════════════
+var int   pos    = 0        // 0 空仓 / 1 多 / -1 空
+var float stopL  = na       // 棘轮止损线
+var float entryP = na       // 开仓价（金字塔加仓会变成加权均价，本脚本不建模加仓）
+var int   consec = 0        // 连续反手计数
+var int   cd     = 0        // 剩余冷却K线数
+
+bool  evLong   = false
+bool  evShort  = false
+bool  evWin    = false      // 盈利出场（止损线越过成本价）
+bool  evLoss   = false      // 亏损出场
+float exitMark = na         // 出场价（= 止损线本身），画标记用
+bool  closedNow = false     // 本根已平过仓 ⇒ 本根不再开新仓（引擎里靠 new_bar 天然隔开）
+
+// 冷却按K线计数，不按 tick（引擎：in.new_bar 时递减）
+if cd > 0
+    cd := cd - 1
+
+if pos != 0
+    isLong = pos > 0
+    // ── 棘轮 ────────────────────────────────────────────────────────────────
+    // 窗口最小值理论上自带棘轮（M 只在新K线跌破旧 M 时下移，而那一刻已经该出场了），
+    // 但两个例外必须靠显式 max/min 兜住：① 信号根的长下影会在它进入窗口时把 M 拉下去
+    // ② 引擎 3 秒采样一次，看不见 2 秒的插针，而下一根的 low 会记下来。
+    // 数据缺失时不推新线，沿用上一条 —— 绝不因为数据断流就撤掉保护。
+    cand = isLong ? swLo : swHi
+    if not na(cand) and cand > 0
+        stopL := isLong ? math.max(nz(stopL, cand), cand) : math.min(nz(stopL, cand), cand)
+
+    // ⚠ 与引擎的差异：引擎拿 3 秒一采的标记价比，Pine 拿整根的 low/high 比。
+    //   Pine 会抓到引擎漏掉的瞬时插针 ⇒ 本脚本的出场【略多于】机器人实际出场。
+    //   这是引擎那边的已知代价（靠下一根的窗口补上），不是脚本写错了。
+    hit = isLong ? low <= stopL : high >= stopL
+    if hit
+        exitPx   = stopL           // 盈亏以【止损线】而非现价衡量：语义是"回撤到线就走"
+        win      = isLong ? exitPx >= entryP : exitPx <= entryP
+        exitMark := exitPx
+        oppSig   = isLong ? sigBear : sigBull
+        dirOk    = isLong ? allowShort : allowLong
+
+        if win
+            // 盈利出场 ⇒ 趋势跑完了，但力竭不等于反转，不反手，等新信号
+            evWin    := true
+            consec   := 0
+            pos      := 0
+            stopL    := na
+            entryP   := na
+            closedNow := true
+        else
+            evLoss := true
+            // 下面这串分支的顺序、以及每个分支【动不动 consec】，与 C++ 逐字对应
+            if not allowReverse
+                pos := 0                        // consec 不动
+                stopL := na
+                entryP := na
+                closedNow := true
+            else if consec >= maxRev
+                cd := cdBars                    // 连续反手到顶 ⇒ 转冷却
+                consec := 0
+                pos := 0
+                stopL := na
+                entryP := na
+                closedNow := true
+            else if (revNeedsSignal and not oppSig) or not dirOk or not dataOk
+                pos := 0                        // consec 不动
+                stopL := na
+                entryP := na
+                closedNow := true
+            else
+                // 反手：平掉并反向开仓。引擎是市价两笔单，成交价≈止损线
+                newPos = -pos
+                pos    := newPos
+                entryP := exitPx
+                stopL  := newPos > 0 ? swLo : swHi
+                consec := consec + 1
+                if newPos > 0
+                    evLong := true
+                else
+                    evShort := true
+
+// ── 空仓：等信号 ──────────────────────────────────────────────────────────────
+// ⚠ 与引擎的差异：引擎在新K线的第一拍下市价单，最坏会晚到 45~60 秒（拉K线的轮询节奏）。
+//   这里按本根 open 成交，是最贴近且确定的近似。
+if pos == 0 and not closedNow and cd <= 0 and dataOk
+    if allowLong and sigBull
+        pos    := 1
+        entryP := open
+        stopL  := swLo
+        consec := 0
+        evLong := true
+    else if allowShort and sigBear
+        pos     := -1
+        entryP  := open
+        stopL   := swHi
+        consec  := 0
+        evShort := true
+
+// ── 开仓当根就被打掉 ──────────────────────────────────────────────────────────
+// 引擎会在同一根的后续 3 秒 tick 上发现触线。那些 tick 的 new_bar 已经是 false，
+// 所以 entry 信号不成立 ⇒ 默认配置（反手需信号）下只平不反手，这里照此处理。
+// ⚠ 与引擎的差异：若把「反手需反向信号」关掉，引擎可以在同一根里反手，本脚本不建模
+//   （一根K线只做一次决策）。
+if pos != 0 and not closedNow and na(exitMark)
+    justOpened = evLong or evShort
+    if justOpened
+        hit2 = pos > 0 ? low <= stopL : high >= stopL
+        if hit2
+            exitMark := stopL
+            evLoss   := true
+            evWin    := false
+            evLong   := false
+            evShort  := false
+            pos      := 0
+            stopL    := na
+            entryP   := na
+            closedNow := true
+
+// ═══════════════════════════ 画线 ══════════════════════════════════════════════
+// ① 悬停读数用：全序列、只进状态栏 + 数据窗口，不画在图上。
+//    鼠标移到任意一根K线，指标标题那行就显示那根K线当时生效的止损价。
+stopHover = pos != 0 ? stopL : na
+plot(stopHover, "止损位", color = stopCol, display = display.data_window + display.status_line)
+
+// ② 图上的视觉：红色虚线。
+//    plot() 不支持虚线样式，line.new() 支持却又不进状态栏、还有 500 条对象上限。
+//    所以用"每 dashOn 根断 1 根"制造断口 —— 看起来是虚线，历史无上限，且和 ①
+//    是同一个数，不会对不上。style_linebr 保证空仓段不被连起来。
+dashVis  = bar_index % (dashOn + 1) != 0
+useDash  = lineStyle == "断口虚线"
+useDots  = lineStyle == "圆点"
+useSolid = lineStyle == "实线"
+plot(useDash  and dashVis ? stopHover : na, "止损线(虚)", color = stopCol, linewidth = 2,
+     style = plot.style_linebr, display = display.pane)
+plot(useDots  ? stopHover : na, "止损线(点)", color = stopCol, linewidth = 1,
+     style = plot.style_circles, display = display.pane)
+plot(useSolid ? stopHover : na, "止损线(实)", color = stopCol, linewidth = 2,
+     style = plot.style_linebr, display = display.pane)
+
+// ③ 空仓时的预备止损位（可选）。引擎此刻的止损线是 0：没有仓位就没有保护，
+//    这两条只是"若下一根给信号，止损会落在哪"。
+idleCol = color.new(stopCol, 65)
+plot(showIdle and pos == 0 and allowLong  ? swLo : na, "预备止损(多)", color = idleCol,
+     linewidth = 1, style = plot.style_circles)
+plot(showIdle and pos == 0 and allowShort ? swHi : na, "预备止损(空)", color = idleCol,
+     linewidth = 1, style = plot.style_circles)
+
+// ── 入场/出场标记 ────────────────────────────────────────────────────────────
+plotshape(showMarks and evLong,  "做多入场", shape.triangleup,   location.belowbar,
+          color.new(color.teal, 0),  size = size.tiny)
+plotshape(showMarks and evShort, "做空入场", shape.triangledown, location.abovebar,
+          color.new(color.maroon, 0), size = size.tiny)
+plotshape(showMarks and evWin  ? exitMark : na, "止盈出场", shape.xcross, location.absolute,
+          color.new(color.teal, 0), size = size.tiny)
+plotshape(showMarks and evLoss ? exitMark : na, "止损出场", shape.xcross, location.absolute,
+          color.new(color.red, 0),  size = size.tiny)
+
+// ── 右侧当前止损标签 ─────────────────────────────────────────────────────────
+var label tag = na
+label.delete(tag)
+if barstate.islast and pos != 0
+    locked = pos > 0 ? stopL >= entryP : stopL <= entryP
+    tag := label.new(bar_index + 2, stopL,
+         text = (pos > 0 ? "多 止损 " : "空 止损 ") + str.tostring(stopL, format.mintick),
+         xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left,
+         color = color.new(locked ? color.teal : stopCol, 15), textcolor = color.white,
+         size = size.small)
+
+// ── 状态面板 ─────────────────────────────────────────────────────────────────
+var table pnl = table.new(position.top_right, 2, 6, border_width = 1)
+if showPanel and barstate.islast
+    // 「距离」= 现价离止损线还有多远，和 GUI 那一列同义：止损线越过成本价后转绿
+    dist   = pos == 0 or na(stopL) ? na : math.abs(close - stopL) / close * 100
+    locked = pos != 0 and (pos > 0 ? stopL >= entryP : stopL <= entryP)
+    posTxt = pos > 0 ? "多" : pos < 0 ? "空" : "空仓"
+    table.cell(pnl, 0, 0, "裸K线 N=" + str.tostring(N), text_color = color.white,
+               bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(pnl, 1, 0, posTxt, text_color = color.white,
+               bgcolor = color.new(pos > 0 ? color.teal : pos < 0 ? color.maroon : color.gray, 30),
+               text_size = size.small)
+    table.cell(pnl, 0, 1, "止损位", text_size = size.small)
+    table.cell(pnl, 1, 1, pos == 0 ? "—" : str.tostring(stopL, format.mintick),
+               text_color = locked ? color.teal : stopCol, text_size = size.small)
+    table.cell(pnl, 0, 2, "距离", text_size = size.small)
+    table.cell(pnl, 1, 2, na(dist) ? "—" : str.tostring(dist, "#.##") + "%",
+               text_color = locked ? color.teal : color.gray, text_size = size.small)
+    table.cell(pnl, 0, 3, "开仓价", text_size = size.small)
+    table.cell(pnl, 1, 3, pos == 0 ? "—" : str.tostring(entryP, format.mintick), text_size = size.small)
+    table.cell(pnl, 0, 4, "连续反手", text_size = size.small)
+    table.cell(pnl, 1, 4, str.tostring(consec) + " / " + str.tostring(maxRev), text_size = size.small)
+    table.cell(pnl, 0, 5, "冷却剩余", text_size = size.small)
+    table.cell(pnl, 1, 5, cd > 0 ? str.tostring(cd) + " 根" : "—", text_size = size.small)
+
+// ── 告警 ─────────────────────────────────────────────────────────────────────
+alertcondition(evLong,  "裸K线：做多入场", "阳线收盘，做多")
+alertcondition(evShort, "裸K线：做空入场", "阴线收盘，做空")
+alertcondition(evWin,   "裸K线：止盈出场", "触摆动止损线，已锁定盈利")
+alertcondition(evLoss,  "裸K线：止损出场", "触摆动止损线，亏损出场")
