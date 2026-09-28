@@ -21,7 +21,12 @@ static void check(bool ok, const char* what) {
     if (!ok) ++g_fail;
 }
 
-// 直接造一份"旧版格式"的密文（3行，没有账户类型），模拟升级前保存的文件
+// 直接造一份"旧版格式"的密文（3行，没有账户类型），模拟升级前保存的文件。
+//
+// ⚠ 整个函数包在 !__APPLE__ 里：macOS 用钥匙串后端，下面那两组"旧版格式兼容"
+//   用例整块被跳过，函数就成了定义而无人调用 —— Clang 的 -Wunused-function 会拦。
+//   这类问题本机（Windows）结构上发现不了，只有目标平台的 CI 能报
+#if !defined(__APPLE__)
 static bool write_legacy_blob(const std::string& path, const std::string& plain) {
 #if defined(_WIN32)
     DATA_BLOB in  = { (DWORD)plain.size(), (BYTE*)plain.data() };
@@ -40,6 +45,7 @@ static bool write_legacy_blob(const std::string& path, const std::string& plain)
     return true;
 #endif
 }
+#endif  // !__APPLE__
 
 int main() {
     const std::string path = "test_creds.bin";
