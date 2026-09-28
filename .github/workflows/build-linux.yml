@@ -72,30 +72,31 @@ jobs:
         run: |
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCCBOT_WERROR=ON \
             -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux
 
       - name: Build
         run: cmake --build build 2>&1 | tee build.log
 
-      # 警告清单。v4.6.2 才第一次给自己的目标开上 -Wall -Wextra 等，而 GCC 会抓到
-      # MSVC 放过的东西（-Wshadow / -Wdouble-promotion 尤其）。
+      # 警告清单。v4.7.1 起 -DCCBOT_WERROR=ON，警告已经是【硬门禁】——有警告的话
+      # 上面那步 Build 就直接失败了，走不到这里。
       #
-      # 这一步【不拦】构建，只把清单摊开来：先看清有多少、是什么，再决定要不要把
-      # CCBOT_WERROR 打开变成硬门禁。盲开 -Werror 的代价是 main 直接变红，
-      # 而拿到的信息和这样看一遍完全相同。
-      #
-      # 只统计我们自己的文件——vcpkg 依赖和 Qt moc 的警告我们既管不了也不该管
-      - name: Warning summary (informational)
+      # 那为什么还留着：Build 失败时 GCC 的输出混在一大堆编译命令里，这一步用
+      # if: always() 把自有代码的警告单独摘出来排好，省掉翻日志。
+      # vcpkg 依赖和 Qt moc 的警告不统计——我们既管不了也不该管。
+      - name: Warning summary
         if: always()
         run: |
           set +e
-          grep -E "warning:" build.log | grep -E "/(src|tests|tools)/" | sort -u > warn.txt
+          grep -E "warning:|error:" build.log | grep -E "/(src|tests|tools)/" | sort -u > warn.txt
           n=$(wc -l < warn.txt)
-          echo "── 自有代码的 GCC 警告：$n 条 ──"
-          cat warn.txt
-          echo "────────────────────────────────"
-          echo "（清零之后把 Configure 里的 -DCCBOT_WERROR=ON 打开，这一步就变成硬门禁）"
+          if [ "$n" = "0" ]; then
+            echo "✅ 自有代码零警告"
+          else
+            echo "── 自有代码的 GCC 警告/错误：$n 条 ──"
+            cat warn.txt
+          fi
 
       - name: Save vcpkg binary cache (even on failure)
         if: always()

@@ -80,13 +80,29 @@ static CURL* make_curl(const std::string& api_key, std::string& resp,
 }
 
 // ── simdjson helpers ─────────────────────────────────────────────────────────
+// 「取不到就沿用默认值」——本文件里绝大多数字段解析都是这个语义：调用方先把变量
+// 初始化成一个安全默认值（orderId=0、dualSidePosition=false、字符串为空…），再尝试
+// 解析，字段缺失或类型不对就让默认值生效。
+//
+// simdjson 的 get() 带 warn_unused_result，直接调用会在 GCC 下报 16 条
+// -Wunused-result。用这个函数把"有意忽略"显式写出来，一是消掉警告（否则 -Werror
+// 开不起来），二是让下一个读代码的人不用逐处判断"这里是不是忘了检查错误"。
+//
+// 返回值给【真的需要区分】的调用点用；不关心的直接丢掉（bool 没有 nodiscard）。
+// ⚠ 用它的前提是默认值本身安全。如果某个字段解析失败会导致错误行为，
+//   就不该用它，而应显式判 == simdjson::SUCCESS。
+template <class Elem, class T>
+static bool get_or_keep(Elem elem, T& out) {
+    return elem.get(out) == simdjson::SUCCESS;
+}
+
 static double parse_dbl_str(simdjson::dom::element& obj, const char* key) {
     std::string_view v;
     if (obj[key].get(v) == simdjson::SUCCESS) {
         try { return std::stod(std::string(v)); } catch (...) {}
     }
     double d = 0;
-    obj[key].get(d);
+    get_or_keep(obj[key], d);
     return d;
 }
 
@@ -94,7 +110,7 @@ static bool binance_error(simdjson::dom::element& doc, std::string& err) {
     int64_t code = 0;
     if (doc["code"].get(code) == simdjson::SUCCESS && code < 0) {
         std::string_view msg;
-        doc["msg"].get(msg);
+        get_or_keep(doc["msg"], msg);
         err = "[" + std::to_string(code) + "] " + std::string(msg);
         return true;
     }
@@ -608,13 +624,13 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions(bool* ok) {
     for (auto item : arr) {
         std::string_view sym, amt_s, ep_s, mp_s, pnl_s, liq_s;
         int64_t lev = 1;
-        item["symbol"].get(sym);
-        item["positionAmt"].get(amt_s);
-        item["entryPrice"].get(ep_s);
-        item["markPrice"].get(mp_s);
-        item["unRealizedProfit"].get(pnl_s);
-        item["liquidationPrice"].get(liq_s);
-        item["leverage"].get(lev);
+        get_or_keep(item["symbol"], sym);
+        get_or_keep(item["positionAmt"], amt_s);
+        get_or_keep(item["entryPrice"], ep_s);
+        get_or_keep(item["markPrice"], mp_s);
+        get_or_keep(item["unRealizedProfit"], pnl_s);
+        get_or_keep(item["liquidationPrice"], liq_s);
+        get_or_keep(item["leverage"], lev);
 
         double pos_amt = 0;
         try { pos_amt = std::stod(std::string(amt_s)); } catch (...) {}
@@ -688,7 +704,7 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     }
 
     int64_t oid = 0;
-    doc["orderId"].get(oid);
+    get_or_keep(doc["orderId"], oid);
     r.order_id     = std::to_string(oid);
     r.avg_price    = parse_dbl_str(doc, "avgPrice");
     r.executed_qty = parse_dbl_str(doc, "executedQty");
@@ -786,7 +802,7 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
 
         // -1111 = 精度超限，放宽一档重试
         int64_t code = 0;
-        doc["code"].get(code);
+        get_or_keep(doc["code"], code);
         if (code == -1111) {
             r.error = "[-1111]";
             continue;
@@ -794,7 +810,7 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
 
         if (binance_error(doc, r.error)) return r;
         int64_t oid = 0;
-        doc["orderId"].get(oid);
+        get_or_keep(doc["orderId"], oid);
         r.order_id     = std::to_string(oid);
         r.avg_price    = parse_dbl_str(doc, "avgPrice");
         r.executed_qty = parse_dbl_str(doc, "executedQty");
@@ -813,7 +829,7 @@ bool TradingClient::fetch_position_mode() {
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
     bool dual = false;
-    doc["dualSidePosition"].get(dual);
+    get_or_keep(doc["dualSidePosition"], dual);
     dual_mode_ = dual;
     return dual;
 }
@@ -1070,7 +1086,7 @@ TradingClient::place_cond_market(const std::string& sym, const char* order_type,
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; return r; }
     if (binance_error(doc, r.error)) return r;
     int64_t oid = 0;
-    doc[pm ? "strategyId" : "orderId"].get(oid);
+    get_or_keep(doc[pm ? "strategyId" : "orderId"], oid);
     r.order_id = std::to_string(oid); r.ok = true;
     return r;
 }
@@ -1109,7 +1125,7 @@ std::string TradingClient::place_disaster_stop(const std::string& sym, double st
     std::string err;
     if (binance_error(doc, err)) return "";
     int64_t oid = 0;
-    doc[pm ? "strategyId" : "orderId"].get(oid);
+    get_or_keep(doc[pm ? "strategyId" : "orderId"], oid);
     return oid > 0 ? std::to_string(oid) : "";
 }
 
@@ -1374,7 +1390,7 @@ TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) 
     if (doc["lastFundingRate"].get(fr) == simdjson::SUCCESS) {
         try { info.funding_rate = std::stod(std::string(fr)); } catch (...) {}
     }
-    doc["nextFundingTime"].get(info.next_ms);
+    get_or_keep(doc["nextFundingTime"], info.next_ms);
     info.ok = true;
     return info;
 }

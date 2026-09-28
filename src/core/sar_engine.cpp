@@ -437,7 +437,9 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
     host_.submit([this, id, dir, from_reverse]() {
         try {
             SarConfig cfg;
-            double price = 0, atr = 0, init_stop = 0;
+            // 这里不再需要 atr：v4.4.0 起 plan_qty 按【真实止损线】算等风险数量，
+            // 而初始止损线在下面用 sar::initial_stop 直接算好（它自己取 si.atr）
+            double price = 0, init_stop = 0;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
@@ -445,7 +447,6 @@ void SarEngine::submit_open(const std::string& id, sar::Pos dir, bool from_rever
                 const auto& b = it->second;
                 cfg   = b.cfg;
                 price = b.current_price;
-                atr   = b.atr;
                 // 初始止损线在【持锁时】按当前快照算好带出去：下单是异步的，
                 // 等回来再算的话快照可能已经换了一根K线，止损线会和成交价错配
                 sar::Inputs si;
