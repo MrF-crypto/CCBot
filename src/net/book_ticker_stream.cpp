@@ -284,6 +284,8 @@ void BookTickerStream::pump_loop() {
                 // 分两种成因说，因为修法完全相反。判据是有没有收到过控制帧
                 // （订阅确认）：币安对每条 SUBSCRIBE 必回 {"result":null,"id":N}
                 const int ctrl = c->ctrl_msgs.load();
+                std::string ctrl_txt;
+                { std::lock_guard<std::mutex> lk(mtx_); ctrl_txt = c->first_ctrl; }
                 const std::string head =
                     "⚠ 行情WS#" + std::to_string(c->id) + " 已连接 "
                     + std::to_string((now - cs) / 1000) + " 秒却一个行情包都没收到 —— ";
@@ -295,7 +297,14 @@ void BookTickerStream::pump_loop() {
                     //   （v5.1.1 这条文案一度写成"币安会因为一条非法流名拒掉
                     //     整条 SUBSCRIBE"，那是错的，会把人往查流名的方向带）
                     say(head + "服务端回了 " + std::to_string(ctrl) +
-                        " 条控制消息且没有报错。注意：/stream 端点对 SUBSCRIBE "
+                        " 条控制消息且没有报错。\n"
+                        "    第一条原文：" + ctrl_txt + "\n"
+                        "    我们发出去的 SUBSCRIBE id = " +
+                        std::to_string(c->last_sub_id.load()) + "\n"
+                        "    ↑ 对面是不是真的币安，看这两行对不对得上：币安回的是 "
+                        "{\"result\":null,\"id\":N}，N 必须等于上面那个 id。"
+                        "对不上、或者格式不是这个样子，说明应答来自中间件而不是币安。\n"
+                        "    注意：/stream 端点对 SUBSCRIBE "
                         "一律回 result:null 且【不校验流名】，不认识的流名会被"
                         "静默忽略——所以「收到确认」不等于「订阅生效」。\n"
                         "    本次这条连接上的流【全部】零数据，个别流名写错解释"
@@ -499,10 +508,12 @@ void BookTickerStream::send_subs(Conn* c, const std::vector<std::string>& stream
             if (j > i) params << ',';
             params << '"' << streams[j] << '"';
         }
+        const int id = req_id_++;
+        if (sub) c->last_sub_id.store(id);   // 给零数据告警比对应答的 id 用
         const std::string msg =
             std::string("{\"method\":\"") + (sub ? "SUBSCRIBE" : "UNSUBSCRIBE")
             + "\",\"params\":[" + params.str()
-            + "],\"id\":" + std::to_string(req_id_++) + "}";
+            + "],\"id\":" + std::to_string(id) + "}";
         c->ws->send(msg);
     }
 }
@@ -524,7 +535,20 @@ void BookTickerStream::on_message(const std::string& json, Conn* c) {
         // 但要【计数】：它是"币安在不在应答"的唯一证据。订阅确认本身不打日志
         //   （正常情况每次重连都刷一条纯噪音），所以没有这个计数的话，
         //   "收到了确认但没行情"和"一个字节都没回来"在日志上完全一样
-        if (c) c->ctrl_msgs.fetch_add(1);
+        if (c) {
+            if (c->ctrl_msgs.fetch_add(1) == 0) {
+                // 留下第一条的原文，给零数据告警当证据用。截到 200 字符：
+                // 正常的订阅确认只有三十来字节，长到需要截的本身就是信息。
+                //
+                // 在 WS 线程里取 mtx_ 是安全的：全部 ws->start/stop/close 调用
+                // 都在锁外（见 stop()、force_reconnect()、subscribe() 的注释），
+                // 所以不存在"持锁等 WS 线程、WS 线程等锁"那个环。
+                // on_open→resubscribe_all 本来也是这么做的。
+                // 控制帧很稀少（每次连接就那一条 ack），不在热路径上
+                std::lock_guard<std::mutex> lk(mtx_);
+                c->first_ctrl = json.substr(0, 200);
+            }
+        }
         return;
     }
     if (json.size() < 20) return;

@@ -379,6 +379,16 @@ private:
         //                      的问题（代理/DNS 把域名劫持到了别处）
         //   实测日志里日志一口咬定"流名有误/被服务端拒绝"，而真因是后者
         std::atomic<int>     ctrl_msgs     {0};
+        // 本次连接的【第一条】控制帧原文（截断）。只在零数据告警里打出来。
+        //
+        // ⚠ 这是"对面到底是不是币安"的唯一直接证据。币安对 SUBSCRIBE 回的是
+        //   {"result":null,"id":N}，其中 id 必须与我们发出去的那个对上；
+        //   而一个只会敷衍的中间件回不出正确的 id，或者格式会有细微差别。
+        //   平时不打（每次重连刷一条纯噪音），只在"连上了却零数据"时才需要它
+        std::string          first_ctrl;              // 由外层 mtx_ 保护
+        // 本次连接最后一条 SUBSCRIBE 用掉的 id。和 first_ctrl 里的 id 比对，
+        // 就能判断那条应答到底是不是在回我们这条消息
+        std::atomic<int>     last_sub_id   {-1};
         std::set<std::string> streams;            // 由外层 mtx_ 保护
         int id = 0;
 
