@@ -3,47 +3,13 @@
   "api_secret": "你的Binance API Secret",
   "testnet": true,
   "account_mode": "futures",
+
   "max_total_margin": 500,
   "max_open_positions": 0,
+
   "alert_webhook": "",
   "state_path": "ccbot_state.json",
   "log_path": "ccbot.log",
-
-  "bots": [
-    {
-      "symbol": "BTCUSDT",
-      "use_disaster_stop": false,
-      "direction": "long",
-      "strat_type": "linear",
-      "budget_usdt": 3000,
-      "leverage": 3,
-      "max_entries": 8,
-      "interval_pct": 6,
-      "trail_entry": 1,
-      "tp_pct": 5,
-      "trail_tp": 2,
-      "auto_restart": true,
-      "cooldown_secs": 300,
-
-      "entry_mode": "indicator",
-      "kline_interval": "1h",
-      "boll_period": 20,
-      "boll_mult": 2,
-      "use_rsi_filter": true,
-      "rsi_period": 14,
-      "rsi_threshold": 30,
-      "rsi_confirm_mode": "cross",
-      "rsi_oversold_th": 25,
-
-      "use_trend_filter": true,
-      "trend_interval": "4h",
-      "trend_ema_period": 200,
-
-      "use_htf_filter": true,
-      "htf_interval": "1d",
-      "htf_pos_max": 0.60
-    }
-  ],
 
   "sar_bots": [
     {
@@ -51,14 +17,41 @@
       "budget_usdt": 500,
       "leverage": 3,
       "interval": "4h",
+
+      "mode": "donchian",
       "donchian_period": 20,
       "atr_period": 14,
       "atr_mult": 3.0,
+
       "allow_reverse": true,
       "reverse_needs_signal": true,
       "max_consecutive_reverses": 2,
       "cooldown_bars": 3,
       "signal_max_age_sec": 900,
+
+      "use_disaster_stop": true,
+      "disaster_stop_buffer_pct": 1.0
+    },
+    {
+      "symbol": "SOLUSDT",
+      "budget_usdt": 500,
+      "leverage": 3,
+      "interval": "3m",
+
+      "mode": "bar_pattern",
+      "swing_bars": 3,
+      "atr_period": 14,
+
+      "size_mode": "risk_based",
+      "risk_usdt": 20,
+
+      "pyramid_max_adds": 2,
+      "pyramid_step_atr": 0.5,
+
+      "allow_reverse": true,
+      "reverse_needs_signal": true,
+      "signal_max_age_sec": 300,
+
       "use_disaster_stop": true,
       "disaster_stop_buffer_pct": 1.0
     }

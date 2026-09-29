@@ -23,7 +23,6 @@
 // 头拖进每个包含 main_window.h 的翻译单元
 class QVBoxLayout;
 
-#include "core/ccg_engine.h"
 #include "core/sar_engine.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
@@ -42,29 +41,14 @@ inline constexpr int    kLogMaxLines   = 3000;    // 日志框保留行数
 inline constexpr size_t kMaxTrades     = 20000;   // 内存/落盘保留的成交记录条数
 inline constexpr int    kTradeSaveMinMs = 3000;   // 成交落盘的最小间隔（合并密集平仓）
 
-// ── 一张表容纳两套策略 ───────────────────────────────────────────────────────
-// v4.5.0 起 DCA 与 SAR 合并进同一张监控表（原先是两个标签页）。合并只发生在
-// 【界面层】：两个引擎各自照原样持有自己的 bot、各自落盘自己的文件，这里只是把
-// 两边的 bot 排成一个行序列给表格用。
+// 表格底部汇总行的累加器。fillSarRow 要往里加，所以提成一个结构体传引用——
+// 否则它要么返回一个五元组，要么把汇总算两遍。
 //
-// 这么做的代价是列语义要跨策略复用（层进度↔金字塔档数、均价↔开仓价、
-// 强平价↔止损线）；换来的是"一个品种一套策略"从【4 处手写检查】变成配置弹窗里
-// 单选框的天然性质。
-struct BotRow {
-    enum class Kind { Dca, Sar };
-    Kind        kind = Kind::Dca;
-    std::string bot_id;
-    std::string symbol;
-    // 排序键：先品种字典序，再 _B(0) < _L(1) < _S(2) < SAR(3)。
-    // 前三档刻意和 CcgEngine 的 bot_id 后缀字典序一致——DCA 的 bot 装在
-    // std::map 里本来就是这个顺序，所以现有用户看到的行序一行都不会变
-    int         sort_key = 0;
-    const CcgBot* dca = nullptr;   // kind==Dca 时有效
-    const SarBot* sar = nullptr;   // kind==Sar 时有效
-};
-
-// 表格底部汇总行的累加器。两种行都要往里加，所以提成一个结构体传引用——
-// 否则 fillSarRow 要么返回一个五元组，要么把汇总算两遍
+// v4.5.0~v4.7.1 这里还有一个 BotRow：把两个引擎（网格DCA + 趋势SAR）的 bot
+// 合成一个行序列给表格用，带 Kind 判别、裸指针和跨策略的排序键。网格DCA 移除后
+// 只有一个数据来源，行序就是品种字典序，那套机制整个塌缩掉了。
+// 它换来的那份代价也一并消失：列语义不再需要跨策略复用
+// （层进度↔金字塔档数、均价↔开仓价、强平价↔止损线）
 struct RowTotals {
     int    running = 0, cooling = 0, stopped = 0;
     double unreal  = 0, real    = 0;
@@ -103,17 +87,11 @@ private:
     void log(const QString& msg, const QString& level = "INFO");
     void run_async(std::function<void()> fn);
 
-    // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）。
-    // 弹窗顶部可选策略：网格 DCA / 趋势 SAR，下面的表单整片切换
+    // 品种右键 → 策略配置弹窗（新建或编辑已存在的 bot 都走这里）
     void openStrategyDialog(const std::string& symbol);
 
-    // 两个引擎的 bot 合成一个行序列。vector 由【调用方持有】——BotRow 里存的是
-    // 裸指针，若在这里构造临时 vector 再返回，指针立刻悬空
-    std::vector<BotRow> buildRows(const std::vector<CcgBot>& dca,
-                                  const std::vector<SarBot>& sar) const;
-
-    // ── SAR 趋势跟随（与 DCA 并列的第二套策略，现已同表显示）────────────────
-    // 把一行填成 SAR 行。列位复用 DCA 的 16 列，语义映射见函数体里的对照表
+    // ── 趋势 SAR（本版起是唯一的策略）────────────────────────────────────────
+    // 把一行填成 SAR 行。16 列的列位沿用（列语义见函数体里的对照表）
     void fillSarRow(int row, const SarBot& b, RowTotals& t);
     // SAR 表单的构建与回读。拆成两半是为了让 openStrategyDialog 能把表单嵌进
     // 自己的分页里，而不用把 30 多个控件的构造逻辑复制一份
@@ -154,8 +132,6 @@ private:
     std::string funding_path()  const;
     void save_credentials();
     void load_credentials();
-    void save_bots();
-    void load_and_restore_bots();
     void save_trades(bool force = false);
     void load_trades();
     void save_settings();
@@ -168,8 +144,7 @@ private:
 
     // 后端
     std::shared_ptr<TradingClient>     client_;
-    std::shared_ptr<CcgEngine>         engine_;
-    // pool_ = 引擎专用（下单/平仓）；fetchPool_ = 数据拉取专用（账户/持仓/指标/趋势）。
+    // pool_ = 引擎专用（下单/平仓）；fetchPool_ = 数据拉取专用（账户/持仓/信号）。
     // 必须分开：拉取任务动辄几百毫秒~几秒，混在一个池里会把手动平仓排到队尾等十几秒
     std::shared_ptr<ThreadPool>        pool_;
     std::shared_ptr<ThreadPool>        fetchPool_;
@@ -179,6 +154,12 @@ private:
     QTimer* tick_timer_  = nullptr;
     QTimer* ob_timer_    = nullptr;
     QTimer* header_timer_ = nullptr;   // 呼吸灯 + 连接计时，高频刷新
+
+    // 行情链路徽标的缓存。header_timer_ 是 50ms 一跳，而 health() 要遍历所有
+    // 已订阅品种并持锁——没必要跟着 50ms 重算，降频到 1 秒一次，中间复用缓存
+    int     feed_hc_ = 0;      // 50ms 节拍计数
+    QString feedBadge_;        // "行情✓" / "⚠行情异常"
+    QString feedTip_;          // Health::summary() 全文，挂在 tooltip 上
 
     // ── 连接区 ──（API Key/Secret/测试网的输入控件挪进了"设置"弹窗，这里只存值）
     QString      apiKey_;
@@ -216,14 +197,17 @@ private:
     QLineEdit*    addSymbolEdit_   = nullptr;
 
     // ── 实盘监控表（右键品种 → 策略配置弹窗）──
-    // DCA 与 SAR 同表。行序由 buildRows() 决定，与两个引擎的 bot 一一对应
+    // 行序 = 品种字典序，由 refreshBotTable / refreshLiveQuotes 两处【同源】排出。
+    // 两处必须一致，否则 100ms 快刷会把价格写到别的品种那一行上
     QTableWidget* botTable_    = nullptr;
     QLabel*       summaryLabel_ = nullptr;
     // 操作列按钮的重建键：键没变就不重建控件（避免点击被刷新吞掉）
     std::vector<QString> opRowKeys_;
 
     // ── 交易明细 / 盈利统计 ──
-    std::vector<TradeRecord> trades_;
+    // 成交明细。类型从 TradeRecord 换成 SarTrade（网格DCA 移除后前者不存在了）：
+    // 少了 layers（层数，DCA 概念），方向从配置里的 direction 换成运行时的 st.pos
+    std::vector<SarTrade> trades_;
     qint64 lastTradeSaveMs_ = 0;   // 落盘去抖
     bool   tradesDirty_     = false;
     QLabel*       statsLabel_ = nullptr;
@@ -243,7 +227,6 @@ private:
 
     // ── 各批次的 tick 计数（仅GUI线程访问）──
     int slowTickCount_  = 0;   // 慢批次节拍：对账(每20) / 重新对时(每300)
-    int trendTickCount_ = 0;
     int fundTickCount_  = 0;
     // 资金费账本：每 8 小时结算一次的真实现金流出，不是浮亏。
     // 只记账不参与任何交易决策
@@ -252,9 +235,11 @@ private:
 
     // 周期性拉取的防堆积守卫：上一批任务没跑完就跳过本批。没有守卫的话，
     // bot 数量多时（31个×每个~0.3s）批量任务的生产速度会超过消化速度，
-    // 拉取队列无限增长——弹窗预览等一次性任务被排到队尾永远轮不到
-    std::atomic<bool> indFetchBusy_{false};
-    std::atomic<bool> trendFetchBusy_{false};
+    // 拉取队列无限增长——弹窗预览等一次性任务被排到队尾永远轮不到。
+    //
+    // indFetchBusy_ / trendFetchBusy_ 随网格DCA 的指标与趋势批次一并删除。
+    // ⚠ 这两个成员删掉之前是【无引用】的——而无引用的私有成员编译器不会警告，
+    //   删代码时靠编译器兜不住，只能靠逐个 grep
     // REST 价格兜底的防重入。串行遍历全部缺价品种，品种一多远超 3 秒的 tick 周期，
     // 没有这道闸会在 fetchPool_ 里无限堆积并饿死高周期指标拉取
     std::atomic<bool> restFetchBusy_{false};

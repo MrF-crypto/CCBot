@@ -84,10 +84,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
+          for t in ccg_indicator_tests ccg_key_store_tests \
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_stress_tests ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests \
-                   ccg_persist_tests ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_pool_tests; do
+                   ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests \
+                   ccg_sar_stress_tests \
+                   ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_pool_tests; do
             echo "── $t ──"
             ./build/Release/$t.exe
           done
@@ -98,7 +99,7 @@ jobs:
           set -e
           mkdir -p pkg/platforms
           cd build/Release
-          cp TradingBot.exe ladder_depth.exe *.dll ../../pkg/
+          cp TradingBot.exe *.dll ../../pkg/
           cp platforms/qwindows.dll ../../pkg/platforms/
           cd ../..
           ls -la pkg | head -30

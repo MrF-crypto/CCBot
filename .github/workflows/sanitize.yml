@@ -1,8 +1,9 @@
 # Sanitizer 门禁。
 #
-# 为什么值得单独一条流水线：本项目 ccg_engine.cpp 有 34 处 mutex/atomic、
-# sar_engine.cpp 27 处，而并发缺陷是所有缺陷里唯一会"看起来一切正常、单元测试
-# 全绿，直到某天对不上账"的一类。15 套测试证明不了它不存在，TSan 能。
+# 为什么值得单独一条流水线：本项目 sar_engine.cpp 有 27 处 mutex/atomic，
+# book_ticker_stream.cpp 还多一个看门狗线程，而并发缺陷是所有缺陷里唯一会
+# "看起来一切正常、单元测试全绿，直到某天对不上账"的一类。
+# 单元测试证明不了它不存在，TSan 能。
 #
 # 只跑 Linux（1× 计费倍率）。本仓库是私有仓库、macOS runner 10× 倍率，
 # 每月提交预算有限——最严的那道门禁要放在最便宜的平台上。
@@ -33,16 +34,21 @@ jobs:
       fail-fast: false      # 一个挂了另一个也要跑完，两份报告一起看
       matrix:
         include:
-          # ASan+UBSan：越界、use-after-free、未定义行为。全部 15 套都跑
+          # ASan+UBSan：越界、use-after-free、未定义行为。全部测试都跑
           - san: address+undefined
             name: ASan+UBSan
             suites: all
           # TSan：数据竞争。只跑真正并发的那几套——其余是纯函数测试，
           # 跑它们只是烧时间。ccg_price_tests 不跑：它碰 book_ticker_stream，
           # 而 ixwebsocket 未 instrumentation，噪音大于价值
+          #
+          # ccg_sar_stress_tests 接替了随网格DCA 一起删掉的 ccg_stress_tests。
+          # 这个替换不能漏：那两套是本仓库【唯一】开真线程池多线程压引擎的测试，
+          # 少了它 TSan 这一格就只剩线程池自测和单线程的订单路径，
+          # 等于把这道门禁降级成摆设
           - san: thread
             name: TSan
-            suites: ccg_stress_tests ccg_pool_tests ccg_sar_engine_tests ccg_risk_tests ccg_order_tests
+            suites: ccg_sar_stress_tests ccg_pool_tests ccg_sar_engine_tests ccg_order_tests
 
     name: ${{ matrix.name }}
     steps:
@@ -118,10 +124,10 @@ jobs:
         run: |
           set -e
           if [ "${{ matrix.suites }}" = "all" ]; then
-            SUITES="ccg_indicator_tests ccg_key_store_tests ccg_risk_tests
+            SUITES="ccg_indicator_tests ccg_key_store_tests
                     ccg_funding_tests ccg_rate_tests ccg_order_tests
-                    ccg_stress_tests ccg_sar_tests ccg_sar_engine_tests
-                    ccg_sar_state_tests ccg_persist_tests ccg_config_tests
+                    ccg_sar_tests ccg_sar_engine_tests ccg_sar_stress_tests
+                    ccg_sar_state_tests ccg_config_tests
                     ccg_price_tests ccg_timesync_tests ccg_pool_tests"
           else
             SUITES="${{ matrix.suites }}"

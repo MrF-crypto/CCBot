@@ -51,101 +51,10 @@ static bool write_file(const std::string& p, const std::string& s) {
 int main() {
     const std::string path = "test_cfg.json";
 
-    // ── ① 最小配置：只给 symbol，其余全部应当回落到【引擎默认值】 ────────────
-    {
-        write_file(path,
-            "{\"api_key\":\"k\",\"api_secret\":\"s\","
-            "\"bots\":[{\"symbol\":\"BTCUSDT\"}]}");
-
-        HeadlessConfig hc; std::string err;
-        check(load_headless_config(path, hc, err), "最小配置能解析: " + err);
-        check(hc.bots.size() == 1, "解析出 1 个 bot");
-        if (hc.bots.empty()) { std::printf("\n无法继续\n"); return 1; }
-
-        const CcgConfig& g = hc.bots[0];   // headless 解析结果
-        const CcgConfig  d;                // 引擎默认值（头文件里的成员初始化器）
-
-        std::printf("\n── 漏填的键必须回落到引擎默认值 ──\n");
-        eq(g.strat_type,   d.strat_type,   "strat_type");
-        eq((int)g.max_entries, (int)d.max_entries, "max_entries（与保底利润强耦合，必须成对）");
-        eq((int)g.leverage,    (int)d.leverage,    "leverage");
-        eqd(g.budget_usdt,  d.budget_usdt,  "budget_usdt");
-        eqd(g.interval_pct, d.interval_pct, "interval_pct");
-        eqd(g.trail_entry,  d.trail_entry,  "trail_entry");
-        eqd(g.tp_pct,       d.tp_pct,       "tp_pct");
-        eqd(g.trail_tp,     d.trail_tp,     "trail_tp");
-        eq(g.auto_restart,  d.auto_restart,  "auto_restart");
-        eq((int)g.cooldown_secs, (int)d.cooldown_secs, "cooldown_secs");
-        eq(g.use_disaster_stop, d.use_disaster_stop, "use_disaster_stop");
-        eqd(g.disaster_stop_pct, d.disaster_stop_pct, "disaster_stop_pct");
-        eq(g.entry_mode,    d.entry_mode,    "entry_mode");
-        eq(g.kline_interval, d.kline_interval, "kline_interval");
-        eq((int)g.boll_period, (int)d.boll_period, "boll_period");
-        eqd(g.boll_mult,    d.boll_mult,    "boll_mult");
-        eq(g.use_rsi_filter, d.use_rsi_filter, "use_rsi_filter");
-        eq((int)g.rsi_period, (int)d.rsi_period, "rsi_period");
-        eqd(g.rsi_threshold, d.rsi_threshold, "rsi_threshold");
-        eq(g.rsi_confirm_mode, d.rsi_confirm_mode, "rsi_confirm_mode");
-        eqd(g.rsi_oversold_th, d.rsi_oversold_th, "rsi_oversold_th");
-        eq(g.use_trend_filter, d.use_trend_filter, "use_trend_filter");
-        eq(g.trend_interval, d.trend_interval, "trend_interval");
-        eq((int)g.trend_ema_period, (int)d.trend_ema_period, "trend_ema_period");
-        eq(g.use_htf_filter, d.use_htf_filter, "use_htf_filter");
-        eq(g.htf_interval,  d.htf_interval,  "htf_interval");
-        eqd(g.htf_pos_max,  d.htf_pos_max,  "htf_pos_max");
-    }
-
-    // ── ② 显式填写的值必须被采纳（别修完默认值把读取也弄坏了）────────────────
-    {
-        std::printf("\n── 显式配置必须覆盖默认值 ──\n");
-        write_file(path,
-            "{\"api_key\":\"k\",\"api_secret\":\"s\",\"bots\":[{"
-            "\"symbol\":\"ETHUSDT\",\"direction\":\"short\",\"strat_type\":\"flat\","
-            "\"max_entries\":3,\"leverage\":10,\"budget_usdt\":777.5,"
-            "\"interval_pct\":6.0,\"trail_entry\":0.4,\"tp_pct\":3.5,"
-            "\"entry_mode\":\"immediate\",\"use_trend_filter\":false}]}");
-        HeadlessConfig hc; std::string err;
-        check(load_headless_config(path, hc, err), "带显式值的配置能解析: " + err);
-        if (!hc.bots.empty()) {
-            const auto& g = hc.bots[0];
-            eq(g.symbol, std::string("ETHUSDT"), "symbol");
-            eq(g.direction, CcgConfig::Direction::Short, "direction=short");
-            eq(g.strat_type, CcgConfig::StratType::Flat, "strat_type=flat");
-            eq((int)g.max_entries, 3, "max_entries=3");
-            eq((int)g.leverage, 10, "leverage=10");
-            eqd(g.budget_usdt, 777.5, "budget_usdt=777.5");
-            eqd(g.interval_pct, 6.0, "interval_pct=6.0（显式值生效）");
-            eqd(g.trail_entry,  0.4, "trail_entry=0.4");
-            eqd(g.tp_pct,       3.5, "tp_pct=3.5");
-            eq(g.entry_mode, CcgConfig::EntryMode::Immediate, "entry_mode=immediate");
-            eq(g.use_trend_filter, false, "use_trend_filter=false");
-        }
-    }
-
-    // ── ③ direction=both 必须被拒绝 ─────────────────────────────────────────
-    // 引擎内部 Both 会走纯空头分支：用户想要对冲、实际拿到裸空单
-    {
-        std::printf("\n── 危险配置必须拒绝 ──\n");
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"bots\":[{\"symbol\":\"BTCUSDT\",\"direction\":\"both\"}]}");
-        HeadlessConfig hc; std::string err;
-        check(!load_headless_config(path, hc, err), "direction=both 被拒绝启动");
-        check(err.find("both") != std::string::npos, "  错误信息说明了原因");
-    }
-
-    // ── ④ 未知键要告警（拼错的键会静默失效，用户以为配上了）──────────────────
-    {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"bots\":[{\"symbol\":\"BTCUSDT\",\"max_entires\":9}]}");
-        HeadlessConfig hc; std::string err;
-        load_headless_config(path, hc, err);
-        bool warned = false;
-        for (const auto& w : hc.warnings)
-            if (w.find("max_entires") != std::string::npos) warned = true;
-        check(warned, "拼错的键（max_entires）产生告警");
-    }
-
-    // ── ⑤ 损坏/缺失文件不崩溃 ───────────────────────────────────────────────
+    // ── ① 损坏/缺失文件不崩溃 ───────────────────────────────────────────────
+    // v4.7.1 之前这里前面还有四组网格DCA 的用例（默认值回落、显式值采纳、
+    // direction=both 拒绝、拼错键告警）。DCA 移除后它们随之删除；
+    // 同类覆盖在下面的 SAR 段里一条不少
     {
         write_file(path, "{ 这不是 json");
         HeadlessConfig hc; std::string err;
@@ -155,15 +64,13 @@ int main() {
         check(!load_headless_config(path, hc2, err2), "文件不存在返回失败");
     }
 
-    // ── ⑥ SAR 策略配置 ──────────────────────────────────────────────────────
+    // ── ② 趋势SAR 配置（本版起是唯一的策略）─────────────────────────────────
     {
-        // 只配 sar_bots、完全不配 bots，必须能启动——两套策略是并列的，
-        // 不该强迫想跑趋势策略的人也配一个 DCA bot
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
         HeadlessConfig hc; std::string err;
-        check(load_headless_config(path, hc, err), "只配 sar_bots 应能加载");
-        check(hc.bots.empty() && hc.sar_bots.size() == 1, "应解析出 1 个 SAR bot");
+        check(load_headless_config(path, hc, err), "最小 sar_bots 配置能加载: " + err);
+        check(hc.sar_bots.size() == 1, "应解析出 1 个 bot");
 
         // 漏填的字段必须落到引擎默认值。解析器用 c.rule.xxx 自身作兜底
         // （而不是抄一遍字面量），所以引擎改默认值时这里不会悄悄漂走
@@ -171,26 +78,33 @@ int main() {
         const auto& g = hc.sar_bots[0];
         check(g.rule.donchian_period == def.rule.donchian_period, "  通道周期取默认值");
         check(g.rule.atr_period == def.rule.atr_period,           "  ATR周期取默认值");
-        check(std::fabs(g.rule.atr_mult - def.rule.atr_mult) < 1e-9, "  k 取默认值");
+        eqd(g.rule.atr_mult, def.rule.atr_mult, "  k 取默认值");
         check(g.rule.reverse_needs_signal == def.rule.reverse_needs_signal,
               "  反手信号闸默认开启（无条件反手在震荡市是绞肉机）");
         check(g.interval == def.interval, "  信号周期取默认值");
     }
     {
-        // 同一品种被两套策略同时接管必须拒绝启动：SAR 的 reduceOnly 平仓会
-        // 平掉 DCA 的层，两个引擎在同一个交易所仓位上互相拆台
+        // 旧版的 "bots"（网格DCA）必须【被明确报出来】而不是静默忽略。
+        // 静默忽略的后果：升级后用户的配置原样放着，进程正常启动、日志一切正常，
+        // 而那些品种其实一个都没在跑——要等到某天去交易所对账才发现。
+        // 这种沉默比启动失败危险得多
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"bots\":[{\"symbol\":\"BTCUSDT\"}],"
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+                         "\"bots\":[{\"symbol\":\"BTCUSDT\"},{\"symbol\":\"ETHUSDT\"}],"
+                         "\"sar_bots\":[{\"symbol\":\"SOLUSDT\"}]}");
         HeadlessConfig hc; std::string err;
-        check(!load_headless_config(path, hc, err), "同品种同时配两套策略应被拒绝");
-        check(err.find("BTCUSDT") != std::string::npos, "  错误信息点名了品种");
+        check(load_headless_config(path, hc, err), "带旧版 bots 的配置仍能启动");
+        check(hc.sar_bots.size() == 1, "  只有 sar_bots 生效");
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("网格DCA") != std::string::npos && w.find("2") != std::string::npos)
+                warned = true;
+        check(warned, "  明确告警\"这 2 个 DCA 条目完全不会运行\"");
     }
     {
-        // 两套都空 = 没有任何策略，应报错而不是静默空转
+        // 一个策略都没配 = 空转，应报错而不是静默启动
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\"}");
         HeadlessConfig hc; std::string err;
-        check(!load_headless_config(path, hc, err), "两套策略都没配应被拒绝");
+        check(!load_headless_config(path, hc, err), "sar_bots 为空应被拒绝");
     }
     {
         // k=0 等于没有止损线，必须拒绝
@@ -234,9 +148,9 @@ int main() {
         if (hc.sar_bots.size() == 1) {
             const auto& g = hc.sar_bots[0];
             check(g.size_mode == SarConfig::SizeMode::RiskBased, "  size_mode=risk");
-            check(std::fabs(g.risk_usdt - 100.0) < 1e-9,           "  risk_usdt");
+            eqd(g.risk_usdt, 100.0,                                "  risk_usdt");
             check(g.rule.pyramid_max_adds == 3,                    "  加仓档数");
-            check(std::fabs(g.rule.pyramid_step_atr - 0.5) < 1e-9, "  加仓间距");
+            eqd(g.rule.pyramid_step_atr, 0.5,                      "  加仓间距");
         }
     }
     {

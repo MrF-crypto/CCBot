@@ -306,6 +306,53 @@ double SarEngine::plan_qty(const SarConfig& cfg, double price,
     return (std::isfinite(q) && q > 0) ? q : 0;
 }
 
+void SarEngine::set_max_total_margin(double usdt) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    max_total_margin_ = (std::isfinite(usdt) && usdt > 0) ? usdt : 0.0;
+}
+
+void SarEngine::set_max_open_positions(int n) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    max_open_positions_ = (n > 0) ? n : 0;
+}
+
+// 账户级闸门。返回空串 = 放行，否则是给人看的拦截原因。
+// ⚠ 调用方必须已持 mtx_（它要遍历 bots_）。声明在 tick 的决策循环内部调用，
+//   那里本来就持着锁
+std::string SarEngine::open_gate_block(const SarBot& self) const {
+    if (max_total_margin_ <= 0 && max_open_positions_ <= 0) return {};
+
+    double used_margin = 0;
+    int    open_n      = 0;
+    for (const auto& kv : bots_) {
+        const auto& b = kv.second;
+        if (b.qty <= 0) continue;
+        ++open_n;
+        const double px = (b.current_price > 0) ? b.current_price : b.st.entry_price;
+        const int    lv = (b.cfg.leverage > 0) ? b.cfg.leverage : 1;
+        if (px > 0) used_margin += b.qty * px / lv;
+    }
+
+    if (max_open_positions_ > 0 && open_n >= max_open_positions_) {
+        return "同时持仓品种数已达上限 " + std::to_string(open_n) + "/" +
+               std::to_string(max_open_positions_);
+    }
+    if (max_total_margin_ > 0) {
+        // 新仓占用按 budget_usdt ÷ leverage 估。等风险模式下实际名义可能更小，
+        // 所以这是【保守】估计——宁可早拦一点，不要漏拦
+        const int    lv   = (self.cfg.leverage > 0) ? self.cfg.leverage : 1;
+        const double want = self.cfg.budget_usdt / lv;
+        if (used_margin + want > max_total_margin_) {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "账户总保证金将达 $%.2f，超过上限 $%.2f（已占用 $%.2f，本笔约 $%.2f）",
+                          used_margin + want, max_total_margin_, used_margin, want);
+            return buf;
+        }
+    }
+    return {};
+}
+
 void SarEngine::tick(const std::string& symbol, double price) {
     // NaN 与任何数比较都是 false，`price <= 0` 拦不住它。这道守卫和
     // CcgEngine::tick 同源——曾经放进去之后会带着 NaN 数量去下单
@@ -377,6 +424,24 @@ void SarEngine::tick(const std::string& symbol, double price) {
                 break;
             case sar::Action::OpenLong:
             case sar::Action::OpenShort:
+                // ── 账户级闸门：只拦【开新仓】────────────────────────────────
+                // 刻意不拦 Add / Close / 反手：
+                //   · Close 与反手里的平仓腿【必须】放行——拦住出场等于把一笔
+                //     该止损的仓位困在原地，这道闸门就从风控变成了风险源
+                //   · 反手的开仓腿走 submit_close 内部那条路，不经过这里。
+                //     那是有意的：反手是"这一笔已经结束、趋势翻了"的延续，
+                //     拦掉它只会留下一个方向已经证伪的空仓状态
+                //   · Add（金字塔）用的是浮盈在推，且只在已持仓时发生，
+                //     不增加"同时压着几个品种"这个维度
+                if (const std::string why = open_gate_block(b); !why.empty()) {
+                    b.last_decision = "空仓 | " + why;
+                    // 日志去重：闸门在每个 tick 都会命中，不去重就是每 3 秒
+                    // 一条同样的话。拦截原因始终在 last_decision 里，界面看得到
+                    if (cap_logged_.insert(b.bot_id).second)
+                        log("⚠ " + b.cfg.symbol + " 开仓被账户级闸门拦下：" + why);
+                    break;
+                }
+                cap_logged_.erase(b.bot_id);
                 if (to_open.empty()) {
                     b.pending = true;
                     to_open   = b.bot_id;

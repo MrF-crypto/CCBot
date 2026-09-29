@@ -65,53 +65,14 @@ QString pnl_color(double v) {
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 行序
+// 行填充
 // ─────────────────────────────────────────────────────────────────────────────
-// 排序键刻意让 DCA 的行序【一行都不变】：CcgEngine 的 bot_id 形如
-// "BTCUSDT_L_3"，装在 std::map 里本来就是按 (品种字典序, 后缀 _B<_L<_S) 排的。
-// 这里用同一个口径，再把 SAR 排在同品种 DCA 之后（sort_key=3）——同一个品种只
-// 可能属于一套策略，所以这一档实际上永远不会和前三档同时出现，写成 3 只是为了
-// 让"万一真出现了"的顺序也是确定的，而不是取决于哈希或插入顺序。
-std::vector<BotRow> MainWindow::buildRows(const std::vector<CcgBot>& dca,
-                                          const std::vector<SarBot>& sar) const {
-    std::vector<BotRow> rows;
-    rows.reserve(dca.size() + sar.size());
-
-    for (const auto& b : dca) {
-        BotRow r;
-        r.kind     = BotRow::Kind::Dca;
-        r.bot_id   = b.bot_id;
-        r.symbol   = b.cfg.symbol;
-        r.sort_key = (b.cfg.direction == CcgConfig::Direction::Both)  ? 0
-                   : (b.cfg.direction == CcgConfig::Direction::Long)  ? 1
-                                                                      : 2;
-        r.dca      = &b;
-        rows.push_back(r);
-    }
-    for (const auto& b : sar) {
-        BotRow r;
-        r.kind     = BotRow::Kind::Sar;
-        r.bot_id   = b.bot_id;
-        r.symbol   = b.cfg.symbol;
-        r.sort_key = 3;
-        r.sar      = &b;
-        rows.push_back(r);
-    }
-
-    // stable_sort 而不是 sort：同品种同 sort_key（只可能是同品种两个 _L，不该
-    // 发生但引擎不禁止）时保持引擎给出的原顺序，避免行在两次刷新间无故换位——
-    // 换位会让正在点的按钮跑到别的 bot 上
-    std::stable_sort(rows.begin(), rows.end(), [](const BotRow& a, const BotRow& b) {
-        if (a.symbol != b.symbol) return a.symbol < b.symbol;
-        return a.sort_key < b.sort_key;
-    });
-    return rows;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SAR 行填充
-// ─────────────────────────────────────────────────────────────────────────────
-// 列位复用 DCA 的 16 列。对照表（6/7/8 由调用方在分派前统一填好，这里不碰）：
+// 行序由调用方（refreshBotTable）按品种字典序排好。v4.5.0~v4.7.1 这里还有一个
+// buildRows：把网格DCA 与趋势SAR 两个引擎的 bot 合成一个带 Kind 判别和跨策略
+// 排序键的行序列。只剩一套策略之后，"行序"就是品种字典序，那套机制整个没了。
+//
+// 16 列的列位沿用当年与 DCA 共表时的排布（列头文案已按趋势策略改过）。
+// 对照表（6/7/8 由调用方统一填好，这里不碰）：
 //
 //   列          DCA 的含义        SAR 放什么            同义?
 //   ──────────────────────────────────────────────────────────────────────────
@@ -945,21 +906,9 @@ void MainWindow::load_and_restore_sar() {
             b.qty = 0;
         }
 
-        // 跨引擎冲突：弹窗里两个方向都拦了，但【恢复路径没有】——落盘文件是
-        // 手工改过的、或者两套配置在不同版本里先后加上的，就会漏进来。
-        // 两个引擎接管同一个交易所仓位会互相平掉对方的单，宁可不恢复
-        bool taken_by_dca = false;
-        if (engine_) {
-            for (const auto& db : engine_->get_bots())
-                if (db.cfg.symbol == b.cfg.symbol &&
-                    db.state != CcgBot::State::Stopped) { taken_by_dca = true; break; }
-        }
-        if (taken_by_dca) {
-            log(QString("SAR %1 未恢复：该品种已由网格 DCA 接管。"
-                        "两套策略会在同一个交易所仓位上互相平掉对方的单，必须二选一")
-                    .arg(QString::fromStdString(b.cfg.symbol)), "WARN");
-            continue;
-        }
+        // v4.7.1 之前这里还要拦"该品种已由网格 DCA 接管"（弹窗里拦了，但恢复
+        // 路径没拦，手改过的落盘文件会漏进来）。只剩一套策略之后，这类跨引擎
+        // 冲突不存在了——同品种只能有一个 bot，由 restore_bot 自己保证
 
         if (!sar_engine_->restore_bot(b).empty()) {
             ++n;

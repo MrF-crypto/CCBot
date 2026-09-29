@@ -121,10 +121,11 @@ jobs:
       - name: Run all test suites
         run: |
           set -e
-          for t in ccg_indicator_tests ccg_key_store_tests ccg_risk_tests \
+          for t in ccg_indicator_tests ccg_key_store_tests \
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_stress_tests ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests \
-                   ccg_persist_tests ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_pool_tests; do
+                   ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests \
+                   ccg_sar_stress_tests \
+                   ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_pool_tests; do
             echo "── $t ──"
             ./build/$t
           done
@@ -133,9 +134,9 @@ jobs:
         run: |
           set -e
           mkdir -p pkg
-          cp build/ccbot_headless build/ladder_depth pkg/
+          cp build/ccbot_headless pkg/
           cp config.example.json pkg/
-          chmod +x pkg/ccbot_headless pkg/ladder_depth
+          chmod +x pkg/ccbot_headless
 
       # 泄漏检查同样是硬门禁。config.example.json 是模板（不含真凭证），但白名单
       # 只放行可执行文件，所以要在检查【之后】再放进 zip

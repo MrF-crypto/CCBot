@@ -9,12 +9,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
 // SAR 引擎：趋势跟随 + 止损反转的执行层。
 //
-// 与 CcgEngine 并列、互不依赖，只共用 ITradingClient 和 ThreadPool。
+// v5.0.0 起是本仓库唯一的策略引擎（曾与网格 DCA 并列，那套已整体移除）。
 // 决策全在 sar_decision.h（纯函数、已穷举单测），这里只负责"把决策变成订单"
 // 以及所有和交易所打交道才会遇到的脏事：零成交、部分成交、状态不明、
 // reduceOnly 被拒、数量取整后归零。
@@ -129,8 +130,9 @@ struct SarBot {
     std::string last_decision;
 };
 
-// 成交记录。刻意不复用 CcgEngine::TradeRecord——那个带 layers（层数），
-// 是 DCA 的概念，SAR 里没有层；混用会让统计口径悄悄串味
+// 成交记录。本版起是【唯一】的成交记录类型——网格DCA 的 TradeRecord 随它一起
+// 移除了。当初刻意不复用那个是因为它带 layers（层数），那是 DCA 的概念，
+// SAR 里没有层，混用会让统计口径悄悄串味
 struct SarTrade {
     std::string symbol;
     sar::Pos    side = sar::Pos::Flat;   // 本笔的方向
@@ -167,6 +169,22 @@ public:
 
     void set_log_cb(LogCb cb)     { log_cb_   = std::move(cb); }
     void set_trade_cb(TradeCb cb) { trade_cb_ = std::move(cb); }
+
+    // ── 账户级闸门（0 = 不限）──────────────────────────────────────────────────
+    // 与每个 bot 的 budget_usdt 是【两道不同的闸】：后者管"单个品种投多少"，
+    // 这两道管"全部品种加起来"。
+    //
+    // 为什么趋势策略比网格更需要它：铺开多个品种是这套策略有效的前提（单个品种
+    // 的胜率本来就低，靠分散摊平），于是 N 个品种 × 各自的 budget 很容易就超过
+    // 账户权益。而每笔都带止损这件事只保证【单笔】亏损有界，不保证同时被打的
+    // 十笔加起来有界——2026 年那种全市场同步下跌的日子里，所有品种会在同一个
+    // 小时内一起触发止损。
+    //
+    // 判定用【保证金】口径（名义 ÷ 杠杆），与界面上"账户总保证金上限"同名同义。
+    // 新仓的占用按 budget_usdt ÷ leverage 估——等风险模式下实际名义可能更小，
+    // 所以这是保守估计：宁可早拦一点，不要漏拦
+    void set_max_total_margin(double usdt);
+    void set_max_open_positions(int n);
 
     // 应用层拉到K线后喂入信号快照（ATR + 唐奇安通道 + 当前K线开盘时间）
     void update_signal(const std::string& bot_id, double atr, double atr_pct,
@@ -230,6 +248,8 @@ private:
     //   拿 ATR 去算那个模式的仓位，算出来的"单次愿亏"是假的
     // stop_price<=0 或与 price 重合时无法计算，返回 0（调用方跳过下单）
     double plan_qty(const SarConfig& cfg, double price, double stop_price) const;
+    // 账户级闸门：空串=放行，否则是拦截原因。⚠ 调用方须已持 mtx_
+    std::string open_gate_block(const SarBot& self) const;
 
     std::shared_ptr<ITradingClient> client_;
     std::shared_ptr<ThreadPool>     pool_;
@@ -239,6 +259,12 @@ private:
     LogCb                           log_cb_;
     TradeCb                         trade_cb_;
     int                             seq_ = 0;
+    double                          max_total_margin_   = 0;   // 0=不限
+    int                             max_open_positions_ = 0;   // 0=不限
+    // 已经因为账户级闸门报过一次的 bot。闸门在每个 tick 都会命中，不去重的话
+    // 就是每 3 秒一条同样的日志——本项目踩过这个（150 行日志里 120 行是噪音）。
+    // 拦截原因始终写进 last_decision，界面上一直看得到，不依赖日志
+    std::set<std::string>           cap_logged_;
 };
 
 } // namespace ccbot

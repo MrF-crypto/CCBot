@@ -1,5 +1,4 @@
 #pragma once
-#include "core/ccg_engine.h"
 #include "core/sar_engine.h"
 #include <string>
 #include <vector>
@@ -22,10 +21,9 @@ struct HeadlessConfig {
     std::string alert_webhook;           // 同 GUI 的关键事件提醒 webhook
     std::string state_path = "ccbot_state.json";   // 仓位运行时状态落盘路径，重启续跑用
     std::string log_path;                // 空=只输出到 stdout，不落盘
-    std::vector<CcgConfig> bots;
-    // SAR 趋势跟随策略（与 bots 是两套并列的策略，可以只配其中一套，
-    // 也可以同时配——但同一个品种不要两套都配，两个引擎会各自按自己的
-    // 逻辑下单，在交易所上叠成一个谁也算不清的净仓位）
+    // 趋势 SAR 策略。本版起是【唯一】的策略——网格DCA 连同它的 bots 数组
+    // 一起移除了，旧配置文件里的 "bots" 会被当作未知键进 warnings，
+    // 而不是静默忽略：静默忽略的话用户会以为 DCA 还在跑
     std::vector<SarConfig> sar_bots;
     std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 

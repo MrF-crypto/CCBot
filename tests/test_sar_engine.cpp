@@ -858,6 +858,119 @@ int main() {
         check(cli->stop_log.empty(), "未开启时全程不得有任何挂单/撤单调用");
     }
 
+    // ── 账户级闸门：总保证金上限 ────────────────────────────────────────────
+    // 这道闸在网格DCA 移除时从 CcgEngine 搬了过来。为什么趋势策略更需要它：
+    // 铺开多个品种是这套策略有效的前提（单品种胜率本来就低，靠分散摊平），
+    // 于是 N 个品种 × 各自的 budget 很容易超过账户权益。而"每笔都带止损"
+    // 只保证【单笔】亏损有界，不保证同时被打的十笔加起来有界
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        eng.set_max_total_margin(400);      // budget 1000 / 杠杆 3 ≈ 333 每笔
+
+        auto a = eng.add_bot(mk_cfg("AAAUSDT"));
+        auto b = eng.add_bot(mk_cfg("BBBUSDT"));
+
+        feed(eng, a, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("AAAUSDT", 110.0);
+        check(eng.get_bots().size() == 2, "两个 bot 都在");
+        {
+            bool opened = false;
+            for (const auto& x : eng.get_bots())
+                if (x.cfg.symbol == "AAAUSDT" && x.qty > 0) opened = true;
+            check(opened, "第一笔在上限内，正常开仓");
+        }
+
+        const size_t calls_before = cli->calls.size();
+        feed(eng, b, 2.0, 110, 90);
+        eng.tick("BBBUSDT", 110.0);
+        check(cli->calls.size() == calls_before,
+              "第二笔会让总保证金超限 → 一张单都不该发出去");
+        for (const auto& x : eng.get_bots())
+            if (x.cfg.symbol == "BBBUSDT") {
+                check(x.qty == 0 && x.st.pos == sar::Pos::Flat, "  被拦的 bot 保持空仓");
+                check(x.last_decision.find("账户总保证金") != std::string::npos,
+                      "  拦截原因写进 last_decision（界面能看到，不只在日志里）");
+            }
+
+        // 放开上限后必须立刻能开——闸门是条件判断，不是一次性的闩
+        eng.set_max_total_margin(0);
+        feed(eng, b, 2.0, 110, 90, 2);
+        eng.tick("BBBUSDT", 110.0);
+        check(cli->calls.size() > calls_before, "上限放开后同一个 bot 立刻能开仓");
+    }
+
+    // ── 账户级闸门：同时持仓品种数上限 ──────────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        eng.set_max_open_positions(1);
+
+        auto a = eng.add_bot(mk_cfg("AAAUSDT"));
+        auto b = eng.add_bot(mk_cfg("BBBUSDT"));
+        feed(eng, a, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("AAAUSDT", 110.0);
+
+        const size_t n1 = cli->calls.size();
+        feed(eng, b, 2.0, 110, 90);
+        eng.tick("BBBUSDT", 110.0);
+        check(cli->calls.size() == n1, "已达并发持仓上限 → 第二个品种不开");
+        for (const auto& x : eng.get_bots())
+            if (x.cfg.symbol == "BBBUSDT")
+                check(x.last_decision.find("品种数") != std::string::npos,
+                      "  拦截原因说明是品种数而不是保证金");
+    }
+
+    // ── 闸门【绝不】拦出场 ──────────────────────────────────────────────────
+    // 这条是这道闸最危险的失败模式：拦住平仓等于把一笔该止损的仓位困在原地，
+    // 闸门就从风控变成了风险源。用"上限设成 0.01（比任何一笔都小）"来构造
+    // 最严的闸，然后验证已有仓位照样能正常止损出场
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto c = mk_cfg();
+        c.rule.allow_reverse = false;       // 先隔离出"纯平仓"这一条路径
+        auto id = eng.add_bot(c);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(eng.get_bots()[0].qty > 0, "先正常开一笔");
+
+        eng.set_max_total_margin(0.01);     // 此后任何开仓都会被拦
+        eng.set_max_open_positions(1);
+
+        const size_t n1 = cli->calls.size();
+        cli->fill_price = 100.0;
+        eng.tick("TESTUSDT", 100.0);        // 跌破 104 的止损线
+        check(cli->calls.size() == n1 + 1, "止损出场照常发单，没有被闸门拦住");
+        check(cli->calls.back().reduce_only, "  且是 reduceOnly 平仓单");
+        check(eng.get_bots()[0].qty == 0, "  仓位已清空");
+    }
+
+    // ── 闸门也不拦【反手的开仓腿】────────────────────────────────────────────
+    // 反手走 submit_close 内部那条路，不经过 tick 里的闸门。这是有意的：
+    // 反手是"这一笔已经结束、趋势翻了"的延续，净敞口大致不变（换个方向而不是
+    // 叠一层）。拦掉它只会留下一个方向已经证伪的空仓状态
+    {
+        auto cli = std::make_shared<FakeClient>();
+        SarEngine eng(cli, inline_host());
+        auto id = eng.add_bot(mk_cfg());     // allow_reverse=true, 不要求反向信号
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+
+        eng.set_max_total_margin(0.01);
+        const size_t n1 = cli->calls.size();
+        cli->fill_price = 100.0;
+        eng.tick("TESTUSDT", 100.0);         // 亏损止损 → 反手
+        check(cli->calls.size() == n1 + 2, "平仓 + 反向开仓两笔都发了出去");
+        check(cli->calls[n1].reduce_only,      "  第一笔是 reduceOnly 平仓");
+        check(!cli->calls[n1 + 1].reduce_only, "  第二笔是反向开仓");
+        check(eng.get_bots()[0].st.pos == sar::Pos::Short, "  已反手为空头");
+    }
+
     if (g_fail == 0) {
         std::printf("OK: SAR 引擎订单路径测试全部通过\n");
         return 0;

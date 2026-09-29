@@ -2,7 +2,6 @@
 // 用法：编译出 ccg_indicator_tests.exe 直接运行，全部通过打印 OK 并 exit 0，
 // 有任何一条不对就打印具体是哪条断言失败并 exit 1。
 #include "core/indicators.h"
-#include "core/decision.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -104,57 +103,6 @@ int main() {
         CHECK(sma_at(c, 3, 0) > sma_at(c, 3, 3), "上涨序列中轨斜率应为正");
     }
 
-
-    // ── 宏观许可层：%B + 24h涨幅 + 7日涨幅 ────────────────────────────────
-    // v4.0.16 移除结构层（支撑/净空/SR区域）后，这里只剩三条平级判据
-    {
-        namespace dc = ccbot::decision;
-
-        // %B 计算
-        CHECK(near(dc::pct_b(100, 90, 110), 0.5), "%B: 价格在带中央 = 0.5");
-        CHECK(near(dc::pct_b(90,  90, 110), 0.0), "%B: 贴下轨 = 0");
-        CHECK(near(dc::pct_b(110, 90, 110), 1.0), "%B: 贴上轨 = 1");
-        CHECK(dc::pct_b(100, 110, 90) < 0,        "%B: 上下轨颠倒应返回 -1");
-        CHECK(dc::pct_b(0,   90, 110) < 0,        "%B: 价格非法应返回 -1");
-
-        dc::Inputs in;
-        in.is_long = true; in.strict = false;
-        in.use_htf = true; in.htf_ok = true;
-        in.htf_pct_b = 0.30; in.htf_pos_max = 0.60;
-        CHECK(dc::evaluate(in).pass(), "%B=0.30 未越界应放行");
-
-        auto t1 = in; t1.htf_pct_b = 0.75;
-        CHECK(dc::evaluate(t1).htf_block, "%B=0.75 > 0.60 应触发高位拦截");
-
-        auto t5 = in; t5.is_long = false; t5.htf_pct_b = 0.1;
-        CHECK(dc::evaluate(t5).htf_block, "做空 %B=0.1 应镜像触发低位拦截");
-
-        // 数据缺失：影子模式标注放行，strict 模式拦截
-        auto t4 = in; t4.htf_ok = false;
-        auto v4 = dc::evaluate(t4);
-        CHECK(v4.htf_missing && v4.pass(), "影子模式下日线数据缺失应放行并标注");
-        auto s1 = in; s1.strict = true; s1.htf_ok = false;
-        auto sv1 = dc::evaluate(s1);
-        CHECK(sv1.data_block && !sv1.pass(), "strict 模式日线数据缺失应拦截");
-        auto s3 = in; s3.strict = true;
-        CHECK(dc::evaluate(s3).pass(), "strict 模式数据齐全应正常放行");
-
-        // 三条判据独立：关掉 %B 后两条涨幅仍要照常工作
-        {
-            auto only_chg = in;
-            only_chg.use_htf = false; only_chg.htf_pct_b = 0.99;   // %B 越界但那条关了
-            only_chg.day_chg_max = 5.0; only_chg.day_chg_ok = true;
-            only_chg.day_chg_pct = 1.0;
-            CHECK(dc::evaluate(only_chg).pass(), "关掉 %B：越界也应放行");
-            only_chg.day_chg_pct = 8.0;
-            CHECK(dc::evaluate(only_chg).day_chg_block, "关掉 %B：24h涨幅仍应拦");
-
-            // 全关 → 完全不参与，连数据缺失都不该拦
-            auto none = in;
-            none.use_htf = false; none.htf_ok = false; none.strict = true;
-            CHECK(dc::evaluate(none).pass(), "三条全关：数据缺失也不拦");
-        }
-    }
 
     // ── ATR ──────────────────────────────────────────────────────────────────
     {

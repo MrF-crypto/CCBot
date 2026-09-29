@@ -1,8 +1,8 @@
 # ccbot_headless：无图形界面版本
 
 配置文件驱动，不依赖 Qt、不需要显示器，可以在 Linux 服务器上完全后台运行。核心策略引擎
-（网格/马丁DCA、指标信号首单、账户级保证金上限、webhook提醒）跟 Windows 图形界面版共用同一份
-代码，行为完全一致，只是把"填表单"换成了"写配置文件"。
+（趋势 SAR、行情链路自愈、账户级闸门、webhook 提醒）跟图形界面版共用同一份代码，
+行为完全一致，只是把"填表单"换成了"写配置文件"。
 
 ## 构建（Linux）
 
@@ -35,57 +35,27 @@ cmake --build build --config Release --target ccbot_headless
 | `testnet` | `true`=连测试网，`false`=连真实账户，强烈建议先用 `true` 跑通 |
 | `account_mode` | `"futures"`（默认）=普通合约账户，走 `fapi.binance.com`；`"portfolio_margin"`=统一账户，走 `papi.binance.com`。**统一账户没有测试网**，填了 `testnet: true` 会被忽略并告警。账户在币安开通统一账户后，普通合约的 API 端点就失效了，两者不能混用同一个账户的 Key |
 | `max_total_margin` | 账户总保证金上限（USDT），`0`=不限，同图形界面版设置里的那个 |
-| `alert_webhook` | 企业微信/飞书/Telegram webhook，触发硬止损、启动连接失败时推送 |
+| `alert_webhook` | 企业微信/飞书/Telegram webhook，行情链路持续异常、对账不一致、账户接口失败、资金费成本跨阈值时推送 |
+| `max_open_positions` | 同时持仓的品种数上限，`0`=不限。与 `max_total_margin` 是两道不同的闸：前者管"总共投多少钱"，这个管"同时压在几个品种上" |
 | `state_path` | 仓位运行时状态落盘路径，重启续跑用，默认 `ccbot_state.json` |
 | `log_path` | 日志文件路径，留空则只输出到 stdout（配合 `journalctl`/`docker logs` 更方便） |
-| `bots` | 策略数组，见下表 |
+| `sar_bots` | 策略数组，见下一节 |
 
-`bots` 数组每一项对应图形界面版"策略配置"弹窗里的一套参数：
-
-| 字段 | 对应GUI | 可选值/说明 |
-|---|---|---|
-| `symbol` | 品种 | 如 `BTCUSDT` |
-| `direction` | 方向 | `long` / `short` / `both` |
-| `strat_type` | 策略 | `flat` `martingale` `mart_plus` `triple` `square` `fibonacci` `lucas` `linear` |
-| `budget_usdt` `leverage` `max_entries` `trail_entry` `tp_pct` `trail_tp` `auto_restart` `cooldown_secs` | 基础网格参数 | 同名，数值/布尔 |
-| `interval_pct` | 补仓间隔% | 相对上一笔成交价。默认 **6** —— 8品种×8个滚动窗口=64个纯样本外测试段里 6% 全面优于 5%/4%，3% 是净负的 |
-| `entry_mode` | 首单模式 | `immediate`（默认，立即开首仓）/ `indicator`（等BOLL+RSI信号） |
-| `kline_interval` `boll_period` `boll_mult` `use_rsi_filter` `rsi_period` `rsi_threshold` | 指标信号参数 | 同GUI |
-| `rsi_confirm_mode` | RSI确认方式 | `snapshot`（瞬时快照）/ `cross`（反转确认：先探底再回穿阈值） |
-| `rsi_oversold_th` | 探底阈值 | 仅 `cross` 模式用 |
-| `use_trend_filter` | 趋势过滤 (v2.5+) | `true` 时用高周期趋势判定空头态（价格在EMA之下且中轨明显下拐）：空头态暂停开新首仓、补仓间隔自动×1.5。趋势数据缺失时过滤自动失效不卡交易 |
-| `trend_interval` / `trend_ema_period` | 趋势参数 | 默认 `4h` / `200`，一般不用改 |
-| `use_htf_filter` / `htf_pos_max` | 高位拦截（日线%B） | `true` + 阈值（默认 `0.60`）。价格在日线布林带中的相对位置高于阈值就不开新首仓，做空镜像 |
-| `htf_interval` | 高位判定周期 | 默认 `1d` |
-| `use_disaster_stop` / `disaster_stop_pct` | 交易所侧灾难止损单 | 默认关。在**交易所**挂 `STOP_MARKET + closePosition`，程序崩了它依然生效——唯一的进程外保护。⚠ 它会把浮亏变成实亏，与「套住长持」的取向冲突 |
-
-> **v4.6.0 移除的键**：`dynamic_band_mode` `min_profit_floor` `floor_decay` `dyn_fixed_interval`
-> `dyn_interval_mult` `dyn_interval_growth` `dca_require_band` `mtf_ladder` `mtf_tier_layers`
-> `mtf_k` `mtf_min_gap_pct` `tp_floor_only` `tp_fixed_profit` `fixed_trail_tp` `fixed_trail_entry`
-> `use_atr_trail` `atr_trail_*` `stop_loss_pct` `htf_24h_chg_max` `htf_week_chg_max`
-> `first_entry_bounce_pct` `use_cycle_bear_switch` `dca_gate_*`
+> ⚠ **v5.0.0：旧的 `bots` 数组（网格 DCA）不再运行。** 它不会被静默忽略——启动时会明确报出
+> "配置里有 N 个 bots 条目，但网格DCA 已整体移除，这些条目【完全不会运行】"。
 >
-> **v4.6.1 又移除**：`reentry_drawdown_pct` `reentry_memory_days`（出场价记忆）
->
-> 老配置里留着它们不会报错（会进"未知键"提示），但不再有任何作用。
-> 其中 `dyn_fixed_interval` 会被**自动迁移**成 `interval_pct`——它原本就是实际生效的间距。
-> 为什么删、以及哪些是被实测证伪的，见 [NEGATIVE_RESULTS.md](NEGATIVE_RESULTS.md)。
-## SAR 趋势跟随策略（`sar_bots`）
+> 静默忽略才是危险的：升级后配置文件原样放着、进程正常启动、日志一切正常，而那些品种其实
+> 一个都没在跑，要等到某天去交易所对账才发现。趋势策略请配在 `sar_bots` 里。
+> DCA 的实测结论见 [NEGATIVE_RESULTS.md](NEGATIVE_RESULTS.md)——代码删了，花钱买来的结论不删。
 
-和 `bots`（DCA 网格）是**两套并列的策略**，可以只配一套，也可以同时配不同品种。
+## 趋势 SAR 策略（`sar_bots`）
 
-> ⚠ **同一个品种不能两套都配**——SAR 的 `reduceOnly` 平仓会平掉 DCA 的层，两个引擎在同一个交易所仓位上互相拆台。配置解析会直接拒绝启动。
+本版起是唯一的策略。状态落盘在 `<state_path>.sar`（后缀保留，老部署升级上来时这个文件已经
+存在，改名等于把在跑的仓位状态丢掉）。重启会恢复持仓、开仓价、止损线、连续反手计数与统计，
+并在启动时与交易所对账一次，运行中每分钟再对一次。
 
-SAR 状态落盘在 `<state_path>.sar`（与 DCA 的状态文件分开，两套字段完全不同）。重启会恢复持仓、开仓价、止损线、连续反手计数与统计，并在启动时与交易所对账一次，运行中每分钟再对一次。
-
-两者的风险形状是镜像的：
-
-| | `bots`（DCA 网格） | `sar_bots`（趋势 SAR） |
-|---|---|---|
-| 胜率 | 高（80%+） | **低（30~40%）** |
-| 亏损 | 不止损，浮亏扛着 | 每笔都止损，频繁小亏 |
-| 盈利来源 | 大量小赢 | **少数几笔跑很远** |
-| 致命场景 | 单边暴跌打光梯子 | **震荡市连续磨损** |
+这套策略的风险形状：**胜率低（30~40%）、每笔都止损、盈利来自少数几笔跑很远的单子、
+致命场景是震荡市连续磨损**。所以判据是 `胜率 × 盈亏比`，不是胜率。
 
 ```json
 "sar_bots": [
@@ -110,18 +80,18 @@ SAR 状态落盘在 `<state_path>.sar`（与 DCA 的状态文件分开，两套�
 | `max_consecutive_reverses` | `2` | 连续反手上限。真趋势不需要连续反手，连续反手本身就是「现在是震荡市」的信号 |
 | `cooldown_bars` | `3` | 触顶后冷却多少根**K线**（不是 tick） |
 | `signal_max_age_sec` | `900` | 信号快照过期时长。过期后**不开新仓**，但已持仓的止损线仍然有效（沿用最后一条有效线，绝不因数据断流撤掉保护） |
-| `use_disaster_stop` | `false` | **强烈建议开。** 把棘轮止损线镜像成交易所上的 `STOP_MARKET + closePosition` 单——SAR 唯一的进程外保护。DCA 有「名义 ≤ 权益 ⇒ 不可强平」这个不依赖任何订单存在的数学兜底，SAR 没有：它的全部保护就是那条活在本进程里的止损线，程序崩了就什么都不剩 |
+| `use_disaster_stop` | `false` | **强烈建议开。** 把棘轮止损线镜像成交易所上的 `STOP_MARKET + closePosition` 单——唯一的进程外保护。这套策略的全部保护就是那条活在本进程里的止损线，程序崩了就什么都不剩 |
 | `disaster_stop_buffer_pct` | `1.0` | 挂单价 = 止损线再外扩这么多%（多头往下、空头往上）。**必须 > 0**，填 0 会被配置校验拒绝。理由：交易所用连续标记价触发而本地每 3 秒采样，挂在线上会让交易所抢先触发，于是正常止损变成「外部平仓 → 对账停 bot」，一次例行出场变成需要人工介入的事件。止损线移动超过 0.5% 才重挂（逐次撤挂会吃光限流额度） |
 | `size_mode` | `notional` | 仓位算法。`notional`=固定名义；`risk`=**按 ATR 等风险**：名义 = `risk_usdt / (k×ATR%)`，每笔止损亏的钱固定。同一份名义在 ATR 1.6% 的 LTC 和 5.3% 的 COTI 上，单次止损亏的钱差 3.3 倍——固定名义等于把风险全压在高波动那几个品种上，「铺开品种分散风险」就此失效。这是海龟的「单位」概念 |
 | `risk_usdt` | `0` | `size_mode=risk` 时**必填**：单次止损愿亏多少钱。账户 10000U、每次探测愿亏 1% ⇒ 填 100。此时 `budget_usdt` 变成**名义上限**（ATR 极小时兜住公式算出的天量仓位） |
-| `pyramid_max_adds` | `0` | **顺势加仓档数**（0=关）。每朝有利方向再走 `pyramid_step_atr` 个 ATR 就加一档。回答的是「怎么低成本试出单边大行情」：错了只亏第一档，对了越骑越重。与 DCA 的补仓方向**相反**——DCA 跌了加（摊薄），这里涨了加（顺势） |
+| `pyramid_max_adds` | `0` | **顺势加仓档数**（0=关）。每朝有利方向再走 `pyramid_step_atr` 个 ATR 就加一档。回答的是「怎么低成本试出单边大行情」：错了只亏第一档，对了越骑越重。方向是**顺势**的：涨了才加，不是跌了摊薄 |
 | `pyramid_step_atr` | `0.5` | 每走多少个 ATR 加一档（海龟原版 0.5）。间距从**上一档的成交价**量起，不是首档，否则越加越密 |
 
 **没有固定止盈，这是设计而非遗漏**：趋势跟随的胜率天然只有 30~40%，全部收益来自少数几笔跑得很远的单子。任何固定止盈都会砍断这些单子，而亏损笔的大小不变——等于单方面砍掉盈利分布的右尾，期望必然转负。
 
 **选 `atr_mult` 前先看实测 ATR**：GUI 版的 SAR 表有一列 ATR%，悬停即给出当前 k 对应的实际止损距离。跨品种唯一可比的口径是 `atr/price`，所以 BTC 和新上山寨能共用同一组参数。
 
-**对账的判定规则**（比 DCA 版保守——SAR 没有「层」可供收敛）：
+**对账的判定规则**（刻意保守——这套策略没有「层」这种可供收敛的中间结构）：
 
 | 情况 | 处理 |
 |---|---|
@@ -259,11 +229,11 @@ sudo systemctl enable --now ccbot-watchdog.timer
 | **行情停摆** | 某品种连续 1 分钟取不到价格，**且该品种有持仓** |
 | **账户接口连续失败** | 心跳连续 3 次失败（约 3 分钟）；恢复后也会通知 |
 | **uniMMR 接近强平** | 统一账户 uniMMR < 1.3（币安 1.05 起强制减仓） |
-| 触发硬止损 | 本地硬止损平仓 |
+| **行情链路持续异常** | 连续约 3 分钟 `Health::healthy()` 为假（WS 半开、订阅失效、涨幅流单独死掉）。**与上面那条"行情停摆"不是一回事**——半开连接下 REST 兜底会让 per-symbol 的停摆计数一直归零、一条告警不发，而链路已经死了 |
 | **进程退出** | 收到退出信号时，附带"还有几个品种有持仓" |
 
 最后一条值得单独说：**进程一停，所有本地风控就停了**，只剩交易所侧的灾难止损单
-（`disaster_stop_pct`，见下）。这条消息本身就是"从现在起没人在管仓位"的信号。
+（`use_disaster_stop`，见下）。这条消息本身就是"从现在起没人在管仓位"的信号。
 
 ## 资金费账本：一笔看不见的真实成本
 
@@ -295,29 +265,26 @@ sudo systemctl enable --now ccbot-watchdog.timer
 它不并进 `realized_pnl`：那个数是按平仓周期结算的，而资金费属于持有期。两个数分开
 显示，口径才不会混。
 
-## 唯一的进程外保护：`disaster_stop_pct`
+## 唯一的进程外保护：`use_disaster_stop`
 
-本地的追踪止盈、硬止损、结构止损**全都活在进程里**。程序崩溃、断电、被 OOM
-杀掉之后，它们一个都不剩。
+**这套策略的全部保护就是那条活在进程里的棘轮止损线。** 程序崩溃、断电、被 OOM
+杀掉之后，它一点都不剩——仓位完全裸奔且没有任何底。
 
-`disaster_stop_pct`（每个 bot 单独配，0=关，默认关）会在**币安服务器上**挂一张
-`STOP_MARKET` + `closePosition` 单，位置在均价下方该比例处。每次补仓拉低均价后
-自动撤旧挂新；平仓后自动撤销；重启对账完成后自动重建。
+打开 `use_disaster_stop` 之后，引擎会在**币安服务器上**挂一张 `STOP_MARKET` +
+`closePosition` 单，镜像当前的棘轮止损线。止损线每次往前推进都会自动撤旧挂新
+（超过 0.5% 才重挂，否则会把限流额度吃光）；平仓后自动撤销；重启对账完成后自动重建。
 
 ```json
-{ "symbol": "BTCUSDT", "use_disaster_stop": true, "disaster_stop_pct": 32, ... }
+{ "symbol": "BTCUSDT", "use_disaster_stop": true, "disaster_stop_buffer_pct": 1.0, ... }
 ```
 
-`use_disaster_stop` 是独立开关，**默认 false**。只写 `disaster_stop_pct` 不写开关的话
-功能不会生效——启动时会明确告警，不让它静默地什么都不做。
+**`disaster_stop_buffer_pct` 不能是 0。** 挂单价 = 止损线再往外扩这么多%（多头往下、
+空头往上）。交易所用连续的标记价触发，而本地是采样的——挂在止损线【上】的话交易所
+几乎总会先触发，于是主出场路径从"本地 reduceOnly 平仓"变成"交易所平掉、本地靠对账
+才发现"，而对账发现外部平仓会**停掉那个 bot**。等于把一次正常的止损出场变成一次
+需要人工介入的事件。留出缓冲之后：正常情况本地先平并撤掉这张单，只有进程真的不在了，
+价格才会继续走到它上面。
 
-**如果你的策略是「套住就长线持有、只要标的不归零就等」，这个功能与你的取向冲突**：
-它会把浮亏变成实亏。保持关闭即可，那正是默认值。
-
-**取值要远离正常止盈区间。** 网格策略天然要吃深度回撤，设太紧会在正常的补仓过程中
-被打掉，把浮亏变成实亏。参考算法：按你的层数和间隔算出满层时的理论跌幅，再留一段
-余量（满层跌 20% 的配置设 30~35）。
-
-它不参与常规交易，只防瀑布。
+它不参与常规交易，只在进程不在时兜底。
 
 

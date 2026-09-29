@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 4.7.1 LANGUAGES CXX)
+project(TradingBot VERSION 5.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,9 +28,10 @@ option(CCBOT_WERROR "把编译警告当作错误（CI 门禁用）" OFF)
 # ── Sanitizer ─────────────────────────────────────────────────────────────────
 # CCBOT_SANITIZE=address / thread / undefined / address+undefined（分号或加号分隔）
 #
-# 为什么这是本项目最该补的一项验证：ccg_engine.cpp 有 34 处 mutex/atomic、
-# sar_engine.cpp 27 处，而并发缺陷是所有缺陷里唯一会"看起来一切正常，直到某天
-# 对不上账"的一类——单元测试全绿也证明不了它不存在。TSan 能证明。
+# 为什么这是本项目最该补的一项验证：sar_engine.cpp 有 27 处 mutex/atomic、
+# book_ticker_stream.cpp 还多一个看门狗线程，而并发缺陷是所有缺陷里唯一会
+# "看起来一切正常，直到某天对不上账"的一类——单元测试全绿也证明不了它不存在。
+# TSan 能证明。
 #
 # address 与 thread 互斥，必须分两次构建（编译器会直接拒绝同时给）。
 # undefined 可以搭着 address 一起。
@@ -93,7 +94,6 @@ find_package(Threads REQUIRED)
 
 # ── 核心引擎/网络代码：GUI 版和无界面(headless)版共用，不含任何 Qt/Windows 专属代码 ──
 set(CORE_SOURCES
-    src/core/ccg_engine.cpp
     src/core/sar_engine.cpp
     src/core/funding_ledger.cpp
     src/net/trading_client.cpp
@@ -164,7 +164,6 @@ endif()
 add_executable(ccbot_headless
     src/headless/main.cpp
     src/headless/headless_config.cpp
-    src/headless/headless_state.cpp
     src/headless/sar_state.cpp
     ${CORE_SOURCES}
 )
@@ -189,19 +188,26 @@ endif()
 # 而偏差在哪儿只有踩到才知道。v4.0.7 的涨幅拦截就已经出现"回测侧未实现，
 # 强制归零"这种补丁——两套逻辑之间的缝开始显形。本仓库现在只留一条真相。
 #
-# 保留的是 EngineHost 的时钟/执行器注入（ccg_engine.h）：那不是为回测存在的，
-# 13 套单元测试的虚拟时钟与确定性复现全靠它。
+# 保留的是 EngineHost 的时钟/执行器注入（engine_host.h）：那不是为回测存在的，
+# 单元测试的虚拟时钟与确定性复现全靠它。
 #
 # 历史结论仍记录在 docs/BACKTEST.md 与各处代码注释里，只是产生它们的工具搬走了。
 
-# ── 梯子深度分析：满层能扛多深 / 剩多少保证金没花。不跑行情，纯确定性推演 ────
-add_executable(ladder_depth tools/ladder_depth.cpp src/core/ccg_engine.cpp)
-target_include_directories(ladder_depth PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ladder_depth PRIVATE Threads::Threads)
-target_compile_definitions(ladder_depth PRIVATE ${CCBOT_VERSION_DEF})
-if(MSVC)
-    target_compile_options(ladder_depth PRIVATE /utf-8)
-endif()
+# ── 网格DCA 已整体移除（本版）──────────────────────────────────────────────────
+# CcgEngine（1809 行）、decision.h（DCA 入场拦截）、headless_state（DCA 落盘）、
+# tools/ladder_depth（梯子深度推演，纯 DCA 工具）连同 ccg_risk_tests /
+# ccg_persist_tests / ccg_stress_tests 一并删除。
+#
+# 不是"暂时停用"而是删干净：本仓库现在只做一件事——为趋势类策略提供稳定的
+# 实时行情。两套并列策略时期最大的成本不是代码量，是每改一处共享代码都要同时
+# 保两套语义不变，而 DCA 的补仓/止盈语义建立在"每 3 秒一次、价格用标记价"
+# 这个节拍上，行情层要改成事件驱动就必须先把这份约束拿掉。
+#
+# DCA 的实测结论（哪些参数有效、哪些被证伪）保留在 docs/NEGATIVE_RESULTS.md，
+# 代码删了但花钱买来的结论不删。
+#
+# ccg_stress_tests 删除后，并发压力覆盖由 ccg_sar_stress_tests 承担——
+# 那是 TSan 矩阵里的目标之一，不能随 DCA 一起消失（见下）。
 
 # ── 指标数学逻辑单元测试——纯 C++ 头文件，不依赖 Qt/curl/网络，独立小可执行文件 ──
 add_executable(ccg_indicator_tests tests/test_indicators.cpp)
@@ -235,12 +241,16 @@ if(MSVC)
     target_compile_options(ccg_sar_state_tests PRIVATE /utf-8)
 endif()
 
-# ── 风控闸门测试（保证金上限 / 交易所侧灾难止损单）：用假客户端单跑引擎 ────────
-add_executable(ccg_risk_tests tests/test_risk_gates.cpp src/core/ccg_engine.cpp)
-target_include_directories(ccg_risk_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_risk_tests PRIVATE Threads::Threads)
+# ── SAR 并发压力测试：实盘前的最后一道自检 ────────────────────────────────────
+# 接替随 DCA 一起删掉的 ccg_stress_tests。它的价值不在"算得对不对"（那是
+# ccg_sar_engine_tests 的事），而在【并发下的状态撕裂】——多线程同时 tick /
+# 喂信号 / 读快照 / 对账，交易所返回随机化。这类缺陷在单线程测试里永远不出现，
+# 而且它是 TSan 矩阵的目标之一，不能随 DCA 一起消失
+add_executable(ccg_sar_stress_tests tests/test_sar_stress.cpp src/core/sar_engine.cpp)
+target_include_directories(ccg_sar_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_sar_stress_tests PRIVATE Threads::Threads)
 if(MSVC)
-    target_compile_options(ccg_risk_tests PRIVATE /utf-8)
+    target_compile_options(ccg_sar_stress_tests PRIVATE /utf-8)
 endif()
 
 # ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
@@ -317,7 +327,6 @@ endif()
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
-                                src/core/ccg_engine.cpp
                                 src/core/sar_engine.cpp)
 target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
@@ -325,27 +334,12 @@ if(MSVC)
     target_compile_options(ccg_config_tests PRIVATE /utf-8)
 endif()
 
-# ── 状态持久化往返测试：重启后仓位对不对，全看这一套 ──────────────────────────
-add_executable(ccg_persist_tests tests/test_persist.cpp
-                                 src/headless/headless_state.cpp
-                                 src/core/ccg_engine.cpp)
-target_include_directories(ccg_persist_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_persist_tests PRIVATE simdjson::simdjson Threads::Threads)
-if(MSVC)
-    target_compile_options(ccg_persist_tests PRIVATE /utf-8)
-endif()
-
+# ccg_persist_tests 随网格DCA 一并移除（本版）：它测的是 headless_state 的
+# DCA 落盘往返。SAR 侧的同类覆盖在 ccg_sar_state_tests 里，一条不少。
+#
 # ccg_liq_tests 随回测子系统一并移除（v4.0.13）。它测的全部是【回测模拟器
 # 内部】的强平会计（PortfolioResult / MultiSimClient / run_portfolio），
 # 实盘引擎侧不损失任何覆盖——实盘的强平价来自交易所，不由本地逻辑推算。
-
-# ── 压力测试（并发撕裂 / 极端行情）：实盘前的最后一道自检 ────────────────────
-add_executable(ccg_stress_tests tests/test_stress.cpp src/core/ccg_engine.cpp)
-target_include_directories(ccg_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_stress_tests PRIVATE Threads::Threads)
-if(MSVC)
-    target_compile_options(ccg_stress_tests PRIVATE /utf-8)
-endif()
 
 # ── 凭证存储格式测试（含加账户类型字段后的向后兼容）──────────────────────────
 add_executable(ccg_key_store_tests tests/test_key_store.cpp src/core/key_store.cpp)
@@ -364,11 +358,11 @@ endif()
 # 列表里的目标必须存在，否则 ccbot_harden 会报错——这正是想要的：
 # 删了目标忘了从这里摘掉，构建就会响
 set(CCBOT_OWN_TARGETS
-    ccbot_headless ladder_depth
+    ccbot_headless
     ccg_indicator_tests ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests
-    ccg_risk_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
+    ccg_sar_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
     ccg_rate_tests ccg_timesync_tests ccg_price_tests ccg_config_tests
-    ccg_persist_tests ccg_stress_tests ccg_key_store_tests
+    ccg_key_store_tests
 )
 if(WIN32 OR APPLE)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)

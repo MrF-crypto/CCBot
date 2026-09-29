@@ -36,92 +36,7 @@ std::string get_str(simdjson::dom::object& o, const char* key, const std::string
     return def;
 }
 
-CcgConfig::StratType parse_strat(const std::string& s) {
-    if (s == "flat")       return CcgConfig::StratType::Flat;
-    if (s == "martingale") return CcgConfig::StratType::Martingale;
-    if (s == "mart_plus")  return CcgConfig::StratType::MartPlus;
-    if (s == "triple")     return CcgConfig::StratType::Triple;
-    if (s == "square")     return CcgConfig::StratType::Square;
-    if (s == "fibonacci")  return CcgConfig::StratType::Fibonacci;
-    if (s == "lucas")      return CcgConfig::StratType::Lucas;
-    if (s == "linear")     return CcgConfig::StratType::Linear;
-    return CcgConfig::StratType::Martingale;
-}
-
-CcgConfig::Direction parse_dir(const std::string& s) {
-    if (s == "short") return CcgConfig::Direction::Short;
-    if (s == "both")  return CcgConfig::Direction::Both;
-    return CcgConfig::Direction::Long;
-}
-
-CcgConfig::EntryMode parse_entry_mode(const std::string& s) {
-    return (s == "indicator") ? CcgConfig::EntryMode::Indicator : CcgConfig::EntryMode::Immediate;
-}
-
-CcgConfig::RsiConfirmMode parse_rsi_mode(const std::string& s) {
-    return (s == "cross") ? CcgConfig::RsiConfirmMode::CrossFromOversold
-                           : CcgConfig::RsiConfirmMode::Snapshot;
-}
-
 } // namespace
-
-// 解析一个 bot 的策略参数。抽成函数是为了让【扫描器模板】复用同一套解析——
-// 否则那 60 行会被复制一遍，然后两份慢慢长歪（headless 默认值与引擎脱节那个
-// 缺陷就是这么来的）。
-// 返回 false 表示配置有致命错误，原因写进 err。
-static bool parse_bot_fields(simdjson::dom::object& bo, CcgConfig& c,
-                             HeadlessConfig& out, std::string& err) {
-    std::string dir_s = get_str(bo, "direction", "long");
-    if (dir_s == "both") {
-        // 引擎内部 Both 会走纯空头分支，headless 又没有 GUI 那样的拆分逻辑——
-        // 用户想要对冲、实际得到裸空单，必须拒绝启动
-        err = c.symbol + " 配置了 direction=both：headless 不支持双向，"
-              "请拆成两个 bot 分别配置 long 和 short（注意需要币安双向持仓模式）";
-        return false;
-    }
-
-    c.strat_type    = parse_strat(get_str(bo, "strat_type", "linear"));
-    c.direction     = parse_dir(dir_s);
-    c.budget_usdt   = get_num(bo, "budget_usdt", c.budget_usdt);
-    c.leverage      = (int)get_num(bo, "leverage", c.leverage);
-    c.max_entries   = (int)get_num(bo, "max_entries", c.max_entries);
-    c.interval_pct  = get_num(bo, "interval_pct", c.interval_pct);
-    c.trail_entry   = get_num(bo, "trail_entry", c.trail_entry);
-    c.tp_pct        = get_num(bo, "tp_pct", c.tp_pct);
-    c.trail_tp      = get_num(bo, "trail_tp", c.trail_tp);
-    c.auto_restart  = get_bool(bo, "auto_restart", c.auto_restart);
-    c.cooldown_secs = (int)get_num(bo, "cooldown_secs", c.cooldown_secs);
-    c.use_disaster_stop = get_bool(bo, "use_disaster_stop", c.use_disaster_stop);
-    c.disaster_stop_pct = get_num(bo, "disaster_stop_pct", c.disaster_stop_pct);
-    // 配了比例却没打开开关是最容易犯的错——它会静默地什么都不做，
-    // 而使用者以为仓位已经有进程外保护了
-    if (!c.use_disaster_stop && bo["disaster_stop_pct"].error() == simdjson::SUCCESS)
-        out.warnings.push_back(c.symbol + " 配了 disaster_stop_pct 但 use_disaster_stop 不是 true，"
-                                          "交易所侧灾难止损单【未启用】");
-
-    c.entry_mode      = parse_entry_mode(get_str(bo, "entry_mode", "indicator"));
-    c.kline_interval  = get_str(bo, "kline_interval", c.kline_interval);
-    c.boll_period     = (int)get_num(bo, "boll_period", c.boll_period);
-    c.boll_mult       = get_num(bo, "boll_mult", c.boll_mult);
-    c.use_rsi_filter  = get_bool(bo, "use_rsi_filter", c.use_rsi_filter);
-    c.rsi_period      = (int)get_num(bo, "rsi_period", c.rsi_period);
-    c.rsi_threshold   = get_num(bo, "rsi_threshold", c.rsi_threshold);
-    c.rsi_confirm_mode = parse_rsi_mode(get_str(bo, "rsi_confirm_mode", "cross"));
-    c.rsi_oversold_th  = get_num(bo, "rsi_oversold_th", c.rsi_oversold_th);
-    c.use_trend_filter  = get_bool(bo, "use_trend_filter", c.use_trend_filter);
-    c.trend_interval    = get_str(bo, "trend_interval", c.trend_interval);
-    c.trend_ema_period  = (int)get_num(bo, "trend_ema_period", c.trend_ema_period);
-    c.use_htf_filter      = get_bool(bo, "use_htf_filter", c.use_htf_filter);
-    c.htf_interval        = get_str(bo, "htf_interval", c.htf_interval);
-    c.htf_pos_max         = get_num(bo, "htf_pos_max", c.htf_pos_max);
-    // v3.8 迁移：老配置的 smart_gates 总开关为 false 时拦截完全不参与，
-    // 升级后必须保持——否则老配置会突然开始拦截。
-    // v4.0.16 移除结构层后，需要迁移的只剩 %B 这一条
-    if (bo["use_sr_support"].error() != simdjson::SUCCESS &&
-        !get_bool(bo, "smart_gates", true))
-        c.use_htf_filter = false;
-    return true;
-}
 
 bool load_headless_config(const std::string& path, HeadlessConfig& out, std::string& err) {
     std::ifstream f(path, std::ios::binary);
@@ -171,41 +86,22 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         return false;
     }
 
-    simdjson::dom::array bots;
-    const bool has_bots = (root["bots"].get(bots) == simdjson::SUCCESS);
-
-    // 已知的 bot 配置键：拼错键名会静默落回默认值（比如 interval_pct 拼错 = 间距变默认值），
-    // 所以未知键必须显式告警
-    static const std::set<std::string> known_keys = {
-        "symbol", "direction", "strat_type", "budget_usdt", "leverage", "max_entries",
-        "interval_pct", "trail_entry", "tp_pct", "trail_tp", "auto_restart",
-        "cooldown_secs",
-        "use_disaster_stop", "disaster_stop_pct",
-        "entry_mode", "kline_interval",
-        "boll_period", "boll_mult", "use_rsi_filter", "rsi_period", "rsi_threshold",
-        "rsi_confirm_mode", "rsi_oversold_th", "use_trend_filter", "trend_interval", "trend_ema_period",
-        "smart_gates", "use_htf_filter", "htf_interval", "htf_pos_max",
-        "use_sr_gate",
-    };
-
-    if (has_bots) for (auto elem : bots) {
-        simdjson::dom::object bo;
-        if (elem.get(bo) != simdjson::SUCCESS) continue;
-
-        CcgConfig c;
-        c.symbol = get_str(bo, "symbol", c.symbol);
-        if (c.symbol.empty()) continue;
-
-        for (auto field : bo) {
-            std::string k(field.key);
-            if (!known_keys.count(k))
-                out.warnings.push_back(c.symbol + " 配置里有无法识别的键 \"" + k +
-                                       "\"（拼写错误?），该项被忽略、对应参数使用默认值");
+    // ── 旧的 "bots" 数组（网格DCA）：本版起不再支持 ──────────────────────────
+    // 必须【显式报出来】而不是静默忽略。静默忽略的后果是：升级后用户的配置文件
+    // 原样放着，进程正常启动、日志一切正常，而那些 DCA 品种其实一个都没在跑——
+    // 使用者要等到某天去交易所对账才发现。这种沉默比启动失败危险得多
+    {
+        simdjson::dom::array old_bots;
+        if (root["bots"].get(old_bots) == simdjson::SUCCESS) {
+            size_t n = 0;
+            for (auto e : old_bots) { (void)e; ++n; }
+            if (n > 0) {
+                out.warnings.push_back(
+                    "配置里有 " + std::to_string(n) + " 个 \"bots\"（网格DCA）条目，"
+                    "但网格DCA 已在本版整体移除，这些条目【完全不会运行】。"
+                    "趋势策略请配在 \"sar_bots\" 里");
+            }
         }
-
-        if (!parse_bot_fields(bo, c, out, err)) return false;
-
-        out.bots.push_back(c);
     }
 
     // ── SAR 趋势跟随策略 ────────────────────────────────────────────────────
@@ -318,18 +214,11 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         }
     }
 
-    // 同一品种被两套策略同时接管：两个引擎各下各的单，在交易所上叠成一个
-    // 谁也算不清的净仓位——SAR 的 reduceOnly 平仓会平掉 DCA 的层，反之亦然
-    for (const auto& sc : out.sar_bots)
-        for (const auto& bc : out.bots)
-            if (sc.symbol == bc.symbol) {
-                err = sc.symbol + " 同时出现在 bots 和 sar_bots 里。两套策略会在同一个"
-                      "交易所仓位上互相平掉对方的单，必须二选一";
-                return false;
-            }
+    // v4.7.1 之前这里还要拦"同一品种被 bots 与 sar_bots 同时接管"（两个引擎各下
+    // 各的单、互相平掉对方的仓）。网格DCA 移除后只剩一套策略，这类冲突不存在了。
 
-    if (out.bots.empty() && out.sar_bots.empty()) {
-        err = "配置文件里 bots 与 sar_bots 都为空（或每一项都缺少 symbol），至少要配一个";
+    if (out.sar_bots.empty()) {
+        err = "配置文件里 sar_bots 为空（或每一项都缺少 symbol），至少要配一个";
         return false;
     }
 
