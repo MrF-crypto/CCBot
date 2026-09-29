@@ -310,6 +310,49 @@ int main() {
         check(r.ok, "查单确认已成交");
     }
 
+    std::printf("── 用例11：硬止损的错误分类（可重试 vs 白等）──\n");
+    {
+        // 重试阶梯要跑十三次、三十多秒，而这段时间里仓位是【没有进程外保护】的。
+        // 所以"这个错还有没有救"这个判断的代价是不对称的：
+        //   误判成可重试 → 白裸三十多秒，然后照样兜底平仓
+        //   误判成没救   → 把一次能恢复的网络抖动直接变成"平掉刚开的仓"
+        // 于是只有【确定无望】的码才标不可重试。这个用例钉住两边各一个代表。
+        auto probe = [](const char* body) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m == "POST") { out.body = body; return true; }
+                return false;
+            });
+            return tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
+        };
+
+        // -4120「这个端点不收这个单型」：重试十三次结果完全一样。
+        // 实测（2026-09-29，$210 的普通合约账户）13 次全 -4120，历时 36 秒
+        auto r1 = probe(R"({"code":-4120,"msg":"Order type not supported for this )"
+                        R"(endpoint. Please use the Algo Order API endpoints instead."})");
+        check(!r1.ok(), "-4120 是失败");
+        check(!r1.retryable, "-4120 不可重试：端点/单型不匹配，白等三十多秒");
+        check(r1.error.find("账户模式") != std::string::npos,
+              "  并提示去核对账户模式（它是手工选的，选错时只有条件单会露馅）");
+
+        // -1003 限流：过一会儿就好了，正是阶梯存在的理由
+        auto r2 = probe(R"({"code":-1003,"msg":"Too many requests."})");
+        check(!r2.ok() && r2.retryable, "-1003 限流可重试：这正是重试阶梯的用途");
+
+        // HTML 错误页：请求没到 API。看起来该直接判死，但 Cloudflare 的 502/503
+        // 也是 HTML，而那种真能重试过去 —— 保持可重试，只把诊断说清楚
+        auto r3 = probe("<!DOCTYPE html><html><head></head><body>error</body></html>");
+        check(!r3.ok() && r3.retryable, "HTML 响应仍可重试（502/503 也是 HTML）");
+        check(r3.error.find("HTML") != std::string::npos,
+              "  但要明说收到的是网页、请求没到币安");
+        check(r3.error.find('\n') == std::string::npos,
+              "  且压平换行：HTML 原样打出来会把一条日志撑成几十行");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

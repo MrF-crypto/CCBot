@@ -1109,6 +1109,12 @@ static bool stop_error_retryable(const std::string& err) {
         "[-1116]",   // 非法 orderType
         "[-1117]",   // 非法 side
         "[-4061]",   // positionSide 与持仓模式不匹配
+        // "Order type not supported for this endpoint. Please use the Algo Order
+        // API endpoints instead." —— 币安明确告诉你这个【端点】不收这个单型。
+        // 这跟精度、触发价一样属于"参数/路由错了"，重试十三次结果完全一样，
+        // 而代价是仓位实打实地裸三十多秒然后照样兜底平仓。
+        // 实测（2026-09-29，$210 的普通合约账户）：13 次全 -4120，历时 36 秒
+        "[-4120]",
     };
     for (const char* c : kHopeless)
         if (err.find(c) != std::string::npos) return false;
@@ -1178,8 +1184,20 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     }
 
     std::string err;
-    if (binance_error(doc, err))
+    if (binance_error(doc, err)) {
+        // -4120 值得单独给一句话。它的字面意思（"换 Algo Order API"）对着
+        // 普通合约账户是讲不通的——/fapi/v1/order 本来就收 STOP_MARKET。
+        // 实际遇到它时，最可能的原因是【账户模式设错了】：账户模式是手工选的，
+        // 不是探测出来的，选错时下单端点整条都是错的。
+        // 而这个"错"很隐蔽：行情、余额、市价单都照常工作，只有条件单会露馅
+        if (err.find("[-4120]") != std::string::npos)
+            err += "  ← 这个端点不收 STOP_MARKET。请核对「账户模式」设置"
+                   "（普通合约 ↔ 统一账户）：它是手工选的而不是探测的，选错时"
+                   "余额和市价单都照常工作，只有条件单会露馅。当前用的是 " +
+                   std::string(pm ? "统一账户(/papi/v1/um/conditional/order)"
+                                  : "普通合约(/fapi/v1/order)");
         return { "", err, stop_error_retryable(err) };
+    }
 
     int64_t oid = 0;
     get_or_keep(doc[pm ? "strategyId" : "orderId"], oid);

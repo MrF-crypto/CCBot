@@ -605,15 +605,27 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
             const bool stop_ok = init_stop > 0 &&
                 (dir == trend::Pos::Long ? init_stop < price : init_stop > price);
             if (qty <= 0 || !stop_ok) {
-                std::lock_guard<std::recursive_mutex> lk(mtx_);
-                auto it = bots_.find(id);
-                if (it != bots_.end()) {
-                    it->second.pending = false;
-                    it->second.last_action = !stop_ok ? "止损线缺失，跳过开仓"
-                                                      : "数量不足，跳过开仓";
+                bool say_it = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lk(mtx_);
+                    auto it = bots_.find(id);
+                    if (it != bots_.end()) {
+                        it->second.pending = false;
+                        it->second.last_action = !stop_ok ? "止损线缺失，跳过开仓"
+                                                          : "数量不足，跳过开仓";
+                        // 每种原因只报一次，恢复正常后复位。
+                        // ⚠ 信号成立而数据没跟上时，这条路径每个 tick 都会走一遍
+                        //   （3 秒一次）。实测日志里"算不出有效止损线"连刷 4 条才
+                        //   等到摆动数据到位——短周期策略下这会是常态，而原因始终
+                        //   写在 last_action 里，界面上一直看得到，不依赖日志
+                        say_it = !it->second.skip_logged;
+                        it->second.skip_logged = true;
+                    }
                 }
-                log(cfg.symbol + (!stop_ok ? " 算不出有效止损线，不开仓"
-                                           : " 开仓数量不足，跳过"));
+                if (say_it)
+                    log(cfg.symbol + (!stop_ok ? " 算不出有效止损线，不开仓"
+                                                 "（数据到位后自动恢复，不再重复提示）"
+                                               : " 开仓数量不足，跳过"));
                 return;
             }
 
@@ -645,6 +657,8 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 trend::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse,
                                  b.bar_open_ms);
                 b.qty = r.executed_qty;
+                // 开成了 ⇒ 数据齐了。复位之后，若将来又开始缺数据会重新提示一次
+                b.skip_logged = false;
                 std::ostringstream ss;
                 ss << cfg.symbol << " 开" << trend::pos_name(dir)
                    << (from_reverse ? "（反手）" : "")

@@ -173,6 +173,11 @@ struct TrendBot {
     //   "这是系统性问题"。只由一次成功挂单清零
     int  ds_fail_closes = 0;
 
+    // "算不出止损线/数量不足，跳过开仓"是否已经报过。信号成立而数据没跟上时
+    // 这条路径每个 tick（3 秒）都会走一遍，不去重就是每 3 秒一条同样的日志。
+    // 成功开仓时复位，所以"又开始缺数据了"仍然会重新提示一次
+    bool skip_logged = false;
+
     double realized_pnl = 0;
     int    trade_count  = 0;
     int    win_count    = 0;
