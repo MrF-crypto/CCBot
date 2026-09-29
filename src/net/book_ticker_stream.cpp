@@ -215,6 +215,74 @@ void BookTickerStream::stop() {
     std::vector<Conn*> all;
     { std::lock_guard<std::mutex> lk(mtx_); for (auto& c : conns_) all.push_back(c.get()); }
     for (Conn* c : all) c->ws->stop();
+
+    // 探针只被 pump 线程碰过，而 pump 已经 join 完了，所以这里独占访问
+    if (probe_) { probe_->stop(); probe_.reset(); }
+}
+
+// ── 自诊断探针 ────────────────────────────────────────────────────────────────
+// 只在 pump 线程里被创建/销毁（start_probe 由零数据告警那一支调用，
+// reap_probe 每轮调用），所以这几个成员不需要额外加锁。
+void BookTickerStream::start_probe(const std::string& stream_name) {
+    if (stream_name.empty()) return;
+    if (probe_done_.exchange(true)) return;   // 整个进程只做一次
+
+    probe_stream_ = stream_name;
+    probe_open_.store(false);
+    probe_msgs_.store(0);
+    probe_start_ms_ = now_ms();
+
+    const std::string url = (testnet_ ? "wss://stream.binancefuture.com/ws/"
+                                      : "wss://fstream.binance.com/ws/") + stream_name;
+    probe_ = std::make_unique<ix::WebSocket>();
+    probe_->setUrl(url);
+    // 一次性对照，不要自动重连：它的职责是回答一个是非题，不是提供行情
+    probe_->disableAutomaticReconnection();
+    probe_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+        switch (msg->type) {
+        case ix::WebSocketMessageType::Open:    probe_open_.store(true);   break;
+        case ix::WebSocketMessageType::Message: probe_msgs_.fetch_add(1);  break;
+        case ix::WebSocketMessageType::Error:
+            say("行情自检 连接错误: " + msg->errorInfo.reason
+                + "（HTTP " + std::to_string(msg->errorInfo.http_status) + "）");
+            break;
+        default: break;
+        }
+    });
+    say("行情自检：拿【原始单流端点】对照一次 —— " + url + "\n"
+        "    这个端点连上即推，不需要发任何 SUBSCRIBE。" +
+        std::to_string(kProbeMs / 1000) + " 秒后给结论。");
+    probe_->start();
+}
+
+void BookTickerStream::reap_probe() {
+    if (!probe_) return;
+    if (now_ms() - probe_start_ms_ < kProbeMs) return;
+
+    const bool opened = probe_open_.load();
+    const int  msgs   = probe_msgs_.load();
+    probe_->stop();
+    probe_.reset();
+
+    if (msgs > 0) {
+        say("🔎 行情自检结论：原始端点 " + probe_stream_ + " 在 "
+            + std::to_string(kProbeMs / 1000) + " 秒内收到 " + std::to_string(msgs)
+            + " 个数据包 —— 【网络没问题，问题在本程序的订阅用法上】。\n"
+            "    /ws/<流名> 有数据而 /stream + SUBSCRIBE 没有，两者的差别就是"
+            "唯一的嫌疑点。请把这条日志发给开发侧。");
+    } else if (opened) {
+        say("🔎 行情自检结论：原始端点 " + probe_stream_ + " 连上了但 "
+            + std::to_string(kProbeMs / 1000) + " 秒内【零数据】—— 与主连接表现一致。\n"
+            "    这说明不是订阅用法的问题：连"
+            "「连上即推、不需要任何 SUBSCRIBE」的端点也拿不到行情。\n"
+            "    请查出口 IP 是否被币安限制、以及代理是否真的把 "
+            "fstream.binance.com 送到了币安（同一台机器上 REST 行情能用"
+            "【不能】说明 WS 也能用：两者常常走不同的分流规则）。");
+    } else {
+        say("🔎 行情自检结论：原始端点 " + probe_stream_ +
+            " 连都没连上 —— 到 fstream.binance.com 的链路本身不通，"
+            "与订阅逻辑无关。请查代理分流与 DNS。");
+    }
 }
 
 // ── 看门狗 + 出站控制消息合并发送 ─────────────────────────────────────────────
@@ -321,6 +389,14 @@ void BookTickerStream::pump_loop() {
                         "以及 DNS 是否把它解析到了 198.18/15 这类 fake-IP："
                         "那种地址上 TCP 握手必然成功，所以「连上了」说明不了任何事");
                 }
+                // 上面那两支只是"优先查什么"，真正的答案得靠对照实验。
+                // 拿这条连接上的第一条流去试【原始单流端点】，让程序自己判：
+                // 那个端点连上即推、不需要任何 SUBSCRIBE，所以它能不能收到数据
+                // 恰好把"我们的订阅用法不对"和"这台机器拿不到币安 WS 行情"分开
+                std::string first;
+                { std::lock_guard<std::mutex> lk(mtx_);
+                  if (!c->streams.empty()) first = *c->streams.begin(); }
+                start_probe(first);
             }
 
             if (should_kick(now, lm, cs, conn, s.n)) {
@@ -337,6 +413,7 @@ void BookTickerStream::pump_loop() {
             }
         }
         connected_.store(any_up);
+        reap_probe();       // 到期就收掉并给结论（没起过探针时是空操作）
     }
 }
 

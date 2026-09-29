@@ -411,6 +411,25 @@ private:
     void force_reconnect(Conn* c, const std::string& why);
     void say(const std::string& m) const;
     void wire(Conn* c);                     // 装回调 + setUrl，start() 与新建连接共用
+
+    // ── 自诊断：拿【原始单流端点】对照一次 ────────────────────────────────────
+    // 币安有两套 WS 用法：
+    //   /stream + SUBSCRIBE 消息   ← 本类平时用的，能动态加减品种
+    //   /ws/<流名>                 ← 连上即推，不需要任何 SUBSCRIBE
+    // "连上了、SUBSCRIBE 的 id 也对得上、却一个数据包都没有"这个状态，光看
+    // 平时那条连接分不出是【我们的 SUBSCRIBE 用法不对】还是【这台机器拿不到
+    // 币安的 WS 行情】——而两者的修法一个在代码里、一个在网络里。
+    //
+    // 所以零数据时自动拿 /ws/ 对照一次：
+    //   它有数据 ⇒ 网络没问题，问题在我们这边
+    //   它也没有 ⇒ 代码清白，去查出口 IP / 代理分流
+    //
+    // 整个进程只跑一次（probe_done_），不参与自愈、不影响任何行情路径，
+    // 结论只写进日志。这是我反复在"你去试试"上打转之后才想明白该做的事：
+    // 一个我自己没法从开发机验证的假设，就该让程序自己去验
+    void start_probe(const std::string& stream_name);
+    void reap_probe();                      // pump 每轮调用，到期就收掉
+    static constexpr int64_t kProbeMs = 8000;   // 给它 8 秒，markPrice@1s 够推 8 条
     Conn* conn_for(const std::string& stream_name);   // 调用方须持 mtx_
     // 一个品种对应的全部流名（小写）。随 Feeds 变化，所以不是静态的
     std::vector<std::string> streams_of(const std::string& symbol) const;
@@ -454,6 +473,15 @@ private:
     std::thread              pump_;
     mutable std::mutex       cv_mtx_;
     std::condition_variable  cv_;       // stop() 靠它立刻叫醒 pump，不用等一个周期
+
+    // ── 自诊断探针（见 start_probe）────────────────────────────────────────────
+    // 只由 pump 线程创建/销毁，回调只碰后面两个 atomic —— 所以不需要额外的锁
+    std::unique_ptr<ix::WebSocket> probe_;
+    std::atomic<bool>    probe_done_ {false};   // 进程级一次性
+    std::atomic<bool>    probe_open_ {false};
+    std::atomic<int>     probe_msgs_ {0};
+    int64_t              probe_start_ms_ = 0;
+    std::string          probe_stream_;
 };
 
 } // namespace ccbot
