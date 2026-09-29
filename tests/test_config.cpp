@@ -74,13 +74,14 @@ int main() {
 
         // 漏填的字段必须落到引擎默认值。解析器用 c.rule.xxx 自身作兜底
         // （而不是抄一遍字面量），所以引擎改默认值时这里不会悄悄漂走
-        const SarConfig def;
+        const TrendConfig def;
         const auto& g = hc.sar_bots[0];
+        check(g.rule.strategy == def.rule.strategy,                "  策略默认是海龟");
         check(g.rule.donchian_period == def.rule.donchian_period, "  通道周期取默认值");
         check(g.rule.atr_period == def.rule.atr_period,           "  ATR周期取默认值");
         eqd(g.rule.atr_mult, def.rule.atr_mult, "  k 取默认值");
-        check(g.rule.reverse_needs_signal == def.rule.reverse_needs_signal,
-              "  反手信号闸默认开启（无条件反手在震荡市是绞肉机）");
+        check(g.rule.reverse == trend::ReverseMode::None,
+              "  默认【不反手】（无条件反手在震荡市是绞肉机）");
         check(g.interval == def.interval, "  信号周期取默认值");
     }
     {
@@ -124,33 +125,171 @@ int main() {
             if (w.find("atr_mlut") != std::string::npos) warned = true;
         check(warned, "SAR 段拼错的键产生告警");
     }
-    {
-        // 关掉信号闸（无条件反手）要明确告警一次
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
-                         "\"reverse_needs_signal\":false}]}");
-        HeadlessConfig hc; std::string err;
-        check(load_headless_config(path, hc, err), "无条件反手应能加载（是合法配置）");
-        bool warned = false;
-        for (const auto& w : hc.warnings)
-            if (w.find("reverse_needs_signal") != std::string::npos) warned = true;
-        check(warned, "无条件反手应产生告警");
-    }
 
-    // ── ⑦ SAR 等风险下单 + 金字塔加仓 ───────────────────────────────────────
+    // ── ②b 三个策略各自的解析与校验 ─────────────────────────────────────────
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
-                         "\"size_mode\":\"risk\",\"risk_usdt\":100,"
-                         "\"pyramid_max_adds\":3,\"pyramid_step_atr\":0.5}]}");
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\","
+                         "\"af_start\":0.03,\"af_step\":0.01,\"af_max\":0.15,"
+                         "\"max_consecutive_reverses\":3}]}");
         HeadlessConfig hc; std::string err;
-        check(load_headless_config(path, hc, err), "等风险+金字塔配置应能加载");
+        check(load_headless_config(path, hc, err), "strategy=psar 能加载: " + err);
         if (hc.sar_bots.size() == 1) {
             const auto& g = hc.sar_bots[0];
-            check(g.size_mode == SarConfig::SizeMode::RiskBased, "  size_mode=risk");
+            check(g.rule.strategy == trend::Strategy::ParabolicSar, "  策略=抛物线SAR");
+            eqd(g.rule.af_start, 0.03, "  af_start");
+            eqd(g.rule.af_step,  0.01, "  af_step");
+            eqd(g.rule.af_max,   0.15, "  af_max");
+            // PSAR 的入场信号【只有】翻转一个来源，不反手就永远空仓——
+            // 所以配置层强制写死，不管 JSON 里写了什么
+            check(g.rule.reverse == trend::ReverseMode::Immediate,
+                  "  PSAR 的反手模式被强制为 immediate");
+        }
+    }
+    {
+        // 显式配 reverse=none 也要被 PSAR 的强制覆盖掉。
+        // 不覆盖的话 bot 启动后一单也不开，而日志上完全正常
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\","
+                         "\"reverse\":\"none\",\"max_consecutive_reverses\":2}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "PSAR + reverse=none 仍能加载");
+        if (hc.sar_bots.size() == 1)
+            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::Immediate,
+                  "PSAR 忽略 reverse=none，否则它会永远空仓");
+    }
+    {
+        // PSAR 不设连续反手上限 = 震荡市里没有刹车，必须明确说一次
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "PSAR 不设上限仍能启动（不拦）");
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("max_consecutive_reverses") != std::string::npos) warned = true;
+        check(warned, "  但必须告警「没有刹车」");
+    }
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\","
+                         "\"af_start\":0.3,\"af_max\":0.2}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err),
+              "af_start > af_max 应被拒绝（起点就封顶，加速机制直接失效）");
+    }
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"bare_entry\":\"immediate\",\"once_per_bar\":true,"
+                         "\"swing_bars\":5}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "strategy=bare_k 能加载: " + err);
+        if (hc.sar_bots.size() == 1) {
+            const auto& g = hc.sar_bots[0];
+            check(g.rule.strategy == trend::Strategy::BareK,          "  策略=纯裸K");
+            check(g.rule.bare_entry == trend::BareEntry::Immediate,   "  入场=盘中即时");
+            check(g.rule.once_per_bar,                                "  每根一次护栏已开");
+            check(g.rule.swing_bars == 5,                             "  摆动根数=5");
+        }
+    }
+    {
+        // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"bare_entry\":\"immediate\",\"reverse\":\"immediate\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "抖动组合仍能启动（合法，只是危险）");
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("once_per_bar") != std::string::npos) warned = true;
+        check(warned, "  必须告警并建议开 once_per_bar");
+    }
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"bare_entry\":\"whatever\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "bare_entry 非法值应被拒绝");
+    }
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"martingale\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "未知 strategy 应被拒绝而不是默默跑海龟");
+    }
+
+    // ── ②c 旧键迁移：必须被明确报出来，不能静默改变行为 ─────────────────────
+    {
+        // 旧 mode=bar 的入场规则是"刚收盘那根是阳线就做多"，已删除。
+        // 静默迁移的后果是信号数量骤变而用户毫不知情
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"mode\":\"bar\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "旧 mode=bar 仍能加载");
+        if (hc.sar_bots.size() == 1)
+            check(hc.sar_bots[0].rule.strategy == trend::Strategy::BareK,
+                  "  mode=bar 迁移为 strategy=bare_k");
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("mode=bar") != std::string::npos) warned = true;
+        check(warned, "  必须告警入场规则已变");
+    }
+    {
+        // 旧默认 allow_reverse=true + reverse_needs_signal=true 没有对应的新档位，
+        // 映射到 none（保护性更强的那边）并说明差别
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\","
+                         "\"allow_reverse\":true,\"reverse_needs_signal\":true}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "旧反手 bool 仍能加载");
+        if (hc.sar_bots.size() == 1)
+            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::None,
+                  "  「反手需信号」映射到 reverse=none");
+        bool warned = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("reverse=none") != std::string::npos) warned = true;
+        check(warned, "  必须告警这是行为变化");
+    }
+    {
+        // 旧的无条件反手（allow=true, needs=false）有精确对应，行为不变
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\","
+                         "\"allow_reverse\":true,\"reverse_needs_signal\":false}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "旧无条件反手仍能加载");
+        if (hc.sar_bots.size() == 1)
+            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::Immediate,
+                  "  无条件反手精确映射到 reverse=immediate");
+    }
+    {
+        // 新键在场时旧键必须【完全不起作用】——两套键同时被尊重是最难查的一类 bug
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"reverse\":\"immediate\","
+                         "\"allow_reverse\":false,\"reverse_needs_signal\":true}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "新旧键并存仍能加载");
+        if (hc.sar_bots.size() == 1)
+            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::Immediate,
+                  "  新键 reverse 优先，旧 bool 被忽略");
+    }
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"reverse\":\"maybe\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "reverse 非法值应被拒绝");
+    }
+
+    // ── ③ 固定单笔风险下单 ──────────────────────────────────────────────────
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"size_mode\":\"risk\",\"risk_usdt\":100}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "固定单笔风险配置应能加载");
+        if (hc.sar_bots.size() == 1) {
+            const auto& g = hc.sar_bots[0];
+            check(g.size_mode == TrendConfig::SizeMode::RiskBased, "  size_mode=risk");
             eqd(g.risk_usdt, 100.0,                                "  risk_usdt");
-            check(g.rule.pyramid_max_adds == 3,                    "  加仓档数");
-            eqd(g.rule.pyramid_step_atr, 0.5,                      "  加仓间距");
         }
     }
     {
@@ -162,25 +301,27 @@ int main() {
               "size_mode=risk 但缺 risk_usdt 应被拒绝");
     }
     {
-        // 加仓间距为 0 会在同一价位无限加仓
+        // 金字塔已整体移除：老配置里的两个键必须落到【未知键告警】上，
+        // 而不是被静默接受——静默接受的话用户会以为加仓还在生效
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
-                         "\"pyramid_max_adds\":3,\"pyramid_step_atr\":0}]}");
+                         "\"pyramid_max_adds\":3,\"pyramid_step_atr\":0.5}]}");
         HeadlessConfig hc; std::string err;
-        check(!load_headless_config(path, hc, err), "pyramid_step_atr=0 应被拒绝");
+        check(load_headless_config(path, hc, err), "带旧金字塔键的配置仍能启动");
+        int warned = 0;
+        for (const auto& w : hc.warnings)
+            if (w.find("pyramid") != std::string::npos) ++warned;
+        check(warned == 2, "  两个已移除的金字塔键都产生了未知键告警");
     }
     {
-        // 默认必须是关闭的：这两个功能都会改变下单行为，不能悄悄生效
+        // 默认必须是固定名义：改变下单行为的东西不能悄悄生效
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
         HeadlessConfig hc; std::string err;
         load_headless_config(path, hc, err);
-        if (hc.sar_bots.size() == 1) {
-            check(hc.sar_bots[0].size_mode == SarConfig::SizeMode::Notional,
+        if (hc.sar_bots.size() == 1)
+            check(hc.sar_bots[0].size_mode == TrendConfig::SizeMode::Notional,
                   "默认仓位算法必须是固定名义");
-            check(hc.sar_bots[0].rule.pyramid_max_adds == 0,
-                  "默认必须不加仓");
-        }
     }
 
     std::remove(path.c_str());

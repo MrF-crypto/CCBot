@@ -16,7 +16,7 @@
 // 判据用【不变量】而不是"期望值"：并发下没有唯一正确的输出，但
 // "pos==Flat 与 qty==0 必须同真同假"这类约束在任何交错下都得成立，
 // 一旦破了就是真的状态撕裂。
-#include "core/sar_engine.h"
+#include "core/trend_engine.h"
 #include "core/thread_pool.h"
 
 #include <atomic>
@@ -79,11 +79,12 @@ public:
     double round_qty(const std::string&, double q) override {
         return std::floor(q / 0.001) * 0.001;
     }
-    std::string place_disaster_stop(const std::string&, double sp,
-                                    const std::string&) override {
-        if (!(sp > 0)) { ++bad_stop_price; return ""; }
+    StopPlacement place_disaster_stop(const std::string&, double sp,
+                                      const std::string&) override {
+        if (!(sp > 0)) { ++bad_stop_price; return { "", "非正触发价", false }; }
         std::lock_guard<std::mutex> lk(m_);
-        return (rng_() % 5 == 0) ? std::string() : "DS" + std::to_string(++ds_);
+        if (rng_() % 5 == 0) return { "", "随机挂单失败", true };
+        return { "DS" + std::to_string(++ds_), "", true };
     }
     bool cancel_disaster_stop(const std::string&, const std::string&) override {
         return true;
@@ -108,7 +109,7 @@ private:
 //   所以这个错只有 Linux 报
 static bool is_finite(double v) { return std::isfinite(v); }
 
-static void check_invariants(const std::vector<SarBot>& bots, const std::string& tag) {
+static void check_invariants(const std::vector<TrendBot>& bots, const std::string& tag) {
     for (const auto& b : bots) {
         const std::string p = tag + " [" + b.cfg.symbol + "] ";
 
@@ -119,7 +120,7 @@ static void check_invariants(const std::vector<SarBot>& bots, const std::string&
         //    撕裂的后果正是这套策略最致命的失败模式：引擎以为自己空仓，
         //    下一个信号会再开一笔 → 净敞口翻倍且方向不明；反过来则是
         //    "以为有仓"，止损线守着一个不存在的仓位
-        const bool flat_by_pos = (b.st.pos == sar::Pos::Flat);
+        const bool flat_by_pos = (b.st.pos == trend::Pos::Flat);
         const bool flat_by_qty = (b.qty <= 0);
         if (flat_by_pos != flat_by_qty) {
             check(false, p + "pos 与 qty 一致（pos=" +
@@ -167,7 +168,7 @@ static void part_a_concurrency() {
 
     auto client = std::make_shared<ChaosClient>(20260929u);
     auto pool   = std::make_shared<ThreadPool>(4);
-    SarEngine eng(client, pool);
+    TrendEngine eng(client, pool);
 
     const std::vector<std::string> syms = {
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "PEPEUSDT", "LTCUSDT"
@@ -177,20 +178,42 @@ static void part_a_concurrency() {
     //   会静默找不到那个 bot，于是【一笔都开不出来】，而所有不变量都平凡成立。
     //   这份测试第一版就是这么假绿的：跑了 256 万次 tick、下单 0 笔
     std::map<std::string, std::string> ids;
-    std::set<std::string> bar_mode;
+    // 三个策略必须同时在跑。只跑一个的话，另外两个的喂入路径（update_bars 的
+    // 两套字段、PSAR 的 AF 递推）根本没有并发压力，而它们各自都会写 State
+    std::set<std::string> bare_syms, psar_syms;
     for (const auto& s : syms) {
-        SarConfig c;
+        TrendConfig c;
         c.symbol      = s;
         c.budget_usdt = 500;
         c.leverage    = 3;
         c.interval    = "3m";
-        c.rule.mode   = (s == "ZECUSDT" || s == "LTCUSDT")
-                        ? sar::Mode::BarPattern : sar::Mode::Donchian;
-        if (c.rule.mode == sar::Mode::BarPattern) bar_mode.insert(s);
-        c.rule.atr_mult              = 3.0;
-        c.rule.allow_reverse         = true;
-        c.rule.reverse_needs_signal  = (s != "PEPEUSDT");   // 一个品种开无条件反手
-        c.rule.pyramid_max_adds      = (s == "BTCUSDT") ? 2 : 0;
+
+        if (s == "ZECUSDT") {                       // ③ 裸K · 等收盘突破
+            c.rule.strategy   = trend::Strategy::BareK;
+            c.rule.bare_entry = trend::BareEntry::BreakPrevBar;
+            c.rule.swing_bars = 3;
+            c.rule.reverse    = trend::ReverseMode::Immediate;
+            bare_syms.insert(s);
+        } else if (s == "LTCUSDT") {                // ③ 裸K · 盘中即时 + 护栏
+            c.rule.strategy     = trend::Strategy::BareK;
+            c.rule.bare_entry   = trend::BareEntry::Immediate;
+            c.rule.once_per_bar = true;
+            c.rule.swing_bars   = 3;
+            c.rule.reverse      = trend::ReverseMode::None;
+            bare_syms.insert(s);
+        } else if (s == "PEPEUSDT") {               // ② 抛物线SAR
+            c.rule.strategy = trend::Strategy::ParabolicSar;
+            c.rule.reverse  = trend::ReverseMode::Immediate;
+            c.rule.max_consecutive_reverses = 3;
+            c.rule.cooldown_bars            = 2;
+            psar_syms.insert(s);
+        } else {                                    // ① 海龟
+            c.rule.strategy = trend::Strategy::Turtle;
+            c.rule.atr_mult = 3.0;
+            c.rule.reverse  = (s == "SOLUSDT") ? trend::ReverseMode::Immediate
+                                               : trend::ReverseMode::None;
+        }
+
         c.use_disaster_stop          = (s != "SOLUSDT");
         c.signal_max_age_sec         = 3600;
         const std::string id = eng.add_bot(c);
@@ -231,14 +254,19 @@ static void part_a_concurrency() {
             const double atr = px * 0.02;
             for (const auto& s : syms) {
                 const std::string& id = ids[s];
-                if (bar_mode.count(s)) {
-                    // 裸K线模式要喂【两次】：update_bars 给形态与摆动点，
-                    // update_signal 给 ATR —— 而 sig_ok 只由后者置起，
-                    // 而 tick 里 bar_ok 要 && fresh（= sig_ok && 未过期）。
-                    // 少了第二次调用，裸K线品种永远开不出仓。GUI 也是这么成对调的
-                    eng.update_bars(id, rng() % 2 == 0, rng() % 2 == 0,
-                                    px * 0.97, px * 1.03, bar);
-                    eng.update_signal(id, atr, 2.0, false, 0, 0, bar);
+                if (bare_syms.count(s) || psar_syms.count(s)) {
+                    // ⚠ v5.1 起 update_bars【自己】置 sig_ok，非海龟策略只调这一次。
+                    //   上一版必须成对调用 update_signal 才能把 sig_ok 置起，
+                    //   漏一次的表现是"配置正常、日志正常、一单不开"
+                    TrendEngine::BarSnap bs;
+                    bs.open = px;
+                    // 收盘价随机落在前一根区间内外，于是突破信号时有时无
+                    bs.prev_close = px * (0.95 + (double)(rng() % 100) / 1000.0);
+                    bs.prev_high  = px * 1.02; bs.prev_low  = px * 0.98;
+                    bs.prev2_high = px * 1.03; bs.prev2_low = px * 0.97;
+                    bs.swing_low  = px * 0.97; bs.swing_high = px * 1.03;
+                    bs.bar_open_ms = bar;
+                    eng.update_bars(id, bs);
                 } else {
                     // 通道要【落在现价之内】才可能被突破：dc_up 高于现价的话
                     // "价格 > 上沿"永远不成立，一笔都开不出来
@@ -265,10 +293,10 @@ static void part_a_concurrency() {
     ths.emplace_back([&]() {
         std::mt19937 rng(99u);
         while (!stop.load()) {
-            std::vector<SarEngine::ExchangePos> ex;
+            std::vector<TrendEngine::ExchangePos> ex;
             for (const auto& s : syms) {
                 if (rng() % 3 == 0) continue;               // 交易所"没有"这个仓位
-                SarEngine::ExchangePos p;
+                TrendEngine::ExchangePos p;
                 p.symbol      = s;
                 p.direction   = (rng() % 2) ? 1 : -1;
                 p.qty         = (double)(rng() % 50) / 10.0;
@@ -326,7 +354,7 @@ static void part_a_concurrency() {
     eng.stop_all();
     bool all_stopped = true;
     for (const auto& b : eng.get_bots())
-        if (b.state != SarBot::State::Stopped) all_stopped = false;
+        if (b.state != TrendBot::State::Stopped) all_stopped = false;
     check(all_stopped, "stop_all 之后无一例外全部为 Stopped");
 }
 
@@ -363,7 +391,7 @@ static void part_b_extremes() {
     };
 
     auto mk = [](const std::string& sym) {
-        SarConfig c;
+        TrendConfig c;
         c.symbol      = sym;
         c.budget_usdt = 1000;
         c.leverage    = 3;
@@ -380,11 +408,11 @@ static void part_b_extremes() {
     // ① 非法价格一律不得改变任何状态
     {
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         const std::string id = eng.add_bot(mk("BTCUSDT"));
         eng.update_signal(id, 2.0, 2.0, true, kUp, kDn, 1);
         eng.tick("BTCUSDT", 100.0);          // 正常建仓
-        check(eng.get_bots().at(0).st.pos != sar::Pos::Flat, "基准：已建仓");
+        check(eng.get_bots().at(0).st.pos != trend::Pos::Flat, "基准：已建仓");
         const auto before = eng.get_bots().at(0);
 
         const double nan_v = std::numeric_limits<double>::quiet_NaN();
@@ -404,13 +432,13 @@ static void part_b_extremes() {
     // 放在这里而不是 check_invariants 里，理由见那个函数里的说明（滑点与 ULP）
     {
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         const std::string id = eng.add_bot(mk("BTCUSDT"));
         eng.update_signal(id, 2.0, 2.0, true, kUp, kDn, 1);
         eng.tick("BTCUSDT", 100.0);                 // 向上突破 → 做多
         {
             const auto b = eng.get_bots().at(0);
-            check(b.st.pos == sar::Pos::Long, "向上突破开多");
+            check(b.st.pos == trend::Pos::Long, "向上突破开多");
             check(b.st.stop < b.st.peak, "  多头止损线在极值下方");
             check(b.st.stop < b.st.entry_price, "  且在开仓价下方");
         }
@@ -420,7 +448,7 @@ static void part_b_extremes() {
             cl->px = px;
             eng.tick("BTCUSDT", px);
             const auto b = eng.get_bots().at(0);
-            if (b.st.pos == sar::Pos::Flat) break;      // 被打掉了，后面不用再看
+            if (b.st.pos == trend::Pos::Flat) break;      // 被打掉了，后面不用再看
             check(b.st.stop >= prev, "  棘轮只上移（不回退）");
             check(b.st.stop < b.st.peak, "  始终在极值下方");
         }
@@ -428,13 +456,13 @@ static void part_b_extremes() {
     {
         // 空头镜像
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         const std::string id = eng.add_bot(mk("ETHUSDT"));
         // 向下突破：通道下沿要在现价【之上】
         eng.update_signal(id, 2.0, 2.0, true, 102.0, 101.0, 1);
         eng.tick("ETHUSDT", 100.0);
         const auto b = eng.get_bots().at(0);
-        check(b.st.pos == sar::Pos::Short, "向下突破开空");
+        check(b.st.pos == trend::Pos::Short, "向下突破开空");
         check(b.st.stop > b.st.peak,        "  空头止损线在极值上方");
         check(b.st.stop > b.st.entry_price, "  且在开仓价上方");
     }
@@ -443,18 +471,18 @@ static void part_b_extremes() {
     //    必须出场，而且出场后 pos 与 qty 要同时归零
     {
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         auto c = mk("ETHUSDT");
-        c.rule.allow_reverse = false;   // 隔离出场行为，不掺反手
+        c.rule.reverse = trend::ReverseMode::None;
         const std::string id = eng.add_bot(c);
         eng.update_signal(id, 2.0, 2.0, true, kUp, kDn, 1);
         eng.tick("ETHUSDT", 100.0);
-        check(eng.get_bots().at(0).st.pos != sar::Pos::Flat, "闪崩前已持仓");
+        check(eng.get_bots().at(0).st.pos != trend::Pos::Flat, "闪崩前已持仓");
 
         cl->px = 5.0;
         eng.tick("ETHUSDT", 5.0);       // -95%
         const auto b = eng.get_bots().at(0);
-        check(b.st.pos == sar::Pos::Flat && b.qty <= 0,
+        check(b.st.pos == trend::Pos::Flat && b.qty <= 0,
               "闪崩 -95% 触发出场，pos 与 qty 同时归零");
         check_invariants(eng.get_bots(), "闪崩后");
     }
@@ -462,12 +490,12 @@ static void part_b_extremes() {
     // ③ 天地针 + 极端量级：微价币与高价币各来一次
     {
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         const std::string id = eng.add_bot(mk("PEPEUSDT"));
         eng.update_signal(id, 1e-9, 2.0, true, 0.99e-7, 0.98e-7, 1);
         cl->px = 1e-7;
         eng.tick("PEPEUSDT", 1e-7);
-        check(eng.get_bots().at(0).st.pos != sar::Pos::Flat, "微价也能正常建仓");
+        check(eng.get_bots().at(0).st.pos != trend::Pos::Flat, "微价也能正常建仓");
         check_invariants(eng.get_bots(), "微价建仓");
         for (double px : {1e-7 * 50, 1e-7 * 0.02, 1e-7, 1e9}) {
             cl->px = px;
@@ -481,7 +509,7 @@ static void part_b_extremes() {
     //    清掉等于行情断流的那一刻保护自己消失了——而断流恰恰是最需要它的时候
     {
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         const std::string id = eng.add_bot(mk("SOLUSDT"));
         eng.update_signal(id, 2.0, 2.0, true, kUp, kDn, 1);
         eng.tick("SOLUSDT", 100.0);
@@ -492,7 +520,7 @@ static void part_b_extremes() {
         cl->px = 101.0;
         eng.tick("SOLUSDT", 101.0);
         const auto b = eng.get_bots().at(0);
-        check(b.st.pos != sar::Pos::Flat, "ATR 缺失不会凭空平仓");
+        check(b.st.pos != trend::Pos::Flat, "ATR 缺失不会凭空平仓");
         check(b.st.stop >= stop0, "ATR 缺失时止损线沿用旧值（不得被清零或回退）");
         check_invariants(eng.get_bots(), "ATR 缺失后");
     }
@@ -501,10 +529,9 @@ static void part_b_extremes() {
     //    不顶的话震荡市就是绞肉机——每次往返吃掉约 2k×ATR 的名义
     {
         auto cl = std::make_shared<OkClient>();
-        SarEngine eng(cl, inline_host());
+        TrendEngine eng(cl, inline_host());
         auto c = mk("LTCUSDT");
-        c.rule.allow_reverse             = true;
-        c.rule.reverse_needs_signal      = false;   // 最激进的配置
+        c.rule.reverse                   = trend::ReverseMode::Immediate;  // 最激进
         c.rule.max_consecutive_reverses  = 2;
         c.rule.cooldown_bars             = 3;
         const std::string id = eng.add_bot(c);

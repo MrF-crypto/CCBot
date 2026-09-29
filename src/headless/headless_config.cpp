@@ -104,29 +104,36 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         }
     }
 
-    // ── SAR 趋势跟随策略 ────────────────────────────────────────────────────
-    static const std::set<std::string> sar_keys = {
+    // ── 趋势策略（海龟 / 抛物线SAR / 纯裸K 三选一）──────────────────────────
+    static const std::set<std::string> trend_keys = {
         "symbol", "budget_usdt", "leverage", "interval",
+        "strategy",
+        // ① 海龟
         "donchian_period", "atr_period", "atr_mult",
-        "allow_reverse", "reverse_needs_signal",
-        "max_consecutive_reverses", "cooldown_bars", "signal_max_age_sec",
-        "use_disaster_stop", "disaster_stop_buffer_pct",
-        "size_mode", "risk_usdt", "pyramid_max_adds", "pyramid_step_atr",
-        "mode", "swing_bars",
+        // ② 抛物线SAR
+        "af_start", "af_step", "af_max",
+        // ③ 纯裸K
+        "bare_entry", "once_per_bar", "swing_bars",
+        // 共享
+        "reverse", "max_consecutive_reverses", "cooldown_bars",
+        "signal_max_age_sec", "use_disaster_stop", "disaster_stop_buffer_pct",
+        "size_mode", "risk_usdt",
+        // 兼容旧键：仍然识别，但会迁移并显式告警（见下）
+        "mode", "allow_reverse", "reverse_needs_signal",
     };
-    simdjson::dom::array sarr;
-    if (root["sar_bots"].get(sarr) == simdjson::SUCCESS) {
-        for (auto elem : sarr) {
+    simdjson::dom::array tarr;
+    if (root["sar_bots"].get(tarr) == simdjson::SUCCESS) {
+        for (auto elem : tarr) {
             simdjson::dom::object so;
             if (elem.get(so) != simdjson::SUCCESS) continue;
 
-            SarConfig c;
+            TrendConfig c;
             c.symbol = get_str(so, "symbol", "");
             if (c.symbol.empty()) continue;
 
             for (auto field : so) {
                 std::string k(field.key);
-                if (!sar_keys.count(k))
+                if (!trend_keys.count(k))
                     out.warnings.push_back(c.symbol + " sar_bots 配置里有无法识别的键 \"" +
                                            k + "\"（拼写错误?），该项被忽略、"
                                            "对应参数使用默认值");
@@ -149,66 +156,130 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 return false;
             }
 
-            c.rule.donchian_period = (int)get_num(so, "donchian_period",
-                                                  c.rule.donchian_period);
-            c.rule.atr_period      = (int)get_num(so, "atr_period", c.rule.atr_period);
-            c.rule.atr_mult        = get_num(so, "atr_mult", c.rule.atr_mult);
-            c.rule.allow_reverse   = get_bool(so, "allow_reverse", c.rule.allow_reverse);
-            c.rule.reverse_needs_signal =
-                get_bool(so, "reverse_needs_signal", c.rule.reverse_needs_signal);
-            c.rule.max_consecutive_reverses =
-                (int)get_num(so, "max_consecutive_reverses",
-                             c.rule.max_consecutive_reverses);
-            c.rule.cooldown_bars = (int)get_num(so, "cooldown_bars",
-                                                c.rule.cooldown_bars);
+            // ── 选策略 ──────────────────────────────────────────────────────
+            // 新键 strategy，旧键 mode 仍然认（带迁移告警）
+            std::string strat = get_str(so, "strategy", "");
+            if (strat.empty()) {
+                const std::string md = get_str(so, "mode", "");
+                if (md == "bar" || md == "bar_pattern") {
+                    strat = "bare_k";
+                    // ⚠ 这不是单纯改名：裸K 的【入场规则本身换了】。
+                    //   老规则是"阳线就做多"，新默认是"收盘价突破上一根最高价"。
+                    //   后者严格得多——下跌趋势里的一根阳线只是噪音，而突破前根
+                    //   高点是真正的动能信号。同一份配置换上来之后开仓频率会
+                    //   明显下降。静默迁移的话用户会以为策略"突然不работ了"
+                    out.warnings.push_back(
+                        c.symbol + "：旧键 mode=bar 已迁移为 strategy=bare_k。"
+                        "⚠ 入场规则【同时变了】——从\"阳线做多\"改为\"收盘价突破"
+                        "上一根最高价\"，开仓会明显变少（这是有意收紧）。"
+                        "想回到盘中即时入场请显式配 bare_entry=immediate");
+                } else if (!md.empty()) {
+                    strat = "turtle";
+                    out.warnings.push_back(
+                        c.symbol + "：旧键 mode=" + md + " 已迁移为 strategy=turtle，行为不变");
+                } else {
+                    strat = "turtle";
+                }
+            }
+            if      (strat == "psar" || strat == "parabolic_sar") c.rule.strategy = trend::Strategy::ParabolicSar;
+            else if (strat == "bare_k" || strat == "bare" || strat == "bark") c.rule.strategy = trend::Strategy::BareK;
+            else if (strat == "turtle" || strat == "donchian")    c.rule.strategy = trend::Strategy::Turtle;
+            else {
+                err = c.symbol + "：strategy 只能是 turtle / psar / bare_k，收到 \"" + strat + "\"";
+                return false;
+            }
 
-            // 仓位模式：notional=固定名义（默认）；risk=按 ATR 等风险
+            // ── 反手模式 ────────────────────────────────────────────────────
+            // 新键 reverse=immediate|none；旧的两个 bool 仍然认（带迁移告警）
+            const std::string rv = get_str(so, "reverse", "");
+            if (!rv.empty()) {
+                if      (rv == "immediate") c.rule.reverse = trend::ReverseMode::Immediate;
+                else if (rv == "none")      c.rule.reverse = trend::ReverseMode::None;
+                else { err = c.symbol + "：reverse 只能是 immediate / none"; return false; }
+            } else if (so["allow_reverse"].error() == simdjson::SUCCESS ||
+                       so["reverse_needs_signal"].error() == simdjson::SUCCESS) {
+                const bool old_allow = get_bool(so, "allow_reverse", true);
+                const bool old_needs = get_bool(so, "reverse_needs_signal", true);
+                if (old_allow && !old_needs) {
+                    c.rule.reverse = trend::ReverseMode::Immediate;
+                    out.warnings.push_back(c.symbol + "：旧的反手配置已迁移为 reverse=immediate，行为不变");
+                } else {
+                    // ⚠ 行为变了。老的"等反向信号才反手"这一档【已经没有了】：
+                    //   映射到 none（平掉回到正常入场流程）是取保护性更强的那边，
+                    //   但原来会在反向信号成立时立刻反手，现在要等正常入场信号
+                    c.rule.reverse = trend::ReverseMode::None;
+                    out.warnings.push_back(
+                        c.symbol + "：旧的反手配置（等反向信号才反手）已迁移为 reverse=none。"
+                        "⚠ 行为【有变化】——原来反向信号成立时会立刻反手，现在是平掉之后"
+                        "走正常入场流程。想要立刻反手请显式配 reverse=immediate");
+                }
+            }
+            c.rule.max_consecutive_reverses =
+                (int)get_num(so, "max_consecutive_reverses", c.rule.max_consecutive_reverses);
+            c.rule.cooldown_bars = (int)get_num(so, "cooldown_bars", c.rule.cooldown_bars);
+
+            // ── 仓位模式 ────────────────────────────────────────────────────
+            // notional=固定名义（默认）；risk=固定单笔风险（数量由真实止损线反推）
             const std::string sm = get_str(so, "size_mode", "notional");
             c.size_mode = (sm == "risk" || sm == "risk_based")
-                          ? SarConfig::SizeMode::RiskBased
-                          : SarConfig::SizeMode::Notional;
+                          ? TrendConfig::SizeMode::RiskBased
+                          : TrendConfig::SizeMode::Notional;
             c.risk_usdt = get_num(so, "risk_usdt", c.risk_usdt);
-            c.rule.pyramid_max_adds = (int)get_num(so, "pyramid_max_adds",
-                                                   c.rule.pyramid_max_adds);
-            c.rule.pyramid_step_atr = get_num(so, "pyramid_step_atr",
-                                              c.rule.pyramid_step_atr);
-
-            // 入场/止损算法：donchian（默认，海龟）或 bar（裸K线）
-            const std::string md = get_str(so, "mode", "donchian");
-            c.rule.mode = (md == "bar" || md == "bar_pattern")
-                          ? sar::Mode::BarPattern : sar::Mode::Donchian;
-            c.rule.swing_bars = (int)get_num(so, "swing_bars", c.rule.swing_bars);
-            if (c.rule.mode == sar::Mode::BarPattern && c.rule.swing_bars < 1) {
-                err = c.symbol + " sar: swing_bars 至少为1";
+            if (c.size_mode == TrendConfig::SizeMode::RiskBased && c.risk_usdt <= 0) {
+                err = c.symbol + " 趋势策略: size_mode=risk 时必须设置 risk_usdt（单笔愿亏金额）";
                 return false;
             }
 
-            if (c.size_mode == SarConfig::SizeMode::RiskBased && c.risk_usdt <= 0) {
-                err = c.symbol + " sar: size_mode=risk 时必须设置 risk_usdt（单次愿亏金额）";
-                return false;
+            // ── 各策略自己的参数 ────────────────────────────────────────────
+            if (c.rule.strategy == trend::Strategy::Turtle) {
+                c.rule.donchian_period = (int)get_num(so, "donchian_period", c.rule.donchian_period);
+                c.rule.atr_period      = (int)get_num(so, "atr_period", c.rule.atr_period);
+                c.rule.atr_mult        = get_num(so, "atr_mult", c.rule.atr_mult);
+                if (c.rule.donchian_period < 2) { err = c.symbol + " 海龟: donchian_period 至少为2"; return false; }
+                if (c.rule.atr_period < 2)      { err = c.symbol + " 海龟: atr_period 至少为2";      return false; }
+                if (c.rule.atr_mult <= 0) {
+                    err = c.symbol + " 海龟: atr_mult 必须大于0（它是止损距离的倍数）";
+                    return false;
+                }
+            } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {
+                c.rule.af_start = get_num(so, "af_start", c.rule.af_start);
+                c.rule.af_step  = get_num(so, "af_step",  c.rule.af_step);
+                c.rule.af_max   = get_num(so, "af_max",   c.rule.af_max);
+                if (!(c.rule.af_start > 0) || !(c.rule.af_step > 0) || !(c.rule.af_max > 0)) {
+                    err = c.symbol + " 抛物线SAR: af_start / af_step / af_max 都必须大于0";
+                    return false;
+                }
+                if (c.rule.af_start > c.rule.af_max) {
+                    err = c.symbol + " 抛物线SAR: af_start 不能大于 af_max（起点就封顶了，加速因子永远不会长）";
+                    return false;
+                }
+                // PSAR 是【无条件翻转】的系统，触及即反手就是它的定义
+                c.rule.reverse = trend::ReverseMode::Immediate;
+                // 震荡市里 PSAR 会一直翻下去没有刹车，这是它最著名的弱点。
+                // 不设上限时明确说一次——不拦，但不能让它悄悄生效
+                if (c.rule.max_consecutive_reverses <= 0)
+                    out.warnings.push_back(
+                        c.symbol + " 抛物线SAR：未设 max_consecutive_reverses（连续反手上限）。"
+                        "PSAR 触及即翻转，震荡市里会一直翻下去没有刹车——"
+                        "每次往返吃掉约 2k×ATR 的名义再加两笔手续费。建议设 2~3");
+            } else {   // BareK
+                const std::string be = get_str(so, "bare_entry", "break_prev");
+                if      (be == "immediate")  c.rule.bare_entry = trend::BareEntry::Immediate;
+                else if (be == "break_prev" || be == "break_prev_bar")
+                                             c.rule.bare_entry = trend::BareEntry::BreakPrevBar;
+                else { err = c.symbol + " 纯裸K: bare_entry 只能是 immediate / break_prev"; return false; }
+                c.rule.once_per_bar = get_bool(so, "once_per_bar", c.rule.once_per_bar);
+                c.rule.swing_bars   = (int)get_num(so, "swing_bars", c.rule.swing_bars);
+                if (c.rule.swing_bars < 1) { err = c.symbol + " 纯裸K: swing_bars 至少为1"; return false; }
+                // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
+                if (c.rule.bare_entry == trend::BareEntry::Immediate &&
+                    c.rule.reverse == trend::ReverseMode::Immediate && !c.rule.once_per_bar)
+                    out.warnings.push_back(
+                        c.symbol + " 纯裸K：盘中即时入场 + 立即反手 + 未开每根一次护栏。"
+                        "新K线刚开盘时价格≈开盘价，微小波动会让多空条件反复翻转，"
+                        "一根K线内可能来回开平数次，每次两笔手续费。"
+                        "建议开 once_per_bar");
             }
-            if (c.rule.pyramid_max_adds > 0 && c.rule.pyramid_step_atr <= 0) {
-                err = c.symbol + " sar: pyramid_step_atr 必须大于0，否则会在同一价位无限加仓";
-                return false;
-            }
-
-            if (c.budget_usdt <= 0) { err = c.symbol + " sar: budget_usdt 必须大于0"; return false; }
-            if (c.leverage    <= 0) { err = c.symbol + " sar: leverage 必须大于0";    return false; }
-            if (c.rule.donchian_period < 2) {
-                err = c.symbol + " sar: donchian_period 至少为2"; return false;
-            }
-            if (c.rule.atr_period < 2) {
-                err = c.symbol + " sar: atr_period 至少为2"; return false;
-            }
-            if (c.rule.atr_mult <= 0) {
-                err = c.symbol + " sar: atr_mult 必须大于0（它是止损距离的倍数）";
-                return false;
-            }
-            // 无条件反手在震荡市是绞肉机，配置里关掉信号闸时明确告警一次
-            if (c.rule.allow_reverse && !c.rule.reverse_needs_signal)
-                out.warnings.push_back(c.symbol + " sar: reverse_needs_signal=false "
-                                       "（无条件反手）——震荡市里每次止损都会立刻反向"
-                                       "开仓，连续绞杀的损耗很快，确认这是你要的");
 
             out.sar_bots.push_back(c);
         }

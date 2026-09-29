@@ -162,7 +162,7 @@ MainWindow::~MainWindow() {
 
     // ③ 此刻状态最完整，落盘
     if (tradesDirty_) save_trades(true);
-    if (sar_engine_) save_sar_bots();
+    if (trend_engine_) save_trend_bots();
 
     // ④ 没排空就【不要】走正常析构路径。
     //
@@ -321,7 +321,7 @@ void MainWindow::load_settings() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 原先这一段是 save_bots / load_and_restore_bots（网格DCA 的配置与仓位落盘）。
 // DCA 移除后只剩这两个小工具还有人用（成交明细落盘），趋势策略的落盘走
-// sar_panel.cpp 里的 save_sar_bots / load_and_restore_sar。
+// trend_panel.cpp 里的 save_trend_bots / load_and_restore_trend。
 static qint64 tp_to_ms(std::chrono::system_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
 }
@@ -362,7 +362,7 @@ void MainWindow::save_trades(bool force) {
         QJsonObject o;
         o["symbol"]      = QString::fromStdString(t.symbol);
         // "side" 而不是原来的 "direction"：值域也变了（0=Flat 1=Long 2=Short，
-        // 来自 sar::Pos），沿用旧键名会让老文件的 0/1/2 被按新含义读出来——
+        // 来自 trend::Pos），沿用旧键名会让老文件的 0/1/2 被按新含义读出来——
         // 多空显示整体错位。换个键名，老值自然落到 read 的默认分支上
         o["side"]        = (int)t.side;
         o["entry_price"] = t.entry_price;
@@ -389,13 +389,13 @@ void MainWindow::load_trades() {
     trades_.clear();
     for (const auto& v : doc.array()) {
         auto o = v.toObject();
-        SarTrade t;
+        TrendTrade t;
         t.symbol      = o["symbol"].toString().toStdString();
         // 老文件（网格DCA 时代）只有 "direction"，没有 "side"。这里刻意【不去
         // 迁移】那个值：两者值域不同（0/1/2 分别是 Long/Short/Both 与
         // Flat/Long/Short），硬翻译只会把历史记录的多空标错。缺 side 时落到
         // Flat，界面显示为 "--"——"不知道"比"标错"好
-        t.side        = (sar::Pos)o["side"].toInt((int)sar::Pos::Flat);
+        t.side        = (trend::Pos)o["side"].toInt((int)trend::Pos::Flat);
         t.entry_price = o["entry_price"].toDouble();
         t.exit_price  = o["exit_price"].toDouble();
         t.qty         = o["qty"].toDouble();
@@ -552,10 +552,10 @@ void MainWindow::openTradeHistoryDialog() {
         // 方向来自本笔的运行时持仓方向。Flat 只会出现在【旧版文件】读进来的
         // 记录上（那时这个字段叫 direction、值域也不同，见 load_trades），
         // 显示 "--" 而不是猜一个方向
-        table->setItem(i, 2, mkc(t.side == sar::Pos::Short ? "空"
-                                 : t.side == sar::Pos::Long ? "多" : "--",
-                                  t.side == sar::Pos::Short ? QColor("#f85149")
-                                  : t.side == sar::Pos::Long ? QColor("#3fb950")
+        table->setItem(i, 2, mkc(t.side == trend::Pos::Short ? "空"
+                                 : t.side == trend::Pos::Long ? "多" : "--",
+                                  t.side == trend::Pos::Short ? QColor("#f85149")
+                                  : t.side == trend::Pos::Long ? QColor("#3fb950")
                                                              : QColor("#8b949e")));
         table->setItem(i, 3, mkc(QString("$%1").arg(t.entry_price, 0, 'f', 4), QColor("#8b949e")));
         table->setItem(i, 4, mkc(QString("$%1").arg(t.exit_price,  0, 'f', 4), QColor("#8b949e")));
@@ -699,7 +699,7 @@ void MainWindow::openSettingsDialog() {
     maxTotalMargin_ = (ok && m > 0) ? m : 0.0;
     alertWebhook_   = webhookEdit->text().trimmed();
 
-    if (sar_engine_) sar_engine_->set_max_total_margin(maxTotalMargin_);
+    if (trend_engine_) trend_engine_->set_max_total_margin(maxTotalMargin_);
     save_settings();
     log(QString("设置已保存：总保证金上限=%1  警报=%2")
         .arg(maxTotalMargin_ > 0 ? QString("$%1").arg(maxTotalMargin_,0,'f',0) : "不限")
@@ -906,45 +906,49 @@ void MainWindow::buildUi() {
             tv->addLayout(row);
         }
 
-        auto* monLbl = new QLabel(
-            "实盘监控  (右键品种进行策略配置 —— 可选 网格 DCA 或 趋势 SAR)");
+        auto* monLbl = new QLabel("实盘监控  (右键品种进行策略配置)");
         monLbl->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding:2px 0;");
         tv->addWidget(monLbl);
 
-        // Bot 表格 — 16 列，DCA 与 SAR 共用。
-        // 资金费不进这张表：它是【账户级慢变量】（8小时才结算一次），而这张表是
-        // 每3秒刷新的【逐品种实时行】。混在一起既挤掉实时数据的宽度，也不符合它
-        // 的性质——账户合计放顶部栏，逐品种细节放"均价"列的悬停提示
+        // Bot 表格。列号全部走 Col 枚举，不写字面量——理由见 main_window.h 的定义处。
         //
-        // ⚠ 三个列头是【跨策略复用】的，含义随行的策略而变（见 fillSarRow）：
-        //     层进度    DCA=已开层数/总层数      SAR=金字塔档数
-        //     均价      DCA=持仓均价             SAR=开仓价
-        //     强平/止损 DCA=强平价               SAR=追踪止损线
-        //   前两个两边同义，直接沿用原名；第三个不同义，所以列头必须改，
-        //   否则 SAR 行会把止损线显示成"强平价"——那是会让人误判风险的假话
-        botTable_ = new QTableWidget(0, 16);
+        // 资金费不进这张表：它是【账户级慢变量】（8小时才结算一次），而这张表是
+        // 逐品种的实时行。混在一起既挤掉实时数据的宽度，也不符合它的性质——
+        // 账户合计放顶部栏，逐品种细节放"开仓价"列的悬停提示
+        //
+        // ⚠ 两个止损【必须分成两列】。它们语义完全不同：
+        //     移动止损  活在进程里，每 tick 棘轮推进，进程死了就没了
+        //     委托止损  开仓时在交易所挂一次、永不移动，进程死了它还在
+        //   塞进一格没法同时表达，而"我的保命单还在不在"恰恰是必须一眼可见的
+        botTable_ = new QTableWidget(0, ColCount);
         botTable_->setHorizontalHeaderLabels(
-            {"#","品种","方向","策略","层进度",
-             "均价","标记价","24h涨跌","延迟","浮动P&L","保证金","收益率","强平/止损",
+            {"#","品种","方向","周期·模式","委托止损",
+             "开仓价","标记价","24h涨跌","延迟","浮动P&L","保证金","收益率","移动止损",
              "已实现","状态","操作"});
-        botTable_->horizontalHeaderItem(12)->setToolTip(
-            "网格 DCA 行：强平价（名义仓位 ≤ 权益时显示 --，数学上不可强平）\n"
-            "趋势 SAR 行：追踪止损线（越过成本价后转绿 = 这笔已锁定盈利）");
-        botTable_->horizontalHeaderItem(4)->setToolTip(
-            "网格 DCA 行：已开层数 / 总层数\n"
-            "趋势 SAR 行：金字塔档数（未开启顺势加仓时显示 —）");
+        botTable_->horizontalHeaderItem(ColHardStop)->setToolTip(
+            "委托止损 —— 交易所侧的 STOP_MARKET + closePosition 单（\"保命单\"）\n"
+            "开仓成交后挂一次，此后【永不移动】，只管最大风险兜底。\n"
+            "进程崩溃、断电、断网之后它依然有效，是唯一不依赖本程序存活的保护。\n\n"
+            "  $价格     已挂上，显示触发价\n"
+            "  重试 N/13 挂单失败中，正在按退避重试\n"
+            "  ⚠ 无保护  已连续失败 10 次，再失败 3 次会立即平掉该仓位\n"
+            "  已熔断    连续 2 次因挂不上而平仓，该 bot 已停止\n"
+            "  —        未开启（配置里的 use_disaster_stop）");
+        botTable_->horizontalHeaderItem(ColTrailStop)->setToolTip(
+            "移动止损 —— 本地棘轮止损线，只朝有利方向移动\n"
+            "显示 触发价(距现价%)。距离才是可操作的信息：一眼知道还有多少余地。\n"
+            "【越过成本价后转绿】= 这笔已锁定盈利。\n\n"
+            "⚠ 它活在本进程里。程序不在了，守着仓位的就只剩上面那张委托止损单");
         auto* hdr = botTable_->horizontalHeader();
         hdr->setSectionResizeMode(QHeaderView::Stretch);
-        // 列索引在 v4.0.15 插入「24h涨跌」后整体后移：延迟 7→8、状态 13→14、操作 14→15
-        for (int c : {0, 4, 7, 8, 14})
+        for (int c : {(int)ColIdx, (int)ColChg24, (int)ColLatency, (int)ColState})
             hdr->setSectionResizeMode(c, QHeaderView::Fixed);
-        hdr->resizeSection(0, 26);
-        hdr->resizeSection(4, 54);
-        hdr->resizeSection(7, 72);    // 24h涨跌
-        hdr->resizeSection(8, 60);    // 延迟
-        hdr->resizeSection(14, 96);   // 状态
-        hdr->setSectionResizeMode(15, QHeaderView::Fixed);
-        hdr->resizeSection(15, 175);  // 操作
+        hdr->resizeSection(ColIdx,      26);
+        hdr->resizeSection(ColChg24,    72);
+        hdr->resizeSection(ColLatency,  60);
+        hdr->resizeSection(ColState,    96);
+        hdr->setSectionResizeMode(ColOps, QHeaderView::Fixed);
+        hdr->resizeSection(ColOps, 175);
 
         botTable_->verticalHeader()->setVisible(false);
         botTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -1089,24 +1093,24 @@ void MainWindow::onConnect() {
                      : "账户持仓模式: 单向持仓", "OK");
             // 首次对时的结果：偏移量是 -1021 的直接成因，连接时就该让人看见
             log(QString::fromStdString(tsync.to_log()), tsync.accepted ? "OK" : "WARN");
-            sar_engine_ = std::make_shared<SarEngine>(client_, pool_);
-            sar_engine_->set_max_total_margin(maxTotalMargin_);
-            sar_engine_->set_log_cb([this](const std::string& msg) {
+            trend_engine_ = std::make_shared<TrendEngine>(client_, pool_);
+            trend_engine_->set_max_total_margin(maxTotalMargin_);
+            trend_engine_->set_log_cb([this](const std::string& msg) {
                 QMetaObject::invokeMethod(this, [this, msg]() {
                     log(QString::fromStdString(msg));
                     refreshBotTable();
-                    save_sar_bots();
+                    save_trend_bots();
                 }, Qt::QueuedConnection);
             });
-            sar_engine_->set_trade_cb([this](const SarTrade& tr) {
+            trend_engine_->set_trade_cb([this](const TrendTrade& tr) {
                 QMetaObject::invokeMethod(this, [this, tr]() {
-                    // 直接存 SarTrade，不再转成中间结构：v4.7.1 之前这里要把它
+                    // 直接存 TrendTrade，不再转成中间结构：v4.7.1 之前这里要把它
                     // 翻译成 DCA 的 TradeRecord（层数填 0、原因加 "SAR " 前缀），
                     // 那层适配随 DCA 一起没了
                     trades_.push_back(tr);
                     save_trades();
                     refreshStats();
-                    save_sar_bots();
+                    save_trend_bots();
                     // 交易所侧灾难止损触发时本地【收不到】这个回调——它在周期
                     // 对账里表现为一条"交易所已无此仓位"，告警走那条路
                 }, Qt::QueuedConnection);
@@ -1142,25 +1146,25 @@ void MainWindow::onConnect() {
                      : QString()), "OK");
 
             // 恢复上次保存的 Bot
-            load_and_restore_sar();
+            load_and_restore_trend();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
             // 本地状态是错的，带着错误均价继续跑会把止盈止损全算错
             run_async([this]() {
-                if (!client_ || !sar_engine_) return;
+                if (!client_ || !trend_engine_) return;
                 auto ex_pos = client_->fetch_positions();
                 QMetaObject::invokeMethod(this, [this, ex_pos]() {
-                    if (!sar_engine_) return;
-                    std::vector<SarEngine::ExchangePos> ex;
+                    if (!trend_engine_) return;
+                    std::vector<TrendEngine::ExchangePos> ex;
                     ex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto issues = sar_engine_->reconcile_positions(ex);
+                    auto issues = trend_engine_->reconcile_positions(ex);
                     if (!issues.empty()) {
                         for (const auto& i : issues)
                             log("对账: " + QString::fromStdString(i), "WARN");
-                        save_sar_bots();   // 收敛后的状态立刻落盘
+                        save_trend_bots();   // 收敛后的状态立刻落盘
                         refreshBotTable();
                         sendAlert(alert_text("启动对账", issues));
                     }
@@ -1177,7 +1181,7 @@ void MainWindow::onConnect() {
 // 所以它和"浮亏"性质完全不同，必须单独看得见。
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshFunding() {
-    if (!client_ || !sar_engine_) return;
+    if (!client_ || !trend_engine_) return;
     if (fundFetchBusy_.exchange(true)) return;   // 上一批没跑完就跳过
 
     // 收集所有品种，以及补历史的起点。
@@ -1187,7 +1191,7 @@ void MainWindow::refreshFunding() {
     std::vector<std::string> syms;
     int64_t earliest = 0;
     std::set<std::string> seen;
-    for (const auto& b : sar_engine_->get_bots()) {
+    for (const auto& b : trend_engine_->get_bots()) {
         if (seen.insert(b.cfg.symbol).second) syms.push_back(b.cfg.symbol);
         if (b.qty > 0) {
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1354,36 +1358,36 @@ void MainWindow::onAddWatchSymbol() {
     addSymbolEdit_->clear();
     if (raw.isEmpty()) return;
 
-    if (!sar_engine_) { log("请先点击【连接】", "WARN"); return; }
+    if (!trend_engine_) { log("请先点击【连接】", "WARN"); return; }
 
     // 只需要输入代币符号（不区分大小写），默认按 USDT 永续合约补全后缀
     if (raw.endsWith("USDT")) raw.chop(4);
     if (raw.isEmpty()) return;
     std::string symbol = (raw + "USDT").toStdString();
 
-    for (const auto& b : sar_engine_->get_bots())
+    for (const auto& b : trend_engine_->get_bots())
         if (b.cfg.symbol == symbol) {
             log(QString::fromStdString(symbol) + " 已经在列表里了", "WARN");
             return;
         }
 
-    SarConfig cfg;              // 全部用默认参数，具体配置留给右键弹窗
+    TrendConfig cfg;              // 全部用默认参数，具体配置留给右键弹窗
     cfg.symbol = symbol;
-    auto id = sar_engine_->add_bot(cfg);
+    auto id = trend_engine_->add_bot(cfg);
     if (id.empty()) return;
-    sar_engine_->stop_bot(id);  // 初始状态为停止，需要手动配置 + 开启监控
+    trend_engine_->stop_bot(id);  // 初始状态为停止，需要手动配置 + 开启监控
     if (ticker_) ticker_->subscribe(symbol);
 
     log(QString::fromStdString(symbol) + " 已添加（已停止），右键进行策略配置", "OK");
     refreshBotTable();
-    save_sar_bots();
+    save_trend_bots();
 }
 
 void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
     if (!botTable_) return;
     auto* item = botTable_->itemAt(pos);
     if (!item) return;
-    auto* symItem = botTable_->item(item->row(), 1);   // 品种列
+    auto* symItem = botTable_->item(item->row(), ColSym);
     if (!symItem) return;
     std::string sym = symItem->text().toStdString();
 
@@ -1402,17 +1406,17 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
 // v4.5.0~v4.7.1 这里是"策略二选一"的双页弹窗（顶部单选 + QStackedWidget，
 // 一页网格DCA 一页趋势SAR，另有带仓锁定与切换确认共约 800 行）。网格DCA 移除后
 // 只剩一套策略，整个选择/切换机制连同 DCA 那一页一并删除——表单本体一直住在
-// sar_panel.cpp（buildSarForm / collectSarForm / applySarConfig），这里只负责
+// trend_panel.cpp（buildTrendForm / collectTrendForm / applyTrendConfig），这里只负责
 // 把它装进一个带滚动区的对话框
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::openStrategyDialog(const std::string& symbol) {
-    auto sar_bots = sar_engine_ ? sar_engine_->get_bots() : std::vector<SarBot>{};
-    const SarBot* sarBot = nullptr;
+    auto sar_bots = trend_engine_ ? trend_engine_->get_bots() : std::vector<TrendBot>{};
+    const TrendBot* trendBot = nullptr;
     for (const auto& b : sar_bots)
-        if (b.cfg.symbol == symbol) { sarBot = &b; break; }
+        if (b.cfg.symbol == symbol) { trendBot = &b; break; }
 
     QDialog dlg(this);
-    dlg.setWindowTitle(QString("趋势SAR 配置 - %1").arg(QString::fromStdString(symbol)));
+    dlg.setWindowTitle(QString("趋势策略配置 - %1").arg(QString::fromStdString(symbol)));
     dlg.resize(860, 760);
 
     // 外层：滚动区 + 固定在底部的按钮。分组之后内容比一屏高，小屏笔记本上
@@ -1429,10 +1433,10 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     scroll->setWidget(canvas);
     outer->addWidget(scroll, 1);
 
-    SarConfig sarCfg;
-    sarCfg.symbol = symbol;
-    if (sarBot) sarCfg = sarBot->cfg;
-    auto sarForm = buildSarForm(dv, sarCfg);
+    TrendConfig trendCfg;
+    trendCfg.symbol = symbol;
+    if (trendBot) trendCfg = trendBot->cfg;
+    auto trendForm = buildTrendForm(dv, trendCfg);
     dv->addStretch(1);
 
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
@@ -1445,15 +1449,15 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
 
     if (dlg.exec() != QDialog::Accepted) return;
 
-    if (!sar_engine_) {
+    if (!trend_engine_) {
         log("请先点击【连接】", "WARN");
         return;
     }
 
-    SarConfig sc;
-    if (!collectSarForm(sarForm, sc)) return;   // 表单级校验没过，状态没动
+    TrendConfig sc;
+    if (!collectTrendForm(trendForm, sc)) return;   // 表单级校验没过，状态没动
     sc.symbol = symbol;
-    applySarConfig(sc, sarBot);                 // 校验 + 建/改 bot + 订阅 + 落盘
+    applyTrendConfig(sc, trendBot);                 // 校验 + 建/改 bot + 订阅 + 落盘
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1476,15 +1480,15 @@ bool MainWindow::confirmDanger(const QString& title, const QString& body,
 }
 
 void MainWindow::onStopAll() {
-    if (!sar_engine_) return;
+    if (!trend_engine_) return;
     // ⚠ 下面会关掉 tick 定时器，而引擎【全靠它驱动】。漏停任何一个 bot 的后果是
     //   它在界面上仍显示"运行中"、实际却再也收不到价格——追踪止损线永远不会被
     //   触发，仓位静默裸奔。这正是单行【继续】按钮里那道"定时器没开就拉起来"
     //   守卫在防的同一件事
     int running = 0, withPos = 0;
-    for (const auto& b : sar_engine_->get_bots()) {
-        if (b.state != SarBot::State::Stopped) ++running;
-        if (b.st.pos != sar::Pos::Flat && b.qty > 0) ++withPos;
+    for (const auto& b : trend_engine_->get_bots()) {
+        if (b.state != TrendBot::State::Stopped) ++running;
+        if (b.st.pos != trend::Pos::Flat && b.qty > 0) ++withPos;
     }
     if (!confirmDanger("确认全部停止",
             QString("将停止 %1 个运行中的 Bot，并关闭 Tick 定时器。\n\n"
@@ -1495,18 +1499,18 @@ void MainWindow::onStopAll() {
                 .arg(running).arg(withPos),
             "全部停止")) return;
 
-    sar_engine_->stop_all();
+    trend_engine_->stop_all();
     tick_timer_->stop();
     log("所有Bot已停止，Tick定时器已关闭", "WARN");
     refreshBotTable();
-    save_sar_bots();
+    save_trend_bots();
 }
 
 void MainWindow::onClearStopped() {
-    if (!sar_engine_) return;
+    if (!trend_engine_) return;
     int n = 0, withPos = 0;
-    for (const auto& b : sar_engine_->get_bots()) {
-        if (b.state != SarBot::State::Stopped) continue;
+    for (const auto& b : trend_engine_->get_bots()) {
+        if (b.state != TrendBot::State::Stopped) continue;
         ++n;
         if (b.qty > 0) ++withPos;
     }
@@ -1522,24 +1526,24 @@ void MainWindow::onClearStopped() {
 
     int done = 0;
     std::set<std::string> touched;
-    for (const auto& b : sar_engine_->get_bots())
-        if (b.state == SarBot::State::Stopped) {
+    for (const auto& b : trend_engine_->get_bots())
+        if (b.state == TrendBot::State::Stopped) {
             touched.insert(b.cfg.symbol);
-            sar_engine_->remove_bot(b.bot_id);
+            trend_engine_->remove_bot(b.bot_id);
             ++done;
         }
     // 全部删完之后再统一退订：边删边退会误判"还有别的 bot 在用"
     for (const auto& s : touched) unsubscribeIfUnused(s);
     if (done > 0) log(QString("已清除 %1 个已停止Bot").arg(done), withPos > 0 ? "WARN" : "INFO");
     refreshBotTable();
-    save_sar_bots();
+    save_trend_bots();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tick（3s 引擎驱动）
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::onTick() {
-    if (!sar_engine_ || !client_) return;
+    if (!trend_engine_ || !client_) return;
 
     refreshPositions();
     refreshAccount();
@@ -1547,19 +1551,19 @@ void MainWindow::onTick() {
     // ── SAR 信号拉取（ATR + 唐奇安通道），每 20 个 tick 约 60 秒 ───────────────
     // 止损线的推进【不靠这个】：它在每个 tick 用实时价推进，只有 ATR 的数值
     // 来自这里。所以这一批慢一点不影响保护，只影响新仓位的入场判定
-    if (sar_engine_ && !sarSigBusy_.load()) {
+    if (trend_engine_ && !trendSigBusy_.load()) {
         // 每个 bot 按自己周期该有的节奏拉：4h 的每 60 秒一次就够，3m 的要 45 秒
         // 一次才不会错过收盘。tick 是 3 秒一拍，所以除以 3 换算成拍数
-        const bool forced = sarSigForce_.exchange(false);
-        std::vector<SarBot> need;
-        for (const auto& b : sar_engine_->get_bots()) {
-            if (b.state != SarBot::State::Running) continue;
+        const bool forced = trendSigForce_.exchange(false);
+        std::vector<TrendBot> need;
+        for (const auto& b : trend_engine_->get_bots()) {
+            if (b.state != TrendBot::State::Running) continue;
             const int ticks = std::max(1,
-                SarEngine::signal_period_sec(b.cfg.interval) / 3);
+                TrendEngine::signal_period_sec(b.cfg.interval) / 3);
             if (forced || (slowTickCount_ % ticks) == 1) need.push_back(b);
         }
         if (!need.empty()) {
-            sarSigBusy_.store(true);
+            trendSigBusy_.store(true);
             run_async([this, need]() {
                 // 失败的品种要报出来。原先这里是 `if (!snap.ok) continue;`——
                 // 完全静默，于是"信号拉不到"和"拉到了但没突破"在界面上长得
@@ -1567,25 +1571,30 @@ void MainWindow::onTick() {
                 QStringList failed;
                 int okn = 0;
                 for (const auto& b : need) {
-                    if (!client_ || !sar_engine_) break;
-                    if (b.cfg.rule.mode == sar::Mode::BarPattern) {
+                    if (!client_ || !trend_engine_) break;
+                    if (b.cfg.rule.strategy != trend::Strategy::Turtle) {
                         auto bp = client_->fetch_bar_pattern(
                             b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
                         if (!bp.ok) { failed << QString::fromStdString(b.cfg.symbol); continue; }
                         ++okn;
-                        sar_engine_->update_bars(b.bot_id, bp.bullish, bp.bearish,
-                                                 bp.swing_low, bp.swing_high,
-                                                 bp.bar_open_ms);
-                        // ATR 照样喂：裸K线模式的止损不用它，但等风险下单的
-                        // 显示、金字塔间距、ATR 列都还要
-                        const double a = client_->fetch_atr(b.cfg.symbol, b.cfg.interval,
-                                                            b.cfg.rule.atr_period);
-                        if (a > 0 && bp.price > 0)
-                            sar_engine_->update_signal(b.bot_id, a, a / bp.price * 100.0,
-                                                       false, 0, 0, bp.bar_open_ms);
+                        // 裸K 与 抛物线SAR 只要原始高低点，【不需要 ATR】——
+                        // 少拉一次 REST。update_bars 自己设 sig_ok，所以不必
+                        // 像 v5.1.0 之前那样成对调用两个接口（漏一次的表现是
+                        // "配置正常、日志正常、一单不开"）
+                        TrendEngine::BarSnap s;
+                        s.open        = bp.cur_open;
+                        s.prev_close  = bp.prev_close;
+                        s.prev_high   = bp.prev_high;
+                        s.prev_low    = bp.prev_low;
+                        s.prev2_high  = bp.prev2_high;
+                        s.prev2_low   = bp.prev2_low;
+                        s.swing_low   = bp.swing_low;
+                        s.swing_high  = bp.swing_high;
+                        s.bar_open_ms = bp.bar_open_ms;
+                        trend_engine_->update_bars(b.bot_id, s);
                         continue;
                     }
-                    auto snap = client_->fetch_sar_signal(
+                    auto snap = client_->fetch_trend_signal(
                         b.cfg.symbol, b.cfg.interval,
                         b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
                     if (!snap.ok) {
@@ -1593,11 +1602,11 @@ void MainWindow::onTick() {
                         continue;
                     }
                     ++okn;
-                    sar_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
+                    trend_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                snap.bar_open_ms);
                 }
-                sarSigBusy_.store(false);
+                trendSigBusy_.store(false);
                 QMetaObject::invokeMethod(this, [this, failed, okn]() {
                     // 只在【集合变化】时报。拉取每分钟一轮，而一个拼错的品种会
                     // 永远失败——每轮都报就是每小时 60 条同样的告警，把真正有用
@@ -1607,13 +1616,13 @@ void MainWindow::onTick() {
 
                     QStringList fresh;
                     for (const auto& s : now)
-                        if (!sarSigFailed_.count(s))
+                        if (!trendSigFailed_.count(s))
                             fresh << QString::fromStdString(s);
                     QStringList healed;
-                    for (const auto& s : sarSigFailed_)
+                    for (const auto& s : trendSigFailed_)
                         if (!now.count(s))
                             healed << QString::fromStdString(s);
-                    sarSigFailed_ = std::move(now);
+                    trendSigFailed_ = std::move(now);
 
                     if (!fresh.isEmpty())
                         log(QString("⚠ SAR 信号拉取失败：%1（本轮成功 %2 个）。"
@@ -1687,16 +1696,16 @@ void MainWindow::onTick() {
     // refreshPositions 只在【真正成功】时才更新 posCacheMs_，所以这里
     // 只要求它足够新；拿不到新数据就这一轮不对账，宁可晚一分钟发现
     const qint64 posAge = QDateTime::currentMSecsSinceEpoch() - posCacheMs_;
-    if (slowTickCount_ % 20 == 0 && sar_engine_ && posCacheMs_ > 0 && posAge < 30000) {
-        std::vector<SarEngine::ExchangePos> sex;
+    if (slowTickCount_ % 20 == 0 && trend_engine_ && posCacheMs_ > 0 && posAge < 30000) {
+        std::vector<TrendEngine::ExchangePos> sex;
         sex.reserve(pos_cache_.size());
         for (const auto& [k, p] : pos_cache_)
             sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-        auto issues = sar_engine_->reconcile_positions(sex);
+        auto issues = trend_engine_->reconcile_positions(sex);
         if (!issues.empty()) {
             for (const auto& i : issues)
                 log("对账: " + QString::fromStdString(i), "WARN");
-            save_sar_bots();          // 收敛后的状态立刻落盘
+            save_trend_bots();          // 收敛后的状态立刻落盘
             refreshBotTable();
             // 明细要进告警正文，不能只报个数：交易所侧灾难止损触发时本地
             // 【收不到成交回调】，它在这里表现为一条"交易所已无此仓位"的
@@ -1720,7 +1729,7 @@ void MainWindow::onTick() {
         //   24h 涨跌 一直空着而且看不出为什么——而"加了品种还没开启"恰恰是最常见的状态。
         //   喂价给引擎那条路才该筛状态（见下面的 syms），两件事必须分开
         bool need_rest_chg = false;
-        for (const auto& b : sar_engine_->get_bots()) {
+        for (const auto& b : trend_engine_->get_bots()) {
             double pct = 0;
             bool stale = false;
             chg24Of(b.cfg.symbol, pct, stale);
@@ -1749,9 +1758,9 @@ void MainWindow::onTick() {
     // markPrice 的 REST 兜底整条路径不执行 → 标记价/延迟一直是 "--"。
     // 而"添加了品种还没开启"正好就是全停状态
     std::set<std::string> engine_syms, disp_syms;
-    for (const auto& b : sar_engine_->get_bots()) {
+    for (const auto& b : trend_engine_->get_bots()) {
         disp_syms.insert(b.cfg.symbol);
-        if (b.state != SarBot::State::Stopped) engine_syms.insert(b.cfg.symbol);
+        if (b.state != TrendBot::State::Stopped) engine_syms.insert(b.cfg.symbol);
     }
     if (disp_syms.empty()) { refreshBotTable(); return; }
 
@@ -1760,7 +1769,7 @@ void MainWindow::onTick() {
         double ws_price = ticker_ ? ticker_->mark_price(sym) : 0.0;
         if (ws_price > 0) {
             // 只有运行中的才驱动引擎；停止的品种拿到价格仅供界面显示
-            if (engine_syms.count(sym)) sar_engine_->tick(sym, ws_price);
+            if (engine_syms.count(sym)) trend_engine_->tick(sym, ws_price);
         } else {
             need_rest.insert(sym);
         }
@@ -1782,7 +1791,7 @@ void MainWindow::onTick() {
             if (price > 0) {
                 // 同上：只有运行中的才驱动引擎。停止的品种走到这里是为了让
                 // 标记价那一列有数
-                if (engine_syms.count(sym) && sar_engine_) sar_engine_->tick(sym, price);
+                if (engine_syms.count(sym) && trend_engine_) trend_engine_->tick(sym, price);
                 // 写回缓存：界面那一列读的是缓存，不写回就会出现
                 // "引擎有价在跑、标记价列却一直空着"
                 if (ticker_) ticker_->set_mark_price(sym, price);
@@ -1896,13 +1905,13 @@ static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, doub
 // 100ms 高频刷新：只更新"最新成交价"与"延迟"两列的文本，不touch行/按钮
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshLiveQuotes() {
-    if (!botTable_ || !sar_engine_ || !ticker_) return;
+    if (!botTable_ || !trend_engine_ || !ticker_) return;
 
     // 行序必须与 refreshBotTable 用的【完全一致】，否则这一路 100ms 的快刷会把
     // 价格写到别的品种那一行上。两处都按品种字典序排，口径同源
-    auto bots = sar_engine_->get_bots();
+    auto bots = trend_engine_->get_bots();
     std::sort(bots.begin(), bots.end(),
-              [](const SarBot& a, const SarBot& b) { return a.cfg.symbol < b.cfg.symbol; });
+              [](const TrendBot& a, const TrendBot& b) { return a.cfg.symbol < b.cfg.symbol; });
     // 行数不一致时交给下次完整刷新。⚠ 这道校验一旦判错，表现是不报错、不崩，
     // 只是标记价从 100ms 刷新悄悄退化成 3 秒——最难发现的那一类故障
     if ((int)bots.size() != botTable_->rowCount()) return;
@@ -1922,7 +1931,7 @@ void MainWindow::refreshLiveQuotes() {
         const std::string& sym = bots[(size_t)i].cfg.symbol;
         auto tick = ticker_->get(sym);
         const double tick_size = tickSizeOf(sym);
-        botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
+        botTable_->setItem(i, ColMark, make_mark_cell(tick, tick_size));
         {
             // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，
             // 等于在一个表达式内既通过引用【写】pct 又【读】pct，而 C++ 的
@@ -1931,7 +1940,7 @@ void MainWindow::refreshLiveQuotes() {
             // 引擎侧走的是另一条分支所以数据是对的，只有界面错，极难对上号
             double pct = 0; bool stale = false;
             const bool has = chg24Of(sym, pct, stale);
-            botTable_->setItem(i, 7, make_chg24_cell(has, pct));
+            botTable_->setItem(i, ColChg24, make_chg24_cell(has, pct));
         }
 
         // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
@@ -1950,7 +1959,7 @@ void MainWindow::refreshLiveQuotes() {
                      : (latency < 1500) ? QColor("#3fb950")
                      : (latency < 3000) ? QColor("#d29922")
                                         : QColor("#f85149");
-        botTable_->setItem(i, 8, mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
+        botTable_->setItem(i, ColLatency, mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
     }
 }
 
@@ -1999,10 +2008,10 @@ double MainWindow::tickSizeOf(const std::string& symbol) {
 }
 
 void MainWindow::unsubscribeIfUnused(const std::string& symbol) {
-    if (!ticker_ || !sar_engine_) return;
+    if (!ticker_ || !trend_engine_) return;
     // 还有任何 bot 在用这个品种就不能退订。退错了的后果是那个 bot 从此收不到
     // 价格——止损线永远不会被触发，仓位静默裸奔
-    for (const auto& b : sar_engine_->get_bots())
+    for (const auto& b : trend_engine_->get_bots())
         if (b.cfg.symbol == symbol) return;
     ticker_->unsubscribe(symbol);
 }
@@ -2046,13 +2055,13 @@ void MainWindow::refreshPositions() {
 // Bot 表格刷新
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::refreshBotTable() {
-    if (!sar_engine_) { botTable_->setRowCount(0); return; }
+    if (!trend_engine_) { botTable_->setRowCount(0); return; }
 
     // 行序 = 品种字典序。v4.5.0~v4.7.1 这里要把两个引擎的 bot 合成一个 BotRow
     // 序列（裸指针 + 排序键），DCA 移除后只有一个来源，直接按品种排就是最终行序
-    auto bots = sar_engine_->get_bots();
+    auto bots = trend_engine_->get_bots();
     std::sort(bots.begin(), bots.end(),
-              [](const SarBot& a, const SarBot& b) { return a.cfg.symbol < b.cfg.symbol; });
+              [](const TrendBot& a, const TrendBot& b) { return a.cfg.symbol < b.cfg.symbol; });
 
     botTable_->setRowCount((int)bots.size());
     // 行数变了就把键表整体作废——行与 bot 的对应关系已经错位
@@ -2073,7 +2082,7 @@ void MainWindow::refreshBotTable() {
         return it;
     };
 
-    // fmt_price 随 DCA 填充体一并删除（均价/强平价/保证金那几列由 fillSarRow 自己格式化）。
+    // fmt_price 随 DCA 填充体一并删除（均价/强平价/保证金那几列由 fillTrendRow 自己格式化）。
     // ⚠ MSVC 对未使用的 lambda 不报警，只有 Clang 的 -Wunused-variable 会——
     //   本机编得过，推上去才发现
 
@@ -2081,13 +2090,13 @@ void MainWindow::refreshBotTable() {
 
     for (int i = 0; i < (int)bots.size(); ++i) {
         // ── 品种级列（6 标记价 / 7 24h涨跌 / 8 延迟）────────────────────────
-        // 这三列和策略无关，单独填在这里而不是塞进 fillSarRow：
+        // 这三列和策略无关，单独填在这里而不是塞进 fillTrendRow：
         // refreshLiveQuotes 每 100ms 会再刷一遍同样的三列，两处口径必须一致
         const std::string& sym = bots[(size_t)i].cfg.symbol;
         const auto   tick      = ticker_ ? ticker_->get(sym) : BookTickerStream::Tick{};
         const double tick_size = tickSizeOf(sym);
         {
-            botTable_->setItem(i, 6, make_mark_cell(tick, tick_size));
+            botTable_->setItem(i, ColMark, make_mark_cell(tick, tick_size));
             // 必须分两步：把 chg24Of(...) 和 pct 写在同一个实参列表里，等于在一个
             // 表达式内既通过引用【写】pct 又【读】pct，而 C++ 的函数实参求值顺序是
             // 【未指定】的——MSVC 从右往左，先把还是初始值的 pct(0) 拷进参数，
@@ -2095,7 +2104,7 @@ void MainWindow::refreshBotTable() {
             // 数据是对的，只有界面错，极难对上号
             double pct = 0; bool stale = false;
             const bool has = chg24Of(sym, pct, stale);
-            botTable_->setItem(i, 7, make_chg24_cell(has, pct));
+            botTable_->setItem(i, ColChg24, make_chg24_cell(has, pct));
 
             // 延迟必须测【引擎实际使用的那条流】。此前测的是 bookTicker，而 v4.0.9
             // 之后引擎决策用的是标记价——markPrice 停了、bookTicker 还在的时候，
@@ -2111,13 +2120,13 @@ void MainWindow::refreshBotTable() {
                                : (latency < 1500) ? QColor("#3fb950")
                                : (latency < 3000) ? QColor("#d29922")
                                                   : QColor("#f85149");
-            botTable_->setItem(i, 8,
+            botTable_->setItem(i, ColLatency,
                 mkc(latency >= 0 ? QString("%1ms").arg(latency) : "--", lat_c));
         }
 
-        // 策略相关的列（含操作列与它的重建去抖键）整片由 sar_panel.cpp 填。
+        // 策略相关的列（含操作列与它的重建去抖键）整片由 trend_panel.cpp 填。
         // v4.7.1 之前这里还有一个 kind 分派和三百多行的 DCA 填充体
-        fillSarRow(i, bots[(size_t)i], rt);
+        fillTrendRow(i, bots[(size_t)i], rt);
     }
 
     // 汇总

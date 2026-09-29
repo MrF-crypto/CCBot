@@ -83,41 +83,6 @@ public:
 
     // set_leverage / round_qty 见下方 ITradingClient 实现区（override 声明）
 
-    // 布林带(BOLL) + RSI 快照——用于指标信号首单判定，公开接口不占用签名限流。
-    // 拉的最后一根K线是币安还在滚动更新的"未收盘"K线，所以数值是实时估算值，
-    // 不是等K线收盘才确定的值（收盘前可能还会变）
-    struct IndicatorSnapshot {
-        bool   ok      = false;
-        double price   = 0;      // 最新价（未收盘K线的当前收盘值，近似最新成交价）
-        double boll_ub = 0;
-        double boll_mb = 0;
-        double boll_lb = 0;
-        double rsi     = 50.0;
-        // 高位涨幅拦截用。相对【前 N 根已收盘K线的收盘价】，不是"本周期开盘至今"——
-        // 后者在每根新K线开出时归零（周线口径下等于每周一闸门失效半天），
-        // 滚动口径任何时刻都是"过去 N 个周期涨了多少"，没有归零窗口。
-        // 币安合约连续交易，本根开盘 == 上根收盘，所以 chg_1 与"今日涨幅"是同一个数。
-        // 历史不足 N 根时保持 0（=不拦），由 chg_ok 区分"真的没涨"和"算不出来"
-        bool   chg_ok  = false;
-        double chg_1   = 0;      // 近 1 根涨幅%
-        double chg_7   = 0;      // 近 7 根涨幅%
-    };
-    IndicatorSnapshot fetch_indicators(const std::string& symbol, const std::string& interval,
-                                        int boll_period, double boll_mult, int rsi_period);
-
-    // 高周期趋势快照（趋势状态机用，公开接口不占签名限流）。
-    // bearish = 价格在 EMA 之下 且 中轨（SMA20）在最近 slope_bars 根K线里下移超过 0.2%
-    // ——两个条件都满足才判定为"空头态"，避免横盘时反复切换状态
-    struct TrendSnapshot {
-        bool   ok       = false;
-        bool   bearish  = false;
-        double price    = 0;
-        double ema_val  = 0;
-        double mb_slope_pct = 0;   // 中轨斜率（最近 slope_bars 根K线的位移%）
-    };
-    TrendSnapshot fetch_trend(const std::string& symbol,
-                              const std::string& interval = "4h",
-                              int ema_period = 200, int slope_bars = 3);
 
     struct Bar {
         double  open = 0, high = 0, low = 0, close = 0, volume = 0;
@@ -136,7 +101,7 @@ public:
     //   当前K线的最高价本身就是上沿的一部分，算进去等于"价格>=上沿"恒成立。
     //   而价格用的【是】当前未收盘K线的实时收盘值——用已收盘的通道，让实时
     //   价格去撞它，这才是突破
-    struct SarSnapshot {
+    struct TrendSnapshot {
         bool    ok      = false;   // ATR 与通道都算得出来
         double  price   = 0;
         double  atr     = 0;       // ATR(period, Wilder)，0=数据不足
@@ -146,29 +111,37 @@ public:
         double  dc_dn   = 0;
         int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
     };
-    SarSnapshot fetch_sar_signal(const std::string& symbol, const std::string& interval,
+    TrendSnapshot fetch_trend_signal(const std::string& symbol, const std::string& interval,
                                  int donchian_period, int atr_period);
 
     // 单独的 ATR 拉取（DCA 的 ATR 移动止损用）。公开接口，不占签名限流。
-    // 与 fetch_sar_signal 分开是因为这里【不需要唐奇安通道】——
+    // 与 fetch_trend_signal 分开是因为这里【不需要唐奇安通道】——
     // DCA 的入场由自己那套闸门决定，ATR 只用来定止损距离。
     // 返回 0 = 数据不足或请求失败，调用方据此判定"不武装"
     double fetch_atr(const std::string& symbol, const std::string& interval, int period);
 
-    // ── 裸K线快照（SAR 的 BarPattern 模式）──────────────────────────────────
-    // 刚收盘那根的方向 + 它【之前】N 根的最高/最低价。
+    // ── K线快照（③ 纯裸K 与 ② 抛物线SAR 用）────────────────────────────────
+    // 当前根开盘价、刚收盘那根的收盘价、前两根的高低点，以及它【之前】N 根的
+    // 最高/最低价。
     //
     // ⚠ 索引口径（与用户规格一致）：bars 最后一根是未收盘的当前根，
     //   倒数第二根是"刚收盘那根"（用户编号的 bar 0），再往前 N 根才是
     //   算摆动高低点的窗口（用户编号的 1..N）。信号根自己【不在】窗口里
+    //
+    // ⚠ 这里给的是【原始价格】，不是"阳线/阴线"这种已经判完的结论。
+    //   v5.1.0 之前它返回 bullish/bearish，那是把策略规则烧进了数据层——
+    //   裸K 的入场规则一改（阳线 → 突破前根高点），这个接口就得跟着改。
+    //   给原始高低点则三个策略都能各取所需，规则留在决策层。
     struct BarSnapshot {
         bool    ok      = false;
-        double  price   = 0;       // 当前未收盘根的实时收盘值
-        bool    bullish = false;   // bar 0 收盘 > 开盘
-        bool    bearish = false;   // bar 0 收盘 < 开盘（十字星两者皆 false）
-        double  swing_low  = 0;    // bar 1..N 的最低价
-        double  swing_high = 0;    // bar 1..N 的最高价
-        int64_t bar_open_ms = 0;   // 当前未收盘根的开盘时间
+        double  price   = 0;        // 当前未收盘根的实时收盘值
+        double  cur_open = 0;       // 当前未收盘根的开盘价（裸K·盘中即时用）
+        double  prev_close = 0;     // 刚收盘那根的收盘价
+        double  prev_high = 0, prev_low = 0;    // 刚收盘那根之前那一根
+        double  prev2_high = 0, prev2_low = 0;  // 再前一根（PSAR 夹逼用）
+        double  swing_low  = 0;     // bar 1..N 的最低价
+        double  swing_high = 0;     // bar 1..N 的最高价
+        int64_t bar_open_ms = 0;    // 当前未收盘根的开盘时间
     };
     BarSnapshot fetch_bar_pattern(const std::string& symbol,
                                   const std::string& interval, int swing_bars);
@@ -330,12 +303,12 @@ public:
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;
-    // 灾难止损单：STOP_MARKET + closePosition=true。
-    // 用 closePosition 而不是"显式数量+reduceOnly"，因为补仓会让仓位不断变大，
-    // 显式数量的单子会立刻过期失真；closePosition 永远平掉整个仓位，且仓位归零
-    // 时交易所自动撤单，不留垃圾挂单
-    std::string place_disaster_stop(const std::string& symbol, double stop_price,
-                                    const std::string& entry_side) override;
+    // 硬止损单：STOP_MARKET + closePosition=true。
+    // 用 closePosition 而不是"显式数量+reduceOnly"，因为金字塔加仓会让仓位不断
+    // 变大，显式数量的单子会立刻过期失真；closePosition 永远平掉当时的整个仓位，
+    // 所以"开仓时挂一次、此后不动"这个语义天然兼容加仓
+    StopPlacement place_disaster_stop(const std::string& symbol, double stop_price,
+                                      const std::string& entry_side) override;
     bool cancel_disaster_stop(const std::string& symbol,
                               const std::string& order_id) override;
 

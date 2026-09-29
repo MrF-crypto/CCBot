@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 5.0.1 LANGUAGES CXX)
+project(TradingBot VERSION 5.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +28,7 @@ option(CCBOT_WERROR "把编译警告当作错误（CI 门禁用）" OFF)
 # ── Sanitizer ─────────────────────────────────────────────────────────────────
 # CCBOT_SANITIZE=address / thread / undefined / address+undefined（分号或加号分隔）
 #
-# 为什么这是本项目最该补的一项验证：sar_engine.cpp 有 27 处 mutex/atomic、
+# 为什么这是本项目最该补的一项验证：trend_engine.cpp 有 27 处 mutex/atomic、
 # book_ticker_stream.cpp 还多一个看门狗线程，而并发缺陷是所有缺陷里唯一会
 # "看起来一切正常，直到某天对不上账"的一类——单元测试全绿也证明不了它不存在。
 # TSan 能证明。
@@ -94,7 +94,7 @@ find_package(Threads REQUIRED)
 
 # ── 核心引擎/网络代码：GUI 版和无界面(headless)版共用，不含任何 Qt/Windows 专属代码 ──
 set(CORE_SOURCES
-    src/core/sar_engine.cpp
+    src/core/trend_engine.cpp
     src/core/funding_ledger.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
@@ -125,7 +125,7 @@ if(WIN32 OR APPLE)
         src/main.cpp
         src/core/key_store.cpp
         src/gui/main_window.cpp
-        src/gui/sar_panel.cpp
+        src/gui/trend_panel.cpp
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )
@@ -164,7 +164,7 @@ endif()
 add_executable(ccbot_headless
     src/headless/main.cpp
     src/headless/headless_config.cpp
-    src/headless/sar_state.cpp
+    src/headless/trend_state.cpp
     ${CORE_SOURCES}
 )
 target_include_directories(ccbot_headless PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -206,7 +206,7 @@ endif()
 # DCA 的实测结论（哪些参数有效、哪些被证伪）保留在 docs/NEGATIVE_RESULTS.md，
 # 代码删了但花钱买来的结论不删。
 #
-# ccg_stress_tests 删除后，并发压力覆盖由 ccg_sar_stress_tests 承担——
+# ccg_stress_tests 删除后，并发压力覆盖由 ccg_trend_stress_tests 承担——
 # 那是 TSan 矩阵里的目标之一，不能随 DCA 一起消失（见下）。
 
 # ── 指标数学逻辑单元测试——纯 C++ 头文件，不依赖 Qt/curl/网络，独立小可执行文件 ──
@@ -217,40 +217,40 @@ if(MSVC)
 endif()
 
 # ── SAR 趋势跟随测试（决策纯逻辑 + 引擎订单路径）───────────────────────────────
-add_executable(ccg_sar_tests tests/test_sar.cpp)
-target_include_directories(ccg_sar_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_sar_tests PRIVATE Threads::Threads)
+add_executable(ccg_trend_tests tests/test_trend.cpp)
+target_include_directories(ccg_trend_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_trend_tests PRIVATE Threads::Threads)
 if(MSVC)
-    target_compile_options(ccg_sar_tests PRIVATE /utf-8)
+    target_compile_options(ccg_trend_tests PRIVATE /utf-8)
 endif()
 
-add_executable(ccg_sar_engine_tests tests/test_sar_engine.cpp src/core/sar_engine.cpp)
-target_include_directories(ccg_sar_engine_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_sar_engine_tests PRIVATE Threads::Threads)
+add_executable(ccg_trend_engine_tests tests/test_trend_engine.cpp src/core/trend_engine.cpp)
+target_include_directories(ccg_trend_engine_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_trend_engine_tests PRIVATE Threads::Threads)
 if(MSVC)
-    target_compile_options(ccg_sar_engine_tests PRIVATE /utf-8)
+    target_compile_options(ccg_trend_engine_tests PRIVATE /utf-8)
 endif()
 
 # ── SAR 持久化与对账测试：守"引擎以为空仓而交易所有仓"这一类裸敞口 ───────────
-add_executable(ccg_sar_state_tests tests/test_sar_state.cpp
-                                   src/headless/sar_state.cpp
-                                   src/core/sar_engine.cpp)
-target_include_directories(ccg_sar_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_sar_state_tests PRIVATE simdjson::simdjson Threads::Threads)
+add_executable(ccg_trend_state_tests tests/test_trend_state.cpp
+                                   src/headless/trend_state.cpp
+                                   src/core/trend_engine.cpp)
+target_include_directories(ccg_trend_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_trend_state_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)
-    target_compile_options(ccg_sar_state_tests PRIVATE /utf-8)
+    target_compile_options(ccg_trend_state_tests PRIVATE /utf-8)
 endif()
 
 # ── SAR 并发压力测试：实盘前的最后一道自检 ────────────────────────────────────
 # 接替随 DCA 一起删掉的 ccg_stress_tests。它的价值不在"算得对不对"（那是
-# ccg_sar_engine_tests 的事），而在【并发下的状态撕裂】——多线程同时 tick /
+# ccg_trend_engine_tests 的事），而在【并发下的状态撕裂】——多线程同时 tick /
 # 喂信号 / 读快照 / 对账，交易所返回随机化。这类缺陷在单线程测试里永远不出现，
 # 而且它是 TSan 矩阵的目标之一，不能随 DCA 一起消失
-add_executable(ccg_sar_stress_tests tests/test_sar_stress.cpp src/core/sar_engine.cpp)
-target_include_directories(ccg_sar_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_sar_stress_tests PRIVATE Threads::Threads)
+add_executable(ccg_trend_stress_tests tests/test_trend_stress.cpp src/core/trend_engine.cpp)
+target_include_directories(ccg_trend_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_trend_stress_tests PRIVATE Threads::Threads)
 if(MSVC)
-    target_compile_options(ccg_sar_stress_tests PRIVATE /utf-8)
+    target_compile_options(ccg_trend_stress_tests PRIVATE /utf-8)
 endif()
 
 # ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
@@ -327,7 +327,7 @@ endif()
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
-                                src/core/sar_engine.cpp)
+                                src/core/trend_engine.cpp)
 target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)
@@ -335,7 +335,7 @@ if(MSVC)
 endif()
 
 # ccg_persist_tests 随网格DCA 一并移除（本版）：它测的是 headless_state 的
-# DCA 落盘往返。SAR 侧的同类覆盖在 ccg_sar_state_tests 里，一条不少。
+# DCA 落盘往返。SAR 侧的同类覆盖在 ccg_trend_state_tests 里，一条不少。
 #
 # ccg_liq_tests 随回测子系统一并移除（v4.0.13）。它测的全部是【回测模拟器
 # 内部】的强平会计（PortfolioResult / MultiSimClient / run_portfolio），
@@ -359,8 +359,8 @@ endif()
 # 删了目标忘了从这里摘掉，构建就会响
 set(CCBOT_OWN_TARGETS
     ccbot_headless
-    ccg_indicator_tests ccg_sar_tests ccg_sar_engine_tests ccg_sar_state_tests
-    ccg_sar_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
+    ccg_indicator_tests ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests
+    ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
     ccg_rate_tests ccg_timesync_tests ccg_price_tests ccg_config_tests
     ccg_key_store_tests
 )

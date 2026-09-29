@@ -1,4 +1,4 @@
-#include "headless/sar_state.h"
+#include "headless/trend_state.h"
 
 #include <simdjson.h>
 #include <chrono>
@@ -57,7 +57,7 @@ std::string get_str(simdjson::dom::object& o, const char* key, const std::string
 
 } // namespace
 
-void save_sar_state(const std::string& path, const std::vector<SarBot>& bots) {
+void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots) {
     std::ostringstream ss;
     // ⚠ 必须设精度。ostringstream 默认 6 位有效数字，而这里存的是开仓价、
     //   止损线、持仓量。截断的后果在 SAR 上比 DCA 更直接：止损线【就是】出场价，
@@ -76,14 +76,18 @@ void save_sar_state(const std::string& path, const std::vector<SarBot>& bots) {
            << "\"entry_price\":" << b.st.entry_price << ","
            << "\"peak\":"        << b.st.peak << ","
            << "\"stop\":"        << b.st.stop << ","
+           // ② 抛物线SAR 专用：AF 丢了的话重启后 SAR 会从 af_start 重新加速，
+           //    止损线瞬间从"贴着价格"退回远处——等于白白让出已经锁住的利润
+           << "\"af\":"          << b.st.af << ","
+           // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
+           //    忘掉，盘中即时模式下同一根里会再开一次
+           << "\"last_entry_bar_ms\":" << b.st.last_entry_bar_ms << ","
            << "\"consec_reverses\":" << b.st.consec_reverses << ","
            // 单号必须跨重启存活：遗留一张触发价对不上的孤儿单会让
            // 下次挂新单被拒（closePosition 同方向只能有一张）
            << "\"disaster_stop_id\":\"" << b.disaster_stop_id << "\","
            << "\"disaster_stop_price\":" << b.disaster_stop_price << ","
            << "\"cooldown_left\":"   << b.st.cooldown_left << ","
-           << "\"adds_done\":"      << b.st.adds_done << ","
-           << "\"last_add_price\":" << b.st.last_add_price << ","
            << "\"qty\":"          << b.qty << ","
            << "\"current_price\":" << b.current_price << ","
            << "\"realized_pnl\":" << b.realized_pnl << ","
@@ -113,9 +117,9 @@ void save_sar_state(const std::string& path, const std::vector<SarBot>& bots) {
     }
 }
 
-std::vector<SarBot> load_sar_state(const std::string& path,
-                                   const std::vector<SarConfig>& cfgs) {
-    std::vector<SarBot> out;
+std::vector<TrendBot> load_trend_state(const std::string& path,
+                                   const std::vector<TrendConfig>& cfgs) {
+    std::vector<TrendBot> out;
 
     std::ifstream f(path, std::ios::binary);
     if (!f) return out;
@@ -137,27 +141,29 @@ std::vector<SarBot> load_sar_state(const std::string& path,
         if (sym.empty()) continue;
 
         // 配置里已经删掉的品种，落盘状态直接丢弃
-        const SarConfig* cfg = nullptr;
+        const TrendConfig* cfg = nullptr;
         for (const auto& c : cfgs) if (c.symbol == sym) { cfg = &c; break; }
         if (!cfg) continue;
 
-        SarBot b;
+        TrendBot b;
         b.cfg   = *cfg;                       // 参数用最新配置，不用落盘的
-        b.state = (SarBot::State)(int)get_num(o, "state", 0);
+        b.state = (TrendBot::State)(int)get_num(o, "state", 0);
 
-        const int pos = (int)get_num(o, "pos", (double)(int)sar::Pos::Flat);
-        b.st.pos = (pos == (int)sar::Pos::Long)  ? sar::Pos::Long
-                 : (pos == (int)sar::Pos::Short) ? sar::Pos::Short
-                                                 : sar::Pos::Flat;
+        const int pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
+        b.st.pos = (pos == (int)trend::Pos::Long)  ? trend::Pos::Long
+                 : (pos == (int)trend::Pos::Short) ? trend::Pos::Short
+                                                 : trend::Pos::Flat;
         b.st.entry_price     = get_num(o, "entry_price", 0);
         b.st.peak            = get_num(o, "peak", 0);
         b.st.stop            = get_num(o, "stop", 0);
+        // 旧存档没有 af。兜底取 af_start 而不是 0：0 会让 SAR 完全不动
+        // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
+        b.st.af              = get_num(o, "af", b.cfg.rule.af_start);
+        b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
         b.disaster_stop_price = get_num(o, "disaster_stop_price", 0);
         b.st.cooldown_left   = (int)get_num(o, "cooldown_left", 0);
-        b.st.adds_done       = (int)get_num(o, "adds_done", 0);
-        b.st.last_add_price  = get_num(o, "last_add_price", 0);
         b.qty           = get_num(o, "qty", 0);
         b.current_price = get_num(o, "current_price", 0);
         b.realized_pnl  = get_num(o, "realized_pnl", 0);
@@ -169,9 +175,9 @@ std::vector<SarBot> load_sar_state(const std::string& path,
         // 人改过。这种状态比"空仓"危险得多——止损线为 0 时，多头的
         // `price <= stop` 永远不成立，仓位会一直裸着没人管。
         // 当成空仓丢弃，交给对账去发现交易所上那笔真实仓位并停掉 bot
-        if (b.st.pos != sar::Pos::Flat &&
+        if (b.st.pos != trend::Pos::Flat &&
             (b.st.entry_price <= 0 || b.st.stop <= 0 || b.qty <= 0)) {
-            b.st = sar::State{};
+            b.st = trend::State{};
             b.qty = 0;
         }
 

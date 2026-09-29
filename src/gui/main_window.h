@@ -23,7 +23,7 @@
 // 头拖进每个包含 main_window.h 的翻译单元
 class QVBoxLayout;
 
-#include "core/sar_engine.h"
+#include "core/trend_engine.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
@@ -41,7 +41,34 @@ inline constexpr int    kLogMaxLines   = 3000;    // 日志框保留行数
 inline constexpr size_t kMaxTrades     = 20000;   // 内存/落盘保留的成交记录条数
 inline constexpr int    kTradeSaveMinMs = 3000;   // 成交落盘的最小间隔（合并密集平仓）
 
-// 表格底部汇总行的累加器。fillSarRow 要往里加，所以提成一个结构体传引用——
+// ── 监控表的列号 ─────────────────────────────────────────────────────────────
+// 收成具名常量而不是散在各处写字面量。理由是这个仓库为此踩过一次：v4.0.15
+// 在中间插入「24h涨跌」之后各列整体后移，有一处判断漏改（查列 14、写列 15），
+// 于是"点击被刷新吞掉"那个优化【从未真正生效过】——而且不报错、看不出来，
+// 直到 v5 重构时逐列核对才发现。
+//
+// 列号现在只在这里定义一次，插列/删列只改这一处。
+enum Col {
+    ColIdx = 0,     // #
+    ColSym,         // 品种
+    ColDir,         // 方向（运行时持仓方向，不是配置）
+    ColMode,        // 周期·模式（如 "3m·裸K" / "4h·通道"）
+    ColHardStop,    // 委托止损：交易所侧那张 STOP_MARKET 的触发价与健康状态
+    ColEntry,       // 开仓价（开了金字塔就是加权开仓价）
+    ColMark,        // 标记价
+    ColChg24,       // 24h涨跌
+    ColLatency,     // 延迟（WS 包龄，测的是引擎实际用的那条流）
+    ColUnreal,      // 浮动P&L
+    ColMargin,      // 保证金
+    ColRoe,         // 收益率
+    ColTrailStop,   // 移动止损：本地棘轮止损线 + 距现价百分比
+    ColReal,        // 已实现
+    ColState,       // 状态
+    ColOps,         // 操作
+    ColCount
+};
+
+// 表格底部汇总行的累加器。fillTrendRow 要往里加，所以提成一个结构体传引用——
 // 否则它要么返回一个五元组，要么把汇总算两遍。
 //
 // v4.5.0~v4.7.1 这里还有一个 BotRow：把两个引擎（网格DCA + 趋势SAR）的 bot
@@ -54,10 +81,10 @@ struct RowTotals {
     double unreal  = 0, real    = 0;
 };
 
-// SAR 配置表单的控件集合。定义在 sar_panel.cpp —— main_window.cpp 只需要能
+// SAR 配置表单的控件集合。定义在 trend_panel.cpp —— main_window.cpp 只需要能
 // 持有并传递它，不需要知道里面有哪些控件（那是 30 多个指针，摊到头文件里
 // 只会让每次改一个 spinbox 都触发全量重编）
-struct SarFormWidgets;
+struct TrendFormWidgets;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -92,16 +119,16 @@ private:
 
     // ── 趋势 SAR（本版起是唯一的策略）────────────────────────────────────────
     // 把一行填成 SAR 行。16 列的列位沿用（列语义见函数体里的对照表）
-    void fillSarRow(int row, const SarBot& b, RowTotals& t);
+    void fillTrendRow(int row, const TrendBot& b, RowTotals& t);
     // SAR 表单的构建与回读。拆成两半是为了让 openStrategyDialog 能把表单嵌进
     // 自己的分页里，而不用把 30 多个控件的构造逻辑复制一份
-    std::shared_ptr<SarFormWidgets> buildSarForm(QVBoxLayout* into, const SarConfig& c);
-    bool collectSarForm(const std::shared_ptr<SarFormWidgets>& w, SarConfig& out);
+    std::shared_ptr<TrendFormWidgets> buildTrendForm(QVBoxLayout* into, const TrendConfig& c);
+    bool collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, TrendConfig& out);
     // 校验 + 落地（建/改 bot、订阅行情、落盘）。返回 false = 已向用户报错且未改动
-    bool applySarConfig(SarConfig c, const SarBot* existing);
-    std::string sar_cfg_path()   const;   // 配置与运行时状态同一个文件
-    void save_sar_bots();          // 配置 + 运行时状态一起落盘
-    void load_and_restore_sar();
+    bool applyTrendConfig(TrendConfig c, const TrendBot* existing);
+    std::string trend_cfg_path()   const;   // 配置与运行时状态同一个文件
+    void save_trend_bots();          // 配置 + 运行时状态一起落盘
+    void load_and_restore_trend();
 
     // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
@@ -148,7 +175,7 @@ private:
     // 必须分开：拉取任务动辄几百毫秒~几秒，混在一个池里会把手动平仓排到队尾等十几秒
     std::shared_ptr<ThreadPool>        pool_;
     std::shared_ptr<ThreadPool>        fetchPool_;
-    std::shared_ptr<SarEngine>         sar_engine_;
+    std::shared_ptr<TrendEngine>         trend_engine_;
     std::unique_ptr<BookTickerStream>  ticker_;
 
     QTimer* tick_timer_  = nullptr;
@@ -205,9 +232,9 @@ private:
     std::vector<QString> opRowKeys_;
 
     // ── 交易明细 / 盈利统计 ──
-    // 成交明细。类型从 TradeRecord 换成 SarTrade（网格DCA 移除后前者不存在了）：
+    // 成交明细。类型从 TradeRecord 换成 TrendTrade（网格DCA 移除后前者不存在了）：
     // 少了 layers（层数，DCA 概念），方向从配置里的 direction 换成运行时的 st.pos
-    std::vector<SarTrade> trades_;
+    std::vector<TrendTrade> trades_;
     qint64 lastTradeSaveMs_ = 0;   // 落盘去抖
     bool   tradesDirty_     = false;
     QLabel*       statsLabel_ = nullptr;
@@ -259,15 +286,15 @@ private:
     std::atomic<bool> fundFetchBusy_{false};
     // SAR 信号拉取（ATR + 唐奇安）。与指标批次分开：周期不同（60秒 vs 5分钟），
     // 而且 SAR 的 bot 集合与 DCA 的完全没有交集
-    std::atomic<bool> sarSigBusy_{false};
+    std::atomic<bool> trendSigBusy_{false};
     // 新增/恢复 SAR bot 后置位，让下一个 tick 立刻拉一次信号而不是等满 20 拍。
     // 没有它的话刚添加的品种会干等最多 60 秒，界面上什么都没有——
     // 而用户此刻正盯着看它到底有没有在工作
-    std::atomic<bool> sarSigForce_{false};
+    std::atomic<bool> trendSigForce_{false};
     // 已经报过「信号拉不到」的品种（仅 GUI 线程访问）。存在的理由是去重：
     // 拉取每分钟一轮，而一个拼错的品种会永远失败——不去重就是每小时 60 条
     // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
-    std::set<std::string> sarSigFailed_;
+    std::set<std::string> trendSigFailed_;
 
     // ── 日志 ──
     QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的

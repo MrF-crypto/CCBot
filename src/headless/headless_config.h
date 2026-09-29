@@ -1,5 +1,5 @@
 #pragma once
-#include "core/sar_engine.h"
+#include "core/trend_engine.h"
 #include <string>
 #include <vector>
 
@@ -21,10 +21,13 @@ struct HeadlessConfig {
     std::string alert_webhook;           // 同 GUI 的关键事件提醒 webhook
     std::string state_path = "ccbot_state.json";   // 仓位运行时状态落盘路径，重启续跑用
     std::string log_path;                // 空=只输出到 stdout，不落盘
-    // 趋势 SAR 策略。本版起是【唯一】的策略——网格DCA 连同它的 bots 数组
-    // 一起移除了，旧配置文件里的 "bots" 会被当作未知键进 warnings，
-    // 而不是静默忽略：静默忽略的话用户会以为 DCA 还在跑
-    std::vector<SarConfig> sar_bots;
+    // 趋势策略（海龟 / 抛物线SAR / 纯裸K 三选一，见 TrendConfig::strategy）。
+    //
+    // ⚠ 成员名与 JSON 键都保留 "sar_bots"，【故意不改】。引擎已经从 SarEngine
+    //   改名成 TrendEngine，但这个键是【对外契约】——改了名，所有在跑的部署
+    //   升级上来之后配置就失效了，而且是"进程正常启动、一个品种都不跑"的
+    //   静默失效。同理落盘路径仍是 <state_path>.sar
+    std::vector<TrendConfig> sar_bots;
     std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 
 };

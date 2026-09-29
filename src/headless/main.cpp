@@ -1,14 +1,14 @@
 // ccbot_headless：无图形界面版本，配置文件驱动，Windows/Linux 都能编译运行。
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
 #include "version.h"
-#include "core/sar_engine.h"
+#include "core/trend_engine.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
 #include "net/book_ticker_stream.h"
 #include "net/alert.h"
 #include "headless/headless_config.h"
-#include "headless/sar_state.h"
+#include "headless/trend_state.h"
 
 #include <csignal>
 #include <atomic>
@@ -181,20 +181,20 @@ int main(int argc, char** argv) {
     }
 
     // ── 趋势 SAR 引擎（本版起是唯一的策略）──────────────────────────────────
-    std::shared_ptr<SarEngine> sar_engine;
-    std::vector<std::string> sar_ids;
+    std::shared_ptr<TrendEngine> trend_engine;
+    std::vector<std::string> trend_ids;
     // 状态文件仍带 .sar 后缀：老部署升级上来时这个文件已经存在，改名等于
     // 把在跑的仓位状态丢掉
-    const std::string sar_state_path = cfg.state_path + ".sar";
+    const std::string trend_state_path = cfg.state_path + ".sar";
     if (!cfg.sar_bots.empty()) {
-        sar_engine = std::make_shared<SarEngine>(client, pool);
+        trend_engine = std::make_shared<TrendEngine>(client, pool);
         // 账户级闸门。v4.7.1 之前这两个配置项挂在 DCA 引擎上，DCA 移除后若不接到
         // 这里，它们就会【静默失效】——配置文件照样写着上限，进程照样启动，
         // 而上限根本没人执行
-        sar_engine->set_max_total_margin(cfg.max_total_margin);
-        sar_engine->set_max_open_positions(cfg.max_open_positions);
-        sar_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
-        sar_engine->set_trade_cb([&](const SarTrade& tr) {
+        trend_engine->set_max_total_margin(cfg.max_total_margin);
+        trend_engine->set_max_open_positions(cfg.max_open_positions);
+        trend_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
+        trend_engine->set_trade_cb([&](const TrendTrade& tr) {
             std::ostringstream ss;
             ss << "[SAR] " << tr.symbol << " " << tr.reason
                << " 开=$" << tr.entry_price << " 平=$" << tr.exit_price
@@ -202,26 +202,29 @@ int main(int argc, char** argv) {
             log_line(ss.str(), tr.pnl >= 0 ? "OK" : "WARN");
             std::ofstream f(trades_csv, std::ios::app);
             if (f) f << now_str() << "," << tr.symbol << ","
-                     << (tr.side == sar::Pos::Short ? "sar_short" : "sar_long") << ","
+                     // 方向值保留 sar_ 前缀：这一列写进的是【追加型】CSV，
+                     // 老行已经这么记了。改了之后同一个文件里会有两种写法，
+                     // 任何按这一列分组的统计都会把同一个方向算成两个
+                     << (tr.side == trend::Pos::Short ? "sar_short" : "sar_long") << ","
                      << tr.reason << "," << tr.entry_price << "," << tr.exit_price << ","
                      << tr.qty << "," << tr.pnl << ",0\n";
         });
         // 先恢复落盘状态，再把配置里新增、落盘没有的品种全新起步。
         // 顺序不能反：反了的话 add_bot 会先占住品种名，restore_bot 被拒，
         // 引擎以为自己空仓而交易所上的仓位还在
-        auto sar_saved = load_sar_state(sar_state_path, cfg.sar_bots);
-        std::set<std::string> sar_restored;
-        for (auto& b : sar_saved) {
-            auto id = sar_engine->restore_bot(b);
-            if (!id.empty()) { sar_ids.push_back(id); sar_restored.insert(b.cfg.symbol); }
+        auto trend_saved = load_trend_state(trend_state_path, cfg.sar_bots);
+        std::set<std::string> trend_restored;
+        for (auto& b : trend_saved) {
+            auto id = trend_engine->restore_bot(b);
+            if (!id.empty()) { trend_ids.push_back(id); trend_restored.insert(b.cfg.symbol); }
         }
         for (const auto& c : cfg.sar_bots) {
-            if (sar_restored.count(c.symbol)) continue;
-            auto id = sar_engine->add_bot(c);
-            if (!id.empty()) sar_ids.push_back(id);
+            if (trend_restored.count(c.symbol)) continue;
+            auto id = trend_engine->add_bot(c);
+            if (!id.empty()) trend_ids.push_back(id);
         }
-        log_line("SAR 引擎已启动，" + std::to_string(sar_ids.size()) + " 个品种（其中 " +
-                 std::to_string(sar_restored.size()) + " 个从落盘恢复）");
+        log_line("SAR 引擎已启动，" + std::to_string(trend_ids.size()) + " 个品种（其中 " +
+                 std::to_string(trend_restored.size()) + " 个从落盘恢复）");
 
         // 启动对账：本地落盘的仓位 vs 交易所实际持仓。
         // 外部手动平过仓、或交易所侧灾难止损触发过的话，本地状态是错的——
@@ -230,14 +233,14 @@ int main(int argc, char** argv) {
             bool pos_ok = false;
             auto ex_pos = client->fetch_positions(&pos_ok);
             if (pos_ok) {
-                std::vector<SarEngine::ExchangePos> ex;
+                std::vector<TrendEngine::ExchangePos> ex;
                 ex.reserve(ex_pos.size());
                 for (const auto& p : ex_pos)
                     ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                auto issues = sar_engine->reconcile_positions(ex);
+                auto issues = trend_engine->reconcile_positions(ex);
                 if (!issues.empty()) {
                     for (const auto& i : issues) log_line("⚠ SAR对账: " + i, "WARN");
-                    save_sar_state(sar_state_path, sar_engine->get_bots());
+                    save_trend_state(trend_state_path, trend_engine->get_bots());
                     if (!cfg.alert_webhook.empty()) {
                         std::string msg = "[ccbot] SAR 启动对账发现 " +
                                           std::to_string(issues.size()) + " 处不一致:";
@@ -269,7 +272,7 @@ int main(int argc, char** argv) {
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
     // ind_busy / trend_busy 随网格DCA 的指标与趋势批次一并删除
     std::atomic<bool> hb_busy{false}, rec_busy{false};
-    std::atomic<bool> sar_sig_busy{false};
+    std::atomic<bool> trend_sig_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
     // 数据池要同时承载价格 REST 兜底、日线/趋势、1h 指标三类批次，2 个线程在
@@ -307,7 +310,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::seconds(3));
         ++tick_n;
 
-        auto bots = sar_engine ? sar_engine->get_bots() : std::vector<SarBot>{};
+        auto bots = trend_engine ? trend_engine->get_bots() : std::vector<TrendBot>{};
 
         // ── 1) 价格喂入 + 策略判定：永远最先执行，不被任何数据拉取阻塞 ────────
         for (const auto& sym : symbols) {
@@ -318,7 +321,7 @@ int main(int argc, char** argv) {
                 if (price > 0) ticker.set_mark_price(sym, price);
             }
             if (price > 0) {
-                if (sar_engine) sar_engine->tick(sym, price);
+                if (trend_engine) trend_engine->tick(sym, price);
                 stall_ticks[sym] = 0;
                 if (stall_alerted.erase(sym)) {
                     log_line(sym + " 行情已恢复", "OK");
@@ -411,45 +414,50 @@ int main(int argc, char** argv) {
         // 每 20 个 tick（约 60 秒）一轮。信号周期通常是 4h，用不着更密；
         // 而止损线的推进【不靠这个】——它在每个 tick 用实时价推，只有 ATR 的
         // 数值来自这里。所以这一批慢一点不影响保护
-        if (sar_engine && !sar_sig_busy.load()) {
-            auto sbots = sar_engine->get_bots();
-            std::vector<SarBot> need;
+        if (trend_engine && !trend_sig_busy.load()) {
+            auto sbots = trend_engine->get_bots();
+            std::vector<TrendBot> need;
             for (const auto& b : sbots) {
-                if (b.state != SarBot::State::Running) continue;
+                if (b.state != TrendBot::State::Running) continue;
                 // 每个 bot 按自己周期的节奏拉：3m 要 45 秒一次才不会错过收盘，
                 // 4h 每 60 秒一次就够。tick 是 3 秒一拍
                 const int ticks = std::max(1,
-                    SarEngine::signal_period_sec(b.cfg.interval) / 3);
+                    TrendEngine::signal_period_sec(b.cfg.interval) / 3);
                 if ((tick_n % ticks) == 1) need.push_back(b);
             }
             if (!need.empty()) {
-                sar_sig_busy.store(true);
-                fetch_pool->submit([client, sar_engine, need, &sar_sig_busy]() {
+                trend_sig_busy.store(true);
+                fetch_pool->submit([client, trend_engine, need, &trend_sig_busy]() {
                     for (const auto& b : need) {
-                        if (b.cfg.rule.mode == sar::Mode::BarPattern) {
+                        // 裸K 与 抛物线SAR 只要原始高低点，【不需要 ATR】——
+                        // 少拉一次 REST。update_bars 自己设 sig_ok，所以不必
+                        // 像 v5.1.0 之前那样成对调用两个接口
+                        if (b.cfg.rule.strategy != trend::Strategy::Turtle) {
                             auto bp = client->fetch_bar_pattern(
                                 b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
                             if (!bp.ok) continue;
-                            sar_engine->update_bars(b.bot_id, bp.bullish, bp.bearish,
-                                                    bp.swing_low, bp.swing_high,
-                                                    bp.bar_open_ms);
-                            const double a = client->fetch_atr(
-                                b.cfg.symbol, b.cfg.interval, b.cfg.rule.atr_period);
-                            if (a > 0 && bp.price > 0)
-                                sar_engine->update_signal(b.bot_id, a,
-                                                          a / bp.price * 100.0,
-                                                          false, 0, 0, bp.bar_open_ms);
+                            TrendEngine::BarSnap s;
+                            s.open        = bp.cur_open;
+                            s.prev_close  = bp.prev_close;
+                            s.prev_high   = bp.prev_high;
+                            s.prev_low    = bp.prev_low;
+                            s.prev2_high  = bp.prev2_high;
+                            s.prev2_low   = bp.prev2_low;
+                            s.swing_low   = bp.swing_low;
+                            s.swing_high  = bp.swing_high;
+                            s.bar_open_ms = bp.bar_open_ms;
+                            trend_engine->update_bars(b.bot_id, s);
                             continue;
                         }
-                        auto snap = client->fetch_sar_signal(
+                        auto snap = client->fetch_trend_signal(
                             b.cfg.symbol, b.cfg.interval,
                             b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
                         if (!snap.ok) continue;
-                        sar_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
+                        trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                   snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                   snap.bar_open_ms);
                     }
-                    sar_sig_busy.store(false);
+                    trend_sig_busy.store(false);
                 });
             }
         }
@@ -461,8 +469,8 @@ int main(int argc, char** argv) {
         // ── 5) 状态落盘：每约1分钟一次。
         //     这里【不用】脏标记：止损线的棘轮推进不产生日志（不置脏），
         //     而它正是重启后最不能丢的那个值——丢了止损线就是一笔无人看管的裸仓位
-        if (sar_engine && tick_n % 20 == 0)
-            save_sar_state(sar_state_path, sar_engine->get_bots());
+        if (trend_engine && tick_n % 20 == 0)
+            save_trend_state(trend_state_path, trend_engine->get_bots());
 
         // ── 6) 心跳（异步，约1分钟一次）─────────────────────────────────────
         if (tick_n % 20 == 0 && !hb_busy.load()) {
@@ -565,7 +573,7 @@ int main(int argc, char** argv) {
                 if (fe.since_open != 0) {
                     // 方向取自决策状态而不是配置：SAR 会反手，同一个 bot 的持仓
                     // 方向是运行时的量，配置里根本没有"方向"这一项
-                    const bool is_long = (b.st.pos == sar::Pos::Long);
+                    const bool is_long = (b.st.pos == trend::Pos::Long);
                     double be = FundingLedger::effective_breakeven(
                         b.st.entry_price, b.qty, fe.since_open, is_long);
                     log_line("资金费 | " + b.cfg.symbol +
@@ -619,23 +627,23 @@ int main(int argc, char** argv) {
         // 主循环里除了价格兜底之外的每一个 HTTP 都走 fetch_pool，这里同理
         if (tick_n % 20 == 0 && !rec_busy.load()) {
             rec_busy.store(true);
-            fetch_pool->submit([client, sar_engine, &rec_busy,
-                                ssp = sar_state_path,
+            fetch_pool->submit([client, trend_engine, &rec_busy,
+                                ssp = trend_state_path,
                                 w = cfg.alert_webhook]() {
                 bool pos_ok = false;
                 auto ex_pos = client->fetch_positions(&pos_ok);
                 // 拉取失败绝不对账：空的持仓列表既可能是"确实没仓"也可能是请求
                 // 失败，把后者当成前者会凭空清掉真实持仓
-                if (pos_ok && sar_engine) {
-                    std::vector<SarEngine::ExchangePos> sex;
+                if (pos_ok && trend_engine) {
+                    std::vector<TrendEngine::ExchangePos> sex;
                     sex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto sissues = sar_engine->reconcile_positions(sex);
+                    auto sissues = trend_engine->reconcile_positions(sex);
                     if (!sissues.empty()) {
                         for (const auto& i : sissues)
                             log_line("⚠ 对账: " + i, "WARN");
-                        save_sar_state(ssp, sar_engine->get_bots());
+                        save_trend_state(ssp, trend_engine->get_bots());
                         if (!w.empty()) {
                             std::string msg = "[ccbot] 运行中对账发现 " +
                                               std::to_string(sissues.size()) + " 处不一致:";
@@ -661,7 +669,7 @@ int main(int argc, char** argv) {
     const bool drained = pool->wait_idle(60000);
     fetch_pool->wait_idle(5000);
 
-    if (sar_engine) save_sar_state(sar_state_path, sar_engine->get_bots());
+    if (trend_engine) save_trend_state(trend_state_path, trend_engine->get_bots());
     funding.save(funding_path);
 
     // 没排空就直接结束进程，不跑析构。在途任务捏着引擎的裸指针，而引擎里 pool_
@@ -678,8 +686,8 @@ int main(int argc, char** argv) {
     // 这条消息本身就是"从现在起没人在管"的信号
     {
         int with_pos = 0;
-        if (sar_engine)
-            for (const auto& b : sar_engine->get_bots()) if (b.qty > 0) ++with_pos;
+        if (trend_engine)
+            for (const auto& b : trend_engine->get_bots()) if (b.qty > 0) ++with_pos;
         if (!webhook.empty())
             send_webhook(webhook, "[ccbot] 进程已退出（" + std::to_string(with_pos) +
                                   " 个品种仍有持仓）——本地移动止损从此刻停止推进，"

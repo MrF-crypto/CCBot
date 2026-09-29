@@ -18,16 +18,31 @@
       "leverage": 3,
       "interval": "4h",
 
-      "mode": "donchian",
+      "strategy": "turtle",
       "donchian_period": 20,
       "atr_period": 14,
       "atr_mult": 3.0,
 
-      "allow_reverse": true,
-      "reverse_needs_signal": true,
-      "max_consecutive_reverses": 2,
-      "cooldown_bars": 3,
-      "signal_max_age_sec": 900,
+      "reverse": "none",
+      "signal_max_age_sec": 0,
+
+      "use_disaster_stop": true,
+      "disaster_stop_buffer_pct": 1.0
+    },
+    {
+      "symbol": "BTCUSDT",
+      "budget_usdt": 500,
+      "leverage": 3,
+      "interval": "1h",
+
+      "strategy": "psar",
+      "af_start": 0.02,
+      "af_step": 0.02,
+      "af_max": 0.20,
+
+      "max_consecutive_reverses": 3,
+      "cooldown_bars": 2,
+      "signal_max_age_sec": 0,
 
       "use_disaster_stop": true,
       "disaster_stop_buffer_pct": 1.0
@@ -36,21 +51,20 @@
       "symbol": "SOLUSDT",
       "budget_usdt": 500,
       "leverage": 3,
-      "interval": "3m",
+      "interval": "5m",
 
-      "mode": "bar_pattern",
+      "strategy": "bare_k",
+      "bare_entry": "break_prev",
+      "once_per_bar": false,
       "swing_bars": 3,
-      "atr_period": 14,
 
       "size_mode": "risk_based",
       "risk_usdt": 20,
 
-      "pyramid_max_adds": 2,
-      "pyramid_step_atr": 0.5,
-
-      "allow_reverse": true,
-      "reverse_needs_signal": true,
-      "signal_max_age_sec": 300,
+      "reverse": "immediate",
+      "max_consecutive_reverses": 2,
+      "cooldown_bars": 3,
+      "signal_max_age_sec": 0,
 
       "use_disaster_stop": true,
       "disaster_stop_buffer_pct": 1.0

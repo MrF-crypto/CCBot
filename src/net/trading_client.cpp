@@ -1094,10 +1094,34 @@ TradingClient::place_cond_market(const std::string& sym, const char* order_type,
 // ── 灾难止损单：STOP_MARKET + closePosition ───────────────────────────────────
 // 与 place_cond_market 的区别：不带 quantity / reduceOnly（币安对 closePosition
 // 同时带这两者会直接拒单），仓位平掉后交易所自动撤销。
-std::string TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
-                                                const std::string& entry_side) {
+// 这个错误码重试还有没有意义。
+//
+// ⚠ 默认返回 true（可重试）。判错的两个方向代价不对称：误判成可重试只是白等
+//   二十多秒然后照样走兜底；误判成不可重试会把一个本来能恢复的网络抖动
+//   直接变成"平掉刚开的仓"。所以只对【确定无望】的码返回 false。
+static bool stop_error_retryable(const std::string& err) {
+    // err 形如 "[-1111] Precision is over the maximum defined for this asset."
+    static const char* kHopeless[] = {
+        "[-1111]",   // 精度超限——参数错了，重试多少次都一样
+        "[-2021]",   // Order would immediately trigger：触发价在错误的一侧
+        "[-1102]",   // 必填参数缺失/为空
+        "[-1106]",   // 发了不该发的参数
+        "[-1116]",   // 非法 orderType
+        "[-1117]",   // 非法 side
+        "[-4061]",   // positionSide 与持仓模式不匹配
+    };
+    for (const char* c : kHopeless)
+        if (err.find(c) != std::string::npos) return false;
+    return true;
+}
+
+TradingClient::StopPlacement
+TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
+                                   const std::string& entry_side) {
     stop_price = round_price(sym, stop_price);
-    if (stop_price <= 0) return "";
+    // 取整之后还 <=0：传进来的价本身就不合法，重试没有意义
+    if (stop_price <= 0)
+        return { "", "止损触发价非法（取整后 <= 0）", false };
 
     const std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
     const auto& info = get_symbol_info(sym);
@@ -1117,16 +1141,27 @@ std::string TradingClient::place_disaster_stop(const std::string& sym, double st
         oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
 
     auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), oss.str());
-    if (resp.empty()) return "";
+    // 空响应 = 超时/网络断。可能单子其实挂上了，但我们拿不到单号——当失败处理
+    // 并重试是安全的：closePosition 单同方向只允许一张，重复挂会被交易所拒，
+    // 拒了就进入下一次重试，不会留下两张
+    if (resp.empty())
+        return { "", "空响应（超时或网络中断）", true };
+
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return "";
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS)
+        return { "", "响应不是合法 JSON: " + resp.substr(0, 120), true };
+
     std::string err;
-    if (binance_error(doc, err)) return "";
+    if (binance_error(doc, err))
+        return { "", err, stop_error_retryable(err) };
+
     int64_t oid = 0;
     get_or_keep(doc[pm ? "strategyId" : "orderId"], oid);
-    return oid > 0 ? std::to_string(oid) : "";
+    if (oid > 0) return { std::to_string(oid), "", true };
+    // 没报错但也没给单号：语义不明，当失败但允许重试
+    return { "", "响应里没有单号: " + resp.substr(0, 120), true };
 }
 
 bool TradingClient::cancel_disaster_stop(const std::string& sym,
@@ -1203,56 +1238,20 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
     return out;
 }
 
-static std::vector<double> closes_of(const std::vector<TradingClient::Bar>& bars) {
-    std::vector<double> c;
-    c.reserve(bars.size());
-    for (const auto& b : bars) c.push_back(b.close);
-    return c;
-}
+// fetch_indicators（BOLL+RSI）、fetch_trend（EMA200 趋势态）与它们共用的
+// closes_of 随网格DCA 一并删除：那三样只服务 DCA 的首单信号与趋势过滤，
+// v5.0.0 删掉 DCA 之后就是零调用者了。
+//
+// ⚠ 删它们的时候踩了个坑，记下来：这两个死函数在文件里【不相邻】，中间夹着
+//   下面这三个还在用的（trend_signal / atr / bar_pattern）。按行号一整段切会
+//   把中间那三个一起带走，而且编译期发现不了——是链接期才报未解析符号。
+//   删函数要逐个定边界，别信"它们看起来是连在一起的"。
 
-
-// ── BOLL + RSI 快照（一次K线拉取，两个指标一起算）───────────────────────────────
-TradingClient::IndicatorSnapshot TradingClient::fetch_indicators(
-        const std::string& sym, const std::string& interval,
-        int boll_period, double boll_mult, int rsi_period) {
-    IndicatorSnapshot out;
-    int need = std::max(boll_period, rsi_period + 20) + 5;
-    auto closes = closes_of(fetch_klines(sym, interval, need));
-    if (closes.empty()) return out;
-
-    out.price = closes.back();
-
-    auto boll = indicators::bollinger(closes, boll_period, boll_mult);
-    out.boll_ub = boll.ub;
-    out.boll_mb = boll.mb;
-    out.boll_lb = boll.lb;
-    out.rsi     = indicators::rsi(closes, rsi_period);
-
-    // 涨幅：closes.back() 是【未收盘】的当前K线，往回数才是已收盘的基准。
-    // need 至少 39 根（boll/rsi 的需求），7 根回看永远够，不必额外拉数据
-    const size_t n = closes.size();
-    auto pct_from = [&](size_t back) -> double {
-        const double base = closes[n - 1 - back];
-        return base > 0 ? (closes.back() - base) / base * 100.0 : 0.0;
-    };
-    // chg_ok 以【两条都算得出】为准（8 根）。不足时保持 0 且 chg_ok=false，
-    // 免得新上市品种因"历史不够"被当成"涨幅为 0"而放行。
-    // 实践中这条兜底不会触发：out.ok 取自 boll.ok，20 根不够就整个快照作废
-    if (n >= 8) {
-        out.chg_1  = pct_from(1);
-        out.chg_7  = pct_from(7);
-        out.chg_ok = true;
-    }
-
-    out.ok = boll.ok;
-    return out;
-}
-
-// ── SAR 信号快照（ATR + 唐奇安通道）──────────────────────────────────────────
-TradingClient::SarSnapshot TradingClient::fetch_sar_signal(
+// ── 趋势信号快照（ATR + 唐奇安通道）──────────────────────────────────────────
+TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         const std::string& sym, const std::string& interval,
         int donchian_period, int atr_period) {
-    SarSnapshot out;
+    TrendSnapshot out;
     if (donchian_period <= 0 || atr_period <= 0) return out;
 
     // 通道要 period+1 根（+1 是被排除的当前根）；ATR 的 Wilder 平滑要预热，
@@ -1306,12 +1305,14 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
     if ((int)bars.size() < swing_bars + 2) return out;
 
     const int n = (int)bars.size();
+    // bars[n-1] = 当前【未收盘】那根；bars[n-2] = 刚收盘那根（用户口径的 bar 0）
     out.price       = bars[n - 1].close;      // 未收盘根的实时值
+    out.cur_open    = bars[n - 1].open;       // 盘中即时入场拿它和实时价比
     out.bar_open_ms = bars[n - 1].open_ms;
 
-    const auto& sig = bars[n - 2];            // 刚收盘那根 = 用户的 bar 0
-    out.bullish = sig.close > sig.open;
-    out.bearish = sig.close < sig.open;
+    out.prev_close = bars[n - 2].close;       // bar 0 的收盘价
+    if (n >= 3) { out.prev_high  = bars[n - 3].high; out.prev_low  = bars[n - 3].low; }
+    if (n >= 4) { out.prev2_high = bars[n - 4].high; out.prev2_low = bars[n - 4].low; }
 
     // 摆动窗口 = 信号根【之前】的 N 根（用户的 1..N），不含信号根自己
     double lo = bars[n - 3].low, hi = bars[n - 3].high;
@@ -1321,29 +1322,8 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
     }
     out.swing_low  = lo;
     out.swing_high = hi;
-    out.ok = (out.price > 0 && lo > 0 && hi > 0 && hi >= lo);
-    return out;
-}
-
-// ── 高周期趋势快照（趋势状态机）───────────────────────────────────────────────
-TradingClient::TrendSnapshot TradingClient::fetch_trend(
-        const std::string& sym, const std::string& interval,
-        int ema_period, int slope_bars) {
-    TrendSnapshot out;
-    int need = ema_period + slope_bars + 25;
-    auto closes = closes_of(fetch_klines(sym, interval, need));
-    if ((int)closes.size() < ema_period + slope_bars) return out;   // 新币历史不够，不判定趋势
-
-    out.price   = closes.back();
-    out.ema_val = indicators::ema(closes, ema_period);
-    double mb_now  = indicators::sma_at(closes, 20, 0);
-    double mb_prev = indicators::sma_at(closes, 20, slope_bars);
-    if (out.ema_val <= 0 || mb_prev <= 0) return out;
-    out.mb_slope_pct = (mb_now - mb_prev) / mb_prev * 100.0;
-
-    // 空头态双条件：价格在 EMA 之下 且 中轨明显下拐（-0.2%阈值防横盘抖动）
-    out.bearish = (out.price < out.ema_val) && (out.mb_slope_pct < -0.2);
-    out.ok = true;
+    out.ok = (out.price > 0 && out.cur_open > 0 && out.prev_close > 0 &&
+              out.prev_high > 0 && out.prev_low > 0 && lo > 0 && hi > 0 && hi >= lo);
     return out;
 }
 

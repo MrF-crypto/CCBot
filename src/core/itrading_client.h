@@ -25,16 +25,32 @@ public:
     virtual bool   set_leverage(const std::string& symbol, int lev)  = 0;
     virtual bool   is_dual_mode() const = 0;
 
-    // ── 交易所侧灾难止损单（进程外兜底）──────────────────────────────────────
-    // 本地的追踪止盈活在进程里，程序崩溃、断电、误关窗口之后仓位就
-    // 完全裸奔。这两个方法在交易所挂一张 STOP_MARKET + closePosition 的单子，
-    // 只防瀑布、不参与正常止盈，进程死了它还在。
-    //
-    // 默认空实现：回测的 SimClient 不需要它（回测里进程不会崩），只有实盘
-    // TradingClient 覆盖。返回空串 = 未挂上（不支持或失败）。
-    virtual std::string place_disaster_stop(const std::string& /*symbol*/,
-                                            double /*stop_price*/,
-                                            const std::string& /*entry_side*/) { return ""; }
+    // ── 交易所侧硬止损（进程外兜底，"保命单"）────────────────────────────────
+    // 本地的移动止损活在进程里，程序崩溃、断电、误关窗口之后仓位就完全裸奔。
+    // 这两个方法在交易所挂一张 STOP_MARKET + closePosition 的单子，
+    // 开仓时挂一次、此后不动，只防瀑布，进程死了它还在。
+    struct StopPlacement {
+        std::string order_id;          // 非空 = 挂上了
+        std::string error;             // 失败原因，给人看
+        // 重试有没有意义。区分它的理由：参数类错误（精度不对、触发价在错误的
+        // 一侧）重试十次也是同样的结果，而引擎的重试阶梯要跑二十多秒——
+        // 那二十多秒里仓位没有进程外保护。分流之后这类错误直接走到兜底处置。
+        //
+        // ⚠ 默认 true。判错的两个方向代价不对称：
+        //   误判成可重试  → 白等二十多秒，然后照样走兜底（只是慢）
+        //   误判成不可重试 → 一个本来能恢复的抖动直接把仓位平掉（丢单）
+        //   所以只对【确定无望】的错误码标 false
+        bool retryable = true;
+        bool ok() const { return !order_id.empty(); }
+    };
+
+    // 默认实现返回"不支持且不必重试"：回测的 SimClient 用不到它（回测里进程
+    // 不会崩）。标 retryable=false 是有意的——否则模拟环境会白跑一遍重试阶梯
+    virtual StopPlacement place_disaster_stop(const std::string& /*symbol*/,
+                                              double /*stop_price*/,
+                                              const std::string& /*entry_side*/) {
+        return StopPlacement{"", "该客户端不支持交易所侧硬止损", false};
+    }
     virtual bool cancel_disaster_stop(const std::string& /*symbol*/,
                                       const std::string& /*order_id*/) { return true; }
 };
