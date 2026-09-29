@@ -67,9 +67,19 @@ std::string BookTickerStream::Health::summary() const {
 
 // ── 纯函数判定 ────────────────────────────────────────────────────────────────
 // 为什么抽出来：见头文件。三个判断的误判都不报错，必须用断言钉住。
+int64_t BookTickerStream::silence_budget_ms(int kicks_since_ok) {
+    // 分档而不是指数：档位少、可读、能在测试里穷举。上限 3 分钟——再长的话
+    // 网络恢复之后要等太久才回到实时行情（期间 REST 兜底价仍在工作，所以
+    // 慢一点是可以接受的，但不能慢到几十分钟）
+    if (kicks_since_ok < 3)  return kSilenceMs;   // 20s，正常灵敏度
+    if (kicks_since_ok < 6)  return 45000;
+    if (kicks_since_ok < 10) return 90000;
+    return 180000;
+}
+
 bool BookTickerStream::should_kick(int64_t now, int64_t last_msg_ms,
                                    int64_t conn_since_ms, bool connected,
-                                   size_t stream_n) {
+                                   size_t stream_n, int kicks_since_ok) {
     // 没连上时重连是库的事，掀它没有意义（也没有东西可掀）
     if (!connected) return false;
     // 这条连接上一条流都没有：本来就不该有数据，不是故障。
@@ -80,7 +90,7 @@ bool BookTickerStream::should_kick(int64_t now, int64_t last_msg_ms,
     // 刚连上还没收到第一包时，从【连接建立】起算而不是从 0 起算——
     // 否则首次连接的瞬间就会被判成静默 (now - 0 必然巨大)
     const int64_t base = (last_msg_ms > conn_since_ms) ? last_msg_ms : conn_since_ms;
-    return now - base > kSilenceMs;
+    return now - base > silence_budget_ms(kicks_since_ok);
 }
 
 bool BookTickerStream::should_warn_no_data(int64_t now, int64_t last_msg_ms,
@@ -349,6 +359,22 @@ void BookTickerStream::pump_loop() {
 
             if (should_warn_no_data(now, lm, cs, conn, s.n)
                 && !c->nodata_warned.exchange(true)) {
+              // 长文只印一次（进程级）。nodata_warned 是【按连接】的 latch，
+              // 每次 Open 都重置，而故障持续时每 20 秒就重连一次——不加这道
+              // 进程级闸，那一整段会每 20 秒重印一遍。实测日志里三分钟刷了九段，
+              // 连自检结论本身都被冲得看不见了。长文的价值在于被读一次
+              if (nodata_essay_done_.exchange(true)) {
+                if (now - last_nodata_note_ms_ >= kNodataNoteMs) {
+                    last_nodata_note_ms_ = now;
+                    const int k = c->kicks_since_ok.load();
+                    say("⚠ 行情WS#" + std::to_string(c->id) + " 仍然零数据（已强制重连 "
+                        + std::to_string(k) + " 次未恢复，重连间隔已退避到 "
+                        + std::to_string(silence_budget_ms(k) / 1000)
+                        + " 秒）。详细诊断与自检结论见上文，不再重复。\n"
+                        "    标记价与K线仍走 REST 兜底，策略照常运行，"
+                        "但用的不是实时价。");
+                }
+              } else {
                 // 分两种成因说，因为修法完全相反。判据是有没有收到过控制帧
                 // （订阅确认）：币安对每条 SUBSCRIBE 必回 {"result":null,"id":N}
                 const int ctrl = c->ctrl_msgs.load();
@@ -397,14 +423,16 @@ void BookTickerStream::pump_loop() {
                 { std::lock_guard<std::mutex> lk(mtx_);
                   if (!c->streams.empty()) first = *c->streams.begin(); }
                 start_probe(first);
+              }
             }
 
-            if (should_kick(now, lm, cs, conn, s.n)) {
+            const int kicks = c->kicks_since_ok.load();
+            if (should_kick(now, lm, cs, conn, s.n, kicks)) {
                 const int64_t base = (lm > cs) ? lm : cs;
                 force_reconnect(c, "连接看起来正常但已 "
                                    + std::to_string((now - base) / 1000) + " 秒");
-            } else if (!conn && c->kicks_since_ok.load() > 0
-                       && now - c->last_kick_ms.load() > kSilenceMs) {
+            } else if (!conn && kicks > 0
+                       && now - c->last_kick_ms.load() > silence_budget_ms(kicks)) {
                 // 掀过一次但连接一直没回来。这种状态下 connected 恒为 false，
                 // should_kick 永远不会再成立，只能靠这条分支升级处置
                 force_reconnect(c, "强制重连后 "
@@ -429,8 +457,13 @@ void BookTickerStream::force_reconnect(Conn* c, const std::string& why) {
     c->conn_since_ms.store(0);
 
     const std::string tag = "行情WS#" + std::to_string(c->id);
+    // 退避之后这条的频率自然降下来了（20s → 45s → 90s → 180s），所以仍然每次都
+    // 报——它是"还在自愈"的唯一凭据。但要把下一次的间隔写出来，否则看日志的人
+    // 会以为程序卡住了不再重试
     say("⚠ " + tag + " " + why + "没有任何数据包，判定为半开连接，强制重连（累计 "
-        + std::to_string(kicks) + " 次）");
+        + std::to_string(kicks) + " 次，本条连接连续 " + std::to_string(since)
+        + " 次未恢复，下次容忍 " + std::to_string(silence_budget_ms(since) / 1000)
+        + " 秒静默）");
 
     // ⚠ 绝不能持 mtx_ 调 ws 的方法：close()/stop() 会等 WS 线程走完，
     //   而 WS 线程可能正在 on_message 里等 mtx_ —— 直接死锁。

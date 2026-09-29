@@ -260,8 +260,17 @@ public:
     // 该不该掀掉这条连接重连：
     //   判太松 → 半开连接永远不恢复，回到本轮要修的那个问题
     //   判太紧 → 正常连接被反复打断，每次重连都要全量重订，反而更不稳
+    //
+    // kicks_since_ok = 连续掀了多少次都没换来一个数据包。据它退避：连续掀不好
+    // 说明这不是"半开连接"那种能靠重连自愈的故障，而是外部原因（出口 IP 被
+    // 限制、代理没把域名送到币安）。此时每 20 秒掀一次只有三个后果——日志被
+    // 刷满、白耗币安的「300 连接 / 5 分钟 / IP」配额、把真正有用的告警冲散。
+    // 收到数据包时 kicks_since_ok 归零（见 on_message），立刻回到 20 秒的灵敏度：
+    // 退避只惩罚"一直好不了"，不惩罚偶发抖动
     static bool should_kick(int64_t now, int64_t last_msg_ms, int64_t conn_since_ms,
-                            bool connected, size_t stream_n);
+                            bool connected, size_t stream_n, int kicks_since_ok = 0);
+    // 当前该容忍多久的静默（毫秒）。抽成纯函数是为了能穷举各档
+    static int64_t silence_budget_ms(int kicks_since_ok);
     // 是否该提示"连上了但订阅没生效"
     static bool should_warn_no_data(int64_t now, int64_t last_msg_ms, int64_t conn_since_ms,
                                     bool connected, size_t stream_n);
@@ -482,6 +491,15 @@ private:
     std::atomic<int>     probe_msgs_ {0};
     int64_t              probe_start_ms_ = 0;
     std::string          probe_stream_;
+
+    // 那段长诊断（含订阅确认原文、排查顺序）只印一次。
+    // ⚠ nodata_warned 是【按连接】的 latch，每次 Open 都重置 —— 而故障持续时
+    //   每 20 秒就重连一次，于是那一整段每 20 秒重印一遍。实测日志里三分钟
+    //   刷了九段，把自检结论本身都冲得看不见了。
+    //   长文的价值在于被读一次；之后只需要"还在坏"这个事实
+    std::atomic<bool>    nodata_essay_done_{false};
+    int64_t              last_nodata_note_ms_ = 0;   // 短提示的节流（pump 线程独占）
+    static constexpr int64_t kNodataNoteMs = 300000; // 5 分钟一条短提示
 };
 
 } // namespace ccbot

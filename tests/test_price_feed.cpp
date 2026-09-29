@@ -267,6 +267,31 @@ int main() {
         check(B::should_kick(T + B::kSilenceMs + 1, T, T, true, 4),
               "边界：超出 1ms 就掀");
 
+        // ── 退避：连续掀不好就放宽静默容忍度 ────────────────────────────────
+        // 连续掀不好说明这不是"半开连接"那种能靠重连自愈的故障，而是外部原因
+        // （出口 IP 被限制、代理没把域名送到币安）。此时每 20 秒掀一次只有三个
+        // 后果：日志被刷满、白耗币安的「300 连接/5 分钟/IP」配额、把真正有用的
+        // 告警冲散。实测日志里三分钟掀了 8 次、刷了 9 段长诊断
+        check(B::silence_budget_ms(0) == B::kSilenceMs, "没失败过 ⇒ 20 秒的正常灵敏度");
+        check(B::silence_budget_ms(2) == B::kSilenceMs, "前两次仍按 20 秒（偶发抖动不该被惩罚）");
+        check(B::silence_budget_ms(3) > B::kSilenceMs,  "连续 3 次未恢复 ⇒ 开始退避");
+        check(B::silence_budget_ms(6) > B::silence_budget_ms(3), "继续失败 ⇒ 继续放宽");
+        check(B::silence_budget_ms(10) > B::silence_budget_ms(6), "再放宽一档");
+        check(B::silence_budget_ms(999) == B::silence_budget_ms(10),
+              "有上限：不能退避到几十分钟，网络恢复后要在可接受时间内回到实时行情");
+        check(B::silence_budget_ms(999) <= 300000, "上限不超过 5 分钟");
+
+        // 退避必须真的作用到 should_kick 上，不能只是个没人用的函数
+        check(B::should_kick(T + 21000, 0, T, true, 4, /*kicks=*/0),
+              "kicks=0：21 秒静默就掀");
+        check(!B::should_kick(T + 21000, 0, T, true, 4, /*kicks=*/5),
+              "kicks=5：同样 21 秒【不】掀了，已退避");
+        check(B::should_kick(T + 200000, 0, T, true, 4, /*kicks=*/5),
+              "  但超过退避后的阈值照样掀（退避不是放弃）");
+        // 默认实参保持旧行为：漏传时不能悄悄变得更钝
+        check(B::should_kick(T + 21000, 0, T, true, 4),
+              "默认实参 == kicks=0，漏传不得让看门狗变钝");
+
         // kSilenceMs 必须比 kStaleMs 宽。两者判的不是一回事：
         // kStaleMs 是"某一个品种的价格旧了"，可能只是那条流抖了一下；
         // kSilenceMs 是"所有品种一个包都没有"。反过来的话，单品种抖动会
