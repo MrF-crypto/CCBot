@@ -166,7 +166,9 @@ int main(int argc, char** argv) {
 
     auto pool = std::make_shared<ThreadPool>(4);
 
-    std::atomic<bool> state_dirty{false};
+    // state_dirty 随 DCA 一起删了：它是"引擎日志触发落盘"的脏标记，而趋势策略的
+    // 落盘不用脏标记——止损线的棘轮推进不产生日志，靠脏标记会永远丢掉那个值，
+    // 所以改成固定每约 1 分钟落一次（见主循环 5)）
     const std::string webhook = cfg.alert_webhook;
 
     // 交易明细 CSV 落盘（周期统计数据源）：追加写，一行一笔平仓。
@@ -265,7 +267,8 @@ int main(int argc, char** argv) {
     // 止损/止盈判定饿死几十秒——现在价格喂入永远最先、拉取全部异步。
     // 注意声明顺序：busy标记/互斥量/区域表必须在 fetch_pool 之前声明——析构是
     // 逆序的，池要最先销毁（join工人线程），否则在途任务会引用已析构的局部变量
-    std::atomic<bool> ind_busy{false}, trend_busy{false}, hb_busy{false}, rec_busy{false};
+    // ind_busy / trend_busy 随网格DCA 的指标与趋势批次一并删除
+    std::atomic<bool> hb_busy{false}, rec_busy{false};
     std::atomic<bool> sar_sig_busy{false};
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。

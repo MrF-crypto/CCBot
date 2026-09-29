@@ -2073,14 +2073,9 @@ void MainWindow::refreshBotTable() {
         return it;
     };
 
-    // 均价/强平价/保证金等。同样的截断问题：原先最细只有 6 位，
-    // 价格低于 0.000001 的品种（1000 系列之外的极便宜币）会显示成 "$0.000000"。
-    // 复用 price_decimals 的数量级阶梯，这里没有 tick_size 可用故传 0
-    auto fmt_price = [](double p) -> QString {
-        if (p <= 0) return "--";
-        return QString("$%1").arg(p, 0, 'f', price_decimals(p, 0));
-    };
-
+    // fmt_price 随 DCA 填充体一并删除（均价/强平价/保证金那几列由 fillSarRow 自己格式化）。
+    // ⚠ MSVC 对未使用的 lambda 不报警，只有 Clang 的 -Wunused-variable 会——
+    //   本机编得过，推上去才发现
 
     int64_t now_ms = BookTickerStream::now_ms();
 

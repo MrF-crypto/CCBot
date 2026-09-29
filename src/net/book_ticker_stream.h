@@ -152,7 +152,15 @@ public:
         std::string summary() const;
     };
 
-    explicit BookTickerStream(bool testnet = false, Feeds feeds = {});
+    // ⚠ 刻意【不】写成 `BookTickerStream(bool, Feeds feeds = {})` 这一个带默认实参的
+    //   构造函数。Feeds 是嵌套类，而它的默认成员初始化器在外层类的类体还没结束时
+    //   不可用——默认实参正好处在那个位置。MSVC 放过了，GCC 与 Clang 都拒绝：
+    //     GCC:   could not convert '<brace-enclosed initializer list>()' to 'Feeds'
+    //     Clang: default member initializer for 'agg_trade' needed within definition
+    //            of enclosing class ... outside of member functions
+    //   拆成两个构造函数之后，Feeds{} 落在 .cpp 的函数体里，这条规则就不适用了
+    explicit BookTickerStream(bool testnet = false);
+    BookTickerStream(bool testnet, Feeds feeds);
     ~BookTickerStream();
 
     BookTickerStream(const BookTickerStream&)            = delete;

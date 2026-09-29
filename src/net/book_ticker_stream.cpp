@@ -107,6 +107,11 @@ size_t BookTickerStream::pick_conn(const std::vector<size_t>& counts,
 }
 
 // ── 构造 / 析构 ───────────────────────────────────────────────────────────────
+// 两个构造函数而不是一个带默认实参的，理由见头文件（嵌套类的默认成员初始化器
+// 不能出现在外层类体内的默认实参位置）
+BookTickerStream::BookTickerStream(bool testnet)
+    : testnet_(testnet), feeds_(Feeds{}) {}
+
 BookTickerStream::BookTickerStream(bool testnet, Feeds feeds)
     : testnet_(testnet), feeds_(feeds) {}
 

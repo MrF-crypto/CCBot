@@ -79,8 +79,15 @@ jobs:
       # -k 0 = 一个目标失败也把其余编完。-Werror 开了之后这很要紧：
       # 默认行为是首个 TU 报错就停，于是一轮 CI 只能暴露一个错误，修一个再推一轮。
       # 编完再报能一次拿全清单
+      # ⚠ pipefail 不能省。管道的退出码默认取【最后一个命令】（tee，永远成功），
+      #   所以没有它的时候【编译失败根本不会让这一步失败】——v5.0.0 那次就是这样：
+      #   三个编译错误被吞掉，Build 显示成功，直到四步之后的测试阶段才以
+      #   "./build/xxx: No such file or directory"（exit 127）的形式冒出来，
+      #   而那个信息完全指不向真正的原因
       - name: Build
-        run: cmake --build build -- -k 0 2>&1 | tee build.log
+        run: |
+          set -o pipefail
+          cmake --build build -- -k 0 2>&1 | tee build.log
 
       # 警告清单。v4.7.1 起 -DCCBOT_WERROR=ON，警告已经是【硬门禁】——有警告的话
       # 上面那步 Build 就直接失败了，走不到这里。

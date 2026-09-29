@@ -103,7 +103,10 @@ private:
 
 // ── 不变量 ───────────────────────────────────────────────────────────────────
 // 这些在【任何】线程交错下都必须成立。破了就是状态撕裂，不是"结果不理想"。
-static bool finite(double v) { return std::isfinite(v); }
+// ⚠ 不能叫 finite()：POSIX 的 <math.h> 里有个同名的 finite(double)，
+//   在 glibc 上会撞成 "ambiguating new declaration"。MSVC 没有那个函数，
+//   所以这个错只有 Linux 报
+static bool is_finite(double v) { return std::isfinite(v); }
 
 static void check_invariants(const std::vector<SarBot>& bots, const std::string& tag) {
     for (const auto& b : bots) {
@@ -140,8 +143,9 @@ static void check_invariants(const std::vector<SarBot>& bots, const std::string&
 
         // ④ 任何浮点字段都不得是 NaN/Inf。这条单独立着是因为 NaN 会
         //    【静默传播】：带着 NaN 数量去下单，比较运算全为假，所有闸门失效
-        if (!finite(b.qty) || !finite(b.st.stop) || !finite(b.st.entry_price) ||
-            !finite(b.st.peak) || !finite(b.realized_pnl) || !finite(b.current_price)) {
+        if (!is_finite(b.qty) || !is_finite(b.st.stop) || !is_finite(b.st.entry_price) ||
+            !is_finite(b.st.peak) || !is_finite(b.realized_pnl) ||
+            !is_finite(b.current_price)) {
             check(false, p + "无 NaN/Inf"); return;
         }
 
