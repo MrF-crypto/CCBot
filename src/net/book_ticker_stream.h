@@ -369,6 +369,16 @@ private:
         //   而重连恰恰是最容易丢订阅的时刻
         std::atomic<bool>    data_seen     {false};
         std::atomic<bool>    nodata_warned {false};
+        // 本次连接收到的【控制帧】数量（订阅确认 {"result":null,"id":N}、
+        // 错误应答等非数据消息）。
+        //
+        // ⚠ 它是"没有行情"的两种成因之间唯一的判据，缺了它两者在日志上
+        //   完全一样，而修法南辕北辙：
+        //     ctrl_msgs > 0  → 币安在应答，是【订阅】的问题（流名错/被拒）
+        //     ctrl_msgs == 0 → 连订阅确认都没回，根本没连到币安，是【网络】
+        //                      的问题（代理/DNS 把域名劫持到了别处）
+        //   实测日志里日志一口咬定"流名有误/被服务端拒绝"，而真因是后者
+        std::atomic<int>     ctrl_msgs     {0};
         std::set<std::string> streams;            // 由外层 mtx_ 保护
         int id = 0;
 

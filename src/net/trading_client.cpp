@@ -1150,8 +1150,32 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS)
-        return { "", "响应不是合法 JSON: " + resp.substr(0, 120), true };
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
+        // 响应不是 JSON = 这个请求没到币安的 API。真实案例（2026-09-29）：
+        // 代理把 *.binance.com 劫持到 198.18/15 的 fake-IP，于是拿回来一张
+        // https://www.binance.com/en/error 的 HTML 页，而原始日志只说
+        // "响应不是合法 JSON"，看的人会以为是止损价精度之类的参数问题。
+        //
+        // ⚠ 仍然【可重试】。看起来该直接判死——网络路径不通、DNS 被劫持
+        //   不会在二十多秒里自己好——但 Cloudflare 的 502/503 也是 HTML，
+        //   而那种是真能重试过去的。判错的代价不对称：白等二十多秒然后照样
+        //   兜底，对上"把一次能恢复的抖动直接变成平掉刚开的仓"。
+        //   开平循环的成本已经由兜底冷却 + 账户级熔断挡住了，不必在这里
+        //   再拿安全性去换。
+        //
+        // 去掉换行：HTML 页原样打出来会把一条日志撑成几十行
+        std::string body = resp.substr(0, 200);
+        for (auto& ch : body) if (ch == '\n' || ch == '\r') ch = ' ';
+        const bool looks_html =
+            body.find("<!DOCTYPE") != std::string::npos ||
+            body.find("<html")     != std::string::npos ||
+            body.find("<HTML")     != std::string::npos;
+        return { "", std::string(looks_html
+                     ? "收到的是 HTML 网页而不是 API 响应 —— 请求没到币安，"
+                       "八成是代理/DNS 把域名劫持到了别处（与止损价、精度无关）: "
+                     : "响应不是合法 JSON: ") + body,
+                 true };
+    }
 
     std::string err;
     if (binance_error(doc, err))

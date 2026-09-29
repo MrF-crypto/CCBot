@@ -1126,6 +1126,7 @@ void MainWindow::load_and_restore_trend() {
     if (!doc.isArray()) return;
 
     int n = 0;
+    int migrated = 0;   // 用到了旧键的条目数，>0 时结束前落盘一次固化迁移结果
     for (const auto& v : doc.array()) {
         if (!v.isObject()) continue;
         const auto o = v.toObject();
@@ -1182,6 +1183,7 @@ void MainWindow::load_and_restore_trend() {
                         "入场条件比原来严格，信号会明显变少——"
                         "这是有意的，旧规则在下跌趋势里会把一根反弹阳线当成做多信号。")
                     .arg(sym), "WARN");
+            ++migrated;
         } else {
             b.cfg.rule.strategy = trend::Strategy::Turtle;
         }
@@ -1199,10 +1201,12 @@ void MainWindow::load_and_restore_trend() {
             const bool needs = o["reverse_needs_signal"].toBool(true);
             b.cfg.rule.reverse = (allow && !needs) ? trend::ReverseMode::Immediate
                                                    : trend::ReverseMode::None;
-            if (allow && needs)
+            if (allow && needs) {
                 log(QString("趋势 %1：旧的「反手需要反向信号」已合并进「只平掉，"
                             "回到正常入场流程」。行为几乎不变，唯一差别是现在"
                             "同向信号先来也会再进一次。").arg(sym), "WARN");
+            }
+            ++migrated;   // 旧键存在本身就该落盘换成新键，不只是有告警的那几条
         }
         // PSAR 的定义就是 stop-and-reverse，不反手它就永远空仓
         if (b.cfg.rule.strategy == trend::Strategy::ParabolicSar)
@@ -1257,6 +1261,14 @@ void MainWindow::load_and_restore_trend() {
     if (n > 0) {
         log(QString("已恢复 %1 个趋势 bot").arg(n), "OK");
         trendSigForce_.store(true);
+        // 迁移结果立刻固化。不存的话每次启动都会从旧键重新推断一遍，于是那几条
+        // 「已迁移为…」的告警每次启动都刷一遍——9 个 bot 就是 9 条，而告警的
+        // 意义是"这一次发生了行为变化"，天天刷就变成了背景噪音，真出事那次
+        // 反而看不见。存一次之后落盘里就是新键，下次启动干干净净
+        if (migrated > 0) {
+            save_trend_bots();
+            log(QString("上面 %1 条迁移已写回配置文件，下次启动不再提示").arg(migrated));
+        }
     }
     refreshBotTable();
 }

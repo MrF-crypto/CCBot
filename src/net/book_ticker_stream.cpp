@@ -155,8 +155,15 @@ void BookTickerStream::wire(Conn* c) {
             // ⚠ 每次连接都要重置这两个 latch，理由见头文件 Conn
             c->data_seen.store(false);
             c->nodata_warned.store(false);
+            c->ctrl_msgs.store(0);
             const int n_conn = ++c->connects;
-            c->kicks_since_ok.store(0);   // 连上了就算自愈成功，升级计数清零
+            // ⚠ 这里【不能】清 kicks_since_ok。
+            //   它原本写的是"连上了就算自愈成功"，但那个前提在真实故障里不成立：
+            //   代理/TUN 对任何 fake-IP 的 TCP 握手都会成功，于是每次 close()
+            //   之后都能重新 Open、计数每轮归零，kKickEscalate 那条"重建连接"
+            //   的升级路径【永远不会触发】——而它恰恰就是为"能连上但没数据"
+            //   写的。实测日志里连掀 11 次、每次都重连成功、一次都没升级。
+            //   真正的自愈标志是【收到数据包】，所以改到 on_message 里清
             connected_.store(true);       // 粗粒度标志；pump 每轮会校正
 
             size_t n_streams = 0;
@@ -274,10 +281,25 @@ void BookTickerStream::pump_loop() {
 
             if (should_warn_no_data(now, lm, cs, conn, s.n)
                 && !c->nodata_warned.exchange(true)) {
-                say("⚠ 行情WS#" + std::to_string(c->id) + " 已连接 "
-                    + std::to_string((now - cs) / 1000)
-                    + " 秒却一个数据包都没收到 —— 订阅很可能没生效（流名有误/"
-                      "被服务端拒绝）。若上面有「服务端消息」，那就是原因");
+                // 分两种成因说，因为修法完全相反。判据是有没有收到过控制帧
+                // （订阅确认）：币安对每条 SUBSCRIBE 必回 {"result":null,"id":N}
+                const int ctrl = c->ctrl_msgs.load();
+                const std::string head =
+                    "⚠ 行情WS#" + std::to_string(c->id) + " 已连接 "
+                    + std::to_string((now - cs) / 1000) + " 秒却一个行情包都没收到 —— ";
+                if (ctrl > 0) {
+                    say(head + "但服务端回了 " + std::to_string(ctrl) +
+                        " 条控制消息，说明【连到币安了】，问题出在订阅上："
+                        "多半是某条流名非法（币安会因为一条非法流名拒掉整条 "
+                        "SUBSCRIBE，于是这条连接上的流一条都订不上）。"
+                        "若上面有「服务端消息」，那就是原因");
+                } else {
+                    say(head + "连订阅确认都没回（币安对每条 SUBSCRIBE 必回 "
+                        "{\"result\":null}）。这不是订阅问题——请求根本没到币安。"
+                        "查代理/VPN 的分流规则是否覆盖 fstream.binance.com，"
+                        "以及 DNS 是否把它解析到了 198.18/15 这类 fake-IP："
+                        "那种地址上 TCP 握手必然成功，所以「连上了」说明不了任何事");
+                }
             }
 
             if (should_kick(now, lm, cs, conn, s.n)) {
@@ -486,6 +508,11 @@ void BookTickerStream::on_message(const std::string& json, Conn* c) {
         // ⚠ 控制消息【不算】数据活性。订阅被拒时服务端照样回消息，
         //   若把它计入 last_msg_ms，看门狗会认为"有来往所以连接是好的"，
         //   于是一条订阅全被拒的连接可以永远存活下去
+        //
+        // 但要【计数】：它是"币安在不在应答"的唯一证据。订阅确认本身不打日志
+        //   （正常情况每次重连都刷一条纯噪音），所以没有这个计数的话，
+        //   "收到了确认但没行情"和"一个字节都没回来"在日志上完全一样
+        if (c) c->ctrl_msgs.fetch_add(1);
         return;
     }
     if (json.size() < 20) return;
@@ -496,8 +523,12 @@ void BookTickerStream::on_message(const std::string& json, Conn* c) {
         //   连"已连接"都没有     → 压根没连上
         //   两条都有             → 数据在流，问题在别处
         // 每次连接都提示一次（不是进程级一次），因为重连是最容易丢订阅的时刻
-        if (!c->data_seen.exchange(true))
+        if (!c->data_seen.exchange(true)) {
             say("行情WS#" + std::to_string(c->id) + " 收到首个数据包，订阅生效");
+            // 真正的"自愈成功"是数据回来了，不是 TCP 连上了。升级计数在这里清，
+            // 不在 Open 分支清——理由见 wire() 里那段注释
+            c->kicks_since_ok.store(0);
+        }
         c->last_msg_ms.store(now_ms());
     }
 

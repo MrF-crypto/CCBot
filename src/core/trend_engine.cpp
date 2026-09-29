@@ -54,9 +54,30 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg) {
     b.start_time = host_.now_wall();
     b.last_action = "等待信号";
     bots_[b.bot_id] = b;
-    log(cfg.symbol + " SAR bot 已创建（通道" +
-        std::to_string(cfg.rule.donchian_period) + " / ATR" +
-        std::to_string(cfg.rule.atr_period) + " / k=" + fmt(cfg.rule.atr_mult, 1) + "）");
+    // 参数摘要要跟着策略走。此前这里无条件打印海龟的三个参数，于是裸K的 bot
+    // 刚配完就会看到"（通道20 / ATR14 / k=3.0）"——那三个数对它一个都不生效，
+    // 而日志读起来像是配置没生效
+    std::string params;
+    switch (cfg.rule.strategy) {
+    case trend::Strategy::ParabolicSar:
+        params = "AF " + fmt(cfg.rule.af_start, 3) + "/" + fmt(cfg.rule.af_step, 3) +
+                 "/" + fmt(cfg.rule.af_max, 3);
+        break;
+    case trend::Strategy::BareK:
+        params = std::string(cfg.rule.bare_entry == trend::BareEntry::Immediate
+                                 ? "立即顺势" : "等收盘突破") +
+                 " / 摆动N=" + std::to_string(cfg.rule.swing_bars) +
+                 (cfg.rule.once_per_bar ? " / 每根限一次" : "");
+        break;
+    case trend::Strategy::Turtle:
+    default:
+        params = "通道" + std::to_string(cfg.rule.donchian_period) +
+                 " / ATR" + std::to_string(cfg.rule.atr_period) +
+                 " / k=" + fmt(cfg.rule.atr_mult, 1);
+        break;
+    }
+    log(cfg.symbol + " " + trend::strategy_name(cfg.rule.strategy) +
+        " bot 已创建（" + params + " / " + cfg.interval + "）");
     return b.bot_id;
 }
 
@@ -336,6 +357,18 @@ void TrendEngine::set_max_open_positions(int n) {
 // ⚠ 调用方必须已持 mtx_（它要遍历 bots_）。声明在 tick 的决策循环内部调用，
 //   那里本来就持着锁
 std::string TrendEngine::open_gate_block(const TrendBot& self) const {
+    // 账户级硬止损熔断排在最前：它的判据与保证金/品种数无关，而且一旦成立，
+    // 后面两项算得再对也没有意义——开仓的前提（交易所侧有底）已经不成立了。
+    //
+    // ⚠ 这道闸和 per-bot 的 kDsCircuitBreak 不重复：后者只停出问题的那个 bot，
+    //   而挂不上硬止损几乎总是系统性的（账户受限、网络到不了交易所、条件单
+    //   端点不对、精度规则变了）。只有 per-bot 熔断时，N 个 bot 会各自烧满
+    //   自己的额度才停下——9 个 bot 就是 18 轮"开仓→挂不上→平仓"、36 笔
+    //   白付手续费的市价单，而第一轮结束时其实就已经能断定了
+    if (ds_account_broken_)
+        return "账户级熔断：已连续 " + std::to_string(ds_abandons_total_) +
+               " 次因挂不上交易所侧硬止损而兜底平仓，全局暂停开新仓";
+
     if (max_total_margin_ <= 0 && max_open_positions_ <= 0) return {};
 
     double used_margin = 0;
@@ -713,6 +746,7 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
     const auto placed = client_->place_disaster_stop(sym, target, side);
 
     bool give_up = false;
+    bool unbroke = false;           // 本次挂单成功是否解除了账户级熔断
     std::string give_up_why;
     std::string orphan_to_cancel;   // 挂上了但已经不需要的单，撤销放在锁外
     {
@@ -745,6 +779,15 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                 b.ds_attempts    = 0;
                 b.ds_unprotected = false;
                 b.ds_fail_closes = 0; // 挂成功 = 不是系统性故障，熔断计数清零
+                // 账户级熔断同理自动解除：能挂上就说明故障过去了。
+                // 要求人工干预才能复位是错的——故障往往是网络抖动或代理掉线，
+                // 恢复之后没有任何人会记得回来按一下
+                if (ds_account_broken_ || ds_abandons_total_ > 0) {
+                    const bool was_broken = ds_account_broken_;
+                    ds_abandons_total_ = 0;
+                    ds_account_broken_ = false;
+                    if (was_broken) unbroke = true;
+                }
             }
         // ⚠ 成功分支这里【不能 return】：孤儿单必须在锁外撤，return 会跳过那一步。
         //   所以失败处理整体放进 else，而不是靠提前返回
@@ -783,6 +826,9 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
         }   // ← else（挂单失败）结束
     }       // ← mtx_ 在此释放
 
+    if (unbroke)
+        log("✅ 账户级熔断已解除（" + sym + " 硬止损挂单成功），恢复开新仓");
+
     // 撤孤儿单必须在锁外：cancel 是 HTTP
     if (!orphan_to_cancel.empty()) client_->cancel_disaster_stop(sym, orphan_to_cancel);
     if (give_up) abandon_and_close(bot_id, give_up_why);
@@ -795,7 +841,8 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
 // 另一套风险模型——那正是这个仓库一路在消灭的那类"静默降级"。
 void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string& why) {
     std::string sym;
-    int fails = 0;
+    int  fails = 0, total = 0;
+    bool account_broken = false;   // 本次是否【刚刚】触发账户级熔断（只报一次）
     {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
         auto it = bots_.find(bot_id);
@@ -805,6 +852,21 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
         sym   = b.cfg.symbol;
         fails = ++b.ds_fail_closes;
         b.ds_unprotected = true;
+
+        // ⚠ 冷却必须在这里设，不能等 submit_close 回来再设：平仓是异步的，
+        //   而 tick 每 3 秒一拍。裸K·盘中即时 的入场条件（实时价 vs 本根开盘价）
+        //   在平仓成交后的下一拍就可能又成立——实测日志里 22:16:28 兜底平仓、
+        //   22:16:31 就又开了一笔，间隔 3 秒。
+        //   兜底平仓不是策略出场，它的含义是"开仓前提不成立"，而那个前提
+        //   在 3 秒后不会变成立。
+        // on_closed() 不碰 cooldown_left，所以在这里先设是安全的
+        b.st.cooldown_left = std::max(b.st.cooldown_left,
+                                      std::max(kDsAbandonCooldownBars,
+                                               b.cfg.rule.cooldown_bars));
+
+        account_broken = (++ds_abandons_total_ >= kDsAccountBreak) && !ds_account_broken_;
+        if (account_broken) ds_account_broken_ = true;
+        total = ds_abandons_total_;
     }
 
     log("⚠⚠ " + sym + " " + why + " —— 立即平掉该仓位。"
@@ -820,13 +882,29 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
     if (fails >= kDsCircuitBreak) {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
         auto it = bots_.find(bot_id);
-        if (it == bots_.end()) return;
-        it->second.state = TrendBot::State::Stopped;
-        it->second.last_action = "⚠ 硬止损连续挂不上，已停止";
+        if (it != bots_.end()) {
+            it->second.state = TrendBot::State::Stopped;
+            it->second.last_action = "⚠ 硬止损连续挂不上，已停止";
+        }
         log("⚠⚠ " + sym + " 已连续 " + std::to_string(fails) +
             " 次因挂不上硬止损而平仓，判定为系统性故障，**已停止该 bot**。"
             "继续重试只会不断支付开平手续费——请检查账户权限、品种是否支持"
             "closePosition、以及止损价精度");
+    }
+
+    // 账户级熔断只在【刚跨过阈值】那一次报。不去重的话，之后每个 bot 的每次
+    // 兜底平仓都会再刷一条同样的话
+    if (account_broken) {
+        log("⛔ 全局暂停开新仓：已累计 " + std::to_string(total) +
+            " 次因挂不上交易所侧硬止损而兜底平仓，判定为账户级/网络级故障。"
+            "挂不上硬止损几乎总是系统性的，让每个 bot 各自烧满自己的重试额度"
+            "只是在重复付手续费。\n"
+            "    已有仓位【不受影响】，移动止损照常工作、平仓照常执行；"
+            "只是不再开新仓。\n"
+            "    常见原因：① 网络到不了交易所（代理/DNS 把币安域名劫持到别处，"
+            "此时响应往往不是 JSON 而是一张 HTML 错误页）；② 统一账户的条件单"
+            "端点或权限不对；③ 止损价精度不符合该品种的 tickSize。\n"
+            "    修好之后任意一次挂单成功就会自动解除。");
     }
 }
 

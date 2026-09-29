@@ -130,6 +130,14 @@ static TrendConfig mk_cfg(const std::string& sym = "TESTUSDT") {
     return c;
 }
 
+// 多品种用例里按品种取 bot。get_bots() 的顺序是 map 的顺序（按 bot_id），
+// 靠下标去猜是哪个 bot 迟早会错
+static TrendBot bot_of(TrendEngine& e, const std::string& sym) {
+    for (const auto& b : e.get_bots())
+        if (b.cfg.symbol == sym) return b;
+    return {};
+}
+
 // ③ 纯裸K 的默认配置：等收盘突破 + 3 根摆动止损 + 立即反手
 static TrendConfig mk_bare_cfg(const std::string& sym = "TESTUSDT") {
     TrendConfig c = mk_cfg(sym);
@@ -1072,6 +1080,97 @@ int main() {
         check(b.state == TrendBot::State::Stopped,
               "  连续 2 次 → 判定为系统性故障，停掉 bot，不再开新仓");
         check(b.st.pos == trend::Pos::Flat, "  且仓位是平的");
+    }
+
+    // ── 兜底平仓后不得在【同一根K线】里重开 ─────────────────────────────────
+    // 实测日志（2026-09-29）：22:16:28 兜底平仓、22:16:31 就又开了一笔，间隔 3 秒。
+    // 裸K·盘中即时 的入场条件（实时价 > 本根开盘价）在平仓后的下一拍照样成立，
+    // 于是变成 开→挂不上→平→开 的循环，每轮两笔市价单手续费。
+    // 兜底平仓的含义是"开仓前提不成立"，而那个前提 3 秒后不会变成立
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_bare_cfg();
+        cfg.rule.bare_entry = trend::BareEntry::Immediate;
+        cfg.rule.reverse    = trend::ReverseMode::None;
+        cfg.use_disaster_stop = true;
+        auto id = eng.add_bot(cfg);
+        cli->ds_place_fails    = true;
+        cli->ds_fail_retryable = false;   // 快速路径：一次失败就兜底
+
+        TrendEngine::BarSnap s;
+        s.open = 100.0; s.swing_low = 94.0; s.swing_high = 106.0; s.bar_open_ms = 1;
+        eng.update_bars(id, s);
+        cli->fill_price = 101.0;
+        eng.tick("TESTUSDT", 101.0);      // 开仓 → 挂不上 → 兜底平仓
+        check(eng.get_bots()[0].st.pos == trend::Pos::Flat, "兜底平仓已完成");
+        check(eng.get_bots()[0].st.cooldown_left > 0, "  应进入冷却");
+        const size_t after = cli->calls.size();
+
+        // 同一根K线里价格仍在开盘价之上，入场条件照样成立
+        eng.tick("TESTUSDT", 102.0);
+        eng.tick("TESTUSDT", 103.0);
+        check(cli->calls.size() == after, "  兜底平仓后不得在同一根K线里重开");
+
+        // 跨到下一根：冷却耗尽，恢复开仓（冷却是刹车，不是停机）
+        s.bar_open_ms = 2;
+        eng.update_bars(id, s);
+        eng.tick("TESTUSDT", 102.0);
+        check(cli->calls.size() > after, "  跨到新K线后应恢复开仓");
+    }
+
+    // ── 账户级熔断：系统性故障不该让每个 bot 各烧满自己的额度 ─────────────────
+    // 挂不上硬止损的原因基本都是系统性的（账户受限、网络到不了交易所、端点不对），
+    // 而系统性故障对每个品种一视同仁。只有 per-bot 熔断时，9 个 bot 会各烧
+    // kDsCircuitBreak 轮才停 —— 18 轮开平、36 笔白付手续费的市价单
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+
+        // C 先开一笔【不挂硬止损】的仓，留到熔断之后验证出场不受影响
+        auto cc = mk_cfg("CCCUSDT");
+        cc.use_disaster_stop = false;
+        cc.rule.reverse = trend::ReverseMode::None;
+        auto ic = eng.add_bot(cc);
+        feed(eng, ic, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("CCCUSDT", 110.0);
+        check(bot_of(eng, "CCCUSDT").qty > 0, "C 先正常开一笔（不挂硬止损）");
+
+        auto ca = mk_cfg("AAAUSDT");
+        ca.use_disaster_stop = true; ca.rule.reverse = trend::ReverseMode::None;
+        auto cb = mk_cfg("BBBUSDT");
+        cb.use_disaster_stop = true; cb.rule.reverse = trend::ReverseMode::None;
+        auto ia = eng.add_bot(ca);
+        auto ib = eng.add_bot(cb);
+        cli->ds_place_fails    = true;
+        cli->ds_fail_retryable = false;
+
+        feed(eng, ia, 2.0, 110, 90);
+        eng.tick("AAAUSDT", 110.0);       // A：开→挂不上→平（累计 1）
+        feed(eng, ib, 2.0, 110, 90);
+        eng.tick("BBBUSDT", 110.0);       // B：开→挂不上→平（累计 2 ⇒ 账户级熔断）
+        check(bot_of(eng, "AAAUSDT").st.pos == trend::Pos::Flat, "A 已兜底平仓");
+        check(bot_of(eng, "BBBUSDT").st.pos == trend::Pos::Flat, "B 已兜底平仓");
+
+        // 换新K线让 A 的冷却过去，此时拦住它的应该是【账户级闸门】
+        const size_t before = cli->calls.size();
+        feed(eng, ia, 2.0, 110, 90, 2);
+        advance(5);
+        eng.tick("AAAUSDT", 115.0);
+        check(cli->calls.size() == before,
+              "账户级熔断后不得再开新仓（哪怕这个 bot 自己还没到 per-bot 上限）");
+        check(bot_of(eng, "AAAUSDT").last_decision.find("账户级熔断")
+                  != std::string::npos,
+              "  拦截原因要写进 last_decision，界面上看得到");
+
+        // ⚠ 最危险的失败模式：闸门拦住出场。拦住平仓等于把该止损的仓位困在原地，
+        //   闸门就从风控变成了风险源
+        cli->fill_price = 100.0;
+        eng.tick("CCCUSDT", 100.0);       // 跌破 C 的止损线 104
+        check(cli->calls.size() > before, "  但【出场】照常发单，绝不能被闸门拦住");
+        check(cli->last_call().reduce_only, "  且是 reduceOnly 平仓单");
+        check(bot_of(eng, "CCCUSDT").st.pos == trend::Pos::Flat, "  C 已正常止损出场");
     }
 
     // ── 没开开关就一个请求都不发 ────────────────────────────────────────────
