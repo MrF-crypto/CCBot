@@ -769,6 +769,21 @@ int main() {
         check(eng.get_bots()[0].state == TrendBot::State::Stopped, "  必须停止该bot");
         check(eng.get_bots()[0].st.pos == trend::Pos::Long,
               "  方向冲突时不清本地状态：清了就没有证据可核对");
+
+        // ⚠ 但【只报一次】。已停止的 bot 不会再有任何动作，而不一致的事实
+        //   已经写进 last_action（界面上一直看得到）。不去重的话对账每分钟
+        //   一轮就每分钟重报一遍，而且永远不会消失——没有任何东西会去修正它。
+        //   实测日志里 4 分钟刷了 30 行，把同期真正该看的硬止损告警全冲散了
+        auto again = eng.reconcile_positions(ex);
+        check(again.empty(), "  已停止的 bot 不得在后续每一轮对账里重复报");
+        auto again2 = eng.reconcile_positions(ex);
+        check(again2.empty(), "  再对一次也还是不报");
+
+        // 但恢复之后要重新纳入对账：不一致还在，就得重新报出来并再停一次
+        eng.resume_bot(eng.get_bots()[0].bot_id);
+        auto after_resume = eng.reconcile_positions(ex);
+        check(after_resume.size() == 1, "  恢复后重新纳入对账，不一致仍要报");
+        check(eng.get_bots()[0].state == TrendBot::State::Stopped, "  并再次停止");
     }
 
     // ── 外部已平：两边都没有同向仓，也没有反向仓 ────────────────────────────

@@ -27,3 +27,6 @@ ccbot_state.json
 # 一个 git add -A 就把实盘配置和全部成交推上去。仓库已公开，历史删不掉
 data/
 
+
+# 本地打出来的可分发包（CI 的 Package 步骤产物，体积 60MB+，不进版本控制）
+pkg/

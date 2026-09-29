@@ -122,6 +122,15 @@ std::vector<std::string> TrendEngine::reconcile_positions(
         auto& b = kv.second;
         // 在途的跳过：订单可能已在交易所生效而本地还没入账，此刻比对必然误判
         if (b.pending) continue;
+        // 已停止的跳过。它不会再有任何动作，而不一致的事实已经报过、也写进了
+        // last_action（界面上一直看得到）。
+        //
+        // ⚠ 不跳的话每一轮对账都会重新发现同样的不一致并重新报一遍——对账每
+        //   分钟一轮，6 个 bot 就是每分钟 6 行，而这些行永远不会消失（bot 已经
+        //   停了，没有任何东西会去修正它）。实测日志里 4 分钟刷了 30 行，
+        //   把同期真正该看的硬止损告警全冲散了。
+        //   恢复该 bot（resume_bot 置回 Running）时自然会重新纳入对账
+        if (b.state == TrendBot::State::Stopped) continue;
 
         const bool local_has = (b.st.pos != trend::Pos::Flat && b.qty > 0);
         const int  local_dir = (b.st.pos == trend::Pos::Long) ? 1 : -1;
