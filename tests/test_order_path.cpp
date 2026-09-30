@@ -404,8 +404,21 @@ int main() {
         check(!r3.ok() && r3.retryable, "HTML 响应仍可重试（502/503 也是 HTML）");
         check(r3.error.find("HTML") != std::string::npos,
               "  但要明说收到的是网页、请求没到币安");
-        check(r3.error.find('\n') == std::string::npos,
-              "  且压平换行：HTML 原样打出来会把一条日志撑成几十行");
+        // 要钉的是"HTML 自己的换行不得漏进日志"——那会把一条日志撑成几十行。
+        // 错误串本身用了两行做排版（端点/参数/响应体分行），那是有意的，
+        // 所以不能简单断言"整串无换行"，要断言【响应体那一段】无换行
+        {
+            const auto p = r3.error.find("响应体: ");
+            check(p != std::string::npos, "  错误里要有「响应体」这一段");
+            if (p != std::string::npos)
+                check(r3.error.find('\n', p) == std::string::npos,
+                      "  且响应体段内必须压平换行（HTML 原样打出来会撑成几十行）");
+        }
+        check(r3.error.find("实际发出的参数") != std::string::npos,
+              "  还要带上实际发出的参数：靠读代码猜是哪个参数不对已经绕了好几轮");
+        check(r3.error.find("signature") == std::string::npos,
+              "  但绝不能带 signature —— 那是用 API secret 算的 HMAC，"
+              "写进日志/工单等于泄露一次可重放的凭据");
 
         // ── 状态码必须出现在错误里，且按码给出不同的成因 ──────────────────
         // 这是把成因分开的唯一依据：实测里同一个端点 5 秒内一次成功（市价单）、

@@ -1235,9 +1235,22 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         default:  why = "HTTP " + std::to_string(http_code); break;
         }
 
+        // 把【实际发出去的参数】一起打出来。到这一步为止，"哪个参数让它变成 400"
+        // 是唯一还没拿到的事实，而靠读代码猜已经绕了好几轮：市价单和硬止损走的是
+        // 同一个 http_post、同一个 /fapi/v1/order，一个成功一个 400，差别只在参数里。
+        //
+        // build() 本身不含 timestamp/signature（那两个由 http_post 在发出前追加），
+        // 所以这里打出来的本来就不含凭据。下面那道打码是【防回归】的：哪天有人
+        // 把签名挪进 build()，这条日志就会把一次可重放的 HMAC 直接写进日志和工单。
+        // 其余参数都是公开语义（品种、方向、触发价），留着才有诊断价值
+        std::string sent = build(pm);
+        if (auto p2 = sent.find("&signature="); p2 != std::string::npos)
+            sent = sent.substr(0, p2) + "&signature=<已打码>";
         return { "", std::string(looks_html ? "收到的是 HTML 网页而不是 API 响应"
                                             : "响应不是合法 JSON")
-                     + "（" + why + "，端点 " + first_path + "）: " + body,
+                     + "（" + why + "，端点 " + first_path + "）\n"
+                       "    实际发出的参数: " + sent + "\n"
+                       "    响应体: " + body,
                  true };
     }
 
