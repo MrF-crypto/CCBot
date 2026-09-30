@@ -976,11 +976,16 @@ TradingClient::SymbolInfo TradingClient::get_symbol_info(const std::string& sym)
 
     SymbolInfo info;
     auto resp = http_get_public("/fapi/v1/exchangeInfo?symbol=" + sym);
+    // 先按"没查成"起算，只有真的解析出了币安的应答才把它放下来。
+    // 空响应、非 JSON（网关 HTML 页、被代理截断）都属于没查成 ——
+    // 而"查成了但币安说没有这个品种"是另一回事，那是合法 JSON（-1121）
+    info.lookup_failed = true;
     if (!resp.empty()) {
         simdjson::dom::parser p;
         simdjson::dom::element doc;
         auto ps = simdjson::padded_string(resp);
         if (p.parse(ps).get(doc) == simdjson::SUCCESS) {
+            info.lookup_failed = false;   // 拿到了合法应答
             simdjson::dom::array symbols;
             if (doc["symbols"].get(symbols) == simdjson::SUCCESS) {
                 for (auto sym_elem : symbols) {
@@ -1029,8 +1034,12 @@ TradingClient::SymbolInfo TradingClient::get_symbol_info(const std::string& sym)
     std::lock_guard<std::mutex> lk(sym_mtx_);
     if (!info.valid) {
         // 拉取失败不写缓存（负缓存会把"首次网络抖动"固化成整个进程生命周期的
-        // 错误精度）——返回默认值，下次调用重试拉取
-        return SymbolInfo{};
+        // 错误精度）——返回默认值，下次调用重试拉取。
+        // ⚠ 但要把 lookup_failed 带出去：调用方靠它区分"这个品种不存在"和
+        //   "这次没查成"，混起来就会把网络抖动报成"请检查拼写"
+        SymbolInfo none;
+        none.lookup_failed = info.lookup_failed;
+        return none;
     }
     sym_cache_[sym] = info;
     return info;

@@ -206,6 +206,14 @@ public:
         // 界面那一列已经改成"tick 推的位数与数量级取较大者"，所以【显示正常不再
         // 是证据】——只有这个标志能说明 tick_size 到底可不可信
         bool   tick_found       = false;
+        // 这次【没能查成】—— 与"查成了，币安说没有这个品种"是两件事。
+        //
+        // ⚠ 两者都会让 valid==false，混起来的后果是：网络抖一下，一个完全正确的
+        //   品种会被界面判成"在币安 USDT-M 合约上不存在，请检查拼写"而拒绝添加。
+        //   用户会去改拼写——而拼写本来就是对的。
+        //   判据：币安对不存在的品种回的是合法 JSON（-1121 Invalid symbol），
+        //   而空响应 / 非 JSON 才是没查成
+        bool   lookup_failed    = false;
 
         // 返回市价单实际使用的步长
         double effective_market_step() const {

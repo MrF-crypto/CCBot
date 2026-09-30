@@ -257,7 +257,7 @@ data/
 
 ## 测试
 
-17 套单元测试、974 条断言，覆盖引擎、网络、持久化、并发：
+17 套单元测试、980 条断言，覆盖引擎、网络、持久化、并发：
 
 ```powershell
 cmake --build build --config Release

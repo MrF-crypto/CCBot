@@ -507,6 +507,46 @@ int main() {
         check(!ok, "有一条缺 positionAmt ⇒ 同样不可信（缺字段和解析失败等价）");
     }
 
+    std::printf("── 用例14：品种校验必须分清「不存在」和「没查成」──\n");
+    {
+        // 混起来的后果实测过：网络抖一下，一个完全正确的品种被界面报成
+        // "在币安 USDT-M 合约上不存在，请检查拼写" —— 而拼写本来就是对的。
+        // 判据：币安对不存在的品种回的是合法 JSON（-1121），
+        // 空响应 / 非 JSON 才是没查成
+        auto probe = [](const char* body) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string&, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = body; return true;
+                }
+                return false;
+            });
+            return tc.get_symbol_info("BTCUSDT");
+        };
+
+        auto ok = probe(kExchangeInfo);
+        check(ok.valid && !ok.lookup_failed, "正常应答：valid 且没有标成没查成");
+
+        // 币安对不存在的品种：合法 JSON 的错误对象 ⇒ 查成了，它真的不存在
+        auto gone = probe(R"({"code":-1121,"msg":"Invalid symbol."})");
+        check(!gone.valid, "不存在的品种：valid=false");
+        check(!gone.lookup_failed,
+              "  但【不是】没查成 —— 这种才该报「请检查拼写」");
+
+        // 网络失败的两种形态
+        auto empty = probe("");
+        check(!empty.valid && empty.lookup_failed, "空响应：标成没查成，不得说品种不存在");
+        auto html = probe("<!DOCTYPE html><html><body>gateway error</body></html>");
+        check(!html.valid && html.lookup_failed,
+              "网关 HTML 页：同样是没查成（这台机器上这是常态）");
+
+        // 缺 symbols 数组但 JSON 合法：算查成了、确实没有
+        auto weird = probe(R"({"serverTime":1700000000000})");
+        check(!weird.valid && !weird.lookup_failed,
+              "合法 JSON 但没有 symbols：算查成了，不是网络问题");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

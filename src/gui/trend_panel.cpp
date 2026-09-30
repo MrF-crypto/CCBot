@@ -994,7 +994,18 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
     // 这里一次同步查询（有缓存，通常是内存命中），比让用户干等一小时划算
     if (client_) {
         auto info = client_->get_symbol_info(c.symbol);
-        if (!info.valid) {
+        // ⚠ "币安说没有这个品种"和"这次没查成"必须分开处置。
+        //   混起来的后果实测过：网络抖一下，一个完全正确的品种被报成
+        //   "在币安 USDT-M 合约上不存在，请检查拼写" —— 而拼写本来就是对的，
+        //   用户会一直去改那个没错的东西。
+        //   没查成时【不拦】：拦住的代价是完全无法工作，而放行的代价只是
+        //   万一真拼错了会多等一会儿才发现（表现为一直"等信号"）
+        if (info.lookup_failed) {
+            log(QString::fromStdString(c.symbol) +
+                " 无法校验是否存在（拉取 exchangeInfo 失败，多半是网络/代理）。"
+                "已按你填的品种继续添加 —— 若它其实拼错了，表现会是一直「等信号」"
+                "且标记价那一列始终为空。", "WARN");
+        } else if (!info.valid) {
             QMessageBox::warning(this, "品种不存在",
                 QString::fromStdString(c.symbol) +
                 " 在币安 USDT-M 合约上不存在。\n\n"
