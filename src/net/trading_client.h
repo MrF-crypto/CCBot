@@ -75,8 +75,12 @@ public:
     // 周期对账靠它区分两者：把失败当成"没有持仓"会凭空清掉真实仓位
     std::vector<Position>  fetch_positions(bool* ok = nullptr);
 
+    // ⚠ 真正发单的是 place_market_once；place_market 在它外面多包了一层
+    //   「-4061 ⇒ 重新探测持仓模式并重发一次」。见 .cpp 里那段注释
     OrderResult place_market(const std::string& symbol, const std::string& side,
                               double qty, bool reduce_only = false);
+    OrderResult place_market_once(const std::string& symbol, const std::string& side,
+                              double qty, bool reduce_only);
     // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
     OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
     bool close_all_positions();

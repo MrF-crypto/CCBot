@@ -757,7 +757,51 @@ static bool is_timestamp_reject(const std::string& resp) {
     return code == -1021;
 }
 
+// -4061 "Order's position side does not match user's setting."
+//
+// dual_mode_ 只在【连接的那一刻】探测一次，此后整个进程都不再更新。
+// 于是账户的持仓模式一旦在连接之后被改掉（币安要求改模式时必须无持仓无挂单，
+// 所以这通常发生在人工清理完仓位之后），本进程的每一笔单都会被拒，
+// 直到重启为止 —— 而 -4061 还被归进"重试也没用"的那一档，连怀疑都不会怀疑。
+//
+// 实盘 2026-10-01：23:59:33 连接时探到【双向持仓】，02:15 起平仓与开仓
+// 全部 -4061（QNTUSDT 平仓两次、USUSDT 开仓一次），期间账户被改成了单向。
+//
+// 所以 -4061 的正确反应不是放弃，而是【重新探测一次持仓模式】：
+//   · 模式确实变了 ⇒ 用新设置重发一次，自愈，不需要人工重启
+//   · 模式没变     ⇒ 那就不是这个原因，把这句结论写进错误里，免得下一个人
+//                    又从"是不是模式变了"开始猜
 TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
+                                                        const std::string& side,
+                                                        double qty, bool reduce_only) {
+    auto r = place_market_once(sym, side, qty, reduce_only);
+    if (r.ok || r.error.find("[-4061]") == std::string::npos) return r;
+    // ⚠ uncertain 绝不重发：订单状态未知时重发可能变成双倍仓位。
+    //   开仓【不幂等】，这条底线比自愈重要
+    if (r.uncertain) return r;
+
+    const bool before = dual_mode_.load();
+    bool probe_ok = false;
+    fetch_position_mode(&probe_ok);
+    if (!probe_ok) {
+        r.error += "（重新探测持仓模式也失败了，无法确认是不是模式在连接之后被改过）";
+        return r;
+    }
+    if (dual_mode_.load() == before) {
+        r.error += std::string("（已重新探测：账户仍是") +
+                   (before ? "双向持仓" : "单向持仓") +
+                   "，与下单时一致，所以不是模式变更导致的）";
+        return r;
+    }
+    auto r2 = place_market_once(sym, side, qty, reduce_only);
+    if (!r2.ok)
+        r2.error += std::string("（账户持仓模式已在运行期改成") +
+                    (dual_mode_.load() ? "双向持仓" : "单向持仓") +
+                    "，已按新模式重发但仍失败）";
+    return r2;
+}
+
+TradingClient::OrderResult TradingClient::place_market_once(const std::string& sym,
                                                         const std::string& side,
                                                         double qty, bool reduce_only) {
     OrderResult r;
@@ -1190,6 +1234,27 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     if (binance_error(doc, err)) {
         out.error     = err;
         out.retryable = stop_error_retryable(err);
+        // -4061 在上面那张表里是"重试也没用"，而这在【持仓模式于运行期被改过】
+        // 的情况下是错的：dual_mode_ 只在连接时探一次，此后不再更新。
+        // 这条路径上判错的代价特别大——-4061 不可重试 ⇒ 立即放弃 ⇒ 兜底平仓，
+        // 也就是说账户改一下模式就足以让引擎把刚开的仓位平掉。
+        // 重新探一次；模式确实变了就放它回重试队列，下一次尝试会带上正确的
+        // positionSide（整个请求体是每次重新拼的）
+        if (err.find("[-4061]") != std::string::npos) {
+            const bool before = dual_mode_.load();
+            bool probe_ok = false;
+            fetch_position_mode(&probe_ok);
+            if (probe_ok && dual_mode_.load() != before) {
+                out.retryable = true;
+                out.error += std::string("（账户持仓模式已在运行期改成") +
+                             (dual_mode_.load() ? "双向持仓" : "单向持仓") +
+                             "，已更新并重试）";
+            } else if (probe_ok) {
+                out.error += "（已重新探测：持仓模式与挂单时一致，不是模式变更导致）";
+            } else {
+                out.error += "（重新探测持仓模式失败，无法确认是不是模式变更导致）";
+            }
+        }
         return out;
     }
 

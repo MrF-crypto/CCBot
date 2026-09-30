@@ -654,6 +654,92 @@ int main() {
         check(ok && !r.second, "真的读到 false ⇒ ok=true 且如实返回单向");
     }
 
+    std::printf("\n── 用例17：-4061 ⇒ 重新探测持仓模式并自愈 ──\n");
+    // dual_mode_ 只在【连接那一刻】探一次，此后整个进程都不再更新。账户的持仓
+    // 模式一旦在连接之后被改掉（币安要求改模式时无持仓无挂单，所以通常发生在
+    // 人工清理完仓位之后），本进程每一笔单都会被 -4061 拒到重启为止。
+    // 实盘 2026-10-01：连接时探到双向，02:15 起平仓/开仓全部 -4061。
+    {
+        TradingClient tc(test_cfg());
+        // 先把 dual_mode_ 探成【双向】，模拟连接那一刻的状态
+        tc.set_test_hook([&](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("positionSide/dual") != std::string::npos) {
+                out.body = R"({"dualSidePosition":true})"; return true;
+            }
+            return false;
+        });
+        bool ok0 = false;
+        check(tc.fetch_position_mode(&ok0) && ok0, "连接时探到双向持仓（前提成立）");
+
+        // 现在账户被改成【单向】：带 positionSide 的单一律 -4061
+        int posts = 0, probes = 0;
+        std::string last_params;
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string& params, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
+            if (path.find("positionSide/dual") != std::string::npos) {
+                ++probes;
+                out.body = R"({"dualSidePosition":false})";   // 已经改成单向了
+                return true;
+            }
+            if (m == "POST") {
+                ++posts;
+                last_params = params;
+                if (params.find("positionSide=") != std::string::npos) {
+                    out.body = R"({"code":-4061,"msg":"Order's position side does not match user's setting."})";
+                } else {
+                    out.body = R"({"orderId":1234,"status":"FILLED","avgPrice":"63000",)"
+                               R"("executedQty":"0.015","origQty":"0.015"})";
+                }
+                return true;
+            }
+            return false;
+        });
+
+        auto r = tc.place_market("BTCUSDT", "BUY", 0.015, false);
+        check(r.ok, "⚠ -4061 之后必须自愈成功，而不是把这笔单判死");
+        check(probes >= 1, "  必须重新探测过持仓模式");
+        check(posts == 2, "  且只重发一次（不是无限重试）");
+        check(last_params.find("positionSide=") == std::string::npos,
+              "  重发时不再带 positionSide —— 说明用的是探回来的新模式");
+        check(!tc.is_dual_mode(), "  dual_mode_ 已更新为单向");
+    }
+
+    std::printf("\n── 用例18：-4061 但模式没变 ⇒ 不重发，并把结论写进错误 ──\n");
+    // 模式确实没变时再重发一次只是白烧一次限流额度，而且会掩盖真正的原因。
+    // 更重要的是要把"已经查过、不是这个原因"写进错误里，否则下一个人还会
+    // 从"是不是模式变了"重新猜一遍
+    {
+        TradingClient tc(test_cfg());
+        int posts = 0;
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
+            if (path.find("positionSide/dual") != std::string::npos) {
+                out.body = R"({"dualSidePosition":false})";   // 一直是单向，没变过
+                return true;
+            }
+            if (m == "POST") {
+                ++posts;
+                out.body = R"({"code":-4061,"msg":"Order's position side does not match user's setting."})";
+                return true;
+            }
+            return false;
+        });
+        auto r = tc.place_market("BTCUSDT", "BUY", 0.015, false);
+        check(!r.ok, "仍然失败");
+        check(posts == 1, "  模式没变就不该重发");
+        check(r.error.find("与下单时一致") != std::string::npos,
+              "  错误里要写明「已经查过、不是模式变更导致」");
+    }
+
+    // ⚠ place_market 里还有一道 `if (r.uncertain) return r;`，没有对应用例：
+    //   uncertain 只由"空响应/非 JSON + 查单也确认不了"那条分支产生，那时
+    //   error 里不会有 -4061（压根没解析出 code），所以这两个条件【构造不出来】。
+    //   留着它是纯防御：开仓不幂等，万一将来有别的路径同时置上这两者，
+    //   重发会变成双倍仓位。不为一个构造不出的场景写假用例。
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }
