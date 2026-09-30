@@ -10,6 +10,10 @@
 //
 // 这些测试用假 HTTP 响应把那几秒复现出来。不需要网络。
 #include "net/trading_client.h"
+// ⚠ <cmath> 必须显式写：MSVC 的标准库会传递包含它，libstdc++ 不会，
+//   于是 std::fabs 在本机编得过、推上去 GCC 直接拒。本机那道
+//   clang --driver-mode=g++ 扫描也抓不到 —— 它用的是 MSVC 的头文件
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>

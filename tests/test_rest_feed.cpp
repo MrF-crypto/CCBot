@@ -3,10 +3,21 @@
 // 这里守的是"行情层最容易静默出错"的那几条：冻结价绝不能当现价交出去、
 // 拉取失败不等于"价格没了"、失败日志不能每轮都刷。
 #include "net/rest_price_feed.h"
+// ⚠ 直接用到的都显式 include，不靠项目头文件传递。
+//   MSVC 的标准库会传递包含一大堆东西，libstdc++ 不会 —— 少写一个 <cmath>
+//   在本机编得过、推上去 GCC 直接拒（'fabs' is not a member of 'std'）。
+//   本机那道 clang --driver-mode=g++ 扫描也抓不到：它用的是 MSVC 的头文件，
+//   能查语言层问题，查不了另一个标准库实现的头文件卫生
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 using namespace ccbot;
 
