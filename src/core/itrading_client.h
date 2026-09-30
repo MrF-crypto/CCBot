@@ -48,6 +48,10 @@ public:
         // ⇒ 账户模式设错了。account_mode 是手工选的不是探测的，设错时行情、
         // 余额、市价单全部照常工作，只有条件单会露馅——不报出来就永远查不到
         bool via_cond_fallback = false;
+        // 一次性的说明，非空时上层【原样打一条日志】。
+        // 用来报告"换了写法/换了端点"这类少见但必须让人知道的事——每次挂单都打
+        // 就是噪音，所以由下层只在真的变化时填，读走即清
+        std::string note;
         bool ok() const { return !order_id.empty(); }
     };
 
@@ -56,7 +60,15 @@ public:
     virtual StopPlacement place_disaster_stop(const std::string& /*symbol*/,
                                               double /*stop_price*/,
                                               const std::string& /*entry_side*/) {
-        return StopPlacement{"", "该客户端不支持交易所侧硬止损", false};
+        // ⚠ 按字段赋值，不用花括号聚合初始化。
+        //   聚合初始化只写前 N 个字段时，GCC/Clang 的
+        //   -Wmissing-field-initializers + -Werror 会直接拒编（MSVC 放过），
+        //   于是每次给 StopPlacement 加字段就要去修所有构造点。
+        //   这个坑在本会话已经踩过一次（加 note 字段时四处同时编不过）
+        StopPlacement p;
+        p.error     = "该客户端不支持交易所侧硬止损";
+        p.retryable = false;
+        return p;
     }
     virtual bool cancel_disaster_stop(const std::string& /*symbol*/,
                                       const std::string& /*order_id*/) { return true; }

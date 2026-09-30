@@ -792,6 +792,7 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                           "（单号 " + placed.order_id + "）");
             } else {
                 b.disaster_stop_id = placed.order_id;
+                if (!placed.note.empty()) log("ℹ " + sym + " " + placed.note);
                 if (placed.via_cond_fallback)
                     log("⚠ " + sym + " 硬止损是靠【条件单端点】挂上的 —— 普通端点回了 "
                         "-4120。这几乎肯定意味着「账户模式」设错了：请把它改成"
@@ -821,6 +822,8 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
         //   所以失败处理整体放进 else，而不是靠提前返回
         } else {
 
+        // 失败路径也要报：换写法的说明恰恰是在连续失败时产生的
+        if (!placed.note.empty()) log("ℹ " + sym + " " + placed.note);
         b.ds_attempts = attempt;
 
         // 参数类错误重试没有意义（精度不对、触发价在错误的一侧）。硬等完

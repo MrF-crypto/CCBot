@@ -81,11 +81,13 @@ public:
                                       const std::string&) override {
         if (ds_place_fails) {
             stop_log.push_back({"place_fail", stop_price, ""});
-            return { "", "boom", ds_fail_retryable };
+            StopPlacement p; p.error = "boom"; p.retryable = ds_fail_retryable;
+            return p;
         }
         std::string id = "DS" + std::to_string(++ds_seq);
         stop_log.push_back({"place", stop_price, id});
-        return { id, "", true };
+        StopPlacement p; p.order_id = id;
+        return p;
     }
     bool cancel_disaster_stop(const std::string&, const std::string& id) override {
         stop_log.push_back({"cancel", 0, id});

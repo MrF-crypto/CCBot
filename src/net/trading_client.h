@@ -340,6 +340,13 @@ private:
     // 这样订单路径的超时/查单恢复逻辑一行不用动
     std::shared_ptr<RateGate> gate_;
     TestHook    test_hook_;
+    // 硬止损当前用的"写法"下标（见 place_disaster_stop 里的变体表）。
+    // 一旦某个变体挂成了就记住它，后续直接用 —— 稳态只发一次请求。
+    // atomic：多个品种会并发挂单
+    std::atomic<int> ds_variant_{0};
+    // 上一次换写法/换端点时的说明，供上层日志取用一次（换写法很少见，
+    // 每次挂单都打就是噪音）。只在 place_disaster_stop 里写，读走即清
+    std::string ds_last_note_;
     std::string base_;       // 签名端点的域名（统一账户 = papi.binance.com）
     std::string pub_base_;   // 公开行情端点的域名（永远是 fapi，papi 没有行情接口）
     // ⚠ 这两个都是【一处写、多处读，且跨线程】，必须是原子的。

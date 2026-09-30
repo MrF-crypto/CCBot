@@ -81,10 +81,15 @@ public:
     }
     StopPlacement place_disaster_stop(const std::string&, double sp,
                                       const std::string&) override {
-        if (!(sp > 0)) { ++bad_stop_price; return { "", "非正触发价", false }; }
+        if (!(sp > 0)) {
+            ++bad_stop_price;
+            StopPlacement p; p.error = "非正触发价"; p.retryable = false;
+            return p;
+        }
         std::lock_guard<std::mutex> lk(m_);
-        if (rng_() % 5 == 0) return { "", "随机挂单失败", true };
-        return { "DS" + std::to_string(++ds_), "", true };
+        if (rng_() % 5 == 0) { StopPlacement p; p.error = "随机挂单失败"; return p; }
+        StopPlacement p; p.order_id = "DS" + std::to_string(++ds_);
+        return p;
     }
     bool cancel_disaster_stop(const std::string&, const std::string&) override {
         return true;

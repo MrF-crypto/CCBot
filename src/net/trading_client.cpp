@@ -1129,36 +1129,107 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
                                    const std::string& entry_side) {
     stop_price = round_price(sym, stop_price);
     // 取整之后还 <=0：传进来的价本身就不合法，重试没有意义
-    if (stop_price <= 0)
-        return { "", "止损触发价非法（取整后 <= 0）", false };
+    if (stop_price <= 0) {
+        // 按字段赋值而不是聚合初始化：见 itrading_client.h 里 StopPlacement 的注释
+        StopPlacement p;
+        p.error     = "止损触发价非法（取整后 <= 0）";
+        p.retryable = false;
+        return p;
+    }
 
     const std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
     const auto& info = get_symbol_info(sym);
     const int price_dp = step_decimals(info.tick_size);
     const bool pm = is_pm();
 
-    // 同一张单的两种写法，只差"往哪个端点发 + 类型字段叫什么"。
+    // 同一张单的几种写法。只差"往哪个端点发 + 类型字段叫什么 + 带哪几个可选参数"。
     // 普通合约账户走 /fapi/v1/order 的 type=；统一账户的条件单是另一套端点，
-    // 字段叫 strategyType=（普通端点只收 LIMIT/MARKET，发 STOP_MARKET 会被拒）
-    auto build = [&](bool as_conditional) {
+    // 字段叫 strategyType=（普通端点只收 LIMIT/MARKET，发 STOP_MARKET 会被拒）。
+    //
+    // ── 为什么要有"备选写法"这个概念 ──────────────────────────────────────────
+    // 实测（2026-09-30，$208 的普通合约账户）：市价单成功，而 5 秒后同一个端点、
+    // 同一个方法的 STOP_MARKET 拿回 HTTP 400 + 一张网页。差别只在参数里，而
+    // 靠读代码猜了四轮都没定位到（端点、账户模式、代理劫持、deflate、数字格式化
+    // 全部排除）。
+    //
+    // 与其继续要日志，不如让它自己按"从功能完整到最保守"的顺序试一遍：
+    // 每个变体都是【同等保护力】的同一张单（同一个触发价、同样平掉整个仓位），
+    // 只是把可选参数逐个摘掉。第一个成功的会被记住，之后直接用它 —— 稳态仍然
+    // 是一次请求。哪个变体成功，也就顺手告诉了我们是哪个可选参数不被接受。
+    //
+    //   变体0  closePosition + MARK_PRICE + priceProtect   ← 功能最全，原来的写法
+    //   变体1  去掉 priceProtect（它只是"标记价明显异常时不触发"的附加保护）
+    //   变体2  再把 workingType 换成 CONTRACT_PRICE（币安的默认口径）
+    //
+    // ⚠ 摘掉的都是【可选增强】，不是保护本身：触发价与 closePosition 一直在。
+    //   变体2 的代价是改用成交价触发，插针更容易打到 —— 所以它排在最后，
+    //   只有前两个都被拒才会用上，而"有个会早触发的底"远好过"没有底"。
+    static constexpr int kVariants = 3;
+    auto build = [&](bool as_conditional, int variant) {
         std::ostringstream oss;
         oss << "symbol=" << sym
             << "&side=" << close_side
             << (as_conditional ? "&strategyType=" : "&type=") << "STOP_MARKET"
             << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
-            << "&closePosition=true"
-            << "&workingType=MARK_PRICE"   // 用标记价，避免插针成交价误触发
-            << "&priceProtect=true"
-            << "&recvWindow=5000";
+            << "&closePosition=true";
+        // 用标记价，避免插针成交价误触发；变体2 退回币安默认口径
+        oss << "&workingType=" << (variant >= 2 ? "CONTRACT_PRICE" : "MARK_PRICE");
+        if (variant < 1) oss << "&priceProtect=true";
+        oss << "&recvWindow=5000";
         if (dual_mode_)
             oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
         return oss.str();
     };
+    // 说明读走即清：换写法/换端点很少见，每次挂单都重复打就成了噪音
+    auto take_note = [this]() {
+        std::string n;
+        n.swap(ds_last_note_);
+        return n;
+    };
+    auto variant_desc = [](int v) {
+        switch (v) {
+        case 0:  return "完整（MARK_PRICE + priceProtect）";
+        case 1:  return "去掉 priceProtect";
+        default: return "去掉 priceProtect 且改用 CONTRACT_PRICE 触发";
+        }
+    };
 
     long http_code = 0;
     const std::string first_path = pm ? ep(Ep::CondOrder) : ep(Ep::Order);
-    auto resp = http_post(first_path, build(pm), &http_code);
     bool used_cond = pm;   // 最终是从哪个端点拿到的回执（决定单号字段名）
+
+    // 从上次成功的变体起试。稳态下 ds_variant_ 已经是能用的那个，只发一次请求；
+    // 只有在它也失败时才往后退。ds_variant_ 是 atomic：多个品种可能并发挂单
+    int variant = ds_variant_.load();
+    if (variant < 0 || variant >= kVariants) variant = 0;
+    std::string resp;
+    int tried_upto = variant;
+    for (int i = variant; i < kVariants; ++i) {
+        tried_upto = i;
+        resp = http_post(first_path, build(pm, i), &http_code);
+        // 只有"请求被判畸形/参数不被接受"才值得换写法。空响应是网络问题，
+        // 换参数没有意义；业务性拒绝（触发价在错误一侧之类）换参数也没有意义
+        const bool param_rejected =
+            (http_code == 400 || http_code == 422) ||
+            (!resp.empty() && (resp.find("-1106") != std::string::npos ||   // 发了不该发的参数
+                               resp.find("-1102") != std::string::npos ||   // 必填参数缺失/非法
+                               resp.find("-1104") != std::string::npos));   // 有参数没被读取
+        if (!param_rejected) break;
+        if (i + 1 < kVariants)
+            ds_last_note_ = std::string("硬止损写法「") + variant_desc(i) +
+                            "」被拒（HTTP " + std::to_string(http_code) +
+                            "），改用「" + variant_desc(i + 1) + "」再试";
+    }
+    // 成功就把这个变体记住，后续直接用它
+    if (!resp.empty() && resp.find("\"code\"") == std::string::npos &&
+        tried_upto != ds_variant_.load()) {
+        ds_variant_.store(tried_upto);
+        ds_last_note_ = std::string("硬止损改用写法「") + variant_desc(tried_upto) +
+                        "」后挂单成功，后续沿用它" +
+                        (tried_upto >= 2 ? "。⚠ 这个写法用【成交价】触发而不是标记价，"
+                                           "插针更容易打到 —— 但有个会早触发的底，"
+                                           "远好过完全没有底" : "");
+    }
 
     // ── -4120 的定向回退 ──────────────────────────────────────────────────────
     // 币安回 -4120 时的原话是 "Please use the Algo Order API endpoints instead"，
@@ -1174,7 +1245,7 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     // 成功的话说明【账户模式设错了】：account_mode 是手工选的不是探测的，
     //   设错时行情、余额、市价单全部照常，只有条件单会露馅
     if (!pm && !resp.empty() && resp.find("-4120") != std::string::npos) {
-        auto alt = http_post(ep(Ep::CondOrder), build(true));
+        auto alt = http_post(ep(Ep::CondOrder), build(true, tried_upto));
         if (!alt.empty() && alt.find("\"code\"") == std::string::npos) {
             // 换端点之后不再报错 ⇒ 用它的结果继续往下解析。
             // 判据用"没有 code 字段"而不是"没有 -4120"：条件单端点可能回一个
@@ -1188,7 +1259,12 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     // 并重试是安全的：closePosition 单同方向只允许一张，重复挂会被交易所拒，
     // 拒了就进入下一次重试，不会留下两张
     if (resp.empty())
-        return { "", "空响应（超时或网络中断）", true };
+    {
+        StopPlacement p;
+        p.error = "空响应（超时或网络中断）";
+        p.note  = take_note();
+        return p;
+    }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -1243,15 +1319,18 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         // 所以这里打出来的本来就不含凭据。下面那道打码是【防回归】的：哪天有人
         // 把签名挪进 build()，这条日志就会把一次可重放的 HMAC 直接写进日志和工单。
         // 其余参数都是公开语义（品种、方向、触发价），留着才有诊断价值
-        std::string sent = build(pm);
+        std::string sent = build(pm, tried_upto);
         if (auto p2 = sent.find("&signature="); p2 != std::string::npos)
             sent = sent.substr(0, p2) + "&signature=<已打码>";
-        return { "", std::string(looks_html ? "收到的是 HTML 网页而不是 API 响应"
-                                            : "响应不是合法 JSON")
-                     + "（" + why + "，端点 " + first_path + "）\n"
-                       "    实际发出的参数: " + sent + "\n"
-                       "    响应体: " + body,
-                 true };
+        StopPlacement bad;
+        bad.error = std::string(looks_html ? "收到的是 HTML 网页而不是 API 响应"
+                                           : "响应不是合法 JSON")
+                    + "（" + why + "，端点 " + first_path + "，写法「"
+                    + variant_desc(tried_upto) + "」）\n"
+                      "    实际发出的参数: " + sent + "\n"
+                      "    响应体: " + body;
+        bad.note = take_note();
+        return bad;
     }
 
     std::string err;
@@ -1268,7 +1347,11 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
                    std::string(pm ? "统一账户(/papi/v1/um/conditional/order)"
                                   : "普通合约(/fapi/v1/order)") +
                    "；已自动改用条件单端点重试过一次，同样没成功";
-        return { "", err, stop_error_retryable(err) };
+        StopPlacement bad;
+        bad.error     = err;
+        bad.retryable = stop_error_retryable(err);
+        bad.note = take_note();
+        return bad;
     }
 
     // 单号字段随端点变：普通端点给 orderId，条件单端点给 strategyId。
@@ -1279,14 +1362,19 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     get_or_keep(doc[used_cond ? "strategyId" : "orderId"], oid);
     if (oid <= 0) get_or_keep(doc[used_cond ? "orderId" : "strategyId"], oid);
     if (oid > 0) {
-        StopPlacement ok{std::to_string(oid), "", true};
+        StopPlacement ok;
+        ok.order_id = std::to_string(oid);
         // 首发端点被拒、换条件单端点成功 ⇒ 账户模式设错了。这条必须报出来，
         // 否则每次开仓都要白走一次 -4120 + 一次回退，而根因一直没人知道
         ok.via_cond_fallback = (used_cond != pm);
+        ok.note = take_note();
         return ok;
     }
     // 没报错但也没给单号：语义不明，当失败但允许重试
-    return { "", "响应里没有单号: " + resp.substr(0, 120), true };
+    StopPlacement bad;
+    bad.error = "响应里没有单号: " + resp.substr(0, 120);
+    bad.note = take_note();
+    return bad;
 }
 
 bool TradingClient::cancel_disaster_stop(const std::string& sym,

@@ -394,6 +394,71 @@ int main() {
             check(!r.via_cond_fallback, "  没挂上就不该标成回退成功");
         }
 
+        // ── 写法变体阶梯：HTTP 400 时自己退到更保守的参数组合 ────────────────
+        // 实测里市价单成功而同一端点的 STOP_MARKET 拿 400，差别只在参数里，
+        // 而靠读代码猜了四轮都没定位到。所以让它自己按"功能最全 → 最保守"试一遍，
+        // 每个变体都是同等保护力的同一张单（同一触发价、同样平掉整个仓位），
+        // 只是把可选增强逐个摘掉
+        {
+            TradingClient tc(test_cfg());
+            std::vector<std::string> sent;
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string& params, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m != "POST") return false;
+                sent.push_back(params);
+                // 模拟"带 priceProtect 就 400"：这正是要让它自己绕过去的那类
+                if (params.find("priceProtect") != std::string::npos) {
+                    out.code = 400;
+                    out.body = "<!DOCTYPE html><html><body>bad request</body></html>";
+                } else {
+                    out.code = 200;
+                    out.body = R"({"orderId":4242,"status":"NEW"})";
+                }
+                return true;
+            });
+
+            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
+            check(r.ok(), "带 priceProtect 被 400 拒后，自动退到不带它的写法并挂上");
+            check(sent.size() == 2, "  只多试一次（第一个成功就停）");
+            check(sent[0].find("priceProtect") != std::string::npos, "  第一发是完整写法");
+            check(sent[1].find("priceProtect") == std::string::npos, "  第二发摘掉了 priceProtect");
+            check(sent[1].find("closePosition=true") != std::string::npos,
+                  "  但 closePosition 必须还在 —— 摘的只能是可选增强，不能是保护本身");
+            check(sent[1].find("stopPrice=60000") != std::string::npos,
+                  "  触发价也必须还在");
+            check(sent[1].find("workingType=MARK_PRICE") != std::string::npos,
+                  "  workingType 还没到要退的那一档（标记价触发优先保留）");
+            check(!r.note.empty(), "  换了写法要留一句说明给上层打日志");
+
+            // 记住成功的那个：下一次直接用，稳态仍是一次请求
+            sent.clear();
+            auto r2 = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
+            check(r2.ok() && sent.size() == 1,
+                  "第二次只发一次请求（记住了能用的写法，不再白试被拒的那个）");
+            check(sent[0].find("priceProtect") == std::string::npos, "  直接用能用的那个");
+            check(r2.note.empty(), "  没有变化就不要重复打说明（否则每次挂单都刷一条）");
+        }
+        {
+            // 非参数类失败不该触发换写法：空响应是网络问题，换参数毫无意义，
+            // 而白试三遍等于把一次网络抖动变成三倍的挂单延迟
+            TradingClient tc(test_cfg());
+            int posts = 0;
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m == "POST") { ++posts; out.body = ""; return true; }
+                return false;
+            });
+            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
+            check(!r.ok() && r.retryable, "空响应仍是可重试的失败");
+            check(posts == 1, "  但不得为它轮换写法：那是网络问题，不是参数问题");
+        }
+
         // -1003 限流：过一会儿就好了，正是阶梯存在的理由
         auto r2 = probe(R"({"code":-1003,"msg":"Too many requests."})");
         check(!r2.ok() && r2.retryable, "-1003 限流可重试：这正是重试阶梯的用途");
