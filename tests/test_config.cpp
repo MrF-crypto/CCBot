@@ -126,6 +126,59 @@ int main() {
         check(warned, "SAR 段拼错的键产生告警");
     }
 
+    // ── 外扩缓冲换口径：占价格% → 占止损距离%（v5.10.0）────────────────────
+    // 这是一次【静默改变行为】的改动：两个键都是"一个百分数"，认错了不报错，
+    // 只会挂出一张几乎必被交易所抢先触发的单。所以换了键名，而不是改解释
+    {
+        // 只写旧键：不得被当成新口径用，必须落到新默认值并告警
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"use_disaster_stop\":true,"
+                         "\"disaster_stop_buffer_pct\":1.0}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "只有旧键时仍应加载成功: " + err);
+        check(hc.sar_bots.size() == 1, "  解析出 1 个 bot");
+        check(std::fabs(hc.sar_bots[0].disaster_stop_buffer_pct - 20.0) < 1e-9,
+              "  ⚠ 旧键的 1.0 不得被沿用——那在新口径下是止损距离的 1%，"
+              "默认参数下约等于价格的 0.06%，比原意紧 16 倍");
+        bool warned = false, unknown = false;
+        for (const auto& w : hc.warnings) {
+            if (w.find("disaster_stop_buf_dist_pct") != std::string::npos) warned = true;
+            if (w.find("无法识别的键") != std::string::npos) unknown = true;
+        }
+        check(warned, "  必须明确告知口径变了、本次按默认值跑");
+        check(!unknown, "  旧键仍在识别列表里，不该再报一条「拼写错误?」把人绕晕");
+    }
+    {
+        // 写了新键：原样采用，且不再告警
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"use_disaster_stop\":true,"
+                         "\"disaster_stop_buf_dist_pct\":35.0}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "新键应加载成功: " + err);
+        check(std::fabs(hc.sar_bots[0].disaster_stop_buffer_pct - 35.0) < 1e-9,
+              "  新键的值原样采用");
+        // ⚠ 写成 for(...) check(...) 的话，warnings 为空时循环体一次都不执行，
+        //   这条断言就【静默变成 0 条】——看起来在测，其实什么都没测。
+        //   先数出来再断言，空列表同样会走到 check
+        int buf_warns = 0;
+        for (const auto& w : hc.warnings)
+            if (w.find("disaster_stop") != std::string::npos) ++buf_warns;
+        check(buf_warns == 0, "  用了新键就不该再有任何缓冲相关的告警");
+    }
+    {
+        // 新键为 0 仍然要拒：挂在止损线上会让交易所抢先触发
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"use_disaster_stop\":true,"
+                         "\"disaster_stop_buf_dist_pct\":0}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err), "缓冲=0 应被拒绝");
+        check(err.find("disaster_stop_buf_dist_pct") != std::string::npos,
+              "  报错里要写【新】键名，否则人会去改一个已经不生效的键");
+    }
+
     // ── ②b 三个策略各自的解析与校验 ─────────────────────────────────────────
     {
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["

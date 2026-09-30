@@ -207,7 +207,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                          "开仓时挂一次，此后【不随移动止损走】——它的职责是"
                          "最大风险兜底，不是第二条移动止损。\n\n"
                          "进程崩溃、断电、断网之后它依然有效。\n"
-                         "触发用【标记价】，所以比移动止损外扩了 %3%%，"
+                         "触发用【标记价】，所以比移动止损外扩了止损距离的 %3%%，"
                          "让本地先触发、交易所只在进程真的不在时才兜底。")
                      .arg(hs_s).arg(QString::fromStdString(b.disaster_stop_id))
                      .arg(b.cfg.disaster_stop_buffer_pct, 0, 'f', 2);
@@ -811,19 +811,26 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
     riskForm->addRow(w->disStop);
 
     w->disBuf = new QDoubleSpinBox();
-    w->disBuf->setRange(0.1, 20.0);
-    w->disBuf->setSingleStep(0.1);
+    w->disBuf->setRange(1.0, 100.0);
+    w->disBuf->setSingleStep(1.0);
     w->disBuf->setDecimals(2);
     w->disBuf->setValue(c.disaster_stop_buffer_pct);
     w->disBuf->setToolTip(
-        "挂单价 = 止损线再往外扩这么多%（多头往下、空头往上）。\n\n"
+        "挂单价 = 止损线再往外扩【止损距离的】这么多%（多头往下、空头往上）。\n"
+        "止损距离 = |开仓价 − 初始止损线|，也就是这一仓计划内的单位风险。\n\n"
+        "填 20 的含义：进程真的死了、价格一路走到这张兜底单上，实际亏损是\n"
+        "计划风险的 1.2 倍。这个倍数与品种波动率、杠杆、止损松紧都无关。\n\n"
         "⚠ 不能填 0。交易所用连续的标记价触发，而本地是每 3 秒采样一次——挂在\n"
         "止损线【上】的话交易所几乎总会先触发，于是主出场路径从「本地平仓」变成\n"
         "「交易所平掉、本地靠对账才发现」，而对账发现外部平仓会【停掉 bot】。\n"
         "等于把一次正常的止损出场变成需要人工介入的事件。\n\n"
         "留出缓冲之后：正常情况本地先平并撤掉这张单，只有进程真的不在了，\n"
-        "价格才会继续走到这张单上。1% 对常态 ATR 2% 的品种是合适的起点。");
-    riskForm->addRow("外扩缓冲 %", w->disBuf);
+        "价格才会继续走到这张单上。\n\n"
+        "v5.10.0 之前这里是【占价格的百分比】。改口径是因为占价格会让兜底单的\n"
+        "代价与仓位风险脱钩：止损距离 0.5% 的仓位配 1%，兜底单落在 1.5% 外，\n"
+        "进程一死就是计划亏损的 3 倍；而止损距离 8% 的仓位，1% 又紧到容易被\n"
+        "交易所抢先。老配置读进来会置为默认 20 并提示——两种口径无法换算。");
+    riskForm->addRow("外扩缓冲（占止损距离 %）", w->disBuf);
     {
         auto* h = new QLabel(
             "止损线每根K线都可能棘轮上移，但这张单只在线移动超过 0.5% 时才重挂——"
@@ -1093,7 +1100,10 @@ void MainWindow::save_trend_bots() {
         o["swing_bars"]      = b.cfg.rule.swing_bars;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
         o["use_disaster_stop"]  = b.cfg.use_disaster_stop;
-        o["disaster_stop_buffer_pct"] = b.cfg.disaster_stop_buffer_pct;
+        // 新键名：占【止损距离】的百分比。旧键 disaster_stop_buffer_pct 是
+        // 占价格的百分比，语义不同且无法换算，所以不再写出——留着的话
+        // 旧版本读到会当成自己的口径用，那是一张几乎必被交易所抢先触发的单
+        o["disaster_stop_buf_dist_pct"] = b.cfg.disaster_stop_buffer_pct;
         // 单号必须跨重启存活：不存的话重启后会遗留一张触发价对不上的
         // 孤儿单，而 closePosition 同方向只能有一张，新的挂不上去
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
@@ -1227,8 +1237,34 @@ void MainWindow::load_and_restore_trend() {
         // 就会误判"信号过期"而停开新仓。想用自动值的话到弹窗里清成 0
         b.cfg.signal_max_age_sec   = o["signal_max_age_sec"].toInt(0);
         b.cfg.use_disaster_stop    = o["use_disaster_stop"].toBool(false);
-        b.cfg.disaster_stop_buffer_pct =
-            o["disaster_stop_buffer_pct"].toDouble(1.0);
+
+        // ── 迁移：外扩缓冲 占价格% → 占止损距离% ───────────────────────────
+        // 必须换键名，不能沿用旧键。两者都是"一个百分数"，旧值 1.0 在新语义下
+        // 会被读成"止损距离的 1%"——默认参数下约等于价格的 0.06%，比原意紧 16 倍，
+        // 而这个变化【不会有任何报错】：单子照挂、日志照打，只是几乎必然被交易所
+        // 抢先触发，于是正常止损变成"外部平仓 → 停 bot"要人工介入。
+        // 换键名之后旧值读不到，落到新默认值 20，并明确告诉用户这件事。
+        //
+        // 不做数值换算是因为【换不了】：旧值是价格的百分比，要折成止损距离的
+        // 百分比得知道该 bot 当时的止损距离，而那是运行期的 ATR，配置文件里没有。
+        // 与其按"典型品种"折一个假精确的数，不如直说换了口径、请自己确认一次
+        if (o.contains("disaster_stop_buf_dist_pct")) {
+            b.cfg.disaster_stop_buffer_pct =
+                o["disaster_stop_buf_dist_pct"].toDouble(20.0);
+        } else {
+            b.cfg.disaster_stop_buffer_pct = 20.0;
+            if (o.contains("disaster_stop_buffer_pct")) {
+                const double old_pct = o["disaster_stop_buffer_pct"].toDouble(1.0);
+                if (b.cfg.use_disaster_stop) {
+                    log(QString("趋势 %1：硬止损的「外扩缓冲」已从「占价格 %2%」改为"
+                                "「占止损距离的百分比」，本条已置为默认的 20%。"
+                                "两种口径无法换算（旧口径要折算得知道当时的 ATR），"
+                                "请到设置里确认一次。默认参数下 20% 与旧的 1% 大致等价。")
+                            .arg(sym).arg(old_pct, 0, 'f', 2), "WARN");
+                }
+                ++migrated;
+            }
+        }
         b.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
         b.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         b.state = (TrendBot::State)o["state"].toInt(0);

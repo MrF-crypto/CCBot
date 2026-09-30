@@ -1191,6 +1191,10 @@ void MainWindow::onConnect() {
                 //   没有，已清空本地状态" 就是这条
                 bool pos_ok = false;
                 auto ex_pos = client_->fetch_positions(&pos_ok);
+                // 快照拍摄的时刻。下面要跨线程排队到 GUI 线程才真正比对，
+                // 那段排队时间也算快照的年龄——对账要按【拍摄时刻】判断
+                // 它来不来得及包含某笔仓位变化，不是按比对时刻
+                const qint64 snapMs = QDateTime::currentMSecsSinceEpoch();
                 if (!pos_ok) {
                     QMetaObject::invokeMethod(this, [this]() {
                         log("启动对账已跳过：拉取交易所持仓失败。"
@@ -1200,13 +1204,16 @@ void MainWindow::onConnect() {
                     }, Qt::QueuedConnection);
                     return;
                 }
-                QMetaObject::invokeMethod(this, [this, ex_pos]() {
+                QMetaObject::invokeMethod(this, [this, ex_pos, snapMs]() {
                     if (!trend_engine_) return;
                     std::vector<TrendEngine::ExchangePos> ex;
                     ex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto issues = trend_engine_->reconcile_positions(ex);
+                    const qint64 age =
+                        QDateTime::currentMSecsSinceEpoch() - snapMs;
+                    auto issues = trend_engine_->reconcile_positions(
+                        ex, std::chrono::milliseconds(age < 0 ? 0 : age));
                     if (!issues.empty()) {
                         for (const auto& i : issues)
                             log("对账: " + QString::fromStdString(i), "WARN");
@@ -1734,8 +1741,13 @@ void MainWindow::onTick() {
     // 不额外请求：refreshPositions() 每个 tick 都在拉持仓填 pos_cache_，
     // 此前那份数据只喂给了界面显示，这里直接复用，权重成本为零。
     //
-    // 用 Periodic 模式——它会跳过在途和刚成交的 bot，否则正在止盈的那笔
-    // 会被当成"外部平仓"清掉（详见 reconcile_positions 的说明）
+    // ⚠ 必须把【快照有多旧】传进去。这里复用的 pos_cache_ 最旧可达 30 秒，
+    //   而本地仓位可能在这 30 秒里刚刚开出来——快照里当然没有它。
+    //   v5.9.4 之前这里写着"用 Periodic 模式，它会跳过刚成交的 bot"，
+    //   而 reconcile_positions 【根本没有】这个模式，也没有这道跳过：
+    //   注释描述了一个不存在的保护，于是没人再去看那条路径。实盘代价是
+    //   开空成交的同一秒仓位被判成"外部已平"，硬止损随后被当孤儿单撤掉，
+    //   交易所上留下一笔无人管理、没有止损的真实仓位。
     // ⚠ 判据用【快照新鲜度】，不能用 pos_cache_ 非空：所有仓位都被外部平掉时
     // 缓存本来就是空的，而那恰恰是最需要对账的时刻。反过来，拉取失败时缓存
     // 同样是空的（或陈旧的），此时若当成"交易所无持仓"就会凭空清掉真实仓位。
@@ -1747,7 +1759,8 @@ void MainWindow::onTick() {
         sex.reserve(pos_cache_.size());
         for (const auto& [k, p] : pos_cache_)
             sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-        auto issues = trend_engine_->reconcile_positions(sex);
+        auto issues = trend_engine_->reconcile_positions(
+            sex, std::chrono::milliseconds(posAge));
         if (!issues.empty()) {
             for (const auto& i : issues)
                 log("对账: " + QString::fromStdString(i), "WARN");

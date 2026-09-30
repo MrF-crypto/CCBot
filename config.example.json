@@ -27,7 +27,7 @@
       "signal_max_age_sec": 0,
 
       "use_disaster_stop": true,
-      "disaster_stop_buffer_pct": 1.0
+      "disaster_stop_buf_dist_pct": 20.0
     },
     {
       "symbol": "BTCUSDT",
@@ -45,7 +45,7 @@
       "signal_max_age_sec": 0,
 
       "use_disaster_stop": true,
-      "disaster_stop_buffer_pct": 1.0
+      "disaster_stop_buf_dist_pct": 20.0
     },
     {
       "symbol": "SOLUSDT",
@@ -67,7 +67,7 @@
       "signal_max_age_sec": 0,
 
       "use_disaster_stop": true,
-      "disaster_stop_buffer_pct": 1.0
+      "disaster_stop_buf_dist_pct": 20.0
     }
   ]
 }

@@ -3,6 +3,11 @@
 #include <fstream>
 #include <sstream>
 #include <set>
+// ⚠ <string> 显式写出来：本文件用了 std::string / std::to_string。MSVC 的标准库
+//   与 <sstream> 都会传递包含它，所以本机编得过、clang --driver-mode=g++ 那道
+//   扫描也查不到（它用的是 MSVC 的头文件）——libstdc++ 严格起来就是推上去才炸。
+//   v5.9.4 那次 CI 失败就是这个（少了 <cmath>），别再交第二次学费
+#include <string>
 
 namespace ccbot {
 
@@ -116,10 +121,11 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "bare_entry", "once_per_bar", "swing_bars",
         // 共享
         "reverse", "max_consecutive_reverses", "cooldown_bars",
-        "signal_max_age_sec", "use_disaster_stop", "disaster_stop_buffer_pct",
+        "signal_max_age_sec", "use_disaster_stop", "disaster_stop_buf_dist_pct",
         "size_mode", "risk_usdt",
         // 兼容旧键：仍然识别，但会迁移并显式告警（见下）
         "mode", "allow_reverse", "reverse_needs_signal",
+        "disaster_stop_buffer_pct",
     };
     simdjson::dom::array tarr;
     if (root["sar_bots"].get(tarr) == simdjson::SUCCESS) {
@@ -146,12 +152,33 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                                                 c.signal_max_age_sec);
             // 交易所侧灾难止损：SAR 唯一的进程外保护，强烈建议开
             c.use_disaster_stop = get_bool(so, "use_disaster_stop", c.use_disaster_stop);
-            c.disaster_stop_buffer_pct = get_num(so, "disaster_stop_buffer_pct",
+            // ⚠ 换过口径：旧键 disaster_stop_buffer_pct 是【占价格】的百分比，
+            //   新键 disaster_stop_buf_dist_pct 是【占止损距离】的百分比。
+            //   两者都是"一个百分数"，认错了不会报错、只会静默挂出一张几乎
+            //   必被交易所抢先触发的单，所以必须换键名而不是改解释。
+            //   也【不做数值换算】：旧口径要折成新口径得知道该 bot 当时的
+            //   止损距离（运行期 ATR），配置文件里没有这个信息。
+            c.disaster_stop_buffer_pct = get_num(so, "disaster_stop_buf_dist_pct",
                                                  c.disaster_stop_buffer_pct);
+            simdjson::dom::element probe;
+            const bool has_new = (so["disaster_stop_buf_dist_pct"].get(probe)
+                                  == simdjson::SUCCESS);
+            const bool has_old = (so["disaster_stop_buffer_pct"].get(probe)
+                                  == simdjson::SUCCESS);
+            if (!has_new && has_old) {
+                // 只写了旧键：用新默认值，并且每次启动都说一次。headless 不回写
+                // 配置，所以这条告警会一直在——正是想要的，直到人去改配置文件
+                out.warnings.push_back(
+                    c.symbol + ": disaster_stop_buffer_pct 已废弃（它是占价格的百分比）。"
+                    "现在用 disaster_stop_buf_dist_pct，含义是占【止损距离】的百分比，"
+                    "本次按默认值 " + std::to_string((int)c.disaster_stop_buffer_pct) +
+                    " 运行。两种口径无法换算，请自行确认一次"
+                    "（默认参数下 20 与旧的 1 大致等价）");
+            }
             if (c.use_disaster_stop && c.disaster_stop_buffer_pct <= 0) {
                 // 缓冲为 0 会让交易所抢在本地之前触发，把正常止损变成"外部平仓
                 // → 停 bot"。这是一个静默改变行为的配置错误，必须拦
-                err = c.symbol + ": disaster_stop_buffer_pct 必须大于 0"
+                err = c.symbol + ": disaster_stop_buf_dist_pct 必须大于 0"
                       "（挂在止损线上会让交易所抢先触发，正常出场会变成需要人工介入的事件）";
                 return false;
             }

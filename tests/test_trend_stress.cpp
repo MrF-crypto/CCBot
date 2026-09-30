@@ -308,7 +308,11 @@ static void part_a_concurrency() {
                 p.entry_price = client->price.load();
                 ex.push_back(p);
             }
-            eng.reconcile_positions(ex);
+            // ⚠ 本文件的 g_now 始终停在 epoch，于是 last_pos_change 也恒为 0，
+            //   正好落进"本轮还没变过"那一支，新鲜度守卫不会跳过任何 bot——
+            //   对账线程照旧全速压测。哪天这里开始推进 g_now，就要同步把
+            //   snapshot_age 一起考虑进来，否则对账会被大面积跳过而压不到东西
+            eng.reconcile_positions(ex, std::chrono::milliseconds(0));
             ++recons;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
