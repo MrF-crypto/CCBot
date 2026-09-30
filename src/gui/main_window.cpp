@@ -1135,6 +1135,13 @@ void MainWindow::onConnect() {
                 [this]() -> std::unordered_map<std::string, double> {
                     if (!client_) return {};
                     return client_->fetch_all_24h_changes();
+                },
+                // 备用价格源（成交价口径）。主源连续失败到健康灯转红时才启用，
+                // 切换会明确报出来 —— 见 RestPriceFeed 里的说明。
+                // 在它之前所有价格都来自 premiumIndex 一个端点，挂了就全挂
+                [this]() -> std::unordered_map<std::string, double> {
+                    if (!client_) return {};
+                    return client_->fetch_all_last_prices();
                 });
             // 行情层的告警（拉取失败/恢复）。回调跑在轮询线程，转回 GUI 线程再写日志
             ticker_->on_server_msg([this](const std::string& m) {

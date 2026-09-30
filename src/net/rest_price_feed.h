@@ -45,7 +45,14 @@ public:
     using FetchMap = std::function<std::unordered_map<std::string, double>()>;
     using LogCb    = std::function<void(const std::string&)>;
 
-    RestPriceFeed(FetchMap fetch_marks, FetchMap fetch_changes);
+    // fetch_fallback = 备用价格源（成交价口径）。可以传空 —— 那就没有第二来源。
+    //
+    // ⚠ 兜底放在【行情源内部】而不是各调用方各写一份：GUI 与 headless 原先各有
+    //   一套补拉逻辑，v5.7.0 删了 GUI 那份、忘了 headless 那份，结果两边在故障下
+    //   行为不同（GUI 就不喂了，headless 每 3 秒自己补）。"界面上好的、VPS 上
+    //   不一样"是最难查的一类问题，所以这次只在一个地方实现
+    RestPriceFeed(FetchMap fetch_marks, FetchMap fetch_changes,
+                  FetchMap fetch_fallback = {});
     ~RestPriceFeed();
     RestPriceFeed(const RestPriceFeed&)            = delete;
     RestPriceFeed& operator=(const RestPriceFeed&) = delete;
@@ -61,6 +68,10 @@ public:
         int64_t ws_mark_ms = 0;
         double  chg_24h    = 0;
         int64_t chg_ms     = 0;
+        // 这个价来自【备用源】（成交价），不是标记价。
+        // 留着它是为了让界面/日志能说清口径变了 —— 成交价不抗插针，
+        // 拿它推移动止损比标记价更容易被打掉，用的人有权知道
+        bool    from_fallback = false;
     };
 
     // 健康状态。只有四个数，而且每一个都是【直接观测】到的，不是推断出来的。
@@ -131,7 +142,7 @@ private:
     void loop();
     void say(const std::string& m) const;
 
-    FetchMap fetch_marks_, fetch_changes_;
+    FetchMap fetch_marks_, fetch_changes_, fetch_fallback_;
 
     mutable std::mutex mtx_;
     std::unordered_map<std::string, Tick> cache_;   // 键 = 大写品种
@@ -144,6 +155,9 @@ private:
     // 连续失败时只报一次，恢复时报一次。中间每轮都报的话，1 秒一轮就是刷屏——
     // 这正是 WS 版里那套退避+节流在解决的问题，而轮询只要一个 bool 就够
     std::atomic<bool>    fail_reported_{false};
+    // 当前是否在用备用源。切换进/出各报一次 —— 口径变化必须让人知道，
+    // 但每轮都报就是刷屏
+    std::atomic<bool>    on_fallback_{false};
 
     std::thread             th_;
     mutable std::mutex      cv_mtx_;

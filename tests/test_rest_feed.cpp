@@ -169,6 +169,83 @@ int main() {
         feed.stop();
     }
 
+    std::printf("\n── 用例6：备用价格源（口径从标记价换成成交价，必须说出来）──\n");
+    {
+        // 在它之前所有价格都来自 premiumIndex 一个端点 —— 挂了就全挂，
+        // 而"退回单品种查询"退的还是同一个端点，同一个故障下一起死。
+        // 备用源走另一条路径，但口径是成交价（不抗插针），所以：
+        //   · 只在主源连续失败到健康灯该转红时才上
+        //   · 切换必须报出来 —— 悄悄换掉风控赖以生存的价格口径是不可接受的
+        std::atomic<bool> mark_fail{false};
+        std::atomic<int>  fb_calls{0};
+        std::vector<std::string> logs;
+        std::mutex lm;
+        RestPriceFeed feed(
+            [&]() -> std::unordered_map<std::string, double> {
+                if (mark_fail.load()) return {};
+                return {{"BTCUSDT", 60000.0}};
+            },
+            []() -> std::unordered_map<std::string, double> { return {}; },
+            [&]() -> std::unordered_map<std::string, double> {
+                ++fb_calls;
+                return {{"BTCUSDT", 59990.0}};     // 成交价，略有差别
+            });
+        feed.on_server_msg([&](const std::string& m) {
+            std::lock_guard<std::mutex> lk(lm); logs.push_back(m);
+        });
+        feed.subscribe("BTCUSDT");
+        feed.start();
+        check(wait_until([&] { return feed.mark_price("BTCUSDT") > 0; }), "主源正常时先拿到价");
+        check(fb_calls.load() == 0, "  主源正常时【绝不】碰备用源");
+        check(!feed.get("BTCUSDT").from_fallback, "  且标记为非备用来源");
+
+        mark_fail.store(true);
+        // 前两轮失败不该启用备用源：单轮抖动很常见，一抖就换口径太激进
+        check(wait_until([&] { return feed.health().fail_streak >= 1; }), "主源开始失败");
+        check(fb_calls.load() == 0, "  第 1 轮失败还不启用备用源");
+
+        check(wait_until([&] { return fb_calls.load() > 0; }, 8000),
+              "连续失败到阈值后启用备用源");
+        check(wait_until([&] { return feed.get("BTCUSDT").from_fallback; }),
+              "  价格标记为来自备用源（界面/日志据此说明口径）");
+        check(std::fabs(feed.mark_price("BTCUSDT") - 59990.0) < 1e-9, "  用的是备用源的价");
+
+        {
+            std::lock_guard<std::mutex> lk(lm);
+            int sw = 0;
+            for (const auto& m : logs) if (m.find("备用价格源") != std::string::npos) ++sw;
+            check(sw == 1, "切换到备用源只报一次（而不是每轮都报）");
+            bool said_basis = false;
+            for (const auto& m : logs)
+                if (m.find("成交价") != std::string::npos) said_basis = true;
+            check(said_basis, "  且必须说清口径变成了成交价、不抗插针");
+        }
+
+        // 主源恢复 ⇒ 自动切回，并报一次
+        mark_fail.store(false);
+        check(wait_until([&] { return !feed.get("BTCUSDT").from_fallback; }),
+              "主源恢复后自动切回标记价");
+        {
+            std::lock_guard<std::mutex> lk(lm);
+            int back = 0;
+            for (const auto& m : logs) if (m.find("切回标记价") != std::string::npos) ++back;
+            check(back == 1, "  切回也只报一次");
+        }
+        feed.stop();
+    }
+    {
+        // 没给备用源时行为不变：拿不到就是拿不到，不该凭空冒出价格
+        RestPriceFeed feed(
+            []() -> std::unordered_map<std::string, double> { return {}; },
+            []() -> std::unordered_map<std::string, double> { return {}; });
+        feed.subscribe("BTCUSDT");
+        feed.start();
+        check(wait_until([&] { return feed.health().fail_streak >= 3; }), "一直失败");
+        check(feed.mark_price("BTCUSDT") == 0.0,
+              "没有备用源时就是没有价（不许凭空造一个）");
+        feed.stop();
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

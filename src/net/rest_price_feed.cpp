@@ -28,8 +28,11 @@ std::string RestPriceFeed::Health::summary() const {
     return o.str();
 }
 
-RestPriceFeed::RestPriceFeed(FetchMap fetch_marks, FetchMap fetch_changes)
-    : fetch_marks_(std::move(fetch_marks)), fetch_changes_(std::move(fetch_changes)) {}
+RestPriceFeed::RestPriceFeed(FetchMap fetch_marks, FetchMap fetch_changes,
+                             FetchMap fetch_fallback)
+    : fetch_marks_(std::move(fetch_marks)),
+      fetch_changes_(std::move(fetch_changes)),
+      fetch_fallback_(std::move(fetch_fallback)) {}
 
 RestPriceFeed::~RestPriceFeed() { stop(); }
 
@@ -83,8 +86,26 @@ void RestPriceFeed::loop() {
 
         // ① 标记价：一次全取，与品种数无关
         bool ok = false;
+        bool used_fallback = false;
         if (fetch_marks_) {
             auto all = fetch_marks_();
+
+            // ② 主源连续失败到"健康灯该转红"的程度，就启用备用源。
+            //
+            // ⚠ 在它之前，所有价格都来自 premiumIndex 这一个端点 —— 它挂了就全挂，
+            //   而"退回单品种查询"退的还是同一个端点，同一个故障下一起死。
+            //   备用源走 /fapi/v1/ticker/price，不同路径、不同权重池。
+            //
+            // ⚠ 口径变了：备用源给的是【成交价】，不是标记价。成交价不抗插针，
+            //   拿它推移动止损比标记价更容易被打掉。所以它只在主源真的不行时才上，
+            //   而且切换必须报出来 —— 悄悄换掉风控赖以生存的价格口径是不可接受的。
+            //   阈值与 kUnhealthyFails 一致：健康灯转红的同一刻启用备用口径
+            if (all.empty() && fetch_fallback_ &&
+                fail_streak_.load() >= kUnhealthyFails) {
+                all = fetch_fallback_();
+                used_fallback = !all.empty();
+            }
+
             if (!all.empty()) {
                 ok = true;
                 const int64_t t = now_ms();
@@ -93,12 +114,25 @@ void RestPriceFeed::loop() {
                     auto it = all.find(s);
                     if (it == all.end() || !(it->second > 0)) continue;
                     auto& c = cache_[s];
-                    c.symbol     = s;
-                    c.mark_price = it->second;
-                    c.mark_ms    = t;
-                    c.ws_mark_ms = t;   // 与 mark_ms 恒等，见头文件
+                    c.symbol        = s;
+                    c.mark_price    = it->second;
+                    c.mark_ms       = t;
+                    c.ws_mark_ms    = t;   // 与 mark_ms 恒等，见头文件
+                    c.from_fallback = used_fallback;
                 }
             }
+        }
+
+        // 切换进/出备用源各报一次
+        if (used_fallback != on_fallback_.exchange(used_fallback)) {
+            if (used_fallback)
+                say("⚠ 标记价拉不到，已切到【备用价格源】（/fapi/v1/ticker/price）。\n"
+                    "    ⚠ 口径变了：这是【成交价】而不是标记价。标记价带指数成分、"
+                    "抗单交易所插针，成交价不抗 —— 移动止损会比平时更容易被插针打掉。\n"
+                    "    主源一恢复就自动切回。交易所侧那张硬止损单不受影响"
+                    "（它由交易所按标记价触发）");
+            else
+                say("✅ 标记价已恢复，价格口径切回标记价");
         }
 
         if (ok) {

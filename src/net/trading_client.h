@@ -157,6 +157,19 @@ public:
     //   24h 涨跌那条兜底早就是全取的，标记价这条一直是逐品种，属于遗漏
     std::unordered_map<std::string, double> fetch_all_mark_prices();
 
+    // 全市场【最新成交价】，一次取回（/fapi/v1/ticker/price 不带 symbol，权重 2）。
+    //
+    // ⚠ 口径与 fetch_all_mark_prices 不同：这是成交价，标记价带指数成分与资金费
+    //   基差、抗单交易所插针，而成交价不抗。所以它【只用作标记价拿不到时的替代】，
+    //   平时绝不能用 —— 拿成交价推移动止损会比标记价更容易被插针打掉。
+    //
+    // 存在的理由：在它之前，所有价格都来自 premiumIndex 这一个端点，
+    //   那个端点挂了就全挂（"退回单品种查询"退的还是同一个端点，同一个故障下
+    //   一起死，不算兜底）。这是第一条真正独立的价格通路。
+    //   为什么不用 K 线：K 线是逐品种 N 次请求，而故障时最不该做的就是把请求数
+    //   乘以品种数；ticker/price 一次全取、权重 2，口径还一样
+    std::unordered_map<std::string, double> fetch_all_last_prices();
+
     // 交易所上【当前活跃】的条件单 algoId 集合。
     //
     // ⚠ 存在的理由：本地只要 disaster_stop_id 非空就认为这个仓位受保护、

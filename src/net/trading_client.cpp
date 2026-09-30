@@ -1536,6 +1536,30 @@ std::set<std::string> TradingClient::fetch_open_algo_ids(bool* ok) {
     return out;
 }
 
+std::unordered_map<std::string, double> TradingClient::fetch_all_last_prices() {
+    std::unordered_map<std::string, double> out;
+    // 不带 symbol ⇒ 返回全市场数组
+    auto resp = http_get_public("/fapi/v1/ticker/price");
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    // 错误时币安回对象而非数组。返回空表让调用方保留旧价，绝不因为一次失败清价
+    if (doc.get(arr) != simdjson::SUCCESS) return out;
+    out.reserve(arr.size());
+    for (auto e : arr) {
+        std::string_view s, px;
+        if (e["symbol"].get(s) != simdjson::SUCCESS) continue;
+        if (e["price"].get(px) != simdjson::SUCCESS) continue;
+        double v = 0;
+        try { v = std::stod(std::string(px)); } catch (...) { continue; }
+        if (v > 0) out.emplace(std::string(s), v);
+    }
+    return out;
+}
+
 std::unordered_map<std::string, double> TradingClient::fetch_all_mark_prices() {
     std::unordered_map<std::string, double> out;
     // 不带 symbol ⇒ 返回全市场数组
