@@ -497,8 +497,12 @@ int main() {
                   "  最后一个变体继承了数量写法（不得退回 closePosition）");
             check(sent[3].find("closePosition") == std::string::npos,
                   "  且确实没有 closePosition");
-            check(sent[3].find("workingType=CONTRACT_PRICE") != std::string::npos,
-                  "  同时退让 workingType —— 这才是它与变体2 的唯一差别");
+            check(sent[3].find("workingType") == std::string::npos,
+                  "  最简形式必须【不带】workingType：审计发现原来四个变体只换过它的"
+                  "取值、从未缺席过，等于漏掉了最可能通过严格校验的那个形状");
+            check(sent[3].find("recvWindow") == std::string::npos,
+                  "  recvWindow 同理，它也是可选参数");
+            check(sent[3].find("priceProtect") == std::string::npos, "  也不带 priceProtect");
         }
         {
             // 拿不到持仓数量时跳过变体2：它非要 quantity，缺了就只是变体1 的重复，
@@ -640,6 +644,59 @@ int main() {
         check(mixed.size() == 2, "坏条目逐个跳过，好的照常返回（缺字段/零价/非数字）");
         check(mixed.count("BTCUSDT") && mixed.count("ETHUSDT"), "  两个好品种都在");
         check(!mixed.count("ZEROUSDT"), "  价格为 0 不算有效价");
+    }
+
+    std::printf("── 用例13：持仓快照的 ok 语义（对账的输入，错了会清掉真实持仓）──\n");
+    {
+        // 对账把"交易所没有这个仓位"处置成【清掉本地跟踪并停掉 bot】。所以这份
+        // 快照必须能区分"确实没仓"和"这次没拉到" —— 混淆的后果是一笔真实持仓
+        // 变成无人看管的裸敞口，而且发生在启动、刚恢复完仓位之后
+        auto probe = [](const char* body, bool* ok_out) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string&, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("positionRisk") != std::string::npos) { out.body = body; return true; }
+                return false;
+            });
+            return tc.fetch_positions(ok_out);
+        };
+        bool ok = true;
+        auto v = probe("", &ok);
+        check(!ok && v.empty(), "空响应 ⇒ ok=false（不是「交易所没有仓位」）");
+
+        ok = true;
+        v = probe(R"({"code":-1121,"msg":"Invalid symbol."})", &ok);
+        check(!ok, "错误对象（而非数组）⇒ ok=false");
+
+        ok = false;
+        v = probe("[]", &ok);
+        check(ok && v.empty(), "合法的空数组 ⇒ ok=true 且无仓位（这才是真的没仓）");
+
+        ok = false;
+        v = probe(R"([{"symbol":"BTCUSDT","positionAmt":"0.015","entryPrice":"60000",)"
+                  R"("markPrice":"60100","unRealizedProfit":"1.5","liquidationPrice":"0",)"
+                  R"("leverage":"3"}])", &ok);
+        check(ok && v.size() == 1, "正常一条 ⇒ ok=true");
+        if (v.size() == 1) {
+            check(v[0].direction == 1 && std::fabs(v[0].qty - 0.015) < 1e-9, "  多头 0.015");
+        }
+
+        ok = false;
+        v = probe(R"([{"symbol":"BTCUSDT","positionAmt":"-0.02","entryPrice":"60000",)"
+                  R"("markPrice":"59000","unRealizedProfit":"20","liquidationPrice":"0",)"
+                  R"("leverage":"3"}])", &ok);
+        check(ok && v.size() == 1 && v[0].direction == -1, "负数量 ⇒ 空头");
+
+        // ⚠ 单条解析失败必须把【整份快照】标成不可信，而不是静默少一条：
+        //   少的那一条在对账眼里就是"交易所没有这个仓位" ⇒ 清掉本地跟踪
+        ok = true;
+        v = probe(R"([{"symbol":"BTCUSDT","positionAmt":"0.015","entryPrice":"60000"},)"
+                  R"({"symbol":"ETHUSDT","positionAmt":"abc","entryPrice":"2600"}])", &ok);
+        check(!ok, "有一条 positionAmt 解析不出来 ⇒ 整份快照 ok=false");
+        ok = true;
+        v = probe(R"([{"symbol":"BTCUSDT","positionAmt":"0.015"},)"
+                  R"({"symbol":"ETHUSDT","entryPrice":"2600"}])", &ok);
+        check(!ok, "有一条缺 positionAmt ⇒ 同样不可信（缺字段和解析失败等价）");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

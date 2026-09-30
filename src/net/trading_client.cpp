@@ -635,8 +635,19 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions(bool* ok) {
         get_or_keep(item["liquidationPrice"], liq_s);
         get_or_keep(item["leverage"], lev);
 
+        // ⚠ positionAmt 解析不出来时【不能】当成"没有仓位"。
+        //   这份快照是对账的输入，而对账把"交易所没有这个仓位"处置成
+        //   「清掉本地跟踪并停掉 bot」—— 所以一个解析失败就会让一笔真实持仓
+        //   变成无人看管的裸敞口。
+        //   宁可把整份快照标成不可信（ok=false ⇒ 调用方这一轮不对账），
+        //   也不要交出一份"少了几个仓位"的快照。下一轮会再拉一次
         double pos_amt = 0;
-        try { pos_amt = std::stod(std::string(amt_s)); } catch (...) {}
+        bool   amt_ok  = false;
+        try { pos_amt = std::stod(std::string(amt_s)); amt_ok = true; } catch (...) {}
+        if (!amt_ok) {
+            if (ok) *ok = false;
+            continue;
+        }
         if (std::abs(pos_amt) < 1e-10) continue;
 
         Position pos;
@@ -1160,7 +1171,13 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     //   变体0  closePosition + MARK_PRICE + priceProtect   ← 功能最全，原来的写法
     //   变体1  去掉 priceProtect（它只是"标记价明显异常时不触发"的附加保护）
     //   变体2  quantity + reduceOnly 取代 closePosition（需要 qty，拿不到就跳过）
-    //   变体3  再把 workingType 换成 CONTRACT_PRICE（币安的默认口径）
+    //   变体3  【最简形式】：只留币安要求的必填项 —— 连 workingType 和 recvWindow
+    //          都不带（workingType 缺省即 CONTRACT_PRICE）
+    //
+    // ⚠ 变体3 是审计时补上的。原来的变体3 只是把 workingType 的【值】换成
+    //   CONTRACT_PRICE，于是 workingType 与 recvWindow 在四个变体里【从未缺席】过。
+    //   "把可选参数全摘干净"这个最可能通过严格校验的形状，一次都没试到。
+    //   一个只试了参数【取值】而没试过参数【存在与否】的阶梯，是排查上的盲区。
     //
     // ⚠ 变体0→1 摘掉的是【可选增强】，触发价与 closePosition 一直在。
     // ⚠ 变体2 是唯一【结构上不同】的那个：手机 App 上的「整个仓位 / 仅减仓」就是
@@ -1195,9 +1212,12 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
             oss << "&closePosition=true";
         }
         // 用标记价，避免插针成交价误触发；最后一个变体退回币安默认口径
-        oss << "&workingType=" << (variant >= 3 ? "CONTRACT_PRICE" : "MARK_PRICE");
+        // 变体3 连 workingType 都不带（缺省即 CONTRACT_PRICE）；其余用标记价触发，
+        // 避免插针成交价误触发
+        if (variant < 3) oss << "&workingType=MARK_PRICE";
         if (variant < 1) oss << "&priceProtect=true";
-        oss << "&recvWindow=5000";
+        // recvWindow 同理：它也是可选参数，最简形式里一并摘掉
+        if (variant < 3) oss << "&recvWindow=5000";
         if (dual_mode_)
             oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
         return oss.str();
@@ -1213,7 +1233,7 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         case 0:  return "完整（closePosition + MARK_PRICE + priceProtect）";
         case 1:  return "去掉 priceProtect";
         case 2:  return "数量 取代 closePosition";
-        default: return "数量 取代 closePosition 且改用 CONTRACT_PRICE 触发";
+        default: return "最简形式（只留必填项，不带 workingType / recvWindow）";
         }
     };
 

@@ -1153,7 +1153,26 @@ void MainWindow::onConnect() {
             // 本地状态是错的，带着错误均价继续跑会把止盈止损全算错
             run_async([this]() {
                 if (!client_ || !trend_engine_) return;
-                auto ex_pos = client_->fetch_positions();
+                // ⚠ 必须看 ok：空的持仓列表既可能是"确实没仓"，也可能是这次请求
+                //   失败（超时、网关返回 HTML、被代理拦掉）。把后者当成前者，
+                //   对账就会对【每一个】有持仓的 bot 判定"交易所已无此仓位"，
+                //   于是清掉开仓价/止损线/数量并停掉 bot —— 而真实仓位还在交易所上
+                //   无人看管。而且这条路跑在【启动、刚从落盘恢复完仓位之后】，
+                //   是最坏的时刻。
+                //   headless 侧一直是判 ok 的（那边注释也写着这个风险），
+                //   GUI 的启动对账漏了 —— 实盘日志里 "LINKUSDT 本地有仓位但交易所
+                //   没有，已清空本地状态" 就是这条
+                bool pos_ok = false;
+                auto ex_pos = client_->fetch_positions(&pos_ok);
+                if (!pos_ok) {
+                    QMetaObject::invokeMethod(this, [this]() {
+                        log("启动对账已跳过：拉取交易所持仓失败。"
+                            "宁可不对账，也不能把「拉取失败」当成「交易所没有仓位」——"
+                            "那会清掉本地跟踪而真实仓位还在。下一轮周期对账会再试",
+                            "WARN");
+                    }, Qt::QueuedConnection);
+                    return;
+                }
                 QMetaObject::invokeMethod(this, [this, ex_pos]() {
                     if (!trend_engine_) return;
                     std::vector<TrendEngine::ExchangePos> ex;
