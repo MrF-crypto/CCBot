@@ -130,6 +130,7 @@ const char* TradingClient::ep(Ep e) const {
     case Ep::ListenKey:        return pm ? "/papi/v1/listenKey"            : "/fapi/v1/listenKey";
     case Ep::PmAccount:        return "/papi/v1/account";
     case Ep::CondOrder:        return "/papi/v1/um/conditional/order";
+    case Ep::AlgoOrder:        return pm ? "/papi/v1/um/algoOrder" : "/fapi/v1/algoOrder";
     case Ep::Income:           return pm ? "/papi/v1/um/income"            : "/fapi/v1/income";
     }
     return "";
@@ -1135,306 +1136,134 @@ static bool stop_error_retryable(const std::string& err) {
     return true;
 }
 
+// ── 交易所侧硬止损：条件单，走 algoOrder 端点 ─────────────────────────────────
+// 币安 2025-11-06 公告、2025-12-09 强制生效：STOP_MARKET / TAKE_PROFIT_MARKET
+// 这类条件单不再接受 /fapi/v1/order，必须走 /fapi/v1/algoOrder。
+// 老端点上发条件单会回 -4120（"…Please use the Algo Order API endpoints instead."）。
+//
+// ⚠ 新端点的触发价参数叫 triggerPrice，【不是】stopPrice。而且——这是整件事里
+//   最危险的一条——传错名字【不会报错】：币安照常接受这张单、我们照常拿到
+//   algoId，但它永远不会触发。那比"挂不上"糟糕得多：挂不上会走兜底平仓，
+//   而静默的假保护会让人以为仓位有底。
+//   所以下面在成功路径上【强制校验回执里的 triggerPrice】，对不上就当失败。
+//
+// ⚠ workingType 的默认值在新端点上是 CONTRACT_PRICE（成交价），必须显式写
+//   MARK_PRICE —— 否则插针就能打掉这张单，而它的全部意义是"只有真的跌到那里
+//   才平"。
+//
+// v5.5.1 之前这里有一套四变体的写法阶梯（摘 priceProtect、换 workingType、
+// 用 quantity 取代 closePosition、最简形式），那是在给【错误的端点】试形状，
+// 四个变体必然全部被拒。端点对了之后它们没有意义，整套删掉。
 TradingClient::StopPlacement
 TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
                                    const std::string& entry_side, double qty) {
+    StopPlacement out;
     stop_price = round_price(sym, stop_price);
-    // 取整之后还 <=0：传进来的价本身就不合法，重试没有意义
     if (stop_price <= 0) {
-        // 按字段赋值而不是聚合初始化：见 itrading_client.h 里 StopPlacement 的注释
-        StopPlacement p;
-        p.error     = "止损触发价非法（取整后 <= 0）";
-        p.retryable = false;
-        return p;
+        out.error     = "止损触发价非法（取整后 <= 0）";
+        out.retryable = false;
+        return out;
     }
 
     const std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
     const auto& info = get_symbol_info(sym);
     const int price_dp = step_decimals(info.tick_size);
-    const bool pm = is_pm();
 
-    // 同一张单的几种写法。只差"往哪个端点发 + 类型字段叫什么 + 带哪几个可选参数"。
-    // 普通合约账户走 /fapi/v1/order 的 type=；统一账户的条件单是另一套端点，
-    // 字段叫 strategyType=（普通端点只收 LIMIT/MARKET，发 STOP_MARKET 会被拒）。
-    //
-    // ── 为什么要有"备选写法"这个概念 ──────────────────────────────────────────
-    // 实测（2026-09-30，$208 的普通合约账户）：市价单成功，而 5 秒后同一个端点、
-    // 同一个方法的 STOP_MARKET 拿回 HTTP 400 + 一张网页。差别只在参数里，而
-    // 靠读代码猜了四轮都没定位到（端点、账户模式、代理劫持、deflate、数字格式化
-    // 全部排除）。
-    //
-    // 与其继续要日志，不如让它自己按"从功能完整到最保守"的顺序试一遍：
-    // 每个变体都是【同等保护力】的同一张单（同一个触发价、同样平掉整个仓位），
-    // 只是把可选参数逐个摘掉。第一个成功的会被记住，之后直接用它 —— 稳态仍然
-    // 是一次请求。哪个变体成功，也就顺手告诉了我们是哪个可选参数不被接受。
-    //
-    //   变体0  closePosition + MARK_PRICE + priceProtect   ← 功能最全，原来的写法
-    //   变体1  去掉 priceProtect（它只是"标记价明显异常时不触发"的附加保护）
-    //   变体2  quantity + reduceOnly 取代 closePosition（需要 qty，拿不到就跳过）
-    //   变体3  【最简形式】：只留币安要求的必填项 —— 连 workingType 和 recvWindow
-    //          都不带（workingType 缺省即 CONTRACT_PRICE）
-    //
-    // ⚠ 变体3 是审计时补上的。原来的变体3 只是把 workingType 的【值】换成
-    //   CONTRACT_PRICE，于是 workingType 与 recvWindow 在四个变体里【从未缺席】过。
-    //   "把可选参数全摘干净"这个最可能通过严格校验的形状，一次都没试到。
-    //   一个只试了参数【取值】而没试过参数【存在与否】的阶梯，是排查上的盲区。
-    //
-    // ⚠ 变体0→1 摘掉的是【可选增强】，触发价与 closePosition 一直在。
-    // ⚠ 变体2 是唯一【结构上不同】的那个：手机 App 上的「整个仓位 / 仅减仓」就是
-    //   closePosition 与 quantity+reduceOnly 这两种形态，两者都合法且等效。
-    //   0/1 都被拒时，"是不是 closePosition 本身不被接受"是唯一还没试过的方向。
-    //   它的代价：数量在挂单那一刻冻结，此后仓位若被外部加仓，这张单只平原来
-    //   那部分（而 closePosition 平全部）。本策略不加仓，所以代价基本为零。
-    // ⚠ 变体3 改用成交价触发，插针更容易打到 —— 所以排在最后，
-    //   而"有个会早触发的底"远好过"没有底"。
-    static constexpr int kVariants = 4;
-    const bool have_qty = (qty > 0);
-    const int  qty_dp   = step_decimals(info.effective_market_step());
-    const double rq     = have_qty ? round_qty(sym, qty) : 0.0;
-    auto build = [&](bool as_conditional, int variant) {
-        std::ostringstream oss;
-        oss << "symbol=" << sym
-            << "&side=" << close_side
-            << (as_conditional ? "&strategyType=" : "&type=") << "STOP_MARKET"
-            << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price;
-        if (variant >= 2 && rq > 0) {
-            // ⚠ closePosition 与 quantity/reduceOnly 互斥：币安对同时带这两者
-            //   直接拒单。所以这里是【取代】而不是叠加。
-            //   变体3 = 变体2 的写法再把 workingType 退让，所以用 >= 而不是 ==
-            //   （写成 == 的后果：变体3 悄悄退回 closePosition，而日志还在说
-            //     「数量+仅减仓」—— 描述与实际发出的参数不一致，实测日志里
-            //     就是这么骗了我一轮）
-            oss << "&quantity=" << std::setprecision(qty_dp) << rq;
-            // ⚠ reduceOnly 在【双开模式】下币安不接受这个参数（官方明文）。
-            //   双开模式靠 positionSide 指明要减哪条腿，reduceOnly 是多余且非法的
-            if (!dual_mode_) oss << "&reduceOnly=true";
-        } else {
-            oss << "&closePosition=true";
-        }
-        // 用标记价，避免插针成交价误触发；最后一个变体退回币安默认口径
-        // 变体3 连 workingType 都不带（缺省即 CONTRACT_PRICE）；其余用标记价触发，
-        // 避免插针成交价误触发
-        if (variant < 3) oss << "&workingType=MARK_PRICE";
-        if (variant < 1) oss << "&priceProtect=true";
-        // recvWindow 同理：它也是可选参数，最简形式里一并摘掉
-        if (variant < 3) oss << "&recvWindow=5000";
-        if (dual_mode_)
-            oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
-        return oss.str();
-    };
-    // 说明读走即清：换写法/换端点很少见，每次挂单都重复打就成了噪音
-    auto take_note = [this]() {
-        std::string n;
-        n.swap(ds_last_note_);
-        return n;
-    };
-    auto variant_desc = [](int v) {
-        switch (v) {
-        case 0:  return "完整（closePosition + MARK_PRICE + priceProtect）";
-        case 1:  return "去掉 priceProtect";
-        case 2:  return "数量 取代 closePosition";
-        default: return "最简形式（只留必填项，不带 workingType / recvWindow）";
-        }
-    };
+    std::ostringstream oss;
+    oss << "algoType=CONDITIONAL"          // 必填，且只支持这一个值
+        << "&symbol=" << sym
+        << "&side=" << close_side
+        << "&type=STOP_MARKET"
+        << "&triggerPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
+        << "&workingType=MARK_PRICE";      // 默认是 CONTRACT_PRICE，必须显式覆盖
+    // closePosition 与 quantity 互斥（币安对同时带这两者直接拒单）。
+    // 优先 closePosition：它不带数量，仓位被外部加仓后照样平掉当时的【整个】仓位，
+    // 而带数量的那张只平挂单那一刻的数量
+    oss << "&closePosition=true";
+    (void)qty;   // 保留参数：closePosition 形态不需要它，签名留着以便将来切换
+    if (dual_mode_)
+        oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
+    oss << "&recvWindow=5000";
 
     long http_code = 0;
-    const std::string first_path = pm ? ep(Ep::CondOrder) : ep(Ep::Order);
-    bool used_cond = pm;   // 最终是从哪个端点拿到的回执（决定单号字段名）
+    const std::string path = ep(Ep::AlgoOrder);
+    auto resp = http_post(path, oss.str(), &http_code);
 
-    // 从上次成功的变体起试。稳态下 ds_variant_ 已经是能用的那个，只发一次请求；
-    // 只有在它也失败时才往后退。ds_variant_ 是 atomic：多个品种可能并发挂单
-    int variant = ds_variant_.load();
-    if (variant < 0 || variant >= kVariants) variant = 0;
-    std::string resp;
-    int tried_upto = variant;
-    for (int i = variant; i < kVariants; ++i) {
-        // 拿不到持仓数量时跳过变体2：它非要 quantity，缺了就退化成变体1 的重复
-        if (i == 2 && !(rq > 0)) continue;
-        tried_upto = i;
-        resp = http_post(first_path, build(pm, i), &http_code);
-        // 只有"请求被判畸形/参数不被接受"才值得换写法。空响应是网络问题，
-        // 换参数没有意义；业务性拒绝（触发价在错误一侧之类）换参数也没有意义
-        const bool param_rejected =
-            (http_code == 400 || http_code == 422) ||
-            (!resp.empty() && (resp.find("-1106") != std::string::npos ||   // 发了不该发的参数
-                               resp.find("-1102") != std::string::npos ||   // 必填参数缺失/非法
-                               resp.find("-1104") != std::string::npos));   // 有参数没被读取
-        if (!param_rejected) break;
-        // ⚠ 同一个变体被拒只报一次。
-        //   重试阶梯要跑 13 次，每一次都是一轮完整的变体轮换，不去重就是 13 条
-        //   一模一样的提示 —— 实测日志里刷了 9 条，正是用户抱怨的那种黄色噪音。
-        //   它要传达的信息（这个写法不行、换下一个）只有第一次是新的
-        if (i + 1 < kVariants && ds_noted_reject_.load() != i) {
-            ds_noted_reject_.store(i);
-            ds_last_note_ = std::string("硬止损写法「") + variant_desc(i) +
-                            "」被拒（HTTP " + std::to_string(http_code) +
-                            "），改用「" + variant_desc(i + 1) + "」再试";
-        }
-    }
-    // 成功就把这个变体记住，后续直接用它
-    if (!resp.empty() && resp.find("\"code\"") == std::string::npos &&
-        tried_upto != ds_variant_.load()) {
-        ds_variant_.store(tried_upto);
-        ds_last_note_ = std::string("硬止损改用写法「") + variant_desc(tried_upto) +
-                        "」后挂单成功，后续沿用它" +
-                        (tried_upto >= 2 ? "。⚠ 这个写法用【成交价】触发而不是标记价，"
-                                           "插针更容易打到 —— 但有个会早触发的底，"
-                                           "远好过完全没有底" : "");
-    }
-
-    // ── -4120 的定向回退 ──────────────────────────────────────────────────────
-    // 币安回 -4120 时的原话是 "Please use the Algo Order API endpoints instead"，
-    // 而条件单端点就是它指的那个。按它说的再试一次，只试一次。
-    //
-    // 为什么值得这一次额外往返：走到这里的替代路径是【平掉刚开的仓】，
-    // 代价是两笔市价单手续费加一个本该存在的敞口没了。相比之下多发一个请求
-    // 便宜得多，而且失败也只是多一条日志——它不会创建一张"错"的单，
-    // 参数完全相同，只是换个端点。
-    //
-    // ⚠ 只在非统一账户模式下回退（pm 时首发已经是条件单端点，重复没有意义），
-    //   而且只回退一次，不进入循环。
-    // 成功的话说明【账户模式设错了】：account_mode 是手工选的不是探测的，
-    //   设错时行情、余额、市价单全部照常，只有条件单会露馅
-    if (!pm && !resp.empty() && resp.find("-4120") != std::string::npos) {
-        auto alt = http_post(ep(Ep::CondOrder), build(true, tried_upto));
-        if (!alt.empty() && alt.find("\"code\"") == std::string::npos) {
-            // 换端点之后不再报错 ⇒ 用它的结果继续往下解析。
-            // 判据用"没有 code 字段"而不是"没有 -4120"：条件单端点可能回一个
-            // 完全不同的错误码，那种情况下回退没成功，应该保留首发的 -4120
-            // 让上层按"端点不对"处置，而不是拿一个更陌生的码去误导人
-            resp = alt;
-            used_cond = true;
-        }
-    }
-    // 空响应 = 超时/网络断。可能单子其实挂上了，但我们拿不到单号——当失败处理
-    // 并重试是安全的：closePosition 单同方向只允许一张，重复挂会被交易所拒，
-    // 拒了就进入下一次重试，不会留下两张
-    if (resp.empty())
-    {
-        StopPlacement p;
-        p.error = "空响应（超时或网络中断）";
-        p.note  = take_note();
-        return p;
+    // 空响应 = 超时/网络断。单子可能其实挂上了但拿不到单号——当失败并重试是
+    // 安全的：closePosition 单同方向只允许一张，重复挂会被交易所拒
+    if (resp.empty()) {
+        out.error = "空响应（超时或网络中断）";
+        return out;
     }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
-        // 响应不是 JSON = 这个请求没到币安的 API。真实案例（2026-09-29）：
-        // 代理把 *.binance.com 劫持到 198.18/15 的 fake-IP，于是拿回来一张
-        // https://www.binance.com/en/error 的 HTML 页，而原始日志只说
-        // "响应不是合法 JSON"，看的人会以为是止损价精度之类的参数问题。
-        //
-        // ⚠ 仍然【可重试】。看起来该直接判死——网络路径不通、DNS 被劫持
-        //   不会在二十多秒里自己好——但 Cloudflare 的 502/503 也是 HTML，
-        //   而那种是真能重试过去的。判错的代价不对称：白等二十多秒然后照样
-        //   兜底，对上"把一次能恢复的抖动直接变成平掉刚开的仓"。
-        //   开平循环的成本已经由兜底冷却 + 账户级熔断挡住了，不必在这里
-        //   再拿安全性去换。
-        //
-        // 去掉换行：HTML 页原样打出来会把一条日志撑成几十行
         std::string body = resp.substr(0, 160);
         for (auto& ch : body) if (ch == '\n' || ch == '\r') ch = ' ';
-        const bool looks_html =
-            body.find("<!DOCTYPE") != std::string::npos ||
-            body.find("<html")     != std::string::npos ||
-            body.find("<HTML")     != std::string::npos;
-
-        // 状态码是这里唯一能把成因分开的东西。没有它只能猜——而实测里
-        // 同一个端点 5 秒内一次成功（市价单）一次拿到 HTML（条件单），
-        // 光看 body 完全解释不了
-        std::string why;
-        switch (http_code) {
-        case 404: why = "HTTP 404：这个路径在币安上不存在 —— 是【我们的】端点拼错了，"
-                        "属于代码缺陷，请把这条日志发给开发侧"; break;
-        case 401: case 403:
-                  why = "HTTP " + std::to_string(http_code) +
-                        "：被币安边缘拒绝 —— 常见于出口 IP 所在地域受限，"
-                        "或 API Key 没有合约交易权限"; break;
-        case 451: why = "HTTP 451：币安按地域拦截了这个出口 IP（法律原因），换节点"; break;
-        case 429: case 418:
-                  why = "HTTP " + std::to_string(http_code) +
-                        "：被限流/临时封禁，等一等会自己好"; break;
-        case 0:   why = "连接层就没拿到响应（超时/TLS 失败），不是币安拒的"; break;
-        case 200: why = "HTTP 200 却是网页 —— 200 的 HTML 不可能出自币安 API，"
-                        "应答来自中间件（代理的拦截页/缓存页）。查代理分流"; break;
-        default:  why = "HTTP " + std::to_string(http_code); break;
-        }
-
-        // 把【实际发出去的参数】一起打出来。到这一步为止，"哪个参数让它变成 400"
-        // 是唯一还没拿到的事实，而靠读代码猜已经绕了好几轮：市价单和硬止损走的是
-        // 同一个 http_post、同一个 /fapi/v1/order，一个成功一个 400，差别只在参数里。
-        //
-        // build() 本身不含 timestamp/signature（那两个由 http_post 在发出前追加），
-        // 所以这里打出来的本来就不含凭据。下面那道打码是【防回归】的：哪天有人
-        // 把签名挪进 build()，这条日志就会把一次可重放的 HMAC 直接写进日志和工单。
-        // 其余参数都是公开语义（品种、方向、触发价），留着才有诊断价值
-        std::string sent = build(pm, tried_upto);
-        if (auto p2 = sent.find("&signature="); p2 != std::string::npos)
-            sent = sent.substr(0, p2) + "&signature=<已打码>";
-        StopPlacement bad;
-        bad.error = std::string(looks_html ? "收到的是 HTML 网页而不是 API 响应"
-                                           : "响应不是合法 JSON")
-                    + "（" + why + "，端点 " + first_path + "，写法「"
-                    + variant_desc(tried_upto) + "」）\n"
-                      "    实际发出的参数: " + sent + "\n"
-                      "    响应体: " + body;
-        bad.note = take_note();
-        return bad;
+        out.error = "响应不是合法 JSON（HTTP " + std::to_string(http_code) +
+                    "，端点 " + path + "）: " + body;
+        return out;   // 保持可重试：Cloudflare 的 502/503 也是 HTML，那种能重试过去
     }
 
     std::string err;
     if (binance_error(doc, err)) {
-        // -4120 值得单独给一句话。它的字面意思（"换 Algo Order API"）对着
-        // 普通合约账户是讲不通的——/fapi/v1/order 本来就收 STOP_MARKET。
-        // 实际遇到它时，最可能的原因是【账户模式设错了】：账户模式是手工选的，
-        // 不是探测出来的，选错时下单端点整条都是错的。
-        // 而这个"错"很隐蔽：行情、余额、市价单都照常工作，只有条件单会露馅
-        if (err.find("[-4120]") != std::string::npos)
-            err += "  ← 这个端点不收 STOP_MARKET。请核对「账户模式」设置"
-                   "（普通合约 ↔ 统一账户）：它是手工选的而不是探测的，选错时"
-                   "余额和市价单都照常工作，只有条件单会露馅。当前用的是 " +
-                   std::string(pm ? "统一账户(/papi/v1/um/conditional/order)"
-                                  : "普通合约(/fapi/v1/order)") +
-                   "；已自动改用条件单端点重试过一次，同样没成功";
-        StopPlacement bad;
-        bad.error     = err;
-        bad.retryable = stop_error_retryable(err);
-        bad.note = take_note();
-        return bad;
+        out.error     = err;
+        out.retryable = stop_error_retryable(err);
+        return out;
     }
 
-    // 单号字段随端点变：普通端点给 orderId，条件单端点给 strategyId。
-    // 两个都试而不是只按 used_cond 挑一个——判错的话会变成"挂上了但我们以为
-    // 没挂上"，那是最坏的一种：交易所留着一张单，本地当失败继续重试，
-    // 而 closePosition 同方向只允许一张，于是重试永远失败
-    int64_t oid = 0;
-    get_or_keep(doc[used_cond ? "strategyId" : "orderId"], oid);
-    if (oid <= 0) get_or_keep(doc[used_cond ? "orderId" : "strategyId"], oid);
-    if (oid > 0) {
-        StopPlacement ok;
-        ok.order_id = std::to_string(oid);
-        // 首发端点被拒、换条件单端点成功 ⇒ 账户模式设错了。这条必须报出来，
-        // 否则每次开仓都要白走一次 -4120 + 一次回退，而根因一直没人知道
-        ok.via_cond_fallback = (used_cond != pm);
-        ok.note = take_note();
-        return ok;
+    int64_t algo_id = 0;
+    get_or_keep(doc["algoId"], algo_id);
+    if (algo_id <= 0) {
+        out.error = "响应里没有 algoId: " + resp.substr(0, 120);
+        return out;
     }
-    // 没报错但也没给单号：语义不明，当失败但允许重试
-    StopPlacement bad;
-    bad.error = "响应里没有单号: " + resp.substr(0, 120);
-    bad.note = take_note();
-    return bad;
+
+    // ⚠ 必须校验回执里的 triggerPrice。传错触发价参数名时币安【不报错】、
+    //   照常给 algoId，而那张单永远不会触发 —— 只看 algoId 的话我们会打出
+    //   "硬止损已挂"，而仓位其实完全没有底。这道校验是唯一能挡住那种
+    //   静默假保护的东西
+    double got_trigger = 0;
+    std::string_view tp_s;
+    if (get_or_keep(doc["triggerPrice"], tp_s)) {
+        try { got_trigger = std::stod(std::string(tp_s)); } catch (...) {}
+    } else {
+        get_or_keep(doc["triggerPrice"], got_trigger);   // 有的返回是数字而非字符串
+    }
+    // 容差取一个 tick：交易所会按 tickSize 取整，不该因为末位差异判成失败
+    const double tol = (info.tick_size > 0) ? info.tick_size * 1.5 : stop_price * 1e-6;
+    if (!(got_trigger > 0) || std::fabs(got_trigger - stop_price) > tol) {
+        auto px = [price_dp](double v) {
+            std::ostringstream o;
+            o << std::fixed << std::setprecision(price_dp) << v;
+            return o.str();
+        };
+        out.error = "挂单被接受但回执里的触发价不对（我们要 " + px(stop_price) +
+                    "，回执是 " + (got_trigger > 0 ? px(got_trigger) : std::string("缺失")) +
+                    "）。这种单【不会触发】，当挂单失败处理 —— "
+                    "静默的假保护比挂不上危险得多";
+        out.retryable = false;   // 参数名/格式问题，重试结果一样
+        // 单子已经在交易所上了，必须撤掉，否则留一张永不触发的孤儿单
+        cancel_disaster_stop(sym, std::to_string(algo_id));
+        return out;
+    }
+
+    out.order_id = std::to_string(algo_id);
+    return out;
 }
 
 bool TradingClient::cancel_disaster_stop(const std::string& sym,
                                           const std::string& order_id) {
     if (order_id.empty()) return true;
-    const bool pm = is_pm();
-    // 统一账户的条件单不在普通撤单端点上，且用 strategyId 而不是 orderId
-    auto resp = http_del(pm ? ep(Ep::CondOrder) : ep(Ep::Order),
-        "symbol=" + sym + (pm ? "&strategyId=" : "&orderId=") + order_id +
+    // ⚠ 条件单要用 algoOrder 的撤单端点、并用 algoId 作键。
+    //   用普通撤单端点 + orderId 撤不掉它 —— 后果不是"少撤一张"，而是仓位
+    //   平掉之后交易所上留着一张活的条件单：closePosition 单同方向只允许一张，
+    //   于是【下一次开仓永远挂不上硬止损】，而本地只看到"挂单失败"。
+    //   freqtrade 那边同期也踩到这个（"leaves orphaned conditional orders"）
+    auto resp = http_del(ep(Ep::AlgoOrder),
+        "symbol=" + sym + "&algoId=" + order_id +
         "&recvWindow=5000");
     if (resp.empty()) return false;
     simdjson::dom::parser p;

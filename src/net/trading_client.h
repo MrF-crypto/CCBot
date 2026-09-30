@@ -328,6 +328,13 @@ private:
         PositionSideDual, Leverage, ListenKey,
         PmAccount,     // 统一账户专属：/papi/v1/account（全账户视角，uniMMR 在这里）
         CondOrder,     // 统一账户专属：条件单（STOP_MARKET / TAKE_PROFIT_MARKET）
+        // ⚠ 条件单的【正确】端点。币安 2025-11-06 公告、2025-12-09 强制生效：
+        //   STOP_MARKET / TAKE_PROFIT_MARKET 等条件单不再接受 /fapi/v1/order，
+        //   必须走 algoOrder。老端点上发条件单会回 -4120
+        //   （"Order type not supported for this endpoint. Please use the Algo
+        //   Order API endpoints instead."）。
+        //   这条错误信息一直是对的，是我们的先验过时了
+        AlgoOrder,
         Income,        // 资金费/手续费流水
     };
     const char* ep(Ep e) const;
@@ -341,16 +348,6 @@ private:
     // 这样订单路径的超时/查单恢复逻辑一行不用动
     std::shared_ptr<RateGate> gate_;
     TestHook    test_hook_;
-    // 硬止损当前用的"写法"下标（见 place_disaster_stop 里的变体表）。
-    // 一旦某个变体挂成了就记住它，后续直接用 —— 稳态只发一次请求。
-    // atomic：多个品种会并发挂单
-    std::atomic<int> ds_variant_{0};
-    // 已经报过"被拒"的变体下标，-1 = 还没报过。重试阶梯跑 13 次、每次都轮换
-    // 一遍变体，不去重就是 13 条一模一样的提示（实测刷了 9 条）
-    std::atomic<int> ds_noted_reject_{-1};
-    // 上一次换写法/换端点时的说明，供上层日志取用一次（换写法很少见，
-    // 每次挂单都打就是噪音）。只在 place_disaster_stop 里写，读走即清
-    std::string ds_last_note_;
     std::string base_;       // 签名端点的域名（统一账户 = papi.binance.com）
     std::string pub_base_;   // 公开行情端点的域名（永远是 fapi，papi 没有行情接口）
     // ⚠ 这两个都是【一处写、多处读，且跨线程】，必须是原子的。

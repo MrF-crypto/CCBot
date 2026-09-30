@@ -310,272 +310,78 @@ int main() {
         check(r.ok, "查单确认已成交");
     }
 
-    std::printf("── 用例11：硬止损的错误分类（可重试 vs 白等）──\n");
+    std::printf("── 用例11：硬止损走 algoOrder 端点（币安 2025-12-09 起强制）──\n");
     {
-        // 重试阶梯要跑十三次、三十多秒，而这段时间里仓位是【没有进程外保护】的。
-        // 所以"这个错还有没有救"这个判断的代价是不对称的：
-        //   误判成可重试 → 白裸三十多秒，然后照样兜底平仓
-        //   误判成没救   → 把一次能恢复的网络抖动直接变成"平掉刚开的仓"
-        // 于是只有【确定无望】的码才标不可重试。这个用例钉住两边各一个代表。
-        auto probe = [](const char* body) {
-            TradingClient tc(test_cfg());
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string&, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m == "POST") { out.body = body; return true; }
-                return false;
-            });
-            return tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
-        };
+        // 币安 2025-11-06 公告、2025-12-09 强制：STOP_MARKET 这类条件单不再接受
+        // /fapi/v1/order，必须走 /fapi/v1/algoOrder。老端点上发会回 -4120。
+        // 这个用例把新端点的四条硬规格钉住 —— 每一条错了都是静默后果
+        std::string seen_path, seen_params;
+        TradingClient tc(test_cfg());
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string& params, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) {
+                out.body = kExchangeInfo; return true;
+            }
+            if (m != "POST") return false;
+            seen_path = path; seen_params = params;
+            // 回执按真实形状：algoId + triggerPrice
+            out.body = R"({"algoId":2146760,"clientAlgoId":"x","algoType":"CONDITIONAL",)"
+                       R"("orderType":"STOP_MARKET","symbol":"BTCUSDT","side":"SELL",)"
+                       R"("triggerPrice":"60000.00","algoStatus":"NEW"})";
+            return true;
+        });
+        auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
 
-        // -4120「这个端点不收这个单型」：重试十三次结果完全一样。
-        // 实测（2026-09-29，$210 的普通合约账户）13 次全 -4120，历时 36 秒
-        auto r1 = probe(R"({"code":-4120,"msg":"Order type not supported for this )"
-                        R"(endpoint. Please use the Algo Order API endpoints instead."})");
-        check(!r1.ok(), "-4120 是失败");
-        check(!r1.retryable, "-4120 不可重试：端点/单型不匹配，白等三十多秒");
-        check(r1.error.find("账户模式") != std::string::npos,
-              "  并提示去核对账户模式（它是手工选的，选错时只有条件单会露馅）");
-
-        // -4120 的定向回退：币安自己说"请用 Algo Order API"，那就按它说的
-        // 换条件单端点再试一次。成功了就说明账户模式设错了，必须报出来——
-        // 否则每次开仓都白走一次被拒 + 一次回退，而中间仓位没有进程外保护
-        {
-            TradingClient tc(test_cfg());
-            int fapi_posts = 0, cond_posts = 0;
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string&, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m != "POST") return false;
-                if (path.find("conditional") != std::string::npos) {
-                    ++cond_posts;
-                    out.body = R"({"strategyId":778899,"strategyStatus":"NEW"})";
-                } else {
-                    ++fapi_posts;
-                    out.body = R"({"code":-4120,"msg":"Order type not supported for )"
-                               R"(this endpoint. Please use the Algo Order API endpoints instead."})";
-                }
+        check(seen_path.find("/fapi/v1/algoOrder") != std::string::npos,
+              "① 端点必须是 /fapi/v1/algoOrder（老的 /fapi/v1/order 会回 -4120）");
+        check(seen_params.find("algoType=CONDITIONAL") != std::string::npos,
+              "② algoType=CONDITIONAL 是必填项，漏了整条请求非法");
+        check(seen_params.find("triggerPrice=60000") != std::string::npos,
+              "③ 触发价参数名是 triggerPrice");
+        check(seen_params.find("stopPrice") == std::string::npos,
+              "   而【绝不能】用 stopPrice —— 新端点对它不报错，但那张单永远不会触发");
+        check(seen_params.find("workingType=MARK_PRICE") != std::string::npos,
+              "④ workingType 必须显式写 MARK_PRICE（新端点默认 CONTRACT_PRICE，"
+              "而插针打的就是成交价）");
+        check(r.ok() && r.order_id == "2146760", "单号取 algoId");
+    }
+    {
+        // ⚠ 这一条是整件事里最危险的失败模式的防线：
+        //   触发价参数名传错时币安【不报错】、照常给 algoId，而那张单永远不触发。
+        //   只看 algoId 的话我们会打出"硬止损已挂"，而仓位其实完全没有底 ——
+        //   静默的假保护比挂不上危险得多（挂不上至少会走兜底平仓）
+        int cancels = 0;
+        TradingClient tc(test_cfg());
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string& params, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) {
+                out.body = kExchangeInfo; return true;
+            }
+            if (m == "DELETE") {
+                ++cancels;
+                check(params.find("algoId=99") != std::string::npos,
+                      "  撤单用 algoId（普通撤单端点 + orderId 撤不掉条件单）");
+                out.body = R"({"algoId":99})";
                 return true;
-            });
-            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
-            check(fapi_posts == 1, "普通端点先试一次");
-            check(cond_posts == 1, "  被 -4120 拒后，换条件单端点再试一次（只一次）");
-            check(r.ok(), "  回退成功即算挂上");
-            check(r.order_id == "778899",
-                  "  单号取 strategyId（条件单端点不给 orderId，取错会变成"
-                  "「挂上了但以为没挂上」——那是最坏的一种）");
-            check(r.via_cond_fallback,
-                  "  必须标出这是回退挂上的，好让上层提示改账户模式");
-        }
-        {
-            // 回退也失败时，保留【首发的 -4120】而不是条件单端点那个更陌生的码：
-            // 上层要按"端点不对"处置，换个码只会误导人
-            TradingClient tc(test_cfg());
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string&, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m != "POST") return false;
-                out.body = (path.find("conditional") != std::string::npos)
-                    ? R"({"code":-2015,"msg":"Invalid API-key, IP, or permissions."})"
-                    : R"({"code":-4120,"msg":"Order type not supported for this endpoint."})";
-                return true;
-            });
-            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
-            check(!r.ok(), "回退也失败 ⇒ 整体失败");
-            check(r.error.find("-4120") != std::string::npos,
-                  "  保留首发的 -4120，不要换成条件单端点那个陌生码");
-            check(!r.retryable, "  仍然按「重试无意义」处置");
-            check(!r.via_cond_fallback, "  没挂上就不该标成回退成功");
-        }
-
-        // ── 写法变体阶梯：HTTP 400 时自己退到更保守的参数组合 ────────────────
-        // 实测里市价单成功而同一端点的 STOP_MARKET 拿 400，差别只在参数里，
-        // 而靠读代码猜了四轮都没定位到。所以让它自己按"功能最全 → 最保守"试一遍，
-        // 每个变体都是同等保护力的同一张单（同一触发价、同样平掉整个仓位），
-        // 只是把可选增强逐个摘掉
-        {
-            TradingClient tc(test_cfg());
-            std::vector<std::string> sent;
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string& params, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m != "POST") return false;
-                sent.push_back(params);
-                // 模拟"带 priceProtect 就 400"：这正是要让它自己绕过去的那类
-                if (params.find("priceProtect") != std::string::npos) {
-                    out.code = 400;
-                    out.body = "<!DOCTYPE html><html><body>bad request</body></html>";
-                } else {
-                    out.code = 200;
-                    out.body = R"({"orderId":4242,"status":"NEW"})";
-                }
-                return true;
-            });
-
-            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
-            check(r.ok(), "带 priceProtect 被 400 拒后，自动退到不带它的写法并挂上");
-            check(sent.size() == 2, "  只多试一次（第一个成功就停）");
-            check(sent[0].find("priceProtect") != std::string::npos, "  第一发是完整写法");
-            check(sent[1].find("priceProtect") == std::string::npos, "  第二发摘掉了 priceProtect");
-            check(sent[1].find("closePosition=true") != std::string::npos,
-                  "  但 closePosition 必须还在 —— 摘的只能是可选增强，不能是保护本身");
-            check(sent[1].find("stopPrice=60000") != std::string::npos,
-                  "  触发价也必须还在");
-            check(sent[1].find("workingType=MARK_PRICE") != std::string::npos,
-                  "  workingType 还没到要退的那一档（标记价触发优先保留）");
-            check(!r.note.empty(), "  换了写法要留一句说明给上层打日志");
-
-            // 记住成功的那个：下一次直接用，稳态仍是一次请求
-            sent.clear();
-            auto r2 = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
-            check(r2.ok() && sent.size() == 1,
-                  "第二次只发一次请求（记住了能用的写法，不再白试被拒的那个）");
-            check(sent[0].find("priceProtect") == std::string::npos, "  直接用能用的那个");
-            check(r2.note.empty(), "  没有变化就不要重复打说明（否则每次挂单都刷一条）");
-        }
-        {
-            // 变体2 是唯一【结构上不同】的：手机 App 上的「整个仓位 / 仅减仓」
-            // 就是 closePosition 与 quantity+reduceOnly 这两种形态。
-            // closePosition 本身被拒时，它是唯一还没试过的方向
-            TradingClient tc(test_cfg());
-            std::vector<std::string> sent;
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string& params, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m != "POST") return false;
-                sent.push_back(params);
-                if (params.find("closePosition") != std::string::npos) {
-                    out.code = 400;                    // 模拟"closePosition 就是不被接受"
-                    out.body = "<!DOCTYPE html><html><body>bad</body></html>";
-                } else {
-                    out.code = 200;
-                    out.body = R"({"orderId":5150,"status":"NEW"})";
-                }
-                return true;
-            });
-            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
-            check(r.ok(), "closePosition 被拒后，退到 数量+仅减仓 并挂上");
-            check(sent.size() == 3, "  依次试了 完整 / 去priceProtect / 数量+仅减仓");
-            check(sent[2].find("quantity=0.015") != std::string::npos, "  带上了持仓数量");
-            check(sent[2].find("reduceOnly=true") != std::string::npos, "  且是仅减仓");
-            check(sent[2].find("closePosition") == std::string::npos,
-                  "  ⚠ 必须【取代】closePosition 而不是叠加：币安对同时带这两者直接拒单");
-            check(sent[2].find("workingType=MARK_PRICE") != std::string::npos,
-                  "  标记价触发要保留到最后一个变体才退让");
-        }
-        {
-            // ⚠ 最后一个变体必须【继承】数量写法，不能悄悄退回 closePosition。
-            //   写成 variant==2 的后果：变体3 发的是 closePosition，而日志还在说
-            //   「数量+仅减仓」—— 描述与实际发出的参数不一致，实测日志里正是这样
-            //   骗了我一轮（dump 出来才发现）
-            TradingClient tc(test_cfg());
-            std::vector<std::string> sent;
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string& params, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m != "POST") return false;
-                sent.push_back(params);
-                out.code = 400;                       // 全部拒掉，把四个变体都走一遍
-                out.body = "<!DOCTYPE html><html><body>bad</body></html>";
-                return true;
-            });
-            tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
-            check(sent.size() == 4, "四个变体都试过");
-            check(sent[3].find("quantity=0.015") != std::string::npos,
-                  "  最后一个变体继承了数量写法（不得退回 closePosition）");
-            check(sent[3].find("closePosition") == std::string::npos,
-                  "  且确实没有 closePosition");
-            check(sent[3].find("workingType") == std::string::npos,
-                  "  最简形式必须【不带】workingType：审计发现原来四个变体只换过它的"
-                  "取值、从未缺席过，等于漏掉了最可能通过严格校验的那个形状");
-            check(sent[3].find("recvWindow") == std::string::npos,
-                  "  recvWindow 同理，它也是可选参数");
-            check(sent[3].find("priceProtect") == std::string::npos, "  也不带 priceProtect");
-        }
-        {
-            // 拿不到持仓数量时跳过变体2：它非要 quantity，缺了就只是变体1 的重复，
-            // 白发一次请求还多占一次限流额度
-            TradingClient tc(test_cfg());
-            std::vector<std::string> sent;
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string& params, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m != "POST") return false;
-                sent.push_back(params);
-                out.code = 400;
-                out.body = "<!DOCTYPE html><html><body>bad</body></html>";
-                return true;
-            });
-            tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");   // qty 缺省 0
-            check(sent.size() == 3, "无 qty 时只试 3 个变体（跳过要数量的那个）");
-            for (const auto& s : sent)
-                check(s.find("quantity=") == std::string::npos,
-                      "  没有一次带 quantity（缺数量还发就是白占限流额度）");
-        }
-        {
-            // 非参数类失败不该触发换写法：空响应是网络问题，换参数毫无意义，
-            // 而白试三遍等于把一次网络抖动变成三倍的挂单延迟
-            TradingClient tc(test_cfg());
-            int posts = 0;
-            tc.set_test_hook([&](const std::string& m, const std::string& path,
-                                 const std::string&, TradingClient::FakeReply& out) {
-                if (path.find("exchangeInfo") != std::string::npos) {
-                    out.body = kExchangeInfo; return true;
-                }
-                if (m == "POST") { ++posts; out.body = ""; return true; }
-                return false;
-            });
-            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
-            check(!r.ok() && r.retryable, "空响应仍是可重试的失败");
-            check(posts == 1, "  但不得为它轮换写法：那是网络问题，不是参数问题");
-        }
-
-        // -1003 限流：过一会儿就好了，正是阶梯存在的理由
-        auto r2 = probe(R"({"code":-1003,"msg":"Too many requests."})");
-        check(!r2.ok() && r2.retryable, "-1003 限流可重试：这正是重试阶梯的用途");
-
-        // HTML 错误页：请求没到 API。看起来该直接判死，但 Cloudflare 的 502/503
-        // 也是 HTML，而那种真能重试过去 —— 保持可重试，只把诊断说清楚
-        auto r3 = probe("<!DOCTYPE html><html><head></head><body>error</body></html>");
-        check(!r3.ok() && r3.retryable, "HTML 响应仍可重试（502/503 也是 HTML）");
-        check(r3.error.find("HTML") != std::string::npos,
-              "  但要明说收到的是网页、请求没到币安");
-        // 要钉的是"HTML 自己的换行不得漏进日志"——那会把一条日志撑成几十行。
-        // 错误串本身用了两行做排版（端点/参数/响应体分行），那是有意的，
-        // 所以不能简单断言"整串无换行"，要断言【响应体那一段】无换行
-        {
-            const auto p = r3.error.find("响应体: ");
-            check(p != std::string::npos, "  错误里要有「响应体」这一段");
-            if (p != std::string::npos)
-                check(r3.error.find('\n', p) == std::string::npos,
-                      "  且响应体段内必须压平换行（HTML 原样打出来会撑成几十行）");
-        }
-        check(r3.error.find("实际发出的参数") != std::string::npos,
-              "  还要带上实际发出的参数：靠读代码猜是哪个参数不对已经绕了好几轮");
-        check(r3.error.find("signature") == std::string::npos,
-              "  但绝不能带 signature —— 那是用 API secret 算的 HMAC，"
-              "写进日志/工单等于泄露一次可重放的凭据");
-
-        // ── 状态码必须出现在错误里，且按码给出不同的成因 ──────────────────
-        // 这是把成因分开的唯一依据：实测里同一个端点 5 秒内一次成功（市价单）、
-        // 一次拿到 HTML（条件单），光看 body 完全解释不了。
-        // 四种码的修法南辕北辙：404 是代码缺陷、403/451 是环境、429 等等就好、
-        // 200+HTML 是中间件冒充
-        auto probe_code = [](const char* body, long code) {
+            }
+            if (m != "POST") return false;
+            // 接受了，但回执里的触发价是 0 —— 正是"传错参数名"的表现
+            out.body = R"({"algoId":99,"triggerPrice":"0","algoStatus":"NEW"})";
+            return true;
+        });
+        auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
+        check(!r.ok(), "回执触发价不对 ⇒ 必须当【挂单失败】，不能当成功");
+        check(r.error.find("不会触发") != std::string::npos, "  错误要说清它不会触发");
+        check(!r.retryable, "  且不可重试：参数名/格式问题，重试结果一样");
+        check(cancels == 1,
+              "  而且必须把那张单撤掉 —— 留着就是一张永不触发的孤儿单，"
+              "而 closePosition 同方向只允许一张，下次开仓就挂不上了");
+    }
+    {
+        // 错误分类：只有【确定无望】的才标不可重试。判错的代价不对称 ——
+        // 误判可重试只是白等三十多秒然后照样兜底；误判不可重试会把一次能恢复的
+        // 网络抖动直接变成"平掉刚开的仓"
+        auto probe = [](const char* body, long code) {
             TradingClient tc(test_cfg());
             tc.set_test_hook([&](const std::string& m, const std::string& path,
                                  const std::string&, TradingClient::FakeReply& out) {
@@ -585,20 +391,22 @@ int main() {
                 if (m == "POST") { out.body = body; out.code = code; return true; }
                 return false;
             });
-            return tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY").error;
+            return tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
         };
-        const char* kHtml = "<!DOCTYPE html><html><body>err</body></html>";
-        check(probe_code(kHtml, 404).find("404") != std::string::npos &&
-              probe_code(kHtml, 404).find("代码缺陷") != std::string::npos,
-              "404 ⇒ 说清是【我们的】端点拼错了，别让人去查网络");
-        check(probe_code(kHtml, 451).find("地域") != std::string::npos,
-              "451 ⇒ 地域拦截，换节点");
-        check(probe_code(kHtml, 429).find("限流") != std::string::npos,
-              "429 ⇒ 限流，等一等会好");
-        check(probe_code(kHtml, 200).find("中间件") != std::string::npos,
-              "200 却是 HTML ⇒ 不可能出自币安 API，是中间件冒充");
-        check(probe_code(kHtml, 200).find("/fapi/v1/order") != std::string::npos,
-              "  并带上实际用的端点路径（省掉一轮「你到底发去哪了」）");
+        auto a = probe(R"({"code":-4120,"msg":"Order type not supported for this endpoint."})", 400);
+        check(!a.ok() && !a.retryable,
+              "-4120 不可重试（端点/单型不匹配，重试十三次结果一样）");
+        auto b = probe(R"({"code":-1003,"msg":"Too many requests."})", 429);
+        check(!b.ok() && b.retryable, "-1003 限流【可】重试，这正是重试阶梯的用途");
+        auto c = probe("<!DOCTYPE html><html><body>err</body></html>", 502);
+        check(!c.ok() && c.retryable,
+              "HTML 响应仍可重试（Cloudflare 的 502/503 也是 HTML）");
+        check(c.error.find("502") != std::string::npos, "  错误里要带上 HTTP 状态码");
+        check(c.error.find("algoOrder") != std::string::npos, "  以及实际用的端点");
+        check(c.error.find('\n') == std::string::npos,
+              "  且压平换行：HTML 原样打出来会把一条日志撑成几十行");
+        auto d = probe("", 0);
+        check(!d.ok() && d.retryable, "空响应可重试（可能其实挂上了，重挂会被拒）");
     }
 
     std::printf("── 用例12：全市场标记价（WS 断流时兜底价的新鲜度全靠它）──\n");
