@@ -415,7 +415,8 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
     return resp;
 }
 
-std::string TradingClient::http_post(const std::string& path, std::string params) {
+std::string TradingClient::http_post(const std::string& path, std::string params,
+                                     long* out_code) {
     std::string url  = base_ + path;
     std::string resp;
 
@@ -443,6 +444,7 @@ std::string TradingClient::http_post(const std::string& path, std::string params
         FakeReply fr;
         if (test_hook_("POST", path, params, fr)) {
             gate_->observe(fr.code, fr.headers, fr.body);
+            if (out_code) *out_code = fr.code;
             return fr.body;
         }
     }
@@ -459,6 +461,7 @@ std::string TradingClient::http_post(const std::string& path, std::string params
     curl_easy_perform(c);
     long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     gate_->observe(code, rhdr, resp);
+    if (out_code) *out_code = code;
     return resp;
 }
 
@@ -1152,7 +1155,9 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         return oss.str();
     };
 
-    auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), build(pm));
+    long http_code = 0;
+    const std::string first_path = pm ? ep(Ep::CondOrder) : ep(Ep::Order);
+    auto resp = http_post(first_path, build(pm), &http_code);
     bool used_cond = pm;   // 最终是从哪个端点拿到的回执（决定单号字段名）
 
     // ── -4120 的定向回退 ──────────────────────────────────────────────────────
@@ -1202,16 +1207,37 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         //   再拿安全性去换。
         //
         // 去掉换行：HTML 页原样打出来会把一条日志撑成几十行
-        std::string body = resp.substr(0, 200);
+        std::string body = resp.substr(0, 160);
         for (auto& ch : body) if (ch == '\n' || ch == '\r') ch = ' ';
         const bool looks_html =
             body.find("<!DOCTYPE") != std::string::npos ||
             body.find("<html")     != std::string::npos ||
             body.find("<HTML")     != std::string::npos;
-        return { "", std::string(looks_html
-                     ? "收到的是 HTML 网页而不是 API 响应 —— 请求没到币安，"
-                       "八成是代理/DNS 把域名劫持到了别处（与止损价、精度无关）: "
-                     : "响应不是合法 JSON: ") + body,
+
+        // 状态码是这里唯一能把成因分开的东西。没有它只能猜——而实测里
+        // 同一个端点 5 秒内一次成功（市价单）一次拿到 HTML（条件单），
+        // 光看 body 完全解释不了
+        std::string why;
+        switch (http_code) {
+        case 404: why = "HTTP 404：这个路径在币安上不存在 —— 是【我们的】端点拼错了，"
+                        "属于代码缺陷，请把这条日志发给开发侧"; break;
+        case 401: case 403:
+                  why = "HTTP " + std::to_string(http_code) +
+                        "：被币安边缘拒绝 —— 常见于出口 IP 所在地域受限，"
+                        "或 API Key 没有合约交易权限"; break;
+        case 451: why = "HTTP 451：币安按地域拦截了这个出口 IP（法律原因），换节点"; break;
+        case 429: case 418:
+                  why = "HTTP " + std::to_string(http_code) +
+                        "：被限流/临时封禁，等一等会自己好"; break;
+        case 0:   why = "连接层就没拿到响应（超时/TLS 失败），不是币安拒的"; break;
+        case 200: why = "HTTP 200 却是网页 —— 200 的 HTML 不可能出自币安 API，"
+                        "应答来自中间件（代理的拦截页/缓存页）。查代理分流"; break;
+        default:  why = "HTTP " + std::to_string(http_code); break;
+        }
+
+        return { "", std::string(looks_html ? "收到的是 HTML 网页而不是 API 响应"
+                                            : "响应不是合法 JSON")
+                     + "（" + why + "，端点 " + first_path + "）: " + body,
                  true };
     }
 

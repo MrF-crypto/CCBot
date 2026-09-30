@@ -400,7 +400,18 @@ private:
 
     // 带签名（需要 timestamp + HMAC）
     std::string http_get (const std::string& path, std::string params = "");
-    std::string http_post(const std::string& path, std::string params = "");
+    // out_code：可选，带回 HTTP 状态码。
+    //
+    // ⚠ 存在的理由：响应体不是 JSON 时，光有 body 分不清到底出了什么事，而这几种
+    //   的修法完全不同 ——
+    //     404      → 我们的路径错了（代码问题）
+    //     403/451  → 币安边缘按地域/IP 拦的（环境问题）
+    //     429/418  → 限流（等一等就好）
+    //     200+HTML → 根本不是币安在应答，是中间件冒充
+    //   实测里同一个端点 5 秒内一次成功一次拿到 HTML，没有状态码就只能靠猜。
+    //   用出参而不是成员变量：并发下的成员会串味，而这条信息要跟着那一次请求
+    std::string http_post(const std::string& path, std::string params = "",
+                          long* out_code = nullptr);
     std::string http_del (const std::string& path, std::string params = "");
     // 不带签名（listenKey 端点只需 X-MBX-APIKEY header）
     std::string http_post_unsigned(const std::string& path, const std::string& body = "");

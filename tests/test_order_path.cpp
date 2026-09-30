@@ -406,6 +406,36 @@ int main() {
               "  但要明说收到的是网页、请求没到币安");
         check(r3.error.find('\n') == std::string::npos,
               "  且压平换行：HTML 原样打出来会把一条日志撑成几十行");
+
+        // ── 状态码必须出现在错误里，且按码给出不同的成因 ──────────────────
+        // 这是把成因分开的唯一依据：实测里同一个端点 5 秒内一次成功（市价单）、
+        // 一次拿到 HTML（条件单），光看 body 完全解释不了。
+        // 四种码的修法南辕北辙：404 是代码缺陷、403/451 是环境、429 等等就好、
+        // 200+HTML 是中间件冒充
+        auto probe_code = [](const char* body, long code) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m == "POST") { out.body = body; out.code = code; return true; }
+                return false;
+            });
+            return tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY").error;
+        };
+        const char* kHtml = "<!DOCTYPE html><html><body>err</body></html>";
+        check(probe_code(kHtml, 404).find("404") != std::string::npos &&
+              probe_code(kHtml, 404).find("代码缺陷") != std::string::npos,
+              "404 ⇒ 说清是【我们的】端点拼错了，别让人去查网络");
+        check(probe_code(kHtml, 451).find("地域") != std::string::npos,
+              "451 ⇒ 地域拦截，换节点");
+        check(probe_code(kHtml, 429).find("限流") != std::string::npos,
+              "429 ⇒ 限流，等一等会好");
+        check(probe_code(kHtml, 200).find("中间件") != std::string::npos,
+              "200 却是 HTML ⇒ 不可能出自币安 API，是中间件冒充");
+        check(probe_code(kHtml, 200).find("/fapi/v1/order") != std::string::npos,
+              "  并带上实际用的端点路径（省掉一轮「你到底发去哪了」）");
     }
 
     std::printf("── 用例12：全市场标记价（WS 断流时兜底价的新鲜度全靠它）──\n");
