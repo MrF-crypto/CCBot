@@ -1265,16 +1265,36 @@ int main() {
               "未开启委托止损的 bot 不参与核对");
     }
 
-    // ── 没开开关就一个请求都不发 ────────────────────────────────────────────
+    // ── 没开开关就一个请求都不发，但【必须说一声】────────────────────────────
     {
         auto cli = std::make_shared<FakeClient>();
         TrendEngine eng(cli, inline_host());
+        std::vector<std::string> logs;
+        eng.set_log_cb([&](const std::string& m) { logs.push_back(m); });
         auto id = eng.add_bot(mk_cfg());   // use_disaster_stop 默认 false
         feed(eng, id, 2.0, 110, 90);
         cli->fill_price = 110.0;
         eng.tick("TESTUSDT", 110.0);
         eng.tick("TESTUSDT", 125.0);
         check(cli->stop_log.empty(), "未开启时全程不得有任何挂单/撤单调用");
+
+        // ⚠ 实测（三小时实盘）：一个从落盘恢复的 bot 开了 5 笔仓，每一笔都没有
+        //   交易所侧保护，而日志一个字都没提 —— 同一份日志里另一个品种每笔都打
+        //   "硬止损已挂"，所以看日志的人只会觉得挺好。
+        //   整套设计的前提是"断电断网也有底"，没有这个底的仓位不该是安静的
+        int notices = 0;
+        for (const auto& m : logs)
+            if (m.find("未开启") != std::string::npos) ++notices;
+        check(notices == 1, "开仓时必须提醒一次「没开委托止损，这个仓位没有底」");
+
+        // 每个 bot 只说一次：每笔都说会变噪音
+        const size_t before = logs.size();
+        feed(eng, id, 2.0, 130, 90, 5);
+        eng.tick("TESTUSDT", 131.0);
+        int again = 0;
+        for (size_t i = before; i < logs.size(); ++i)
+            if (logs[i].find("未开启") != std::string::npos) ++again;
+        check(again == 0, "  但只说一次，后续开仓不再重复");
     }
 
     // ── 账户级闸门：总保证金上限 ────────────────────────────────────────────

@@ -633,6 +633,7 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                     std::to_string(cfg.leverage) + "x），按交易所原有杠杆开仓");
 
             bool need_ds_sync = false;   // 成交后要不要挂灾难止损（派发在锁外）
+            bool no_ds_notice = false;   // 要不要提醒"这个 bot 没开委托止损"
             const double qty = plan_qty(cfg, price, init_stop);
             // 没有止损线就不开仓——这条对两种模式都成立，只是缺的东西不同
             // （唐奇安缺 ATR，裸K线缺摆动低点）
@@ -707,6 +708,21 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 // ⚠ 顺序只能是"先开仓再挂止损"：closePosition 单在没有仓位时
                 //   会被交易所拒。所以这个窗口是结构性的，消不掉，只能缩到最短
                 need_ds_sync = b.cfg.use_disaster_stop;
+                // ⚠ 没开委托止损时必须说一声。
+                //
+                //   实测（2026-09-30 三小时实盘）：一个从落盘恢复的 bot 开了 5 笔仓，
+                //   每一笔都【没有】交易所侧保护，而日志一个字都没提 —— 同一份日志里
+                //   另一个品种每笔都打"硬止损已挂"，所以看日志的人只会觉得"挺好"，
+                //   根本不会注意到有一半的仓位是裸的。
+                //   （落盘恢复时 use_disaster_stop 默认 false，而弹窗里默认是勾上的，
+                //    所以老 bot 与新配的 bot 会静静地跑出两套风险模型。）
+                //
+                //   整套设计的前提是"断电断网也有交易所侧的底"。没有这个底的仓位
+                //   不该是安静的。每个 bot 只说一次，避免每笔都刷
+                if (!b.cfg.use_disaster_stop && !b.no_ds_warned) {
+                    b.no_ds_warned = true;
+                    no_ds_notice   = true;
+                }
             } else if (r.uncertain) {
                 // 开仓状态不明：可能已成交而本地没记录。盲目重试会变双倍仓位——
                 // 停掉等人工核对。这和 reduceOnly 平仓不同，开仓【不幂等】
@@ -719,6 +735,12 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 log(cfg.symbol + " 开仓失败: " + r.error);
             }
             }   // ← mtx_ 在此释放，下面才敢做 HTTP
+            if (no_ds_notice)
+                log("⚠ " + cfg.symbol + " 未开启「在交易所挂灾难止损单」——"
+                    "这个仓位只有活在本进程里的移动止损，程序崩了/断电/窗口被误关"
+                    "就完全没有底。要开在右键→策略配置→进程外保护。\n"
+                    "    （从落盘恢复的 bot 这一项默认是关的，而弹窗里默认是开的，"
+                    "所以老 bot 与新配的 bot 会跑出两套风险模型）");
             if (need_ds_sync) try_place_hard_stop(id);
         } catch (const std::exception& e) {
             clear_pending_after_throw(id, "submit_open 异常: " + std::string(e.what()));

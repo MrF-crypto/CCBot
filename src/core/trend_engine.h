@@ -178,6 +178,10 @@ struct TrendBot {
     // 成功开仓时复位，所以"又开始缺数据了"仍然会重新提示一次
     bool skip_logged = false;
 
+    // 已经提醒过"这个 bot 没开委托止损"。每个 bot 只说一次（每笔都说会变噪音），
+    // 但必须说 —— 见 submit_open 里那段注释
+    bool no_ds_warned = false;
+
     double realized_pnl = 0;
     int    trade_count  = 0;
     int    win_count    = 0;
