@@ -146,7 +146,8 @@ int main(int argc, char** argv) {
     // 探测持仓模式（单向/双向）。此前这个查询【从未被调用】，dual_mode_ 一直是
     // 默认的 false，等于把"单向持仓"写死了：账户若是双向，每笔单都缺 positionSide
     // 参数被交易所拒单 -4061，而那个错误码光看字面很难联想到是这里
-    const bool dual_mode = client->fetch_position_mode();
+    bool mode_ok = false;
+    const bool dual_mode = client->fetch_position_mode(&mode_ok);
     auto info = client->fetch_account();
     if (!info.ok) {
         log_line("连接失败: " + info.error, "ERR");
@@ -160,7 +161,11 @@ int main(int argc, char** argv) {
              " | 权益 $" + std::to_string(info.total_equity) +
              " | 可用 $" + std::to_string(info.available) +
              (info.uni_mmr > 0 ? " | uniMMR " + std::to_string(info.uni_mmr) : "") +
-             " | 持仓模式 " + (dual_mode ? "双向（带 positionSide）" : "单向"), "OK");
+             " | 持仓模式 " + (dual_mode ? "双向（带 positionSide）" : "单向") +
+             // 没查成时必须说出来：这个值决定每张订单要不要带 positionSide，
+             // 猜错会被交易所以 -4061 拒单，而那个码光看字面联想不到这里
+             (mode_ok ? "" : "（⚠ 未查到，沿用默认值；若下单出现 -4061"
+                             "就是这里猜错了）"), "OK");
     // 启动这一条保留：一次性的，而且本机与交易所的时差是排查任何时间戳问题的起点
     log_line(first_sync.to_log(), first_sync.accepted ? "OK" : "WARN");
 

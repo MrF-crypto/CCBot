@@ -599,6 +599,57 @@ int main() {
         check(!ok, "有一条缺 algoId ⇒ 整份快照 ok=false");
     }
 
+    std::printf("── 用例16：持仓模式不能把「没查到」当成「单向」──\n");
+    {
+        // dual_mode_ 决定【每一张订单】要不要带 positionSide。在双开账户上漏带
+        // 会被币安以 -4061 拒单，而 -4061 在硬止损那边是【不可重试】的码 ——
+        // 直接走兜底平仓。所以这个猜测的代价是真金白银。
+        // 实测日志里同一个账户在不同次启动上报出过两种模式，而用户没改过设置
+        auto probe = [](const char* body, bool* ok_out) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string&, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("positionSide/dual") != std::string::npos) {
+                    out.body = body; return true;
+                }
+                return false;
+            });
+            // 先成功读到"双向"，再看失败时会不会把它冲回 false
+            bool warm = false;
+            tc.set_test_hook([&, body](const std::string&, const std::string& path,
+                                       const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("positionSide/dual") == std::string::npos) return false;
+                out.body = warm ? body : R"({"dualSidePosition":true})";
+                return true;
+            });
+            bool first_ok = false;
+            const bool d1 = tc.fetch_position_mode(&first_ok);
+            warm = true;
+            const bool d2 = tc.fetch_position_mode(ok_out);
+            return std::make_pair(d1 && first_ok, d2);
+        };
+
+        bool ok = true;
+        auto r = probe("", &ok);
+        check(r.first, "先成功读到「双向持仓」");
+        check(!ok, "  之后拉取失败 ⇒ ok=false");
+        check(r.second, "  且【沿用】上次的双向判断，不得冲回默认的 false —— "
+                        "冲回去等于把「没查到」变成「单向持仓」这个断言");
+
+        ok = true;
+        r = probe("not json", &ok);
+        check(!ok && r.second, "非 JSON 同理：ok=false 且沿用上次的值");
+
+        ok = true;
+        r = probe(R"({"serverTime":1700000000000})", &ok);
+        check(!ok && r.second,
+              "字段缺失也算没查到 —— 取不到时值会留 false，而那正好与「单向」无法区分");
+
+        ok = false;
+        r = probe(R"({"dualSidePosition":false})", &ok);
+        check(ok && !r.second, "真的读到 false ⇒ ok=true 且如实返回单向");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -1068,10 +1068,11 @@ void MainWindow::onConnect() {
         //   · 账户是双向     → 每笔单都缺 positionSide 参数，交易所一律拒单 -4061
         // 同时 add_bot 那道"单向模式下不许同品种双向 bot"的检查也依赖它，
         // 读到假的 false 会把一个合法配置拦掉
-        const bool dual = client->fetch_position_mode();
+        bool mode_ok = false;
+        const bool dual = client->fetch_position_mode(&mode_ok);
         auto info = client->fetch_account();
 
-        QMetaObject::invokeMethod(this, [this, client, info, cfg, dual, tsync]() {
+        QMetaObject::invokeMethod(this, [this, client, info, cfg, dual, mode_ok, tsync]() {
             btnConnect_->setEnabled(true);
             if (!info.ok) {
                 connLabel_->setText("连接失败: " + QString::fromStdString(info.error));
@@ -1089,8 +1090,17 @@ void MainWindow::onConnect() {
             client_ = client;
             // 把探测结果打出来：持仓模式决定下单参数，配错了是【每笔单都被拒】，
             // 而错误码 -4061 光看字面很难联想到是这里
-            log(dual ? "账户持仓模式: 双向持仓（下单将带 positionSide）"
-                     : "账户持仓模式: 单向持仓", "OK");
+            // ⚠ 没查成时必须说"没查到"，不能把沿用下来的值报成事实。
+            //   这个值决定每张订单要不要带 positionSide，报错了会让人
+            //   在真正的原因（-4061 拒单）面前看着一条自信的错误结论
+            if (!mode_ok)
+                log(QString("⚠ 拉取账户持仓模式失败，沿用上次的判断：%1。"
+                            "若实际是另一种，下单会被交易所以 -4061 拒掉 —— "
+                            "看到 -4061 就先回来核对这一行")
+                        .arg(dual ? "双向持仓" : "单向持仓"), "WARN");
+            else
+                log(dual ? "账户持仓模式: 双向持仓（下单将带 positionSide）"
+                         : "账户持仓模式: 单向持仓", "OK");
             // 首次对时的结果：偏移量是 -1021 的直接成因，连接时就该让人看见
             log(QString::fromStdString(tsync.to_log()), tsync.accepted ? "OK" : "WARN");
             trend_engine_ = std::make_shared<TrendEngine>(client_, pool_);

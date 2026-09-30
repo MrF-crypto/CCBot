@@ -48,11 +48,23 @@ jobs:
           # 等于把这道门禁降级成摆设
           - san: thread
             name: TSan
-            suites: ccg_trend_stress_tests ccg_pool_tests ccg_trend_engine_tests ccg_order_tests
+            # ⚠ ccg_rest_feed_tests 必须在这里：RestPriceFeed 有一个【自己的轮询
+            #   后台线程】，而它是 v5.7.0 起唯一的行情来源。它在 v5.9.2 之前
+            #   两个 sanitizer 列表都不在 —— 门禁列表是硬编码的，加新套件时
+            #   没人提醒，正是上面那段注释担心的"降级成摆设"
+            suites: ccg_trend_stress_tests ccg_pool_tests ccg_trend_engine_tests
+                    ccg_order_tests ccg_rest_feed_tests
 
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # 门禁自身的门禁：套件列表是硬编码的，加新测试目标时没人提醒。
+      # v5.7.0 新增的 ccg_rest_feed_tests 就这样在两个 sanitizer 里都缺席了
+      # 几个版本 —— 而它是唯一的行情来源、还自带一个后台轮询线程。
+      # 放在最前面：列表不完整时后面跑多少套都不算数
+      - name: Suite coverage (hard gate)
+        run: python3 tools/check_suite_coverage.py
 
       # apt 在 GitHub runner 上会偶发挂死（不是报错，是卡住）。同 build-linux：
       # 用 timeout 主动砍掉再由外层循环重试，挂死的进程不会自己退出
@@ -128,7 +140,8 @@ jobs:
                     ccg_funding_tests ccg_rate_tests ccg_order_tests
                     ccg_trend_tests ccg_trend_engine_tests ccg_trend_stress_tests
                     ccg_trend_state_tests ccg_config_tests
-                    ccg_price_tests ccg_timesync_tests ccg_pool_tests"
+                    ccg_price_tests ccg_timesync_tests ccg_pool_tests
+                    ccg_rest_feed_tests"
           else
             SUITES="${{ matrix.suites }}"
           fi

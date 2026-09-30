@@ -842,32 +842,27 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
 }
 
 
-bool TradingClient::fetch_position_mode() {
+bool TradingClient::fetch_position_mode(bool* ok) {
+    if (ok) *ok = false;
+    // 没查成时【保留 dual_mode_ 的现值】而不是让它退回默认的 false。
+    // 退回 false 等于把"没查到"变成"单向持仓"这个断言，而它决定每张订单
+    // 要不要带 positionSide —— 在双开账户上漏带会被 -4061 拒单
     auto resp = http_get(ep(Ep::PositionSideDual), "recvWindow=5000");
-    if (resp.empty()) return false;
+    if (resp.empty()) return dual_mode_;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return dual_mode_;
     bool dual = false;
-    get_or_keep(doc["dualSidePosition"], dual);
+    // ⚠ 字段缺失也算没查成：get_or_keep 取不到时 dual 留 false，
+    //   而那正好与"单向持仓"无法区分
+    if (!get_or_keep(doc["dualSidePosition"], dual)) return dual_mode_;
     dual_mode_ = dual;
+    if (ok) *ok = true;
     return dual;
 }
 
 
-
-bool TradingClient::close_position(const std::string& sym) {
-    // 先拿持仓方向和数量
-    auto positions = fetch_positions();
-    for (const auto& pos : positions) {
-        if (pos.symbol != sym) continue;
-        std::string close_side = pos.direction == 1 ? "SELL" : "BUY";
-        auto r = place_market(sym, close_side, pos.qty, true);
-        return r.ok;
-    }
-    return false;
-}
 
 bool TradingClient::close_all_positions() {
     auto positions = fetch_positions();
@@ -1074,55 +1069,8 @@ double TradingClient::round_price(const std::string& sym, double price) {
     return floor_to_step(price, info.tick_size);
 }
 
-// ── TP/SL 条件市价单（显式数量 + reduceOnly，兼容所有账户模式）─────────────
-// 统一账户下条件单**不走** /papi/v1/um/order —— 那个端点只收 LIMIT/MARKET，
-// 发 STOP_MARKET 会被拒。条件单是独立的一套：
-//   路径   /papi/v1/um/conditional/order
-//   参数   type → strategyType
-//   返回   orderId → strategyId（撤单时也要用 strategyId，不是 orderId）
-TradingClient::OrderResult
-TradingClient::place_cond_market(const std::string& sym, const char* order_type,
-                                  double stop_price, const std::string& entry_side,
-                                  double qty) {
-    OrderResult r;
-    stop_price = round_price(sym, stop_price);
-    if (stop_price <= 0) { r.error = std::string(order_type) + "价格取整后为0，跳过"; return r; }
-
-    std::string close_side = (entry_side == "BUY") ? "SELL" : "BUY";
-    const auto& info = get_symbol_info(sym);
-    const int price_dp = step_decimals(info.tick_size);
-    const int qty_dp   = step_decimals(info.effective_market_step());
-    qty = round_qty(sym, qty);
-    if (qty <= 0) { r.error = std::string(order_type) + "数量取整后为0，跳过"; return r; }
-
-    const bool pm = is_pm();
-    std::ostringstream oss;
-    oss << "symbol=" << sym
-        << "&side=" << close_side
-        << (pm ? "&strategyType=" : "&type=") << order_type
-        << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
-        << "&quantity=" << std::setprecision(qty_dp) << qty
-        << "&reduceOnly=true"
-        << "&workingType=MARK_PRICE"
-        << "&priceProtect=false"
-        << "&recvWindow=5000";
-    if (dual_mode_)
-        oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
-
-    auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), oss.str());
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; return r; }
-    if (binance_error(doc, r.error)) return r;
-    int64_t oid = 0;
-    get_or_keep(doc[pm ? "strategyId" : "orderId"], oid);
-    r.order_id = std::to_string(oid); r.ok = true;
-    return r;
-}
-
 // ── 灾难止损单：STOP_MARKET + closePosition ───────────────────────────────────
-// 与 place_cond_market 的区别：不带 quantity / reduceOnly（币安对 closePosition
+// 不带 quantity / reduceOnly（币安对 closePosition
 // 同时带这两者会直接拒单），仓位平掉后交易所自动撤销。
 // 这个错误码重试还有没有意义。
 //

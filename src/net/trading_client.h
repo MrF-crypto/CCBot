@@ -79,7 +79,6 @@ public:
                               double qty, bool reduce_only = false);
     // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
     OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
-    bool close_position(const std::string& symbol);
     bool close_all_positions();
 
     // set_leverage / round_qty 见下方 ITradingClient 实现区（override 声明）
@@ -216,7 +215,17 @@ public:
                                                     const std::string& symbol = "");
 
     // 持仓模式检测（连接时调用一次）
-    bool fetch_position_mode();
+    // 拉取账户的持仓模式（单向 / 双向）。ok 区分"查成了"与"没查成"。
+    //
+    // ⚠ 为什么必须有 ok：dual_mode_ 决定【每一张订单】要不要带 positionSide。
+    //   在它之前，拉取失败时这个函数 return false 且不动 dual_mode_，而后者
+    //   默认就是 false —— 于是"没查到"被当成"单向持仓"，并且原样打进日志
+    //   （"账户持仓模式: 单向持仓"）。实测日志里同一个账户在不同次启动上
+    //   报出过两种模式，而用户并没有改过设置。
+    //   在双开账户上漏带 positionSide 会被币安以 -4061 拒单 —— 那是【硬止损
+    //   不可重试的错误码】，直接走兜底平仓。所以这个猜测的代价是真金白银。
+    //   没查成时保留上一次的已知值，并让调用方能说"这次没查到"
+    bool fetch_position_mode(bool* ok = nullptr);
 
 
     // ── LOT_SIZE / 价格精度 ─────────────────────────────────────────────────
@@ -380,9 +389,6 @@ private:
     };
     const char* ep(Ep e) const;
 
-    OrderResult place_cond_market(const std::string& symbol, const char* order_type,
-                                   double stop_price, const std::string& entry_side,
-                                   double qty);
 
     Config      cfg_;
     // 限流闸门：所有 HTTP 出口都过它。放在传输层而不是各调用点——
