@@ -1766,11 +1766,6 @@ void MainWindow::onTick() {
 
     std::set<std::string> need_rest;
     for (const auto& sym : disp_syms) {
-        double ws_price = ticker_ ? ticker_->mark_price(sym) : 0.0;
-        if (ws_price > 0) {
-            // 只有运行中的才驱动引擎；停止的品种拿到价格仅供界面显示
-            if (engine_syms.count(sym)) trend_engine_->tick(sym, ws_price);
-        }
         // ⚠ 要不要走 REST，判据是【WS 有没有在喂这个品种】，不是"缓存里有没有价"。
         //
         //   原先只在 mark_price() 返回 0（即缓存已超过 kStaleMs=10 秒）时才补拉，
@@ -1787,7 +1782,25 @@ void MainWindow::onTick() {
         const bool ws_feeding =
             tk.ws_mark_ms > 0 &&
             (QDateTime::currentMSecsSinceEpoch() - tk.ws_mark_ms) <= ccbot::BookTickerStream::kStaleMs;
-        if (!ws_feeding) need_rest.insert(sym);
+
+        // ⚠ 一拍只能喂引擎【一次】，而且喂的必须是这一拍最新的那个价。
+        //
+        //   WS 在喂 ⇒ 用缓存里的 WS 价，这一拍就到此为止。
+        //   WS 没在喂 ⇒ 这里【什么都不做】，交给下面的 REST 那一批去喂。
+        //
+        //   不这么分的话会有一个很别扭的状态：WS 刚死、缓存里还躺着上一轮
+        //   REST 写回的价（未超 10 秒），于是这一拍先拿那个旧价喂一次引擎，
+        //   紧接着 REST 回来又用新价喂第二次 —— 引擎在同一拍里看到两个价。
+        //   多数时候无害（棘轮是单调的，旧价上一轮已经喂过），但对
+        //   ③ 裸K·立即顺势 不是：它的入场判据是"实时价 vs 本根开盘价"，
+        //   一个我们【已经知道不是当前值】的价可能触发一笔新开仓
+        if (ws_feeding) {
+            // 只有运行中的才驱动引擎；停止的品种拿到价格仅供界面显示
+            if (engine_syms.count(sym) && tk.mark_price > 0)
+                trend_engine_->tick(sym, tk.mark_price);
+        } else {
+            need_rest.insert(sym);
+        }
     }
 
     if (need_rest.empty()) { refreshBotTable(); return; }

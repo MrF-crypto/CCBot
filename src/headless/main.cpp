@@ -350,6 +350,11 @@ int main(int argc, char** argv) {
                 double p = (it != rest_px.end()) ? it->second
                                                  : client->fetch_mark_price(sym);
                 // 写回缓存：headless 没有界面，但状态落盘与日志同样读它
+                //
+                // p<=0（这一拍 REST 也没拿到）时刻意【保留】上面那个缓存价：
+                // 它至多 10 秒旧（mark_price 自带陈旧保护），而完全喂不到价会让
+                // 移动止损停止推进——宁可用一个稍旧的价推着走，也不要让保护冻住。
+                // 真的连缓存都过期了，price 就是 0，下面的 stall 告警会接管
                 if (p > 0) { ticker.set_mark_price(sym, p); price = p; }
             }
             if (price > 0) {
