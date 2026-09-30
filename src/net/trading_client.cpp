@@ -1134,19 +1134,51 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     const int price_dp = step_decimals(info.tick_size);
     const bool pm = is_pm();
 
-    std::ostringstream oss;
-    oss << "symbol=" << sym
-        << "&side=" << close_side
-        << (pm ? "&strategyType=" : "&type=") << "STOP_MARKET"
-        << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
-        << "&closePosition=true"
-        << "&workingType=MARK_PRICE"   // 用标记价，避免插针成交价误触发
-        << "&priceProtect=true"
-        << "&recvWindow=5000";
-    if (dual_mode_)
-        oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
+    // 同一张单的两种写法，只差"往哪个端点发 + 类型字段叫什么"。
+    // 普通合约账户走 /fapi/v1/order 的 type=；统一账户的条件单是另一套端点，
+    // 字段叫 strategyType=（普通端点只收 LIMIT/MARKET，发 STOP_MARKET 会被拒）
+    auto build = [&](bool as_conditional) {
+        std::ostringstream oss;
+        oss << "symbol=" << sym
+            << "&side=" << close_side
+            << (as_conditional ? "&strategyType=" : "&type=") << "STOP_MARKET"
+            << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
+            << "&closePosition=true"
+            << "&workingType=MARK_PRICE"   // 用标记价，避免插针成交价误触发
+            << "&priceProtect=true"
+            << "&recvWindow=5000";
+        if (dual_mode_)
+            oss << "&positionSide=" << ((entry_side == "BUY") ? "LONG" : "SHORT");
+        return oss.str();
+    };
 
-    auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), oss.str());
+    auto resp = http_post(pm ? ep(Ep::CondOrder) : ep(Ep::Order), build(pm));
+    bool used_cond = pm;   // 最终是从哪个端点拿到的回执（决定单号字段名）
+
+    // ── -4120 的定向回退 ──────────────────────────────────────────────────────
+    // 币安回 -4120 时的原话是 "Please use the Algo Order API endpoints instead"，
+    // 而条件单端点就是它指的那个。按它说的再试一次，只试一次。
+    //
+    // 为什么值得这一次额外往返：走到这里的替代路径是【平掉刚开的仓】，
+    // 代价是两笔市价单手续费加一个本该存在的敞口没了。相比之下多发一个请求
+    // 便宜得多，而且失败也只是多一条日志——它不会创建一张"错"的单，
+    // 参数完全相同，只是换个端点。
+    //
+    // ⚠ 只在非统一账户模式下回退（pm 时首发已经是条件单端点，重复没有意义），
+    //   而且只回退一次，不进入循环。
+    // 成功的话说明【账户模式设错了】：account_mode 是手工选的不是探测的，
+    //   设错时行情、余额、市价单全部照常，只有条件单会露馅
+    if (!pm && !resp.empty() && resp.find("-4120") != std::string::npos) {
+        auto alt = http_post(ep(Ep::CondOrder), build(true));
+        if (!alt.empty() && alt.find("\"code\"") == std::string::npos) {
+            // 换端点之后不再报错 ⇒ 用它的结果继续往下解析。
+            // 判据用"没有 code 字段"而不是"没有 -4120"：条件单端点可能回一个
+            // 完全不同的错误码，那种情况下回退没成功，应该保留首发的 -4120
+            // 让上层按"端点不对"处置，而不是拿一个更陌生的码去误导人
+            resp = alt;
+            used_cond = true;
+        }
+    }
     // 空响应 = 超时/网络断。可能单子其实挂上了，但我们拿不到单号——当失败处理
     // 并重试是安全的：closePosition 单同方向只允许一张，重复挂会被交易所拒，
     // 拒了就进入下一次重试，不会留下两张
@@ -1195,13 +1227,25 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
                    "（普通合约 ↔ 统一账户）：它是手工选的而不是探测的，选错时"
                    "余额和市价单都照常工作，只有条件单会露馅。当前用的是 " +
                    std::string(pm ? "统一账户(/papi/v1/um/conditional/order)"
-                                  : "普通合约(/fapi/v1/order)");
+                                  : "普通合约(/fapi/v1/order)") +
+                   "；已自动改用条件单端点重试过一次，同样没成功";
         return { "", err, stop_error_retryable(err) };
     }
 
+    // 单号字段随端点变：普通端点给 orderId，条件单端点给 strategyId。
+    // 两个都试而不是只按 used_cond 挑一个——判错的话会变成"挂上了但我们以为
+    // 没挂上"，那是最坏的一种：交易所留着一张单，本地当失败继续重试，
+    // 而 closePosition 同方向只允许一张，于是重试永远失败
     int64_t oid = 0;
-    get_or_keep(doc[pm ? "strategyId" : "orderId"], oid);
-    if (oid > 0) return { std::to_string(oid), "", true };
+    get_or_keep(doc[used_cond ? "strategyId" : "orderId"], oid);
+    if (oid <= 0) get_or_keep(doc[used_cond ? "orderId" : "strategyId"], oid);
+    if (oid > 0) {
+        StopPlacement ok{std::to_string(oid), "", true};
+        // 首发端点被拒、换条件单端点成功 ⇒ 账户模式设错了。这条必须报出来，
+        // 否则每次开仓都要白走一次 -4120 + 一次回退，而根因一直没人知道
+        ok.via_cond_fallback = (used_cond != pm);
+        return ok;
+    }
     // 没报错但也没给单号：语义不明，当失败但允许重试
     return { "", "响应里没有单号: " + resp.substr(0, 120), true };
 }

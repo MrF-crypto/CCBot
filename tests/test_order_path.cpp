@@ -339,6 +339,61 @@ int main() {
         check(r1.error.find("账户模式") != std::string::npos,
               "  并提示去核对账户模式（它是手工选的，选错时只有条件单会露馅）");
 
+        // -4120 的定向回退：币安自己说"请用 Algo Order API"，那就按它说的
+        // 换条件单端点再试一次。成功了就说明账户模式设错了，必须报出来——
+        // 否则每次开仓都白走一次被拒 + 一次回退，而中间仓位没有进程外保护
+        {
+            TradingClient tc(test_cfg());
+            int fapi_posts = 0, cond_posts = 0;
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m != "POST") return false;
+                if (path.find("conditional") != std::string::npos) {
+                    ++cond_posts;
+                    out.body = R"({"strategyId":778899,"strategyStatus":"NEW"})";
+                } else {
+                    ++fapi_posts;
+                    out.body = R"({"code":-4120,"msg":"Order type not supported for )"
+                               R"(this endpoint. Please use the Algo Order API endpoints instead."})";
+                }
+                return true;
+            });
+            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
+            check(fapi_posts == 1, "普通端点先试一次");
+            check(cond_posts == 1, "  被 -4120 拒后，换条件单端点再试一次（只一次）");
+            check(r.ok(), "  回退成功即算挂上");
+            check(r.order_id == "778899",
+                  "  单号取 strategyId（条件单端点不给 orderId，取错会变成"
+                  "「挂上了但以为没挂上」——那是最坏的一种）");
+            check(r.via_cond_fallback,
+                  "  必须标出这是回退挂上的，好让上层提示改账户模式");
+        }
+        {
+            // 回退也失败时，保留【首发的 -4120】而不是条件单端点那个更陌生的码：
+            // 上层要按"端点不对"处置，换个码只会误导人
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m != "POST") return false;
+                out.body = (path.find("conditional") != std::string::npos)
+                    ? R"({"code":-2015,"msg":"Invalid API-key, IP, or permissions."})"
+                    : R"({"code":-4120,"msg":"Order type not supported for this endpoint."})";
+                return true;
+            });
+            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");
+            check(!r.ok(), "回退也失败 ⇒ 整体失败");
+            check(r.error.find("-4120") != std::string::npos,
+                  "  保留首发的 -4120，不要换成条件单端点那个陌生码");
+            check(!r.retryable, "  仍然按「重试无意义」处置");
+            check(!r.via_cond_fallback, "  没挂上就不该标成回退成功");
+        }
+
         // -1003 限流：过一会儿就好了，正是阶梯存在的理由
         auto r2 = probe(R"({"code":-1003,"msg":"Too many requests."})");
         check(!r2.ok() && r2.retryable, "-1003 限流可重试：这正是重试阶梯的用途");

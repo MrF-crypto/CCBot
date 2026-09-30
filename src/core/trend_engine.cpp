@@ -792,6 +792,11 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                           "（单号 " + placed.order_id + "）");
             } else {
                 b.disaster_stop_id = placed.order_id;
+                if (placed.via_cond_fallback)
+                    log("⚠ " + sym + " 硬止损是靠【条件单端点】挂上的 —— 普通端点回了 "
+                        "-4120。这几乎肯定意味着「账户模式」设错了：请把它改成"
+                        "「统一账户」。不改的话每次开仓都要先白走一次被拒 + 一次回退，"
+                        "而这中间仓位是没有进程外保护的。");
                 if (b.ds_unprotected)
                     log("✅ " + sym + " 硬止损已补挂成功（第 " + std::to_string(attempt) +
                         " 次），该仓位重新获得进程外保护");
