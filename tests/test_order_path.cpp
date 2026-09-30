@@ -442,6 +442,60 @@ int main() {
             check(r2.note.empty(), "  没有变化就不要重复打说明（否则每次挂单都刷一条）");
         }
         {
+            // 变体2 是唯一【结构上不同】的：手机 App 上的「整个仓位 / 仅减仓」
+            // 就是 closePosition 与 quantity+reduceOnly 这两种形态。
+            // closePosition 本身被拒时，它是唯一还没试过的方向
+            TradingClient tc(test_cfg());
+            std::vector<std::string> sent;
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string& params, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m != "POST") return false;
+                sent.push_back(params);
+                if (params.find("closePosition") != std::string::npos) {
+                    out.code = 400;                    // 模拟"closePosition 就是不被接受"
+                    out.body = "<!DOCTYPE html><html><body>bad</body></html>";
+                } else {
+                    out.code = 200;
+                    out.body = R"({"orderId":5150,"status":"NEW"})";
+                }
+                return true;
+            });
+            auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
+            check(r.ok(), "closePosition 被拒后，退到 数量+仅减仓 并挂上");
+            check(sent.size() == 3, "  依次试了 完整 / 去priceProtect / 数量+仅减仓");
+            check(sent[2].find("quantity=0.015") != std::string::npos, "  带上了持仓数量");
+            check(sent[2].find("reduceOnly=true") != std::string::npos, "  且是仅减仓");
+            check(sent[2].find("closePosition") == std::string::npos,
+                  "  ⚠ 必须【取代】closePosition 而不是叠加：币安对同时带这两者直接拒单");
+            check(sent[2].find("workingType=MARK_PRICE") != std::string::npos,
+                  "  标记价触发要保留到最后一个变体才退让");
+        }
+        {
+            // 拿不到持仓数量时跳过变体2：它非要 quantity，缺了就只是变体1 的重复，
+            // 白发一次请求还多占一次限流额度
+            TradingClient tc(test_cfg());
+            std::vector<std::string> sent;
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string& params, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m != "POST") return false;
+                sent.push_back(params);
+                out.code = 400;
+                out.body = "<!DOCTYPE html><html><body>bad</body></html>";
+                return true;
+            });
+            tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY");   // qty 缺省 0
+            check(sent.size() == 3, "无 qty 时只试 3 个变体（跳过要数量的那个）");
+            for (const auto& s : sent)
+                check(s.find("quantity=") == std::string::npos,
+                      "  没有一次带 quantity（缺数量还发就是白占限流额度）");
+        }
+        {
             // 非参数类失败不该触发换写法：空响应是网络问题，换参数毫无意义，
             // 而白试三遍等于把一次网络抖动变成三倍的挂单延迟
             TradingClient tc(test_cfg());

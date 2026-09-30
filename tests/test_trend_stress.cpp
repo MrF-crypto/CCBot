@@ -80,7 +80,7 @@ public:
         return std::floor(q / 0.001) * 0.001;
     }
     StopPlacement place_disaster_stop(const std::string&, double sp,
-                                      const std::string&) override {
+                                      const std::string&, double) override {
         if (!(sp > 0)) {
             ++bad_stop_price;
             StopPlacement p; p.error = "非正触发价"; p.retryable = false;

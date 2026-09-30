@@ -1126,7 +1126,7 @@ static bool stop_error_retryable(const std::string& err) {
 
 TradingClient::StopPlacement
 TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
-                                   const std::string& entry_side) {
+                                   const std::string& entry_side, double qty) {
     stop_price = round_price(sym, stop_price);
     // 取整之后还 <=0：传进来的价本身就不合法，重试没有意义
     if (stop_price <= 0) {
@@ -1159,21 +1159,37 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     //
     //   变体0  closePosition + MARK_PRICE + priceProtect   ← 功能最全，原来的写法
     //   变体1  去掉 priceProtect（它只是"标记价明显异常时不触发"的附加保护）
-    //   变体2  再把 workingType 换成 CONTRACT_PRICE（币安的默认口径）
+    //   变体2  quantity + reduceOnly 取代 closePosition（需要 qty，拿不到就跳过）
+    //   变体3  再把 workingType 换成 CONTRACT_PRICE（币安的默认口径）
     //
-    // ⚠ 摘掉的都是【可选增强】，不是保护本身：触发价与 closePosition 一直在。
-    //   变体2 的代价是改用成交价触发，插针更容易打到 —— 所以它排在最后，
-    //   只有前两个都被拒才会用上，而"有个会早触发的底"远好过"没有底"。
-    static constexpr int kVariants = 3;
+    // ⚠ 变体0→1 摘掉的是【可选增强】，触发价与 closePosition 一直在。
+    // ⚠ 变体2 是唯一【结构上不同】的那个：手机 App 上的「整个仓位 / 仅减仓」就是
+    //   closePosition 与 quantity+reduceOnly 这两种形态，两者都合法且等效。
+    //   0/1 都被拒时，"是不是 closePosition 本身不被接受"是唯一还没试过的方向。
+    //   它的代价：数量在挂单那一刻冻结，此后仓位若被外部加仓，这张单只平原来
+    //   那部分（而 closePosition 平全部）。本策略不加仓，所以代价基本为零。
+    // ⚠ 变体3 改用成交价触发，插针更容易打到 —— 所以排在最后，
+    //   而"有个会早触发的底"远好过"没有底"。
+    static constexpr int kVariants = 4;
+    const bool have_qty = (qty > 0);
+    const int  qty_dp   = step_decimals(info.effective_market_step());
+    const double rq     = have_qty ? round_qty(sym, qty) : 0.0;
     auto build = [&](bool as_conditional, int variant) {
         std::ostringstream oss;
         oss << "symbol=" << sym
             << "&side=" << close_side
             << (as_conditional ? "&strategyType=" : "&type=") << "STOP_MARKET"
-            << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
-            << "&closePosition=true";
-        // 用标记价，避免插针成交价误触发；变体2 退回币安默认口径
-        oss << "&workingType=" << (variant >= 2 ? "CONTRACT_PRICE" : "MARK_PRICE");
+            << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price;
+        if (variant == 2 && rq > 0) {
+            // ⚠ closePosition 与 quantity/reduceOnly 互斥：币安对同时带这两者
+            //   直接拒单。所以这里是【取代】而不是叠加
+            oss << "&quantity=" << std::setprecision(qty_dp) << rq
+                << "&reduceOnly=true";
+        } else {
+            oss << "&closePosition=true";
+        }
+        // 用标记价，避免插针成交价误触发；最后一个变体退回币安默认口径
+        oss << "&workingType=" << (variant >= 3 ? "CONTRACT_PRICE" : "MARK_PRICE");
         if (variant < 1) oss << "&priceProtect=true";
         oss << "&recvWindow=5000";
         if (dual_mode_)
@@ -1188,9 +1204,10 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     };
     auto variant_desc = [](int v) {
         switch (v) {
-        case 0:  return "完整（MARK_PRICE + priceProtect）";
+        case 0:  return "完整（closePosition + MARK_PRICE + priceProtect）";
         case 1:  return "去掉 priceProtect";
-        default: return "去掉 priceProtect 且改用 CONTRACT_PRICE 触发";
+        case 2:  return "改用 数量+仅减仓 取代 closePosition";
+        default: return "数量+仅减仓 且改用 CONTRACT_PRICE 触发";
         }
     };
 
@@ -1205,6 +1222,8 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     std::string resp;
     int tried_upto = variant;
     for (int i = variant; i < kVariants; ++i) {
+        // 拿不到持仓数量时跳过变体2：它非要 quantity，缺了就退化成变体1 的重复
+        if (i == 2 && !(rq > 0)) continue;
         tried_upto = i;
         resp = http_post(first_path, build(pm, i), &http_code);
         // 只有"请求被判畸形/参数不被接受"才值得换写法。空响应是网络问题，

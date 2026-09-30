@@ -57,9 +57,19 @@ public:
 
     // 默认实现返回"不支持且不必重试"：回测的 SimClient 用不到它（回测里进程
     // 不会崩）。标 retryable=false 是有意的——否则模拟环境会白跑一遍重试阶梯
+    // qty：当前持仓数量。0 = 调用方不知道/不提供。
+    //
+    // 为什么需要它：交易所侧那张单有两种【结构上不同】的写法，
+    //   ① closePosition=true          —— 不带数量，平掉当时的整个仓位
+    //   ② quantity=N + reduceOnly=true —— 带数量，只减仓
+    // 手机 App 上的「整个仓位 / 仅减仓」就是这两个。①②都是合法且等效的保护，
+    // 但当 ① 被交易所以"请求畸形"拒掉时，② 是唯一还没试过的方向——
+    // 前面那些变体都只是在摘可选参数，没有一个换掉 closePosition 本身。
+    // 拿不到 qty 时退化成只试 ①（行为与加这个参数之前完全一致）
     virtual StopPlacement place_disaster_stop(const std::string& /*symbol*/,
                                               double /*stop_price*/,
-                                              const std::string& /*entry_side*/) {
+                                              const std::string& /*entry_side*/,
+                                              double /*qty*/ = 0) {
         // ⚠ 按字段赋值，不用花括号聚合初始化。
         //   聚合初始化只写前 N 个字段时，GCC/Clang 的
         //   -Wmissing-field-initializers + -Werror 会直接拒编（MSVC 放过），

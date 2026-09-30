@@ -315,7 +315,8 @@ public:
     // 变大，显式数量的单子会立刻过期失真；closePosition 永远平掉当时的整个仓位，
     // 所以"开仓时挂一次、此后不动"这个语义天然兼容加仓
     StopPlacement place_disaster_stop(const std::string& symbol, double stop_price,
-                                      const std::string& entry_side) override;
+                                      const std::string& entry_side,
+                                      double qty = 0) override;
     bool cancel_disaster_stop(const std::string& symbol,
                               const std::string& order_id) override;
 

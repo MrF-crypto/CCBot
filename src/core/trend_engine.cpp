@@ -720,7 +720,7 @@ void TrendEngine::clear_ds_runtime(TrendBot& b) {
 
 void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
     std::string sym, side;
-    double target = 0;
+    double target = 0, qty_now = 0;
     int    attempt = 0;
     {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -749,6 +749,9 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
         sym    = b.cfg.symbol;
         // 传【持仓方向】，由 TradingClient 内部换成平仓方向，别自己反
         side   = (b.st.pos == trend::Pos::Long) ? "BUY" : "SELL";
+        // 数量一并带上：交易所侧那张单有 closePosition / quantity+reduceOnly 两种
+        // 写法，前者被拒时后者是唯一结构上不同的备选（见 place_disaster_stop）
+        qty_now = b.qty;
         attempt = b.ds_attempts + 1;
         b.ds_syncing = true;
     }
@@ -766,7 +769,7 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
 
     if (!(target > 0)) return;
 
-    const auto placed = client_->place_disaster_stop(sym, target, side);
+    const auto placed = client_->place_disaster_stop(sym, target, side, qty_now);
 
     bool give_up = false;
     bool unbroke = false;           // 本次挂单成功是否解除了账户级熔断

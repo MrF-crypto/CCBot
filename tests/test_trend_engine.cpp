@@ -78,7 +78,7 @@ public:
     // 分别构造"可重试"与"参数错误直接放弃"两条路
     bool ds_fail_retryable = true;
     StopPlacement place_disaster_stop(const std::string&, double stop_price,
-                                      const std::string&) override {
+                                      const std::string&, double) override {
         if (ds_place_fails) {
             stop_log.push_back({"place_fail", stop_price, ""});
             StopPlacement p; p.error = "boom"; p.retryable = ds_fail_retryable;
