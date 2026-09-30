@@ -1180,11 +1180,17 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
             << "&side=" << close_side
             << (as_conditional ? "&strategyType=" : "&type=") << "STOP_MARKET"
             << "&stopPrice=" << std::fixed << std::setprecision(price_dp) << stop_price;
-        if (variant == 2 && rq > 0) {
+        if (variant >= 2 && rq > 0) {
             // ⚠ closePosition 与 quantity/reduceOnly 互斥：币安对同时带这两者
-            //   直接拒单。所以这里是【取代】而不是叠加
-            oss << "&quantity=" << std::setprecision(qty_dp) << rq
-                << "&reduceOnly=true";
+            //   直接拒单。所以这里是【取代】而不是叠加。
+            //   变体3 = 变体2 的写法再把 workingType 退让，所以用 >= 而不是 ==
+            //   （写成 == 的后果：变体3 悄悄退回 closePosition，而日志还在说
+            //     「数量+仅减仓」—— 描述与实际发出的参数不一致，实测日志里
+            //     就是这么骗了我一轮）
+            oss << "&quantity=" << std::setprecision(qty_dp) << rq;
+            // ⚠ reduceOnly 在【双开模式】下币安不接受这个参数（官方明文）。
+            //   双开模式靠 positionSide 指明要减哪条腿，reduceOnly 是多余且非法的
+            if (!dual_mode_) oss << "&reduceOnly=true";
         } else {
             oss << "&closePosition=true";
         }
@@ -1206,8 +1212,8 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         switch (v) {
         case 0:  return "完整（closePosition + MARK_PRICE + priceProtect）";
         case 1:  return "去掉 priceProtect";
-        case 2:  return "改用 数量+仅减仓 取代 closePosition";
-        default: return "数量+仅减仓 且改用 CONTRACT_PRICE 触发";
+        case 2:  return "数量 取代 closePosition";
+        default: return "数量 取代 closePosition 且改用 CONTRACT_PRICE 触发";
         }
     };
 
@@ -1234,10 +1240,16 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
                                resp.find("-1102") != std::string::npos ||   // 必填参数缺失/非法
                                resp.find("-1104") != std::string::npos));   // 有参数没被读取
         if (!param_rejected) break;
-        if (i + 1 < kVariants)
+        // ⚠ 同一个变体被拒只报一次。
+        //   重试阶梯要跑 13 次，每一次都是一轮完整的变体轮换，不去重就是 13 条
+        //   一模一样的提示 —— 实测日志里刷了 9 条，正是用户抱怨的那种黄色噪音。
+        //   它要传达的信息（这个写法不行、换下一个）只有第一次是新的
+        if (i + 1 < kVariants && ds_noted_reject_.load() != i) {
+            ds_noted_reject_.store(i);
             ds_last_note_ = std::string("硬止损写法「") + variant_desc(i) +
                             "」被拒（HTTP " + std::to_string(http_code) +
                             "），改用「" + variant_desc(i + 1) + "」再试";
+        }
     }
     // 成功就把这个变体记住，后续直接用它
     if (!resp.empty() && resp.find("\"code\"") == std::string::npos &&

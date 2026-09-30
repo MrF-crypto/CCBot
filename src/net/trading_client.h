@@ -345,6 +345,9 @@ private:
     // 一旦某个变体挂成了就记住它，后续直接用 —— 稳态只发一次请求。
     // atomic：多个品种会并发挂单
     std::atomic<int> ds_variant_{0};
+    // 已经报过"被拒"的变体下标，-1 = 还没报过。重试阶梯跑 13 次、每次都轮换
+    // 一遍变体，不去重就是 13 条一模一样的提示（实测刷了 9 条）
+    std::atomic<int> ds_noted_reject_{-1};
     // 上一次换写法/换端点时的说明，供上层日志取用一次（换写法很少见，
     // 每次挂单都打就是噪音）。只在 place_disaster_stop 里写，读走即清
     std::string ds_last_note_;

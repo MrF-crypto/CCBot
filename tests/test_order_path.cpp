@@ -474,6 +474,33 @@ int main() {
                   "  标记价触发要保留到最后一个变体才退让");
         }
         {
+            // ⚠ 最后一个变体必须【继承】数量写法，不能悄悄退回 closePosition。
+            //   写成 variant==2 的后果：变体3 发的是 closePosition，而日志还在说
+            //   「数量+仅减仓」—— 描述与实际发出的参数不一致，实测日志里正是这样
+            //   骗了我一轮（dump 出来才发现）
+            TradingClient tc(test_cfg());
+            std::vector<std::string> sent;
+            tc.set_test_hook([&](const std::string& m, const std::string& path,
+                                 const std::string& params, TradingClient::FakeReply& out) {
+                if (path.find("exchangeInfo") != std::string::npos) {
+                    out.body = kExchangeInfo; return true;
+                }
+                if (m != "POST") return false;
+                sent.push_back(params);
+                out.code = 400;                       // 全部拒掉，把四个变体都走一遍
+                out.body = "<!DOCTYPE html><html><body>bad</body></html>";
+                return true;
+            });
+            tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
+            check(sent.size() == 4, "四个变体都试过");
+            check(sent[3].find("quantity=0.015") != std::string::npos,
+                  "  最后一个变体继承了数量写法（不得退回 closePosition）");
+            check(sent[3].find("closePosition") == std::string::npos,
+                  "  且确实没有 closePosition");
+            check(sent[3].find("workingType=CONTRACT_PRICE") != std::string::npos,
+                  "  同时退让 workingType —— 这才是它与变体2 的唯一差别");
+        }
+        {
             // 拿不到持仓数量时跳过变体2：它非要 quantity，缺了就只是变体1 的重复，
             // 白发一次请求还多占一次限流额度
             TradingClient tc(test_cfg());

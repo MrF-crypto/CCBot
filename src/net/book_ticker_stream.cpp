@@ -281,6 +281,7 @@ void BookTickerStream::reap_probe() {
             "    /ws/<流名> 有数据而 /stream + SUBSCRIBE 没有，两者的差别就是"
             "唯一的嫌疑点。请把这条日志发给开发侧。");
     } else if (opened) {
+        env_verdict_.store(true);   // 定案：不是订阅逻辑
         say("🔎 行情自检结论：原始端点 " + probe_stream_ + " 连上了但 "
             + std::to_string(kProbeMs / 1000) + " 秒内【零数据】—— 与主连接表现一致。\n"
             "    这说明不是订阅用法的问题：连"
@@ -289,6 +290,7 @@ void BookTickerStream::reap_probe() {
             "fstream.binance.com 送到了币安（同一台机器上 REST 行情能用"
             "【不能】说明 WS 也能用：两者常常走不同的分流规则）。");
     } else {
+        env_verdict_.store(true);   // 定案：链路本身不通，与订阅逻辑无关
         say("🔎 行情自检结论：原始端点 " + probe_stream_ +
             " 连都没连上 —— 到 fstream.binance.com 的链路本身不通，"
             "与订阅逻辑无关。请查代理分流与 DNS。");
@@ -457,13 +459,27 @@ void BookTickerStream::force_reconnect(Conn* c, const std::string& why) {
     c->conn_since_ms.store(0);
 
     const std::string tag = "行情WS#" + std::to_string(c->id);
-    // 退避之后这条的频率自然降下来了（20s → 45s → 90s → 180s），所以仍然每次都
+    // 退避之后这条的频率自然降下来了（20s → 45s → 90s → 180s），所以默认每次都
     // 报——它是"还在自愈"的唯一凭据。但要把下一次的间隔写出来，否则看日志的人
-    // 会以为程序卡住了不再重试
-    say("⚠ " + tag + " " + why + "没有任何数据包，判定为半开连接，强制重连（累计 "
-        + std::to_string(kicks) + " 次，本条连接连续 " + std::to_string(since)
-        + " 次未恢复，下次容忍 " + std::to_string(silence_budget_ms(since) / 1000)
-        + " 秒静默）");
+    // 会以为程序卡住了不再重试。
+    //
+    // ⚠ 自检已经定案"不是我们的订阅逻辑"之后，这条就只剩噪音了：它既不会好转，
+    //   也没有任何新信息，而每 20~180 秒一条会把真正要看的告警（硬止损挂不上、
+    //   对账不一致）全冲散。定案后并入 5 分钟一条的节流。
+    //   ⚠ 只压【日志】，重连本身照常做 —— 网络恢复时仍要能自己接上
+    bool quiet = false;
+    if (env_verdict_.load()) {
+        const int64_t now = now_ms();
+        if (now - last_kick_note_ms_ < kNodataNoteMs) quiet = true;
+        else last_kick_note_ms_ = now;
+    }
+    if (!quiet)
+        say("⚠ " + tag + " " + why + "没有任何数据包，判定为半开连接，强制重连（累计 "
+            + std::to_string(kicks) + " 次，本条连接连续 " + std::to_string(since)
+            + " 次未恢复，下次容忍 " + std::to_string(silence_budget_ms(since) / 1000)
+            + " 秒静默）"
+            + (env_verdict_.load() ? "。自检已判定为环境侧问题，此后这条 5 分钟"
+                                     "最多报一次；重连仍在正常进行" : ""));
 
     // ⚠ 绝不能持 mtx_ 调 ws 的方法：close()/stop() 会等 WS 线程走完，
     //   而 WS 线程可能正在 on_message 里等 mtx_ —— 直接死锁。
@@ -476,7 +492,8 @@ void BookTickerStream::force_reconnect(Conn* c, const std::string& why) {
         // 连续 kKickEscalate 次 close() 都没换来一次成功连接，说明库没有替我们
         // 重拨。整条重建。把自愈全押在一个我们无法在单测里验证的库行为上是不行的，
         // 所以留了这条升级路径
-        say(tag + " 连续 " + std::to_string(since) + " 次强制重连未恢复，改为重建连接");
+        if (!quiet)
+            say(tag + " 连续 " + std::to_string(since) + " 次强制重连未恢复，改为重建连接");
         c->ws->stop();
         if (running_.load()) c->ws->start();
         // ⚠ 这里【不能】把 kicks_since_ok 清零。它只该由"成功连上"来清（见 Open
