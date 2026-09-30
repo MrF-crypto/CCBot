@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <set>
 #include <atomic>
 #include <mutex>
 #include <memory>
@@ -155,6 +156,20 @@ public:
     //   次数决定了兜底价能有多新（串行 N 次的一轮要走几秒到几十秒）。
     //   24h 涨跌那条兜底早就是全取的，标记价这条一直是逐品种，属于遗漏
     std::unordered_map<std::string, double> fetch_all_mark_prices();
+
+    // 交易所上【当前活跃】的条件单 algoId 集合。
+    //
+    // ⚠ 存在的理由：本地只要 disaster_stop_id 非空就认为这个仓位受保护、
+    //   再也不重挂。于是这些情况会变成【静默失去保护】——
+    //     · 用户在 app 上手动撤了那张单
+    //     · 交易所侧因任何原因撤掉它
+    //     · 落盘里存着一个过期的 id（v5.8.0 之前存的是普通 orderId，
+    //       现在是 algoId，两个是不同的命名空间）
+    //   而对账只比仓位、从不查挂单，所以谁都发现不了。
+    //
+    // ok 区分"查成了、确实没有活跃单"与"这次没查成"。混起来的后果是：
+    // 一次网络抖动会让所有仓位的保护单被判成"不存在"而白撤白挂一轮
+    std::set<std::string> fetch_open_algo_ids(bool* ok = nullptr);
 
     // ── 资金费 ───────────────────────────────────────────────────────────────
     // premiumIndex 一次返回标记价 + 当前费率 + 下次结算时间，我们原先只取了标记价
@@ -343,6 +358,11 @@ private:
         //   Order API endpoints instead."）。
         //   这条错误信息一直是对的，是我们的先验过时了
         AlgoOrder,
+        // 活跃条件单列表。用来核对"我们记着的那张保护单是否还真的在交易所上"。
+        // 路径同样两边不对称，都是查到的、不是推的：
+        //   普通合约 /fapi/v1/openAlgoOrders（带 symbol 权重 1，不带 40）
+        //   统一账户 /papi/v1/um/algo/openAlgoOrders
+        AlgoOpenOrders,
         Income,        // 资金费/手续费流水
     };
     const char* ep(Ep e) const;

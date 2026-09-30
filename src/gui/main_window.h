@@ -288,6 +288,9 @@ private:
     int64_t           chg24RestMs_ = 0;
     std::atomic<bool> accFetchBusy_{false};
     std::atomic<bool> posFetchBusy_{false};
+    // 保护单核对的防重入。它每分钟一次、权重 40，而网络慢时一轮可能超过一分钟；
+    // 不防重入就会叠着发，白耗权重
+    std::atomic<bool> stopOrderCheckBusy_{false};
     std::atomic<bool> fundFetchBusy_{false};
     // SAR 信号拉取（ATR + 唐奇安）。与指标批次分开：周期不同（60秒 vs 5分钟），
     // 而且 SAR 的 bot 集合与 DCA 的完全没有交集

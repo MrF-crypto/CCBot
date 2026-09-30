@@ -135,6 +135,8 @@ const char* TradingClient::ep(Ep e) const {
     //   统一账户 /papi/v1/um/algo/order（有斜杠）
     //   我按对称猜成 /papi/v1/um/algoOrder，实测回 HTTP 404
     case Ep::AlgoOrder:        return pm ? "/papi/v1/um/algo/order" : "/fapi/v1/algoOrder";
+    case Ep::AlgoOpenOrders:   return pm ? "/papi/v1/um/algo/openAlgoOrders"
+                                        : "/fapi/v1/openAlgoOrders";
     case Ep::Income:           return pm ? "/papi/v1/um/income"            : "/fapi/v1/income";
     }
     return "";
@@ -1499,6 +1501,39 @@ TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) 
 
 double TradingClient::fetch_mark_price(const std::string& sym) {
     return fetch_premium(sym).mark_price;
+}
+
+std::set<std::string> TradingClient::fetch_open_algo_ids(bool* ok) {
+    std::set<std::string> out;
+    if (ok) *ok = false;
+    // 不带 symbol ⇒ 返回全部品种（权重 40）。一次拿全比逐品种查省往返，
+    // 而这个核对每分钟才做一次，40 的权重完全吃得下
+    auto resp = http_get(ep(Ep::AlgoOpenOrders), "recvWindow=5000");
+    if (resp.empty()) return out;
+
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    // 错误时币安回的是对象而非数组。解析出数组才算查成 ——
+    // 与 fetch_positions 同一个道理：空列表既可能是"确实没有活跃单"也可能是
+    // 请求失败，把后者当前者会让所有保护单被判成不存在
+    if (doc.get(arr) != simdjson::SUCCESS) return out;
+    if (ok) *ok = true;
+
+    for (auto e : arr) {
+        int64_t id = 0;
+        if (!get_or_keep(e["algoId"], id) || id <= 0) {
+            // 单条解析不出 algoId ⇒ 这份快照不完整。同样宁可整份作废：
+            // 少一条 id 就会让那张真实存在的保护单被判成"已消失"，
+            // 于是白撤白挂一轮，运气不好还会因为"同方向只允许一张"而挂不上
+            if (ok) *ok = false;
+            continue;
+        }
+        out.insert(std::to_string(id));
+    }
+    return out;
 }
 
 std::unordered_map<std::string, double> TradingClient::fetch_all_mark_prices() {

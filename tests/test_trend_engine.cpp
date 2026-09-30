@@ -1190,6 +1190,81 @@ int main() {
         check(bot_of(eng, "CCCUSDT").st.pos == trend::Pos::Flat, "  C 已正常止损出场");
     }
 
+    // ── 保护单核对：交易所上那张单没了要能发现并重挂 ─────────────────────────
+    // 本地只要 disaster_stop_id 非空就认为受保护、再也不重挂（见 try_place_hard_stop
+    // 的第一道守卫），而对账只比仓位。于是"单子被手动撤了 / 落盘里是过期单号"
+    // 会变成静默失去保护：界面显示已挂、日志一片安静，交易所上什么都没有
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        const std::string ds_id = eng.get_bots()[0].disaster_stop_id;
+        check(!ds_id.empty(), "先正常挂上一张保护单");
+
+        // 它还在 ⇒ 什么都不该动
+        auto none = eng.reconcile_stop_orders({ds_id});
+        check(none.empty(), "单子还在活跃列表里 ⇒ 不报也不动");
+        check(eng.get_bots()[0].disaster_stop_id == ds_id, "  单号原样保留");
+
+        // 它不在了 ⇒ 清掉本地记录并标红，让每 tick 的重挂逻辑接手
+        auto gone = eng.reconcile_stop_orders({"99999"});
+        check(gone.size() == 1, "单子不在活跃列表里 ⇒ 报一条");
+        check(eng.get_bots()[0].disaster_stop_id.empty(),
+              "  清掉本地单号 —— 不清的话 try_place_hard_stop 第一道守卫就 return，"
+              "永远不会重挂");
+        check(eng.get_bots()[0].disaster_stop_price == 0, "  触发价一并清掉");
+        check(eng.get_bots()[0].ds_unprotected,
+              "  标成无保护：此刻确实没有进程外保护，界面该标红");
+        check(eng.get_bots()[0].ds_attempts == 0,
+              "  重试次数复位 —— 这是全新的挂单机会，不该带着旧计数几次就触发兜底平仓");
+
+        // 下一拍应当真的重挂一张
+        const int before = cli->ds_count("place");
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->ds_count("place") > before, "  下一拍重新挂一张");
+        check(!eng.get_bots()[0].disaster_stop_id.empty(), "  并拿到新单号");
+    }
+    {
+        // 不该动的几种情形。这一层的危害全在【误判】上：错清一次就会白撤白挂，
+        // 而 closePosition 同方向只允许一张，运气不好新的还挂不上
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+
+        // 空仓：没有仓位就没有要保护的东西
+        check(eng.reconcile_stop_orders({}).empty(), "空仓时不报");
+
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        eng.set_pending_for_test(id, true);
+        check(eng.reconcile_stop_orders({}).empty(),
+              "在途(pending)时不报：订单可能已在交易所生效而本地还没入账");
+        eng.set_pending_for_test(id, false);
+    }
+    {
+        // 没开这个功能的 bot 不该被核对 —— 它本来就没有保护单
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = false;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(eng.reconcile_stop_orders({}).empty(),
+              "未开启委托止损的 bot 不参与核对");
+    }
+
     // ── 没开开关就一个请求都不发 ────────────────────────────────────────────
     {
         auto cli = std::make_shared<FakeClient>();

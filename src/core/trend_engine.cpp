@@ -217,6 +217,40 @@ std::vector<std::string> TrendEngine::reconcile_positions(
     return issues;
 }
 
+std::vector<std::string> TrendEngine::reconcile_stop_orders(
+        const std::set<std::string>& live_ids) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    std::vector<std::string> issues;
+
+    for (auto& kv : bots_) {
+        auto& b = kv.second;
+        if (b.pending) continue;                      // 在途：此刻比对必然误判
+        if (!b.cfg.use_disaster_stop)     continue;   // 没开这个功能
+        if (b.st.pos == trend::Pos::Flat || b.qty <= 0) continue;  // 没仓位就不需要
+        if (b.disaster_stop_id.empty())   continue;   // 本来就没挂上，重挂逻辑在管
+        if (b.ds_syncing)                 continue;   // 正有一次挂单在途
+
+        if (live_ids.count(b.disaster_stop_id)) continue;   // 还在，一切正常
+
+        // 不在了。清掉本地 id 与触发价，让每 tick 的重挂逻辑自然接手。
+        //
+        // ⚠ 这里【不】去交易所撤单：那张单按定义已经不存在了，撤它没有意义，
+        //   而对账跑在锁内，做 HTTP 会把 tick / get_bots 全卡住。
+        // ⚠ 也要复位重试状态：不复位的话 ds_attempts 可能已经接近上限，
+        //   重挂一两次失败就直接触发兜底平仓 —— 而这是一次全新的挂单机会，
+        //   应该拿到完整的重试阶梯
+        issues.push_back(b.cfg.symbol + " 交易所侧硬止损单(" + b.disaster_stop_id +
+                         ")已不在活跃列表里 —— 可能被手动撤掉、被交易所撤掉，"
+                         "或落盘里是个过期单号。已清空本地记录，下一拍会重新挂一张");
+        b.disaster_stop_id.clear();
+        b.disaster_stop_price = 0;
+        b.ds_attempts    = 0;
+        b.ds_unprotected = true;   // 此刻确实没有进程外保护，界面该标红
+        b.ds_next_try    = {};
+    }
+    return issues;
+}
+
 void TrendEngine::stop_bot(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);

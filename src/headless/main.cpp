@@ -701,6 +701,30 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+
+                // ── 核对交易所侧那张保护单还在不在 ──────────────────────────
+                // 上面只比仓位。而本地只要 disaster_stop_id 非空就认为受保护、
+                // 再也不重挂，于是"单子被手动撤了 / 落盘里是过期单号"会变成
+                // 静默失去保护：日志一片安静，而交易所上什么都没有。
+                // VPS 上没有界面，这层核对是唯一能发现它的东西
+                bool algo_ok = false;
+                auto live = client->fetch_open_algo_ids(&algo_ok);
+                // 拉取失败绝不核对：给空集合会让所有保护单被判成已消失，
+                // 白撤白挂一轮 —— 与上面那条同一个道理
+                if (algo_ok && trend_engine) {
+                    auto dissues = trend_engine->reconcile_stop_orders(live);
+                    if (!dissues.empty()) {
+                        for (const auto& i : dissues)
+                            log_line("⚠ 保护单核对: " + i, "WARN");
+                        save_trend_state(ssp, trend_engine->get_bots());
+                        if (!w.empty()) {
+                            std::string msg = "[ccbot] 保护单核对发现 " +
+                                              std::to_string(dissues.size()) + " 处异常:";
+                            for (const auto& i : dissues) msg += "\n" + i;
+                            send_webhook(w, msg);
+                        }
+                    }
+                }
                 rec_busy.store(false);
             });
         }

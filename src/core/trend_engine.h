@@ -292,6 +292,25 @@ public:
     // 返回每条不一致的可读描述（空 = 完全一致）
     std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange);
 
+    // 核对"我们记着的那张交易所侧保护单是否还真的在那里"。
+    //
+    // ⚠ 为什么必须单独有这一步：本地只要 disaster_stop_id 非空就认为受保护、
+    //   再也不重挂（见 try_place_hard_stop 的第一道守卫）。而 reconcile_positions
+    //   只比仓位、从不看挂单。于是下面这些都会变成【静默失去保护】——
+    //   界面显示"已挂"、日志一片安静，而交易所上其实什么都没有：
+    //     · 用户在 app 上手动撤了那张单
+    //     · 交易所侧撤掉它（比如改了规则、单子过期）
+    //     · 落盘里存着过期 id：v5.8.0 之前存的是普通 orderId，现在是 algoId，
+    //       两个是不同的命名空间，拿一个去撤另一个会静默失败
+    //
+    // live_ids = 交易所上当前活跃的条件单 id 集合。
+    // ⚠ 调用方【必须】先确认这份集合是真拉到的：拉取失败时给一个空集合，
+    //   会让所有仓位的保护单被判成已消失而白撤白挂一轮
+    //
+    // 发现对不上就清掉本地 id 并复位重试状态，让每 tick 的重挂逻辑自然接手；
+    // 这里不直接发 HTTP（对账在锁内）
+    std::vector<std::string> reconcile_stop_orders(const std::set<std::string>& live_ids);
+
     // 仅测试用：见 CcgEngine::set_pending_for_test 的理由
     void set_pending_for_test(const std::string& bot_id, bool v);
 

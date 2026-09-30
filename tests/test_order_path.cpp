@@ -559,6 +559,46 @@ int main() {
               "合法 JSON 但没有 symbols：算查成了，不是网络问题");
     }
 
+    std::printf("── 用例15：活跃条件单列表（核对保护单还在不在的输入）──\n");
+    {
+        // 与持仓快照同一个道理：空列表既可能是"确实没有活跃单"，也可能是这次
+        // 没查成。混起来的后果是一次网络抖动让【所有】仓位的保护单被判成已消失，
+        // 于是白撤白挂一轮，而 closePosition 同方向只允许一张，新的还可能挂不上
+        auto probe = [](const char* body, bool* ok_out) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string&, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("AlgoOrders") != std::string::npos ||
+                    path.find("algo") != std::string::npos) { out.body = body; return true; }
+                return false;
+            });
+            return tc.fetch_open_algo_ids(ok_out);
+        };
+        bool ok = true;
+        auto v = probe("", &ok);
+        check(!ok && v.empty(), "空响应 ⇒ ok=false（不是「没有活跃单」）");
+
+        ok = true;
+        v = probe(R"({"code":-1130,"msg":"Invalid parameter."})", &ok);
+        check(!ok, "错误对象（而非数组）⇒ ok=false");
+
+        ok = false;
+        v = probe("[]", &ok);
+        check(ok && v.empty(), "合法空数组 ⇒ ok=true 且确实没有活跃单");
+
+        ok = false;
+        v = probe(R"([{"algoId":2146760,"symbol":"BTCUSDT","algoStatus":"NEW"},)"
+                  R"({"algoId":889900,"symbol":"ETHUSDT","algoStatus":"NEW"}])", &ok);
+        check(ok && v.size() == 2, "两条活跃单");
+        check(v.count("2146760") && v.count("889900"), "  id 都在（按字符串比对）");
+
+        // 单条缺 algoId ⇒ 整份快照不可信：少一条 id 就会让那张真实存在的
+        // 保护单被判成"已消失"，白撤白挂
+        ok = true;
+        v = probe(R"([{"algoId":2146760,"symbol":"BTCUSDT"},{"symbol":"ETHUSDT"}])", &ok);
+        check(!ok, "有一条缺 algoId ⇒ 整份快照 ok=false");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

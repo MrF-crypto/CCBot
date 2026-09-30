@@ -1744,6 +1744,34 @@ void MainWindow::onTick() {
         }
     }
 
+    // ── 核对交易所侧那张保护单还在不在 ────────────────────────────────────────
+    // 上面那段只比【仓位】。而本地只要 disaster_stop_id 非空就认为受保护、
+    // 再也不重挂，于是"单子被手动撤了 / 落盘里是过期单号"会变成静默失去保护：
+    // 界面显示已挂、日志一片安静，而交易所上什么都没有。
+    //
+    // 这个要额外发一次请求（权重 40），所以跟着同一班慢车、每分钟一次。
+    // ⚠ 必须判 ok：拉取失败时给空集合，会让所有仓位的保护单被判成已消失，
+    //   于是白撤白挂一轮 —— 又是"没拿到当成没有"那个老毛病
+    if (slowTickCount_ % 20 == 0 && trend_engine_ && client_ &&
+        !stopOrderCheckBusy_.exchange(true)) {
+        run_async([this]() {
+            bool ok = false;
+            auto live = client_->fetch_open_algo_ids(&ok);
+            stopOrderCheckBusy_.store(false);
+            if (!ok) return;            // 这一轮不核对，下一分钟再来
+            QMetaObject::invokeMethod(this, [this, live = std::move(live)]() {
+                if (!trend_engine_) return;
+                auto issues = trend_engine_->reconcile_stop_orders(live);
+                if (issues.empty()) return;
+                for (const auto& i : issues)
+                    log("保护单核对: " + QString::fromStdString(i), "WARN");
+                save_trend_bots();
+                refreshBotTable();
+                sendAlert(alert_text("保护单核对", issues));
+            }, Qt::QueuedConnection);
+        });
+    }
+
     // 24h 滚动涨幅：来自 @ticker 推送流，读一次缓存就行，不发任何请求——
     // 所以每个 tick 都喂，不必搭 5 分钟那班车。@ticker 每秒推一次，
     // 让引擎拿到的始终是最新值
