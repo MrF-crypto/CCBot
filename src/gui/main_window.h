@@ -27,7 +27,7 @@ class QVBoxLayout;
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
-#include "net/book_ticker_stream.h"
+#include "net/rest_price_feed.h"
 #include <map>
 
 namespace ccg {
@@ -176,7 +176,12 @@ private:
     std::shared_ptr<ThreadPool>        pool_;
     std::shared_ptr<ThreadPool>        fetchPool_;
     std::shared_ptr<TrendEngine>         trend_engine_;
-    std::unique_ptr<BookTickerStream>  ticker_;
+    // 行情源：REST 轮询。
+    // v5.7.0 之前是 WebSocket（BookTickerStream）。换掉的理由见
+    // rest_price_feed.h 的头注释：WS 有一个"连上了却没有数据"的失败模式，
+    // 识别它需要六种机制（静默看门狗、强制重连、退避、升级重建、订阅确认
+    // 取证、对照探针），而轮询没有"连接"这个中间状态，压根不存在那个问题
+    std::unique_ptr<RestPriceFeed>     ticker_;
 
     QTimer* tick_timer_  = nullptr;
     QTimer* ob_timer_    = nullptr;

@@ -1123,10 +1123,20 @@ void MainWindow::onConnect() {
             alertedDisconnect_  = false;
             setConnState(ConnState::Connected);   // 顶部计时从此刻开始，文本由 updateHeader() 接管
 
-            // 启动盘口 WebSocket
-            ticker_ = std::make_unique<BookTickerStream>(cfg.testnet);
-            // 订阅被拒之类的服务端消息此前被静默丢弃，某条流没订上时界面
-            // 只是空白、无从查起。回调跑在 WS 线程，转回 GUI 线程再写日志
+            // 启动行情源（REST 轮询）。取数走 client_ —— 复用它已经过测试的
+            // 签名、限流闸门、超时与重试，这里不自己发 HTTP。
+            // 一轮一个请求，与品种数无关（premiumIndex / ticker24hr 不带 symbol
+            // 时返回全市场），所以加品种不会增加任何请求
+            ticker_ = std::make_unique<RestPriceFeed>(
+                [this]() -> std::unordered_map<std::string, double> {
+                    if (!client_) return {};
+                    return client_->fetch_all_mark_prices();
+                },
+                [this]() -> std::unordered_map<std::string, double> {
+                    if (!client_) return {};
+                    return client_->fetch_all_24h_changes();
+                });
+            // 行情层的告警（拉取失败/恢复）。回调跑在轮询线程，转回 GUI 线程再写日志
             ticker_->on_server_msg([this](const std::string& m) {
                 QMetaObject::invokeMethod(this, [this, m]() {
                     log(QString::fromStdString(m), "WARN");
@@ -1762,7 +1772,7 @@ void MainWindow::onTick() {
                 if (!m.empty()) {
                     std::lock_guard<std::mutex> lk(chg24Mtx_);
                     chg24Rest_   = std::move(m);
-                    chg24RestMs_ = BookTickerStream::now_ms();
+                    chg24RestMs_ = RestPriceFeed::now_ms();
                 }
                 chg24FetchBusy_.store(false);
             });
@@ -1783,82 +1793,24 @@ void MainWindow::onTick() {
     }
     if (disp_syms.empty()) { refreshBotTable(); return; }
 
-    std::set<std::string> need_rest;
+    // ── 喂价：直接读行情源，一拍一次 ──────────────────────────────────────────
+    // v5.7.0 之前这里有一整套"WS 在喂就用 WS、没在喂就攒一批 REST 去补"的兜底：
+    // need_rest 集合、restFetchBusy_ 防重入闸、异步批量补拉、写回缓存、
+    // 以及一个 ws_mark_ms 与 mark_ms 的双时间戳来判断"到底是谁在喂"。
+    //
+    // 那套东西存在的唯一理由是"WS 可能连着但不给数据"。行情源换成 REST 轮询之后
+    // 这个前提没了：轮询本身就是那个兜底，不存在第二个来源，也就不需要判断
+    // 该信谁、不需要防两个来源在同一拍喂两个不同的价（那个 bug 真出现过）。
+    //
+    // 陈旧保护仍然在 —— 只是搬到了行情源里（mark_price 超过 kStaleMs 返回 0），
+    // 这里拿到 0 就当没有价，不喂引擎。绝不能把冻结价当现价喂进去
     for (const auto& sym : disp_syms) {
-        // ⚠ 要不要走 REST，判据是【WS 有没有在喂这个品种】，不是"缓存里有没有价"。
-        //
-        //   原先只在 mark_price() 返回 0（即缓存已超过 kStaleMs=10 秒）时才补拉，
-        //   而 REST 补回来的价会写进同一个缓存并刷新 mark_ms。于是 WS 断流时的
-        //   节奏变成：拉一次 → 10 秒内都"有价"不再拉 → 过期 → 再拉。
-        //   兜底价的粒度因此是【10 秒】，而 tick 是 3 秒一拍——中间那几拍
-        //   引擎反复拿到同一个冻结价。markPrice@1s 正常时是 1 秒一包，
-        //   所以 WS 一死，价格新鲜度直接掉到十分之一，界面和策略都会明显"变钝"。
-        //
-        //   ws_mark_ms 是 v5 专门为这件事留的字段：它【只】被 WS 包更新，
-        //   REST 写回时刻意不碰。所以用它判断"WS 是否还在喂"是准确的，
-        //   不会被自己的兜底写回骗过去。
-        const auto tk = ticker_ ? ticker_->get(sym) : ccbot::BookTickerStream::Tick{};
-        const bool ws_feeding =
-            tk.ws_mark_ms > 0 &&
-            (QDateTime::currentMSecsSinceEpoch() - tk.ws_mark_ms) <= ccbot::BookTickerStream::kStaleMs;
-
-        // ⚠ 一拍只能喂引擎【一次】，而且喂的必须是这一拍最新的那个价。
-        //
-        //   WS 在喂 ⇒ 用缓存里的 WS 价，这一拍就到此为止。
-        //   WS 没在喂 ⇒ 这里【什么都不做】，交给下面的 REST 那一批去喂。
-        //
-        //   不这么分的话会有一个很别扭的状态：WS 刚死、缓存里还躺着上一轮
-        //   REST 写回的价（未超 10 秒），于是这一拍先拿那个旧价喂一次引擎，
-        //   紧接着 REST 回来又用新价喂第二次 —— 引擎在同一拍里看到两个价。
-        //   多数时候无害（棘轮是单调的，旧价上一轮已经喂过），但对
-        //   ③ 裸K·立即顺势 不是：它的入场判据是"实时价 vs 本根开盘价"，
-        //   一个我们【已经知道不是当前值】的价可能触发一笔新开仓
-        if (ws_feeding) {
-            // 只有运行中的才驱动引擎；停止的品种拿到价格仅供界面显示
-            if (engine_syms.count(sym) && tk.mark_price > 0)
-                trend_engine_->tick(sym, tk.mark_price);
-        } else {
-            need_rest.insert(sym);
-        }
+        const double px = ticker_ ? ticker_->mark_price(sym) : 0.0;
+        if (!(px > 0)) continue;             // 没有新鲜价：这一拍不喂，等下一轮
+        // 只有运行中的才驱动引擎；停止的品种取到价仅供界面显示
+        if (engine_syms.count(sym)) trend_engine_->tick(sym, px);
     }
-
-    if (need_rest.empty()) { refreshBotTable(); return; }
-
-    // 防重入：这一批是【串行】遍历所有缺价的品种，47 个品种要跑几十秒，
-    // 而引擎 tick 是 3 秒一次。没有这道闸的话每 3 秒就再投递一批，
-    // 任务在只有 4 个线程的 fetchPool_ 里无限堆积——而高周期指标拉取用的是
-    // 同一个池，会被直接饿死，表现为"%B 永远缺失、一单开不出来"。
-    // WS 正常时 need_rest 基本为空，这条路径根本走不到；一旦 WS 断了，
-    // 品种数越多雪崩得越快，恰恰是最需要它撑住的时候
-    if (restFetchBusy_.exchange(true)) { refreshBotTable(); return; }
-
-    run_async([this, need_rest = std::move(need_rest), engine_syms]() {
-        // 一次 REST 拿回全市场（权重 10），不是逐品种 N 次往返。
-        // 逐品种时一轮的耗时随品种数线性增长——10 个品种、每次往返 200ms
-        // 就是 2 秒，47 个品种是十几秒，而这一整轮里最后那个品种拿到的价
-        // 已经比第一个旧了十几秒。全取则所有品种共享同一个时间戳。
-        // 24h 涨跌那条兜底本来就是这么做的，标记价这条一直是逐品种，属于遗漏
-        auto all = client_->fetch_all_mark_prices();
-        for (const auto& sym : need_rest) {
-            auto it = all.find(sym);
-            // 全取失败（空表）或该品种不在返回里 ⇒ 退回单品种查询。
-            // 不退回的话，一次网络抖动会让所有品种这一轮都没价
-            const double price = (it != all.end()) ? it->second
-                                                   : client_->fetch_mark_price(sym);
-            if (price > 0) {
-                // 同上：只有运行中的才驱动引擎。停止的品种走到这里是为了让
-                // 标记价那一列有数
-                if (engine_syms.count(sym) && trend_engine_) trend_engine_->tick(sym, price);
-                // 写回缓存：界面那一列读的是缓存，不写回就会出现
-                // "引擎有价在跑、标记价列却一直空着"
-                if (ticker_) ticker_->set_mark_price(sym, price);
-            }
-        }
-        restFetchBusy_.store(false);
-        QMetaObject::invokeMethod(this, [this]() {
-            refreshBotTable();
-        }, Qt::QueuedConnection);
-    });
+    refreshBotTable();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1921,15 +1873,15 @@ static QTableWidgetItem* make_chg24_cell(bool has, double pct) {
     return it;
 }
 
-static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, double tick_size) {
+static QTableWidgetItem* make_mark_cell(const RestPriceFeed::Tick& tick, double tick_size) {
     const bool has_mark = tick.mark_price > 0;
-    // 陈旧判定必须和引擎用同一把尺子（BookTickerStream::kStaleMs）：超过阈值时
+    // 陈旧判定必须和引擎用同一把尺子（RestPriceFeed::kStaleMs）：超过阈值时
     // mark_price() 对引擎返回 0，界面却还在照常显示那个数字——一个【冻结的价格
     // 长得和实时价一模一样】是最危险的显示方式。
     // 停止的 bot 尤其容易撞上：它被排除在喂价循环之外，REST 兜底也不会跑，
     // 于是这一格就永远停在平仓那一刻的价位上
-    const int64_t age = has_mark ? (BookTickerStream::now_ms() - tick.mark_ms) : -1;
-    const bool stale  = has_mark && age > BookTickerStream::kStaleMs;
+    const int64_t age = has_mark ? (RestPriceFeed::now_ms() - tick.mark_ms) : -1;
+    const bool stale  = has_mark && age > RestPriceFeed::kStaleMs;
 
     auto* it = new QTableWidgetItem(has_mark ? fmt_tick_px(tick.mark_price, tick_size) : "--");
     it->setTextAlignment(Qt::AlignCenter);
@@ -1946,7 +1898,7 @@ static QTableWidgetItem* make_mark_cell(const BookTickerStream::Tick& tick, doub
                       "引擎侧已判定为陈旧（超过 %2 秒即返回 0），不会拿它做任何决策。\n\n"
                       "常见原因：该 bot 已停止（停止的 bot 不参与喂价循环），\n"
                       "或 markPrice 推送流断了/未订阅成功。\n\n")
-                  .arg(age / 1000).arg(BookTickerStream::kStaleMs / 1000);
+                  .arg(age / 1000).arg(RestPriceFeed::kStaleMs / 1000);
     }
     if (tick.chg_ms > 0) {
         tip += QString("24h 涨幅 %1%2%\n")
@@ -1981,7 +1933,7 @@ void MainWindow::refreshLiveQuotes() {
         return it;
     };
 
-    int64_t now_ms = BookTickerStream::now_ms();
+    int64_t now_ms = RestPriceFeed::now_ms();
 
     // 这三列（标记价/24h涨跌/延迟）全是【品种级】数据，与策略状态无关
     for (int i = 0; i < (int)bots.size(); ++i) {
@@ -2033,7 +1985,7 @@ bool MainWindow::chg24Of(const std::string& symbol, double& out_pct, bool& out_s
 
     std::lock_guard<std::mutex> lk(chg24Mtx_);
     auto it = chg24Rest_.find(symbol);
-    const int64_t age = BookTickerStream::now_ms() - chg24RestMs_;
+    const int64_t age = RestPriceFeed::now_ms() - chg24RestMs_;
     // 先续期、后过期：超过 soft 就该刷新，但旧值继续可用到 hard。
     // 单一阈值会在每次过期时制造一个"没有数据"的空窗——v4.0.14 的实盘日志里
     // 是精确的 90 秒周期、3 秒空窗，闸门会在那 3 秒里假拦截并刷一条噪音
@@ -2143,14 +2095,14 @@ void MainWindow::refreshBotTable() {
     // ⚠ MSVC 对未使用的 lambda 不报警，只有 Clang 的 -Wunused-variable 会——
     //   本机编得过，推上去才发现
 
-    int64_t now_ms = BookTickerStream::now_ms();
+    int64_t now_ms = RestPriceFeed::now_ms();
 
     for (int i = 0; i < (int)bots.size(); ++i) {
         // ── 品种级列（6 标记价 / 7 24h涨跌 / 8 延迟）────────────────────────
         // 这三列和策略无关，单独填在这里而不是塞进 fillTrendRow：
         // refreshLiveQuotes 每 100ms 会再刷一遍同样的三列，两处口径必须一致
         const std::string& sym = bots[(size_t)i].cfg.symbol;
-        const auto   tick      = ticker_ ? ticker_->get(sym) : BookTickerStream::Tick{};
+        const auto   tick      = ticker_ ? ticker_->get(sym) : RestPriceFeed::Tick{};
         const double tick_size = tickSizeOf(sym);
         {
             botTable_->setItem(i, ColMark, make_mark_cell(tick, tick_size));

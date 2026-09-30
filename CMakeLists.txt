@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 5.6.0 LANGUAGES CXX)
+project(TradingBot VERSION 5.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,7 +98,13 @@ set(CORE_SOURCES
     src/core/funding_ledger.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
-    src/net/book_ticker_stream.cpp
+    # 行情源：REST 轮询。v5.7.0 起替代 book_ticker_stream（WebSocket）。
+    # 理由见 rest_price_feed.h 的头注释：WS 有"连上了却没有数据"这个失败模式，
+    # 识别它要背六种机制，而轮询没有"连接"这个中间状态，压根不存在那个问题。
+    # book_ticker_stream.cpp 仍然留在仓库里并继续参与 ccg_price_tests——
+    # 它那套纯函数判定（陈旧/静默/分片）是花了代价换来的知识，删掉等于白扔；
+    # 将来网络条件允许时它可以作为可选的低延迟来源回到主路径
+    src/net/rest_price_feed.cpp
     src/net/alert.cpp
 )
 set(CORE_LIBS
@@ -246,6 +252,14 @@ endif()
 # ccg_trend_engine_tests 的事），而在【并发下的状态撕裂】——多线程同时 tick /
 # 喂信号 / 读快照 / 对账，交易所返回随机化。这类缺陷在单线程测试里永远不出现，
 # 而且它是 TSan 矩阵的目标之一，不能随 DCA 一起消失
+# REST 轮询行情源。取数函数是注入的，所以这套测试不需要网络，也不需要 curl/simdjson
+add_executable(ccg_rest_feed_tests tests/test_rest_feed.cpp src/net/rest_price_feed.cpp)
+target_include_directories(ccg_rest_feed_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_rest_feed_tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_rest_feed_tests PRIVATE /utf-8)
+endif()
+
 add_executable(ccg_trend_stress_tests tests/test_trend_stress.cpp src/core/trend_engine.cpp)
 target_include_directories(ccg_trend_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_trend_stress_tests PRIVATE Threads::Threads)
@@ -362,7 +376,7 @@ set(CCBOT_OWN_TARGETS
     ccg_indicator_tests ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests
     ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
     ccg_rate_tests ccg_timesync_tests ccg_price_tests ccg_config_tests
-    ccg_key_store_tests
+    ccg_key_store_tests ccg_rest_feed_tests
 )
 if(WIN32 OR APPLE)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)

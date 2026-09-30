@@ -5,7 +5,7 @@
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
-#include "net/book_ticker_stream.h"
+#include "net/rest_price_feed.h"
 #include "net/alert.h"
 #include "headless/headless_config.h"
 #include "headless/trend_state.h"
@@ -255,8 +255,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    BookTickerStream ticker(cfg.testnet);
-    // 订阅被拒等服务端消息此前静默丢弃：VPS 上没有界面，这类问题只能靠日志发现
+    // 行情源：REST 轮询。v5.7.0 起替代 WebSocket，理由见 rest_price_feed.h ——
+    // WS 有"连上了却没有数据"这个失败模式，识别它要背静默看门狗/强制重连/
+    // 退避/升级重建/订阅确认取证/对照探针六种机制；轮询没有"连接"这个中间
+    // 状态，每一轮的成败是直接观测到的，那六种机制一个都不需要。
+    // 取数走 client，复用它已经过测试的签名、限流闸门与超时；一轮一个请求，
+    // 与品种数无关（premiumIndex / ticker24hr 不带 symbol 时返回全市场）
+    RestPriceFeed ticker(
+        [&]() -> std::unordered_map<std::string, double> {
+            return client->fetch_all_mark_prices();
+        },
+        [&]() -> std::unordered_map<std::string, double> {
+            return client->fetch_all_24h_changes();
+        });
+    // 拉取失败/恢复的告警：VPS 上没有界面，这类问题只能靠日志发现
     ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
     ticker.start();
     std::set<std::string> symbols;
@@ -327,7 +339,7 @@ int main(int argc, char** argv) {
             for (const auto& sym : symbols) {
                 const auto tk = ticker.get(sym);
                 if (!(tk.ws_mark_ms > 0 &&
-                      now_ms_ - tk.ws_mark_ms <= BookTickerStream::kStaleMs)) {
+                      now_ms_ - tk.ws_mark_ms <= RestPriceFeed::kStaleMs)) {
                     any_missing = true;
                     break;
                 }
@@ -343,7 +355,7 @@ int main(int argc, char** argv) {
             const int64_t nms = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             const bool ws_feeding = tk.ws_mark_ms > 0 &&
-                                    nms - tk.ws_mark_ms <= BookTickerStream::kStaleMs;
+                                    nms - tk.ws_mark_ms <= RestPriceFeed::kStaleMs;
             if (!ws_feeding) {
                 auto it = rest_px.find(sym);
                 // 全取失败或没这个品种 ⇒ 退回单品种查询，别让一次抖动把整轮清空
