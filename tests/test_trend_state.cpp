@@ -59,6 +59,14 @@ static EngineHost inline_host() {
     return h;
 }
 
+// 本文件的 bot 都是【从落盘恢复】出来的，last_pos_change 不落盘、恢复后是 0
+// （＝本轮还没变过），所以不会被"仓位刚变过"的新鲜度守卫跳过。
+// 快照按刚拉到的算，age=0
+static std::vector<std::string> reconcile(
+        TrendEngine& e, const std::vector<TrendEngine::ExchangePos>& ex) {
+    return e.reconcile_positions(ex, std::chrono::milliseconds(0));
+}
+
 int main() {
     const std::string path = "trend_state_test.json";
 
@@ -201,7 +209,7 @@ int main() {
     {
         TrendEngine eng(cli, inline_host());
         eng.add_bot(mk_cfg("BTCUSDT"));
-        check(eng.reconcile_positions({}).empty(), "两边都空仓应无不一致");
+        check(reconcile(eng,{}).empty(), "两边都空仓应无不一致");
     }
 
     // ── 孤儿仓：本地空、交易所有 → 必须停 bot ────────────────────────────────
@@ -210,7 +218,7 @@ int main() {
         // 而交易所上那笔无人管理
         TrendEngine eng(cli, inline_host());
         eng.add_bot(mk_cfg("BTCUSDT"));
-        auto issues = eng.reconcile_positions({{"BTCUSDT", 1, 0.5, 100.0}});
+        auto issues = reconcile(eng,{{"BTCUSDT", 1, 0.5, 100.0}});
         check(issues.size() == 1, "孤儿仓应报告 1 处不一致");
         check(eng.get_bots()[0].state == TrendBot::State::Stopped,
               "孤儿仓必须停止该bot，否则会再开一笔造成双倍敞口");
@@ -220,8 +228,12 @@ int main() {
     {
         TrendEngine eng(cli, inline_host());
         eng.restore_bot(mk_bot("BTCUSDT", trend::Pos::Long, 100, 110, 104, 0.5));
-        auto issues = eng.reconcile_positions({});
-        check(issues.size() == 1, "本地有仓交易所没有应报告不一致");
+        // 第一轮只记存疑：清本地状态不可逆，不建立在一次观察上
+        auto first = reconcile(eng,{});
+        check(first.size() == 1, "第一轮应报存疑");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  但不得清本地仓位");
+        auto issues = reconcile(eng,{});
+        check(issues.size() == 1, "第二轮确认后应报告不一致");
         auto b = eng.get_bots()[0];
         check(b.st.pos == trend::Pos::Flat && b.qty == 0, "应清空本地仓位");
         check(b.state == TrendBot::State::Stopped,
@@ -232,7 +244,7 @@ int main() {
     {
         TrendEngine eng(cli, inline_host());
         eng.restore_bot(mk_bot("BTCUSDT", trend::Pos::Long, 100, 110, 104, 1.0));
-        auto issues = eng.reconcile_positions({{"BTCUSDT", 1, 0.4, 100.0}});
+        auto issues = reconcile(eng,{{"BTCUSDT", 1, 0.4, 100.0}});
         check(issues.size() == 1, "部分平仓应报告不一致");
         auto b = eng.get_bots()[0];
         check(std::fabs(b.qty - 0.4) < 1e-12, "数量应收敛到交易所值");
@@ -245,7 +257,7 @@ int main() {
     {
         TrendEngine eng(cli, inline_host());
         eng.restore_bot(mk_bot("BTCUSDT", trend::Pos::Long, 100, 110, 104, 0.5));
-        auto issues = eng.reconcile_positions({{"BTCUSDT", 1, 2.0, 100.0}});
+        auto issues = reconcile(eng,{{"BTCUSDT", 1, 2.0, 100.0}});
         check(issues.size() == 1, "交易所多出应报告不一致");
         auto b = eng.get_bots()[0];
         check(std::fabs(b.qty - 0.5) < 1e-12,
@@ -257,7 +269,7 @@ int main() {
     {
         TrendEngine eng(cli, inline_host());
         eng.restore_bot(mk_bot("BTCUSDT", trend::Pos::Long, 100, 110, 104, 0.5));
-        auto issues = eng.reconcile_positions({{"BTCUSDT", -1, 0.5, 100.0}});
+        auto issues = reconcile(eng,{{"BTCUSDT", -1, 0.5, 100.0}});
         check(issues.size() == 1, "方向不一致应报告");
         check(eng.get_bots()[0].state == TrendBot::State::Stopped, "方向不一致应停bot");
     }
@@ -269,7 +281,7 @@ int main() {
         TrendEngine eng(cli, inline_host());
         auto id = eng.add_bot(mk_cfg("BTCUSDT"));
         eng.set_pending_for_test(id, true);
-        auto issues = eng.reconcile_positions({{"BTCUSDT", 1, 0.5, 100.0}});
+        auto issues = reconcile(eng,{{"BTCUSDT", 1, 0.5, 100.0}});
         check(issues.empty(), "在途的 bot 必须跳过，否则正在开仓的会被误判为孤儿仓");
         check(eng.get_bots()[0].state == TrendBot::State::Running, "  且不得被停掉");
     }

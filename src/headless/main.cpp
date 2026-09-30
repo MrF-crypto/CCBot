@@ -242,7 +242,10 @@ int main(int argc, char** argv) {
                 ex.reserve(ex_pos.size());
                 for (const auto& p : ex_pos)
                     ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                auto issues = trend_engine->reconcile_positions(ex);
+                // 现拉的快照，年龄≈0；引擎内部还会再加一段宽限吸收
+                // 交易所侧的传播延迟（订单回执已拿到、持仓接口还没反映出来）
+                auto issues = trend_engine->reconcile_positions(
+                    ex, std::chrono::milliseconds(0));
                 if (!issues.empty()) {
                     for (const auto& i : issues) log_line("⚠ SAR对账: " + i, "WARN");
                     save_trend_state(trend_state_path, trend_engine->get_bots());
@@ -666,7 +669,8 @@ int main(int argc, char** argv) {
                     sex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto sissues = trend_engine->reconcile_positions(sex);
+                    auto sissues = trend_engine->reconcile_positions(
+                        sex, std::chrono::milliseconds(0));
                     if (!sissues.empty()) {
                         for (const auto& i : sissues)
                             log_line("⚠ 对账: " + i, "WARN");

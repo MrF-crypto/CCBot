@@ -121,6 +121,15 @@ static EngineHost inline_host() {
 }
 static void advance(int secs) { g_now += std::chrono::seconds(secs); }
 
+// 对账的测试入口：先把时钟推过"仓位刚变过"的宽限期，再按【刚拉到的】快照
+// （age=0）比对。绝大多数用例关心的是配对逻辑本身，不是新鲜度守卫——
+// 守卫本身另有专门的用例（见"刚成交的仓位不得被旧快照判成外部已平"）
+static std::vector<std::string> reconcile(
+        TrendEngine& e, const std::vector<TrendEngine::ExchangePos>& ex) {
+    advance(10);
+    return e.reconcile_positions(ex, std::chrono::milliseconds(0));
+}
+
 static TrendConfig mk_cfg(const std::string& sym = "TESTUSDT") {
     TrendConfig c;
     c.symbol      = sym;
@@ -751,11 +760,105 @@ int main() {
             {"TESTUSDT", -1, 5.0, 120.0},   // 空腿（别的东西开的）
             {"TESTUSDT",  1, q,   110.0},   // 我们自己的多腿
         };
-        auto issues = eng.reconcile_positions(ex);
-        check(issues.empty(), "同向腿存在且数量一致时，反向腿不得报成方向不一致");
+        auto issues = reconcile(eng,ex);
+        check(issues.size() == 1, "同向腿存在且数量一致时，不得报成方向不一致");
+        check(issues[0].find("方向") == std::string::npos,
+              "  报的不能是方向冲突");
+        // 但那条反向腿【本身】必须说出来：同品种只剩一套策略之后它没有任何
+        // 归属，旧注释把它委托给了已经删掉的 DCA 孤儿仓核查，等于没人管
+        check(issues[0].find("没有跟踪") != std::string::npos,
+              "  而是明确报出「有一条本程序没有跟踪的反向腿」");
         check(eng.get_bots()[0].state == TrendBot::State::Running,
               "  bot 必须继续运行——误停等于把仓位变成裸敞口");
         check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  仓位状态不得被改动");
+
+        // 同一条腿不重复报：对账每分钟一轮，刷屏会把真正该看的告警冲散
+        auto again = reconcile(eng,ex);
+        check(again.empty(), "  同一条反向腿不得每轮重报");
+
+        // 腿消失后再出现，要重新报——去重不能变成永久静音
+        reconcile(eng, {{"TESTUSDT", 1, q, 110.0}});
+        auto back = reconcile(eng,ex);
+        check(back.size() == 1 && back[0].find("没有跟踪") != std::string::npos,
+              "  反向腿消失后再出现，必须重新报");
+    }
+
+    // ── 刚成交的仓位不得被【旧快照】判成"外部已平"（v5.9.4 实盘事故）────────
+    //
+    // 事故原文（同一秒内的两行）：
+    //   00:20:42 QNTUSDT 开空 qty=0.3 @$303.18
+    //   00:20:42 对账: 本地有仓位但交易所没有（外部已平/被强平），已停止该bot
+    //   00:21:02 硬止损挂上时仓位已不在，撤掉这张孤儿单
+    // GUI 的周期对账复用每 tick 刷新的 pos_cache_，那份快照最旧可达 30 秒，
+    // 于是"快照拍摄时这笔仓位还不存在"被读成了"交易所没有这笔仓位"。
+    // 后果不是少报一条，而是交易所上留下一笔【没有止损、没有 bot 管】的真仓位。
+    //
+    // pending 那道守卫拦不住：订单已经入账，pending 此刻已经是 false
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = false;    // 这条只关心对账
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);      // 开多，此刻刚成交
+
+        const auto b0 = eng.get_bots()[0];
+        check(b0.st.pos == trend::Pos::Long && b0.qty > 0, "已开仓（前提成立）");
+        check(!b0.pending, "  且已入账——pending 已复位，那道守卫拦不住（前提成立）");
+
+        // 30 秒前拍的快照：里面当然没有这笔 3 秒前才开出来的仓位
+        advance(3);
+        auto stale = eng.reconcile_positions({}, std::chrono::milliseconds(30000));
+        check(stale.empty(),
+              "⚠ 快照比这笔仓位还老时，不得判定「交易所没有这个仓位」");
+        const auto b1 = eng.get_bots()[0];
+        check(b1.state == TrendBot::State::Running, "  bot 必须继续运行");
+        check(b1.st.pos == trend::Pos::Long && b1.qty > 0,
+              "  本地跟踪不得被清——清掉就等于放任一笔真实仓位裸奔");
+
+        // 同样的空快照，但确实是【现在】拍的：那才真的是"外部已平"，必须报
+        advance(10);
+        auto fresh = eng.reconcile_positions({}, std::chrono::milliseconds(0));
+        check(fresh.size() == 1,
+              "  快照足够新时，「交易所确实没有」仍必须照报——宽限不能变成漏报");
+        // 新鲜度守卫放行之后，走的是"两轮确认"那条路：第一轮只记存疑
+        advance(10);
+        auto confirm = eng.reconcile_positions({}, std::chrono::milliseconds(0));
+        check(confirm.size() == 1, "  第二轮确认");
+        check(eng.get_bots()[0].state == TrendBot::State::Stopped, "  并停掉该bot");
+    }
+
+    // ── 反过来：刚平掉的仓位不得被旧快照判成"孤儿仓" ────────────────────────
+    // 旧快照里那笔仓位还在，而本地已经平了 —— 按字面比对就是"交易所有仓位但
+    // 本地无跟踪"，于是停掉一个其实完全正常的 bot
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = false;
+        // mk_cfg 默认是"立即反手"，触线会直接开成空单而不是空仓——
+        // 这条用例要的是【平掉变空仓】，所以显式关掉反手
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);       // 开多
+        advance(10);
+        const double q = eng.get_bots()[0].qty;
+
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 100.0;
+        eng.tick("TESTUSDT", 100.0);       // 触线平掉
+        check(eng.get_bots()[0].st.pos == trend::Pos::Flat, "已平仓（前提成立）");
+
+        advance(2);
+        auto stale = eng.reconcile_positions({{"TESTUSDT", 1, q, 110.0}},
+                                             std::chrono::milliseconds(30000));
+        check(stale.empty(), "⚠ 旧快照里仓位还在，不得报成孤儿仓并停 bot");
+        check(eng.get_bots()[0].state == TrendBot::State::Running,
+              "  bot 必须继续运行");
     }
 
     // ── 真正的方向冲突仍必须停 bot（修完不能把这条一起放过去）────────────────
@@ -765,25 +868,26 @@ int main() {
         mk_long_bot(cli, eng);
 
         std::vector<EP> ex = { {"TESTUSDT", -1, 5.0, 120.0} };   // 只有反向
-        auto issues = eng.reconcile_positions(ex);
+        auto issues = reconcile(eng,ex);
         check(issues.size() == 1, "本地持多而交易所只有空仓，必须报一条");
         check(issues[0].find("方向") != std::string::npos, "  应判为方向不一致");
         check(eng.get_bots()[0].state == TrendBot::State::Stopped, "  必须停止该bot");
         check(eng.get_bots()[0].st.pos == trend::Pos::Long,
               "  方向冲突时不清本地状态：清了就没有证据可核对");
 
-        // ⚠ 但【只报一次】。已停止的 bot 不会再有任何动作，而不一致的事实
-        //   已经写进 last_action（界面上一直看得到）。不去重的话对账每分钟
-        //   一轮就每分钟重报一遍，而且永远不会消失——没有任何东西会去修正它。
-        //   实测日志里 4 分钟刷了 30 行，把同期真正该看的硬止损告警全冲散了
-        auto again = eng.reconcile_positions(ex);
-        check(again.empty(), "  已停止的 bot 不得在后续每一轮对账里重复报");
-        auto again2 = eng.reconcile_positions(ex);
+        // ⚠ 但【只报一次】。不去重的话对账每分钟一轮就每分钟重报一遍，而且
+        //   永远不会消失——实测日志里 4 分钟刷了 30 行，把同期真正该看的硬
+        //   止损告警全冲散了。
+        //   注意去重的判据是【不一致的种类】，不是"bot 已停止"：v5.9.4 用的是
+        //   后者（整个跳过已停止的 bot），代价是一笔真实仓位对对账永久隐形
+        auto again = reconcile(eng,ex);
+        check(again.empty(), "  同一类不一致不得在后续每一轮对账里重复报");
+        auto again2 = reconcile(eng,ex);
         check(again2.empty(), "  再对一次也还是不报");
 
         // 但恢复之后要重新纳入对账：不一致还在，就得重新报出来并再停一次
         eng.resume_bot(eng.get_bots()[0].bot_id);
-        auto after_resume = eng.reconcile_positions(ex);
+        auto after_resume = reconcile(eng,ex);
         check(after_resume.size() == 1, "  恢复后重新纳入对账，不一致仍要报");
         check(eng.get_bots()[0].state == TrendBot::State::Stopped, "  并再次停止");
     }
@@ -794,13 +898,53 @@ int main() {
         TrendEngine eng(cli, inline_host());
         mk_long_bot(cli, eng);
 
-        auto issues = eng.reconcile_positions({});   // 交易所空空
-        check(issues.size() == 1, "本地有仓交易所没有，应报一条");
-        check(issues[0].find("外部已平") != std::string::npos, "  应判为外部已平");
-        check(eng.get_bots()[0].st.pos == trend::Pos::Flat, "  应清空本地仓位");
+        // ⚠ 第一轮【只记存疑，不动任何状态】。清本地状态是不可逆的：抹掉开仓价、
+        //   止损线、数量之后，界面上连"平仓"按钮都不再渲染（条件是 pos!=Flat
+        //   && qty>0），于是程序刚刚忘掉的那笔真实仓位，用户在程序里没有任何
+        //   办法处理。v5.9.4 实盘就是这样，只能去交易所人工收拾
+        auto first = reconcile(eng,{});   // 交易所空空
+        check(first.size() == 1, "第一轮应报一条");
+        check(first[0].find("存疑") != std::string::npos, "  且只是【存疑】");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Long,
+              "  ⚠ 第一轮绝不能清本地仓位——清了用户就再也没法在程序里平它");
+        check(eng.get_bots()[0].qty > 0, "  数量也不动");
+        check(eng.get_bots()[0].state == TrendBot::State::Running,
+              "  bot 继续运行：真还在就继续被正常管理，真没了下一拍平仓会撞 -2022 自行收敛");
+
+        // 第二轮仍然查不到 ⇒ 确认，这才清
+        auto second = reconcile(eng,{});
+        check(second.size() == 1, "第二轮应报确认");
+        check(second[0].find("外部已平") != std::string::npos, "  应判为外部已平");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Flat, "  这时才清空本地仓位");
         check(eng.get_bots()[0].qty == 0, "  数量应归零");
         check(eng.get_bots()[0].state == TrendBot::State::Stopped,
               "  应停止：分不清是人工平的还是被强平的，续跑是往坑里跳");
+    }
+
+    // ── 存疑之后仓位又出现了：必须当成误报撤销，不能跨轮累积成确认 ──────────
+    // 拉取抖动、快照陈旧都可能让某一轮查不到。若把互不相邻的两次"查不到"
+    // 攒成一次确认，两轮确认这道防线就形同虚设
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        mk_long_bot(cli, eng);
+        const double q = eng.get_bots()[0].qty;
+
+        auto first = reconcile(eng,{});
+        check(first.size() == 1 && first[0].find("存疑") != std::string::npos,
+              "第一轮记存疑（前提成立）");
+
+        // 中间这一轮查到了 ⇒ 之前那次是误报
+        auto ok = reconcile(eng, {{"TESTUSDT", 1, q, 110.0}});
+        check(ok.empty(), "  查到了，无不一致");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  仓位完好");
+
+        // 再查不到，这只能算【第一次】，不许直接确认
+        auto again = reconcile(eng,{});
+        check(again.size() == 1 && again[0].find("存疑") != std::string::npos,
+              "  ⚠ 不相邻的两次「查不到」不得攒成一次确认");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Long,
+              "  本地仓位仍不得被清");
     }
 
     // ── 孤儿仓：本地空仓而交易所有仓，必须停 ────────────────────────────────
@@ -810,7 +954,7 @@ int main() {
         eng.add_bot(mk_cfg());                        // 加了但没开仓
 
         std::vector<EP> ex = { {"TESTUSDT", 1, 3.0, 100.0} };
-        auto issues = eng.reconcile_positions(ex);
+        auto issues = reconcile(eng,ex);
         check(issues.size() == 1, "本地空仓而交易所有仓，应报一条");
         check(issues[0].find("孤儿") != std::string::npos ||
               issues[0].find("本地无跟踪") != std::string::npos, "  应判为孤儿仓");
@@ -827,7 +971,7 @@ int main() {
         const double stop = eng.get_bots()[0].st.stop;
 
         std::vector<EP> ex = { {"TESTUSDT", 1, q0 / 2, 110.0} };
-        auto issues = eng.reconcile_positions(ex);
+        auto issues = reconcile(eng,ex);
         check(issues.size() == 1, "外部部分平仓应报一条");
         auto b = eng.get_bots()[0];
         check(std::fabs(b.qty - q0 / 2) < 1e-12, "  数量应收敛到交易所值");
@@ -843,7 +987,7 @@ int main() {
         const double q0 = eng.get_bots()[0].qty;
 
         std::vector<EP> ex = { {"TESTUSDT", 1, q0 * 2, 110.0} };
-        auto issues = eng.reconcile_positions(ex);
+        auto issues = reconcile(eng,ex);
         check(issues.size() == 1, "交易所多于本地应报一条");
         auto b = eng.get_bots()[0];
         check(std::fabs(b.qty - q0) < 1e-12,
@@ -860,7 +1004,7 @@ int main() {
         auto id = mk_long_bot(cli, eng);
         eng.set_pending_for_test(id, true);
 
-        auto issues = eng.reconcile_positions({});   // 交易所看起来空
+        auto issues = reconcile(eng,{});   // 交易所看起来空
         check(issues.empty(), "pending 的 bot 必须跳过对账");
         check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  仓位不得被清空");
         check(eng.get_bots()[0].state == TrendBot::State::Running, "  不得被停止");
@@ -877,7 +1021,7 @@ int main() {
             {"OTHERUSDT", -1, 9.0, 50.0},
             {"TESTUSDT",   1, q0,  110.0},
         };
-        check(eng.reconcile_positions(ex).empty(), "不相关品种的仓位不得影响本 bot");
+        check(reconcile(eng,ex).empty(), "不相关品种的仓位不得影响本 bot");
     }
 
     // ═══ 交易所侧灾难止损（v4.7.0）════════════════════════════════════════════

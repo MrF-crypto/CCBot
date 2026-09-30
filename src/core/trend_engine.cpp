@@ -114,23 +114,50 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
 }
 
 std::vector<std::string> TrendEngine::reconcile_positions(
-        const std::vector<ExchangePos>& exchange) {
+        const std::vector<ExchangePos>& exchange,
+        std::chrono::milliseconds snapshot_age) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     std::vector<std::string> issues;
+
+    const auto now = host_.now_steady();
 
     for (auto& kv : bots_) {
         auto& b = kv.second;
         // 在途的跳过：订单可能已在交易所生效而本地还没入账，此刻比对必然误判
         if (b.pending) continue;
-        // 已停止的跳过。它不会再有任何动作，而不一致的事实已经报过、也写进了
-        // last_action（界面上一直看得到）。
+
+        // ⚠ 比 pending 更隐蔽的一类：订单【已经入账】了，但这份交易所快照是在
+        //   入账之前拍的。pending 此刻已经是 false，所以上面那道守卫拦不住。
         //
-        // ⚠ 不跳的话每一轮对账都会重新发现同样的不一致并重新报一遍——对账每
-        //   分钟一轮，6 个 bot 就是每分钟 6 行，而这些行永远不会消失（bot 已经
-        //   停了，没有任何东西会去修正它）。实测日志里 4 分钟刷了 30 行，
-        //   把同期真正该看的硬止损告警全冲散了。
-        //   恢复该 bot（resume_bot 置回 Running）时自然会重新纳入对账
-        if (b.state == TrendBot::State::Stopped) continue;
+        //   v5.9.4 实盘日志（同一秒内的两行）：
+        //     00:20:42 QNTUSDT 开空 qty=0.3 @$303.18
+        //     00:20:42 对账: 本地有仓位但交易所没有（外部已平/被强平），已停止该bot
+        //   之后 00:21:02 硬止损挂上，引擎看到"仓位已不在"把它当孤儿单撤掉——
+        //   交易所上就剩一笔没有止损、没有 bot 管的真实空单。
+        //
+        //   反方向同样成立：刚平掉的仓位，在旧快照里还在，会被报成"孤儿仓"并
+        //   停掉 bot。所以这里比的是"仓位最后一次变化"，不只是"最后一次成交"。
+        //
+        //   宽限的代价是【真的】被外部平掉时晚一个周期（约一分钟）发现，
+        //   而误判的代价是一个裸敞口——两者不对称，宁可晚一分钟
+        if (b.last_pos_change.time_since_epoch().count() != 0) {
+            const auto change_age =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - b.last_pos_change);
+            if (change_age < snapshot_age + kReconcileGrace) continue;
+        }
+        // ⚠ 已停止的 bot【不再跳过】。
+        //
+        //   v5.9.4 之前这里是 `if (state == Stopped) continue;`，理由是不跳会
+        //   每分钟把同样的不一致刷一遍（实测 4 分钟 30 行，把真正该看的硬止损
+        //   告警全冲散）。但代价是：一旦某个 bot 因为任何原因被停掉，它名下
+        //   那笔【真实存在的】仓位就对对账永久隐形。
+        //
+        //   实盘 v5.9.4 正是这条：仓位被误判清掉、bot 被停掉，此后七分钟、
+        //   约七轮对账，一行警告都没有——而交易所上那笔空单一直在，没有止损、
+        //   没有 bot 管。用户是自己去交易所才发现的。
+        //
+        //   噪音的正确解法是【去重】（见下面的 note_once），不是失明。
+        //   停止的 bot 依然不会被自动恢复，这里只负责"把事实说出来"
 
         const bool local_has = (b.st.pos != trend::Pos::Flat && b.qty > 0);
         const int  local_dir = (b.st.pos == trend::Pos::Long) ? 1 : -1;
@@ -156,14 +183,28 @@ std::vector<std::string> TrendEngine::reconcile_positions(
         }
         const ExchangePos* ex = same;
 
-        if (!local_has && !ex) continue;               // 两边都空，一致
+        // 同一类不一致只报一次。换了类、或恢复一致之后，重新允许报——
+        // 这样既不刷屏，又不会让"状况变了"被静音掉
+        auto note_once = [&](TrendBot::Recon kind, const std::string& text) {
+            if (b.recon_noted == kind) return;
+            b.recon_noted = kind;
+            issues.push_back(text);
+        };
+
+        if (!local_has && !ex) {                       // 两边都空，一致
+            b.recon_noted    = TrendBot::Recon::None;
+            b.ext_gone_seen  = 0;
+            continue;
+        }
 
         if (!local_has && ex) {
             // 孤儿仓：最危险的一种。不停的话，下一个突破信号会再开一笔，
             // 而交易所上那笔无人管理——净敞口翻倍且没有任何止损线守着
-            issues.push_back(b.cfg.symbol + " 交易所有仓位(" +
-                             std::string(ex->direction > 0 ? "多" : "空") + " " +
-                             fmt(ex->qty, 8) + ")但本地无跟踪，已停止该bot");
+            note_once(TrendBot::Recon::Orphan,
+                      b.cfg.symbol + " 交易所有仓位(" +
+                      std::string(ex->direction > 0 ? "多" : "空") + " " +
+                      fmt(ex->qty, 8) + ")但本地无跟踪，已停止该bot。"
+                      "这笔仓位没有止损线守着，本程序也不会去平它，请手动核对");
             b.state = TrendBot::State::Stopped;
             b.last_action = "⚠ 孤儿仓，已停止待核对";
             continue;
@@ -174,15 +215,39 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             // 交易所实际持空，任何自动收敛都是在猜，停下来让人看。
             // 反向也没有，才是"外部已平/被强平"
             if (opp) {
-                issues.push_back(b.cfg.symbol + " 本地方向(" + trend::pos_name(b.st.pos) +
-                                 ")与交易所(" + (opp->direction > 0 ? "多" : "空") +
-                                 " " + fmt(opp->qty, 8) + ")不一致，已停止该bot");
+                note_once(TrendBot::Recon::DirConflict,
+                          b.cfg.symbol + " 本地方向(" + trend::pos_name(b.st.pos) +
+                          ")与交易所(" + std::string(opp->direction > 0 ? "多" : "空") +
+                          " " + fmt(opp->qty, 8) + ")不一致，已停止该bot");
                 b.state = TrendBot::State::Stopped;
                 b.last_action = "⚠ 方向不一致，已停止";
                 continue;
             }
-            issues.push_back(b.cfg.symbol + " 本地有仓位但交易所没有（外部已平/被强平），"
-                             "已清空本地状态并停止该bot");
+
+            // ⚠ 清本地状态是【不可逆】的：on_closed 抹掉开仓价、止损线、极值，
+            //   qty 归零，硬止损单号一并清掉。做完之后界面上连"平仓"按钮都不
+            //   再渲染（它的条件是 pos!=Flat && qty>0），也就是说——如果这个
+            //   判断是错的，程序刚刚忘掉的那笔真实仓位，用户在程序里【没有任何
+            //   办法处理】，只能去交易所人工收拾。实盘 v5.9.4 就是这么发生的。
+            //
+            //   所以不可逆的销毁不建立在【一次】观察上：先记一次存疑，本地状态
+            //   原样保留、bot 照常运行（真的还在的话，它继续被正常管理；真的
+            //   没了的话，下一拍平仓会撞 -2022，那条路径本来就会正确收敛）。
+            //   连续两轮都查不到才确认。对账每分钟一轮，代价是晚一分钟。
+            //
+            //   这和本项目修过四次的"拉取失败当成确实没有"是同一个病，只不过
+            //   这次不是失败，是【陈旧】——而陈旧比失败更难看出来
+            if (b.ext_gone_seen == 0) {
+                b.ext_gone_seen = 1;
+                note_once(TrendBot::Recon::ExtGoneSuspect,
+                          b.cfg.symbol + " 交易所侧查不到这笔仓位（存疑，第 1 次）。"
+                          "本地状态原样保留、bot 继续运行；连续两轮确认后才会清掉。"
+                          "若这是误报，下一轮会自动恢复正常");
+                continue;
+            }
+            note_once(TrendBot::Recon::ExtGone,
+                      b.cfg.symbol + " 本地有仓位但交易所没有（连续 2 轮确认：外部已平/被强平），"
+                      "已清空本地状态并停止该bot");
             trend::on_closed(b.st);
             clear_ds_runtime(b);
             // 这条路径【没有】撤单动作（对账在锁内，不能做 HTTP），所以要自己
@@ -199,19 +264,45 @@ std::vector<std::string> TrendEngine::reconcile_positions(
         }
 
         // 走到这里 ex 必然与本地同向（配对时就是按方向挑的），只剩数量要比。
-        // 双向模式下反向腿可能同时存在，那是另一套东西开的（同品种只允许一套策略，
-        // 所以不是本引擎的仓），不在这里管——它由 DCA 侧的孤儿仓核查或人工处理
+        // 同向腿确实在 ⇒ 之前那几次"查不到"是误报，计数清零，别让它们跨轮累积
+        // 成一次确认
+        b.ext_gone_seen = 0;
+
+        // 我们跟踪的那条腿没问题，但双向持仓下【还挂着一条反向腿】。
+        //
+        // ⚠ 旧注释写的是"它由 DCA 侧的孤儿仓核查或人工处理"——而网格 DCA 在
+        //   v4.7.1 就整个删掉了。于是这件事【没有任何人管】：同品种只剩一套
+        //   策略之后，一条没人跟踪的反向腿只可能是外部手工开的，或者是本引擎
+        //   自己误判丢掉的（v5.9.4 那次留下的正是这种）。而且它【完全隐形】：
+        //   同向腿对得上就判定一致，反向腿连看都不看。
+        //   不动它是对的——不知道是谁的仓，自动收敛都是在猜——但必须说出来。
+        //
+        //   放在这里而不是函数开头：真正的方向冲突（同向腿【不存在】、只有
+        //   反向腿）已经由上面那条报过了，在那里再报一次反向腿是同一件事说两遍
+        if (opp && !b.opp_leg_noted) {
+            b.opp_leg_noted = true;
+            issues.push_back(b.cfg.symbol + " 交易所上还有一条【本程序没有跟踪】的反向腿(" +
+                             std::string(opp->direction > 0 ? "多" : "空") + " " +
+                             fmt(opp->qty, 8) + ")。它没有止损线守着，也不会被本"
+                             "程序平掉，请手动核对处理");
+        }
+        if (!opp) b.opp_leg_noted = false;
+
         const double diff = b.qty - ex->qty;
         if (diff > 1e-12) {
-            issues.push_back(b.cfg.symbol + " 外部部分平仓：本地 " + fmt(b.qty, 8) +
-                             " → 交易所 " + fmt(ex->qty, 8) + "，已收敛");
+            note_once(TrendBot::Recon::PartialClose,
+                      b.cfg.symbol + " 外部部分平仓：本地 " + fmt(b.qty, 8) +
+                      " → 交易所 " + fmt(ex->qty, 8) + "，已收敛");
             b.qty = ex->qty;   // 开仓价与止损线保留，它们仍然成立
         } else if (diff < -1e-12) {
             // 只告警不动：外部手动加仓的话，按交易所数量接管等于让止损线
             // 去管一笔不是自己开的仓，开仓价基准也不再成立
-            issues.push_back(b.cfg.symbol + " 交易所持仓(" + fmt(ex->qty, 8) +
-                             ")多于本地跟踪(" + fmt(b.qty, 8) +
-                             ")，可能有外部加仓，本地状态未改动");
+            note_once(TrendBot::Recon::ExtAdd,
+                      b.cfg.symbol + " 交易所持仓(" + fmt(ex->qty, 8) +
+                      ")多于本地跟踪(" + fmt(b.qty, 8) +
+                      ")，可能有外部加仓，本地状态未改动");
+        } else {
+            b.recon_noted = TrendBot::Recon::None;   // 完全一致：允许将来重新报
         }
     }
     return issues;
@@ -265,6 +356,10 @@ void TrendEngine::resume_bot(const std::string& id) {
     if (it == bots_.end()) return;
     it->second.state = TrendBot::State::Running;
     it->second.last_action = "已恢复";
+    // 恢复 = "我看过了，再有问题重新告诉我"。不清去重标记的话，那条把它停掉的
+    // 不一致仍然成立时，下一轮会【静默地】把它再停一次，用户看不到任何原因
+    it->second.recon_noted   = TrendBot::Recon::None;
+    it->second.opp_leg_noted = false;
 }
 
 void TrendEngine::close_bot(const std::string& id) {
@@ -692,6 +787,9 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 trend::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse,
                                  b.bar_open_ms);
                 b.qty = r.executed_qty;
+                // 对账要知道这笔变化发生在什么时候，才能判断交易所快照来不来得及
+                // 包含它。漏打时间戳 = 对账拿旧快照把刚开的仓判成"外部已平"
+                b.last_pos_change = host_.now_steady();
                 // 开成了 ⇒ 数据齐了。复位之后，若将来又开始缺数据会重新提示一次
                 b.skip_logged = false;
                 std::ostringstream ss;
@@ -765,6 +863,12 @@ void TrendEngine::clear_ds_runtime(TrendBot& b) {
     b.ds_attempts    = 0;
     b.ds_unprotected = false;
     b.ds_next_try    = {};
+    // 对账的去重与存疑计数都是【针对某一笔具体仓位】的。仓位换了还留着的话，
+    // 新仓位的第一次不一致会被上一笔的记录静音掉，或者带着半截的存疑计数
+    // 直接走到"第 2 轮确认"
+    b.recon_noted    = TrendBot::Recon::None;
+    b.opp_leg_noted  = false;
+    b.ext_gone_seen  = 0;
     // ⚠ 不碰 ds_fail_closes：熔断要跨仓位累计才看得出是系统性故障。
     //
     // ⚠ 也【不碰 disaster_stop_id / disaster_stop_price】。它们由
@@ -1080,6 +1184,7 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                     trend::on_closed(b.st);
                     clear_ds_runtime(b);
                     b.qty = 0;
+                    b.last_pos_change = host_.now_steady();
                     b.pending = false;
                     b.state = TrendBot::State::Stopped;
                     b.last_action = "⚠ 交易所侧已无仓位，已停止待核对";
@@ -1121,6 +1226,8 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 trend::on_closed(b.st);
                 clear_ds_runtime(b);
                 b.qty = 0;
+                // 平仓同样要打时间戳：旧快照里这笔仓位还在，会被报成"孤儿仓"
+                b.last_pos_change = host_.now_steady();
 
                 std::ostringstream ss;
                 ss << cfg.symbol << " 平" << trend::pos_name(pos) << " @$" << fmt(exit_px)

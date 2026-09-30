@@ -168,6 +168,33 @@ struct TrendBot {
     bool ds_unprotected = false;
     // 下次允许重试的时刻（退避）。用单调钟，回放时由 EngineHost 注入
     std::chrono::steady_clock::time_point ds_next_try{};
+    // 对账上一轮报过的那一类不一致。同一类只报一次，换了类或恢复一致后重置。
+    //
+    // ⚠ 为什么需要它：v5.9.4 之前对账【整个跳过已停止的 bot】，理由是不跳会每
+    //   分钟把同样的不一致刷一遍（实测 4 分钟 30 行）。但那等于让"停止的 bot
+    //   名下有一笔真实仓位"这件事永久隐形——实盘正是这样：仓位被误判清掉、bot
+    //   被停掉，此后七分钟七轮对账一行警告都没有。
+    //   噪音该用去重解决，不该用失明解决
+    enum class Recon : uint8_t {
+        None = 0, Orphan, DirConflict, ExtGoneSuspect, ExtGone, PartialClose, ExtAdd
+    };
+    Recon recon_noted = Recon::None;
+    // 双向持仓下"存在一条本引擎没有跟踪的反向腿"是否已经报过
+    bool  opp_leg_noted = false;
+    // "交易所侧查不到这笔仓位"已经连续看到几轮。见 reconcile_positions
+    int   ext_gone_seen = 0;
+
+    // 本地仓位最后一次【发生变化】的时刻（开仓成交 / 平仓 / 反手），单调钟。
+    //
+    // ⚠ 对账专用，别拿它做别的判断。对账是把「本地状态」和「交易所快照」比对，
+    //   而快照是过去某一刻拍的——如果这笔变化发生在快照【之后】，快照里当然
+    //   没有它，此时比对必然误判。实盘 v5.9.4 吃过一次：开空成交的【同一秒】，
+    //   周期对账拿着一份最多 30 秒前的缓存判定"交易所没有这个仓位"，清掉本地
+    //   跟踪并停掉 bot；20 秒后硬止损挂上，引擎又因为"仓位已不在"把它当孤儿单
+    //   撤了——于是交易所上留下一笔【没有止损、没有 bot 管】的真实仓位。
+    //   0 = 本轮还没变过（比如刚从落盘恢复），此时不跳过
+    std::chrono::steady_clock::time_point last_pos_change{};
+
     // 连续【因为挂不上硬止损而被迫平仓】的次数。熔断用。
     // ⚠ 它是唯一一个【不随仓位关闭复位】的字段：跨仓位累计才能看出
     //   "这是系统性问题"。只由一次成功挂单清零
@@ -294,7 +321,17 @@ public:
     //                          这是最危险的一种——不停的话引擎以为自己空仓，
     //                          下一个突破信号会再开一笔，净敞口翻倍
     // 返回每条不一致的可读描述（空 = 完全一致）
-    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange);
+    // snapshot_age = 这份交易所快照【拍摄于多久以前】。
+    //
+    // ⚠ 必须由调用方如实给出，不能省。本地仓位在快照拍摄【之后】才变化的话，
+    //   快照里不可能有这笔变化，拿它去比对只会得出"交易所没有这个仓位"或
+    //   "孤儿仓"这类结论，然后清掉本地跟踪 / 停掉 bot ——而真实仓位还在
+    //   交易所上，此后无人管理、止损线不再推进。
+    //   GUI 的周期对账复用每 tick 刷新的 pos_cache_，那份数据最旧可达 30 秒，
+    //   正是 v5.9.4 实盘踩到的那一下；headless 每次现拉，age≈0，但仍有
+    //   交易所侧的传播延迟，所以引擎内部还会再加一段宽限
+    std::vector<std::string> reconcile_positions(const std::vector<ExchangePos>& exchange,
+                                                 std::chrono::milliseconds snapshot_age);
 
     // 核对"我们记着的那张交易所侧保护单是否还真的在那里"。
     //
@@ -329,6 +366,11 @@ public:
     // 但本地移动止损照常工作——所以这是"进程活着时的降级"，不是裸奔。
     // 时间预算的两头：太短则同一个原因连败十三次、白重试；太长则真出事时
     // 裸的时间过久
+    // 对账宽限：仓位变化距今【不足 快照年龄 + 这段】的 bot 本轮不比对。
+    // 纯粹为交易所侧的传播延迟留的——订单回执已经拿到，但 /fapi 的持仓接口
+    // 可能还要一小会儿才反映出来。headless 每次现拉（age≈0），靠的就是这段
+    static constexpr auto kReconcileGrace = std::chrono::seconds(5);
+
     static constexpr int kDsFastTries   = 3;    // 第 1..3 次：0.5 秒间隔
     static constexpr int kDsAlertAt     = 3;    // 第 3 次失败：先告一次警（还在重试）
     static constexpr int kDsBackoffEnd  = 10;   // 第 4..10 次：2 秒间隔
