@@ -1421,6 +1421,31 @@ double TradingClient::fetch_mark_price(const std::string& sym) {
     return fetch_premium(sym).mark_price;
 }
 
+std::unordered_map<std::string, double> TradingClient::fetch_all_mark_prices() {
+    std::unordered_map<std::string, double> out;
+    // 不带 symbol ⇒ 返回全市场数组
+    auto resp = http_get_public("/fapi/v1/premiumIndex");
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    // 错误时币安回的是对象而不是数组，get(arr) 会失败——这里不当异常处理，
+    // 返回空表，调用方保留旧价（绝不因为一次拉取失败就把价格清掉）
+    if (doc.get(arr) != simdjson::SUCCESS) return out;
+    out.reserve(arr.size());
+    for (auto e : arr) {
+        std::string_view s, mp;
+        if (e["symbol"].get(s) != simdjson::SUCCESS)    continue;
+        if (e["markPrice"].get(mp) != simdjson::SUCCESS) continue;
+        double v = 0;
+        try { v = std::stod(std::string(mp)); } catch (...) { continue; }
+        if (v > 0) out.emplace(std::string(s), v);
+    }
+    return out;
+}
+
 std::vector<TradingClient::FundingRecord>
 TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
                                      const std::string& sym) {

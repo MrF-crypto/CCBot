@@ -353,6 +353,51 @@ int main() {
               "  且压平换行：HTML 原样打出来会把一条日志撑成几十行");
     }
 
+    std::printf("── 用例12：全市场标记价（WS 断流时兜底价的新鲜度全靠它）──\n");
+    {
+        // 逐品种查是 N 次往返，一轮耗时随品种数线性增长，最后那个品种拿到的价
+        // 已经比第一个旧了好几秒。全取是 1 次往返、所有品种共享同一时间戳。
+        // 这条路径只在 WS 断流时跑 —— 也就是最需要它对的时候，平时不执行
+        auto probe = [](const char* body) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string&, const std::string& path,
+                                 const std::string&, TradingClient::FakeReply& out) {
+                if (path.find("premiumIndex") != std::string::npos) {
+                    out.body = body; return true;
+                }
+                return false;
+            });
+            return tc.fetch_all_mark_prices();
+        };
+
+        auto m = probe(R"([{"symbol":"BTCUSDT","markPrice":"83610.20","lastFundingRate":"0.0001"},)"
+                       R"({"symbol":"ETHUSDT","markPrice":"2685.0987"},)"
+                       R"({"symbol":"XLMUSDT","markPrice":"0.23220000"}])");
+        check(m.size() == 3, "三个品种一次取回");
+        check(m.count("BTCUSDT") && std::fabs(m["BTCUSDT"] - 83610.20) < 1e-6, "  BTC 价格");
+        check(m.count("ETHUSDT") && std::fabs(m["ETHUSDT"] - 2685.0987) < 1e-9,
+              "  ETH 价格：小数位不得被截（止损线就是出场价）");
+        check(m.count("XLMUSDT") && std::fabs(m["XLMUSDT"] - 0.2322) < 1e-9, "  微价品种");
+
+        // 币安出错时回的是对象而不是数组。必须返回空表让调用方保留旧价，
+        // 绝不能因为一次拉取失败就把价格清掉（那会让移动止损失去基准）
+        check(probe(R"({"code":-1121,"msg":"Invalid symbol."})").empty(),
+              "错误对象（而非数组）⇒ 空表，调用方保留旧价");
+        check(probe("").empty(),            "空响应 ⇒ 空表");
+        check(probe("not json at all").empty(), "非 JSON ⇒ 空表，不抛异常");
+
+        // 坏条目要被跳过而不是让整批失败：一个新上币种字段缺失不该拖垮其余品种
+        auto mixed = probe(R"([{"symbol":"BTCUSDT","markPrice":"83610.20"},)"
+                           R"({"symbol":"BADUSDT"},)"
+                           R"({"markPrice":"1.0"},)"
+                           R"({"symbol":"ZEROUSDT","markPrice":"0"},)"
+                           R"({"symbol":"NANUSDT","markPrice":"abc"},)"
+                           R"({"symbol":"ETHUSDT","markPrice":"2685.10"}])");
+        check(mixed.size() == 2, "坏条目逐个跳过，好的照常返回（缺字段/零价/非数字）");
+        check(mixed.count("BTCUSDT") && mixed.count("ETHUSDT"), "  两个好品种都在");
+        check(!mixed.count("ZEROUSDT"), "  价格为 0 不算有效价");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

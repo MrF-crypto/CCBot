@@ -1770,9 +1770,24 @@ void MainWindow::onTick() {
         if (ws_price > 0) {
             // 只有运行中的才驱动引擎；停止的品种拿到价格仅供界面显示
             if (engine_syms.count(sym)) trend_engine_->tick(sym, ws_price);
-        } else {
-            need_rest.insert(sym);
         }
+        // ⚠ 要不要走 REST，判据是【WS 有没有在喂这个品种】，不是"缓存里有没有价"。
+        //
+        //   原先只在 mark_price() 返回 0（即缓存已超过 kStaleMs=10 秒）时才补拉，
+        //   而 REST 补回来的价会写进同一个缓存并刷新 mark_ms。于是 WS 断流时的
+        //   节奏变成：拉一次 → 10 秒内都"有价"不再拉 → 过期 → 再拉。
+        //   兜底价的粒度因此是【10 秒】，而 tick 是 3 秒一拍——中间那几拍
+        //   引擎反复拿到同一个冻结价。markPrice@1s 正常时是 1 秒一包，
+        //   所以 WS 一死，价格新鲜度直接掉到十分之一，界面和策略都会明显"变钝"。
+        //
+        //   ws_mark_ms 是 v5 专门为这件事留的字段：它【只】被 WS 包更新，
+        //   REST 写回时刻意不碰。所以用它判断"WS 是否还在喂"是准确的，
+        //   不会被自己的兜底写回骗过去。
+        const auto tk = ticker_ ? ticker_->get(sym) : ccbot::BookTickerStream::Tick{};
+        const bool ws_feeding =
+            tk.ws_mark_ms > 0 &&
+            (QDateTime::currentMSecsSinceEpoch() - tk.ws_mark_ms) <= ccbot::BookTickerStream::kStaleMs;
+        if (!ws_feeding) need_rest.insert(sym);
     }
 
     if (need_rest.empty()) { refreshBotTable(); return; }
@@ -1786,8 +1801,18 @@ void MainWindow::onTick() {
     if (restFetchBusy_.exchange(true)) { refreshBotTable(); return; }
 
     run_async([this, need_rest = std::move(need_rest), engine_syms]() {
+        // 一次 REST 拿回全市场（权重 10），不是逐品种 N 次往返。
+        // 逐品种时一轮的耗时随品种数线性增长——10 个品种、每次往返 200ms
+        // 就是 2 秒，47 个品种是十几秒，而这一整轮里最后那个品种拿到的价
+        // 已经比第一个旧了十几秒。全取则所有品种共享同一个时间戳。
+        // 24h 涨跌那条兜底本来就是这么做的，标记价这条一直是逐品种，属于遗漏
+        auto all = client_->fetch_all_mark_prices();
         for (const auto& sym : need_rest) {
-            double price = client_->fetch_mark_price(sym);
+            auto it = all.find(sym);
+            // 全取失败（空表）或该品种不在返回里 ⇒ 退回单品种查询。
+            // 不退回的话，一次网络抖动会让所有品种这一轮都没价
+            const double price = (it != all.end()) ? it->second
+                                                   : client_->fetch_mark_price(sym);
             if (price > 0) {
                 // 同上：只有运行中的才驱动引擎。停止的品种走到这里是为了让
                 // 标记价那一列有数

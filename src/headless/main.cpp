@@ -313,12 +313,44 @@ int main(int argc, char** argv) {
         auto bots = trend_engine ? trend_engine->get_bots() : std::vector<TrendBot>{};
 
         // ── 1) 价格喂入 + 策略判定：永远最先执行，不被任何数据拉取阻塞 ────────
+        //
+        // WS 没在喂的品种，这一拍就用 REST 全取补上。判据是 ws_mark_ms（只被 WS
+        // 包更新，REST 写回刻意不碰），而不是 mark_price() 是否为 0——后者会被
+        // 自己上一轮的 REST 写回骗过去：写回时 mark_ms 被刷新，于是 10 秒内都
+        // "有价"不再补拉，兜底价的粒度就成了 10 秒而 tick 是 3 秒，中间几拍
+        // 引擎反复拿到同一个冻结价。markPrice@1s 正常时是 1 秒一包
+        std::unordered_map<std::string, double> rest_px;
+        {
+            bool any_missing = false;
+            const int64_t now_ms_ = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            for (const auto& sym : symbols) {
+                const auto tk = ticker.get(sym);
+                if (!(tk.ws_mark_ms > 0 &&
+                      now_ms_ - tk.ws_mark_ms <= BookTickerStream::kStaleMs)) {
+                    any_missing = true;
+                    break;
+                }
+            }
+            // 一次往返拿回全市场（权重 10），不是逐品种 N 次。逐品种时一轮的
+            // 耗时随品种数线性增长，最后那个品种拿到的价已经比第一个旧了好几秒
+            if (any_missing) rest_px = client->fetch_all_mark_prices();
+        }
+
         for (const auto& sym : symbols) {
             double price = ticker.mark_price(sym);   // 内置10秒陈旧保护，冻结价返回0
-            if (price <= 0) {
-                price = client->fetch_mark_price(sym);
+            const auto tk = ticker.get(sym);
+            const int64_t nms = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const bool ws_feeding = tk.ws_mark_ms > 0 &&
+                                    nms - tk.ws_mark_ms <= BookTickerStream::kStaleMs;
+            if (!ws_feeding) {
+                auto it = rest_px.find(sym);
+                // 全取失败或没这个品种 ⇒ 退回单品种查询，别让一次抖动把整轮清空
+                double p = (it != rest_px.end()) ? it->second
+                                                 : client->fetch_mark_price(sym);
                 // 写回缓存：headless 没有界面，但状态落盘与日志同样读它
-                if (price > 0) ticker.set_mark_price(sym, price);
+                if (p > 0) { ticker.set_mark_price(sym, p); price = p; }
             }
             if (price > 0) {
                 if (trend_engine) trend_engine->tick(sym, price);
