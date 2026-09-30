@@ -130,7 +130,11 @@ const char* TradingClient::ep(Ep e) const {
     case Ep::ListenKey:        return pm ? "/papi/v1/listenKey"            : "/fapi/v1/listenKey";
     case Ep::PmAccount:        return "/papi/v1/account";
     case Ep::CondOrder:        return "/papi/v1/um/conditional/order";
-    case Ep::AlgoOrder:        return pm ? "/papi/v1/um/algoOrder" : "/fapi/v1/algoOrder";
+    // ⚠ 两边路径【不对称】，别照着一边推另一边：
+    //   普通合约 /fapi/v1/algoOrder（驼峰、无斜杠）
+    //   统一账户 /papi/v1/um/algo/order（有斜杠）
+    //   我按对称猜成 /papi/v1/um/algoOrder，实测回 HTTP 404
+    case Ep::AlgoOrder:        return pm ? "/papi/v1/um/algo/order" : "/fapi/v1/algoOrder";
     case Ep::Income:           return pm ? "/papi/v1/um/income"            : "/fapi/v1/income";
     }
     return "";
@@ -1211,8 +1215,24 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
         std::string body = resp.substr(0, 160);
         for (auto& ch : body) if (ch == '\n' || ch == '\r') ch = ' ';
-        out.error = "响应不是合法 JSON（HTTP " + std::to_string(http_code) +
-                    "，端点 " + path + "）: " + body;
+        // 按状态码给出成因：四种码的修法南辕北辙，只打 body 的话只能靠猜。
+        // 404 那条实测救了一次 —— 我把统一账户的端点路径猜错了
+        std::string why;
+        switch (http_code) {
+        case 404: why = "HTTP 404：这个路径在币安上不存在 —— 是【我们的】端点"
+                        "写错了，属于代码缺陷，请把这条日志发给开发侧"; break;
+        case 401: case 403:
+                  why = "HTTP " + std::to_string(http_code) +
+                        "：被币安拒绝 —— 出口 IP 地域受限，或 API Key 没有合约权限"; break;
+        case 451: why = "HTTP 451：按地域拦截了这个出口 IP，换节点"; break;
+        case 429: case 418:
+                  why = "HTTP " + std::to_string(http_code) + "：被限流，等一等会自己好"; break;
+        case 0:   why = "连接层就没拿到响应（超时/TLS 失败），不是币安拒的"; break;
+        case 200: why = "HTTP 200 却是网页 —— 200 的 HTML 不可能出自币安 API，"
+                        "应答来自中间件。查代理分流"; break;
+        default:  why = "HTTP " + std::to_string(http_code); break;
+        }
+        out.error = "响应不是合法 JSON（" + why + "，端点 " + path + "）: " + body;
         return out;   // 保持可重试：Cloudflare 的 502/503 也是 HTML，那种能重试过去
     }
 

@@ -332,8 +332,13 @@ int main() {
         });
         auto r = tc.place_disaster_stop("BTCUSDT", 60000.0, "BUY", 0.015);
 
-        check(seen_path.find("/fapi/v1/algoOrder") != std::string::npos,
-              "① 端点必须是 /fapi/v1/algoOrder（老的 /fapi/v1/order 会回 -4120）");
+        // ⚠ 两边路径不对称，别照着一边推另一边：
+        //   普通合约 /fapi/v1/algoOrder（驼峰、无斜杠）
+        //   统一账户 /papi/v1/um/algo/order（有斜杠）
+        //   我按对称猜错过一次，实测回 HTTP 404
+        check(seen_path == "/fapi/v1/algoOrder",
+              "① 普通合约的端点必须【正好】是 /fapi/v1/algoOrder"
+              "（老的 /fapi/v1/order 会回 -4120）");
         check(seen_params.find("algoType=CONDITIONAL") != std::string::npos,
               "② algoType=CONDITIONAL 是必填项，漏了整条请求非法");
         check(seen_params.find("triggerPrice=60000") != std::string::npos,
@@ -403,6 +408,13 @@ int main() {
               "HTML 响应仍可重试（Cloudflare 的 502/503 也是 HTML）");
         check(c.error.find("502") != std::string::npos, "  错误里要带上 HTTP 状态码");
         check(c.error.find("algoOrder") != std::string::npos, "  以及实际用的端点");
+        // ⚠ 404 必须明说是【我们的】端点写错了。实测救了一次：统一账户的路径
+        //   是 /papi/v1/um/algo/order（有斜杠），我按普通合约那边的驼峰猜成
+        //   /papi/v1/um/algoOrder，回了 404。没有这句解释就会被当成又一次网络问题
+        auto e = probe("<!DOCTYPE html><html><body>not found</body></html>", 404);
+        check(e.error.find("404") != std::string::npos, "404 要带上状态码");
+        check(e.error.find("代码缺陷") != std::string::npos,
+              "  并明说是我们的端点写错了，别让人再去查网络");
         check(c.error.find('\n') == std::string::npos,
               "  且压平换行：HTML 原样打出来会把一条日志撑成几十行");
         auto d = probe("", 0);
