@@ -2,6 +2,7 @@
 // 用法：ccbot_headless [配置文件路径，默认 config.json]
 #include "version.h"
 #include "core/trend_engine.h"
+#include "core/app_logic.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
@@ -128,7 +129,7 @@ int main(int argc, char** argv) {
     // 顺带让版本串真正进到二进制里——发布流水线的泄漏检查靠它核对
     // "包里的可执行文件是不是这个 tag 编出来的"
     log_line(std::string("ccbot headless ") + ccbot::kVersion + " 启动，配置文件: "
-             + config_path + "，趋势SAR " + std::to_string(cfg.sar_bots.size()) + " 个品种");
+             + config_path + "，趋势策略 " + std::to_string(cfg.trend_bots.size()) + " 个品种");
 
     TradingClient::Config tc_cfg;
     tc_cfg.api_key    = cfg.api_key;
@@ -185,13 +186,13 @@ int main(int argc, char** argv) {
         if (f) f << "time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers\n";
     }
 
-    // ── 趋势 SAR 引擎（本版起是唯一的策略）──────────────────────────────────
+    // ── 趋势引擎（海龟 / 抛物线SAR / 纯裸K，本版起是唯一的引擎）──────────────
     std::shared_ptr<TrendEngine> trend_engine;
     std::vector<std::string> trend_ids;
     // 状态文件仍带 .sar 后缀：老部署升级上来时这个文件已经存在，改名等于
     // 把在跑的仓位状态丢掉
     const std::string trend_state_path = cfg.state_path + ".sar";
-    if (!cfg.sar_bots.empty()) {
+    if (!cfg.trend_bots.empty()) {
         trend_engine = std::make_shared<TrendEngine>(client, pool);
         // 账户级闸门。v4.7.1 之前这两个配置项挂在 DCA 引擎上，DCA 移除后若不接到
         // 这里，它们就会【静默失效】——配置文件照样写着上限，进程照样启动，
@@ -201,7 +202,7 @@ int main(int argc, char** argv) {
         trend_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
         trend_engine->set_trade_cb([&](const TrendTrade& tr) {
             std::ostringstream ss;
-            ss << "[SAR] " << tr.symbol << " " << tr.reason
+            ss << "[趋势] " << tr.symbol << " " << tr.reason
                << " 开=$" << tr.entry_price << " 平=$" << tr.exit_price
                << " P&L=" << tr.pnl << "U" << (tr.reversed ? "（已反手）" : "");
             log_line(ss.str(), tr.pnl >= 0 ? "OK" : "WARN");
@@ -217,18 +218,18 @@ int main(int argc, char** argv) {
         // 先恢复落盘状态，再把配置里新增、落盘没有的品种全新起步。
         // 顺序不能反：反了的话 add_bot 会先占住品种名，restore_bot 被拒，
         // 引擎以为自己空仓而交易所上的仓位还在
-        auto trend_saved = load_trend_state(trend_state_path, cfg.sar_bots);
+        auto trend_saved = load_trend_state(trend_state_path, cfg.trend_bots);
         std::set<std::string> trend_restored;
         for (auto& b : trend_saved) {
             auto id = trend_engine->restore_bot(b);
             if (!id.empty()) { trend_ids.push_back(id); trend_restored.insert(b.cfg.symbol); }
         }
-        for (const auto& c : cfg.sar_bots) {
+        for (const auto& c : cfg.trend_bots) {
             if (trend_restored.count(c.symbol)) continue;
             auto id = trend_engine->add_bot(c);
             if (!id.empty()) trend_ids.push_back(id);
         }
-        log_line("SAR 引擎已启动，" + std::to_string(trend_ids.size()) + " 个品种（其中 " +
+        log_line("趋势引擎已启动，" + std::to_string(trend_ids.size()) + " 个品种（其中 " +
                  std::to_string(trend_restored.size()) + " 个从落盘恢复）");
 
         // 启动对账：本地落盘的仓位 vs 交易所实际持仓。
@@ -237,27 +238,28 @@ int main(int argc, char** argv) {
         {
             bool pos_ok = false;
             auto ex_pos = client->fetch_positions(&pos_ok);
-            if (pos_ok) {
+            // 判定规则在 app::reconcile_gate（有测试），GUI 用的是同一个。
+            // 现拉的快照年龄≈0；引擎内部还会再加一段宽限吸收交易所侧的传播延迟
+            const int64_t snap_ms = RestPriceFeed::now_ms();
+            const auto gate = app::reconcile_gate(pos_ok, snap_ms, RestPriceFeed::now_ms());
+            if (gate.ok()) {
                 std::vector<TrendEngine::ExchangePos> ex;
                 ex.reserve(ex_pos.size());
                 for (const auto& p : ex_pos)
                     ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                // 现拉的快照，年龄≈0；引擎内部还会再加一段宽限吸收
-                // 交易所侧的传播延迟（订单回执已拿到、持仓接口还没反映出来）
-                auto issues = trend_engine->reconcile_positions(
-                    ex, std::chrono::milliseconds(0));
+                auto issues = trend_engine->reconcile_positions(ex, gate.age);
                 if (!issues.empty()) {
-                    for (const auto& i : issues) log_line("⚠ SAR对账: " + i, "WARN");
+                    for (const auto& i : issues) log_line("⚠ 对账: " + i, "WARN");
                     save_trend_state(trend_state_path, trend_engine->get_bots());
                     if (!cfg.alert_webhook.empty()) {
-                        std::string msg = "[ccbot] SAR 启动对账发现 " +
+                        std::string msg = "[ccbot] 启动对账发现 " +
                                           std::to_string(issues.size()) + " 处不一致:";
                         for (const auto& i : issues) msg += "\n" + i;
                         send_webhook(cfg.alert_webhook, msg);
                     }
                 }
             } else {
-                log_line("⚠ SAR 启动对账跳过：拉取交易所持仓失败。"
+                log_line("⚠ 启动对账跳过：拉取交易所持仓失败。"
                          "本地跟踪可能与交易所不一致，请留意", "WARN");
             }
         }
@@ -285,7 +287,7 @@ int main(int argc, char** argv) {
     ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
     ticker.start();
     std::set<std::string> symbols;
-    for (const auto& c : cfg.sar_bots) symbols.insert(c.symbol);
+    for (const auto& c : cfg.trend_bots) symbols.insert(c.symbol);
     for (const auto& s : symbols) ticker.subscribe(s);
 
     log_line("主循环启动，Ctrl+C 退出");
@@ -440,7 +442,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ── 1c) SAR 信号拉取（ATR + 唐奇安通道）──────────────────────────────
+        // ── 1c) 趋势信号拉取（ATR + 唐奇安通道 / K线快照）────────────────────
         // 每 20 个 tick（约 60 秒）一轮。信号周期通常是 4h，用不着更密；
         // 而止损线的推进【不靠这个】——它在每个 tick 用实时价推，只有 ATR 的
         // 数值来自这里。所以这一批慢一点不影响保护
@@ -663,14 +665,15 @@ int main(int argc, char** argv) {
                 bool pos_ok = false;
                 auto ex_pos = client->fetch_positions(&pos_ok);
                 // 拉取失败绝不对账：空的持仓列表既可能是"确实没仓"也可能是请求
-                // 失败，把后者当成前者会凭空清掉真实持仓
-                if (pos_ok && trend_engine) {
+                // 失败，把后者当成前者会凭空清掉真实持仓。规则在 app::reconcile_gate
+                const int64_t snap_ms = RestPriceFeed::now_ms();
+                const auto gate = app::reconcile_gate(pos_ok, snap_ms, RestPriceFeed::now_ms());
+                if (gate.ok() && trend_engine) {
                     std::vector<TrendEngine::ExchangePos> sex;
                     sex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    auto sissues = trend_engine->reconcile_positions(
-                        sex, std::chrono::milliseconds(0));
+                    auto sissues = trend_engine->reconcile_positions(sex, gate.age);
                     if (!sissues.empty()) {
                         for (const auto& i : sissues)
                             log_line("⚠ 对账: " + i, "WARN");

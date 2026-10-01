@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 5.9.8 LANGUAGES CXX)
+project(TradingBot VERSION 5.9.9 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,7 +29,7 @@ option(CCBOT_WERROR "把编译警告当作错误（CI 门禁用）" OFF)
 # CCBOT_SANITIZE=address / thread / undefined / address+undefined（分号或加号分隔）
 #
 # 为什么这是本项目最该补的一项验证：trend_engine.cpp 有 27 处 mutex/atomic、
-# book_ticker_stream.cpp 还多一个看门狗线程，而并发缺陷是所有缺陷里唯一会
+# rest_price_feed.cpp 还多一个轮询线程，而并发缺陷是所有缺陷里唯一会
 # "看起来一切正常，直到某天对不上账"的一类——单元测试全绿也证明不了它不存在。
 # TSan 能证明。
 #
@@ -86,7 +86,9 @@ function(ccbot_harden tgt)
     endif()
 endfunction()
 
-find_package(ixwebsocket CONFIG REQUIRED)
+# ixwebsocket 已于 v5.9.9 移除：它只服务 book_ticker_stream（WebSocket 行情），
+# 而那个文件自 v5.7.0 起就不在生产路径上（见 CORE_SOURCES 那段）。
+# HMAC 签名用的 mbedtls 是下面独立 find 的，不经过它
 find_package(simdjson CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 find_package(MbedTLS CONFIG REQUIRED)
@@ -101,14 +103,19 @@ set(CORE_SOURCES
     # 行情源：REST 轮询。v5.7.0 起替代 book_ticker_stream（WebSocket）。
     # 理由见 rest_price_feed.h 的头注释：WS 有"连上了却没有数据"这个失败模式，
     # 识别它要背六种机制，而轮询没有"连接"这个中间状态，压根不存在那个问题。
-    # book_ticker_stream.cpp 仍然留在仓库里并继续参与 ccg_price_tests——
-    # 它那套纯函数判定（陈旧/静默/分片）是花了代价换来的知识，删掉等于白扔；
-    # 将来网络条件允许时它可以作为可选的低延迟来源回到主路径
+    #
+    # book_ticker_stream.{cpp,h} 与它的测试 test_price_feed.cpp 已于 v5.9.9 删除
+    # （共约 2030 行）。v5.7.0~v5.9.8 期间它留在仓库里"作为将来的低延迟来源"，
+    # 但那段时间它的代价是每轮都在付的：
+    #   · ixwebsocket 这个依赖只为它而存在
+    #   · 它的 128 条断言让全仓断言总数虚高约 16%（测的是不在跑的代码）
+    #   · 每轮 CI 都要编译、链接、运行它
+    # 那套陈旧/静默/分片判定的知识没有丢：它在 git 历史与 v5.9.8 及之前的
+    # 每个 tag 里都完整可取。真要重新接 WS，从那里拿比留着它腐烂便宜
     src/net/rest_price_feed.cpp
     src/net/alert.cpp
 )
 set(CORE_LIBS
-    ixwebsocket::ixwebsocket
     simdjson::simdjson
     CURL::libcurl
     MbedTLS::mbedcrypto
@@ -323,20 +330,10 @@ if(MSVC)
     target_compile_options(ccg_timesync_tests PRIVATE /utf-8)
 endif()
 
-# ── 价格源测试：报文解析 + 陈旧保护（WS 半开时的冻结价是最凶险的故障）──────────
-add_executable(ccg_price_tests tests/test_price_feed.cpp src/net/book_ticker_stream.cpp)
-target_include_directories(ccg_price_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(ccg_price_tests PRIVATE ixwebsocket::ixwebsocket simdjson::simdjson
-                                              Threads::Threads)
-if(WIN32)
-    # bcrypt：ixwebsocket 的 TLS 后端（mbedtls）要 BCryptGenRandom。
-    # 主程序通过别的目标间接带进来了，这个独立小目标必须自己声明
-    target_link_libraries(ccg_price_tests PRIVATE crypt32 bcrypt ws2_32 wsock32)
-    target_compile_definitions(ccg_price_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-endif()
-if(MSVC)
-    target_compile_options(ccg_price_tests PRIVATE /utf-8)
-endif()
+# ccg_price_tests（book_ticker_stream 的测试）已于 v5.9.9 随被测对象一并删除。
+# 它的 128 条断言测的是自 v5.7.0 起就不在生产路径上的代码 —— 留着它，
+# 全仓断言总数就一直虚高约 16%。v5.9.3 揪出过"陈旧 exe 让统计虚高 135 条"，
+# 那是同一种病的另一种形态：那次是产物陈旧，这次是被测对象已经下线
 
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
@@ -346,6 +343,16 @@ target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)
     target_compile_options(ccg_config_tests PRIVATE /utf-8)
+endif()
+
+# ── 应用层判定测试：GUI 与 headless 共用的那几条规则（src/core/app_logic.h）────
+# GUI 层 3887 行没有一行自动化测试 —— 逻辑写在 Qt 回调里，不开窗口调不到。
+# 把最危险的几条判定（对账闸门、配置迁移、品种名规范化）抽成纯函数，两边都调用它，
+# 就能在这里不开窗口地测。纯头文件、不起线程 ⇒ 只进 ASan 列表，不进 TSan 列表
+add_executable(ccg_app_logic_tests tests/test_app_logic.cpp)
+target_include_directories(ccg_app_logic_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(ccg_app_logic_tests PRIVATE /utf-8)
 endif()
 
 # ccg_persist_tests 随网格DCA 一并移除（本版）：它测的是 headless_state 的
@@ -375,8 +382,8 @@ set(CCBOT_OWN_TARGETS
     ccbot_headless
     ccg_indicator_tests ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests
     ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
-    ccg_rate_tests ccg_timesync_tests ccg_price_tests ccg_config_tests
-    ccg_key_store_tests ccg_rest_feed_tests
+    ccg_rate_tests ccg_timesync_tests ccg_config_tests
+    ccg_key_store_tests ccg_rest_feed_tests ccg_app_logic_tests
 )
 if(WIN32 OR APPLE)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)

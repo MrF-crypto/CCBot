@@ -75,15 +75,14 @@ public:
     // 周期对账靠它区分两者：把失败当成"没有持仓"会凭空清掉真实仓位
     std::vector<Position>  fetch_positions(bool* ok = nullptr);
 
-    // ⚠ 真正发单的是 place_market_once；place_market 在它外面多包了一层
-    //   「-4061 ⇒ 重新探测持仓模式并重发一次」。见 .cpp 里那段注释
+    // ⚠ 真正发单的是 place_market_once（private）；本函数在它外面多包了一层
+    //   「-4061 ⇒ 重新探测持仓模式并重发一次」。见 .cpp 里那段注释。
+    //   裸版本【刻意不公开】：公开出去等于留了一条绕过那层自愈的路
     OrderResult place_market(const std::string& symbol, const std::string& side,
                               double qty, bool reduce_only = false);
-    OrderResult place_market_once(const std::string& symbol, const std::string& side,
-                              double qty, bool reduce_only);
     // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
     OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
-    bool close_all_positions();
+    // close_all_positions 删于 v5.9.9：零调用者，且内含 fetch_positions() 不判 ok
 
     // set_leverage / round_qty 见下方 ITradingClient 实现区（override 声明）
 
@@ -119,10 +118,7 @@ public:
                                  int donchian_period, int atr_period);
 
     // 单独的 ATR 拉取（DCA 的 ATR 移动止损用）。公开接口，不占签名限流。
-    // 与 fetch_trend_signal 分开是因为这里【不需要唐奇安通道】——
-    // DCA 的入场由自己那套闸门决定，ATR 只用来定止损距离。
-    // 返回 0 = 数据不足或请求失败，调用方据此判定"不武装"
-    double fetch_atr(const std::string& symbol, const std::string& interval, int period);
+    // fetch_atr 删于 v5.9.9：零调用者，它只服务已移除的网格 DCA
 
     // ── K线快照（③ 纯裸K 与 ② 抛物线SAR 用）────────────────────────────────
     // 当前根开盘价、刚收盘那根的收盘价、前两根的高低点，以及它【之前】N 根的
@@ -150,8 +146,7 @@ public:
     BarSnapshot fetch_bar_pattern(const std::string& symbol,
                                   const std::string& interval, int swing_bars);
 
-    // 拉取标记价格（公开接口，CCG 价格轮询用）
-    double fetch_mark_price(const std::string& symbol);
+    // fetch_mark_price 删于 v5.9.9：零调用者，行情改走下面的全市场批量端点
     // 全市场标记价，一次取回。/fapi/v1/premiumIndex 不带 symbol 时返回整个数组。
     //
     // ⚠ 权重账：逐品种是 N 次往返 × 权重 1，全取是 1 次往返 × 权重 10。
@@ -272,9 +267,8 @@ public:
     double round_price(const std::string& symbol, double price);
 
     // ── UserData Stream ─────────────────────────────────────────────────────
-    std::string create_listen_key();
-    bool        keepalive_listen_key(const std::string& key);
-    void        delete_listen_key(const std::string& key);
+    // create/keepalive/delete_listen_key 删于 v5.9.9：从未被接上，三个都是零调用者，
+    // 而它们是 http_*_unsigned 三件套的唯一使用者（那三个也一并删了）
 
     // 拉取 Binance 服务器时间，计算本机与服务器的时钟偏移（一次即可）
     // ── 与交易所对时 ──────────────────────────────────────────────────────────
@@ -347,7 +341,6 @@ public:
     struct RateStatus { int used_weight, limit, throttled, rejected; bool banned; int64_t ban_left_ms; };
     RateStatus rate_status() const;
 
-    bool is_testnet()   const { return cfg_.testnet; }
     bool is_pm()        const { return cfg_.account_mode == AccountMode::PortfolioMargin; }
     bool is_dual_mode() const override { return dual_mode_; }
 
@@ -372,11 +365,17 @@ public:
                                const std::string& order_id, bool* ok) override;
 
 private:
-    // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换（listenKey 就没有
-    // um 前缀），所以用枚举查表，不做字符串拼接，免得漏改一处就打到错误的账户上。
+    // 不带 -4061 自愈包装的裸下单。只给 place_market 用 —— 见它那段注释：
+    // 持仓模式在运行期被改掉时，-4061 要靠重新探测 + 重发一次来自愈，
+    // 绕过这一层会退回到"每笔单都被拒到重启为止"
+    OrderResult place_market_once(const std::string& symbol, const std::string& side,
+                                  double qty, bool reduce_only);
+
+    // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换，
+    // 所以用枚举查表，不做字符串拼接，免得漏改一处就打到错误的账户上。
     enum class Ep {
         Account, PositionRisk, Order,
-        PositionSideDual, Leverage, ListenKey,
+        PositionSideDual, Leverage,
         PmAccount,     // 统一账户专属：/papi/v1/account（全账户视角，uniMMR 在这里）
         CondOrder,     // 统一账户专属：条件单（STOP_MARKET / TAKE_PROFIT_MARKET）
         // ⚠ 条件单的【正确】端点。币安 2025-11-06 公告、2025-12-09 强制生效：
@@ -475,9 +474,6 @@ private:
                           long* out_code = nullptr);
     std::string http_del (const std::string& path, std::string params = "");
     // 不带签名（listenKey 端点只需 X-MBX-APIKEY header）
-    std::string http_post_unsigned(const std::string& path, const std::string& body = "");
-    void        http_put_unsigned (const std::string& path, const std::string& body = "");
-    void        http_del_unsigned (const std::string& path, const std::string& body = "");
     std::string http_get_public  (const std::string& path);
 };
 

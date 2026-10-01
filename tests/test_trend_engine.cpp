@@ -1314,9 +1314,13 @@ int main() {
               "  重试无意义的错误 → 立即兜底平仓，不白等二十多秒");
     }
 
-    // ── 熔断：连续 2 次因挂不上而平仓 → 停掉这个 bot ────────────────────────
+    // ── 熔断：连续 2 次因挂不上而平仓 → 暂停该品种开仓（递增退避）────────────
     // 没有熔断的话，持续性故障会变成 开仓→挂不上→平仓→等信号→开仓→… 的循环，
-    // 每轮付两次手续费，而单边行情里信号可能每根K线都来
+    // 每轮付两次手续费，而单边行情里信号可能每根K线都来。
+    //
+    // v5.9.9 之前这里是【永久停止】bot。那会让持续性故障下所有 bot 先后停光，
+    // 账户级的半开试探就没有 Running 的 bot 可试 —— 熔断还是解不开，
+    // 还得人去一个个点"继续"。改成暂停 10 分钟、每次翻倍、封顶 4 小时
     {
         auto cli = std::make_shared<FakeClient>();
         TrendEngine eng(cli, inline_host());
@@ -1339,9 +1343,46 @@ int main() {
         eng.tick("TESTUSDT", 115.0);
         const auto b = eng.get_bots()[0];
         check(b.ds_fail_closes == 2, "第 2 轮计数 = 2");
-        check(b.state == TrendBot::State::Stopped,
-              "  连续 2 次 → 判定为系统性故障，停掉 bot，不再开新仓");
+        check(b.state == TrendBot::State::Running,
+              "  ⚠ 不再永久停止：bot 保持 Running，否则全停之后熔断永远解不开");
+        check(b.ds_pause_until.time_since_epoch().count() != 0, "  而是进入暂停");
         check(b.st.pos == trend::Pos::Flat, "  且仓位是平的");
+
+        // 暂停期内：有信号也不开
+        size_t before = cli->calls.size();
+        feed(eng, id, 2.0, 110, 90, 3);
+        advance(300);                      // 5 分钟 < 10 分钟
+        eng.tick("TESTUSDT", 116.0);
+        check(cli->calls.size() == before, "暂停期内（第 1 次跳闸 = 10 分钟）不得开仓");
+        check(eng.get_bots()[0].last_decision.find("自动试探") != std::string::npos,
+              "  拦截原因里要写明会自动试探，而不是让人以为它坏了");
+
+        // 暂停到期：放行试探；又失败 ⇒ 第 2 次跳闸，暂停翻倍成 20 分钟
+        before = cli->calls.size();
+        feed(eng, id, 2.0, 110, 90, 4);
+        advance(301);                      // 累计 > 10 分钟
+        eng.tick("TESTUSDT", 117.0);
+        check(cli->calls.size() > before, "暂停到期后放行一笔试探");
+        check(eng.get_bots()[0].ds_fail_closes == 3, "  又挂不上 ⇒ 计数 3");
+
+        before = cli->calls.size();
+        feed(eng, id, 2.0, 110, 90, 5);
+        advance(900);                      // 15 分钟：超过 10，但不到翻倍后的 20
+        eng.tick("TESTUSDT", 118.0);
+        check(cli->calls.size() == before,
+              "  ⚠ 第 2 次跳闸暂停要翻倍（20 分钟）—— 15 分钟时仍须拦住，"
+              "否则一个坏品种会每 10 分钟白付一笔来回手续费");
+
+        // 故障恢复 + 到期 ⇒ 试探成功 ⇒ 计数与暂停一并清零
+        cli->ds_place_fails = false;
+        before = cli->calls.size();
+        feed(eng, id, 2.0, 110, 90, 6);
+        advance(301);                      // 累计 > 20 分钟
+        eng.tick("TESTUSDT", 119.0);
+        check(cli->calls.size() > before, "故障恢复后到期试探得以成行");
+        const auto b2 = eng.get_bots()[0];
+        check(b2.ds_fail_closes == 0, "  挂单成功 ⇒ 熔断计数清零");
+        check(b2.ds_pause_until.time_since_epoch().count() == 0, "  暂停一并解除");
     }
 
     // ── 兜底平仓后不得在【同一根K线】里重开 ─────────────────────────────────
@@ -1433,6 +1474,98 @@ int main() {
         check(cli->calls.size() > before, "  但【出场】照常发单，绝不能被闸门拦住");
         check(cli->last_call().reduce_only, "  且是 reduceOnly 平仓单");
         check(bot_of(eng, "CCCUSDT").st.pos == trend::Pos::Flat, "  C 已正常止损出场");
+    }
+
+    // ── 账户级熔断必须【自己打开】：v5.9.8 之前这是个死锁 ────────────────────
+    //
+    // 旧实现的唯一解除点在 try_place_hard_stop 的成功分支，而那个函数开头就要求
+    // 【已有持仓且还没挂上】；可熔断封掉了所有开仓，拿不到新仓位 ⇒ 永远进不去
+    // 那个函数 ⇒ 标志永远不解除。两次兜底平仓之后仓位都已被平掉，于是整套程序
+    // 静默停止交易，唯一出路是重启进程（标志不落盘，且这一点没写在任何地方）。
+    //
+    // 注释写的意图是对的（"故障往往是网络抖动，恢复之后没人会记得回来按一下"），
+    // 只是实现达不到它。改成半开熔断：冷却后放行一笔试探。
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto ca = mk_cfg("AAAUSDT");
+        ca.use_disaster_stop = true; ca.rule.reverse = trend::ReverseMode::None;
+        auto cb = mk_cfg("BBBUSDT");
+        cb.use_disaster_stop = true; cb.rule.reverse = trend::ReverseMode::None;
+        auto ia = eng.add_bot(ca);
+        auto ib = eng.add_bot(cb);
+        cli->fill_price = 110.0;
+        cli->ds_place_fails    = true;
+        cli->ds_fail_retryable = false;   // 直接放弃，不跑重试阶梯
+
+        feed(eng, ia, 2.0, 110, 90);
+        eng.tick("AAAUSDT", 110.0);       // 累计 1
+        feed(eng, ib, 2.0, 110, 90);
+        eng.tick("BBBUSDT", 110.0);       // 累计 2 ⇒ 账户级熔断
+        check(bot_of(eng, "AAAUSDT").st.pos == trend::Pos::Flat &&
+              bot_of(eng, "BBBUSDT").st.pos == trend::Pos::Flat,
+              "两个 bot 都已兜底平仓、全场空仓（死锁的前提成立）");
+
+        // 冷却期内：拦住，而且要告诉人还要等多久
+        size_t before = cli->calls.size();
+        feed(eng, ia, 2.0, 110, 90, 2);
+        advance(60);
+        eng.tick("AAAUSDT", 115.0);
+        check(cli->calls.size() == before, "冷却期内不得开新仓");
+        check(bot_of(eng, "AAAUSDT").last_decision.find("后自动放行") != std::string::npos,
+              "  拦截原因里要写明【多久之后会自动放行】，而不是只说「暂停开新仓」");
+
+        // 冷却过后：必须放行一笔去试探 —— 这是熔断唯一能自己打开的机会
+        before = cli->calls.size();
+        feed(eng, ia, 2.0, 110, 90, 3);
+        advance(601);                     // > kDsBreakProbeAfter(10 分钟)
+        eng.tick("AAAUSDT", 115.0);
+        check(cli->calls.size() > before,
+              "⚠ 冷却过后必须放行一笔试探 —— 否则全场空仓时熔断永远解除不了");
+
+        // 这一笔试探失败后，A 自己累计到 2 次兜底平仓 ⇒ 撞上 per-bot 熔断。
+        // v5.9.9 之前那会把 A【永久停止】，于是持续性故障下所有 bot 先后停光、
+        // 账户级半开试探无 bot 可试 —— 熔断照样解不开。现在是暂停，不是停止
+        check(bot_of(eng, "AAAUSDT").state == TrendBot::State::Running,
+              "  ⚠ A 撞上 per-bot 熔断后仍是 Running（暂停而非停止）—— "
+              "否则持续性故障下 bot 全部停光，熔断无 bot 可试");
+        check(bot_of(eng, "AAAUSDT").ds_pause_until.time_since_epoch().count() != 0,
+              "  而是带着暂停截止时刻");
+
+        // 试探又失败 ⇒ 重新跳闸并【重置冷却】，不能时间一到就无限制地连试。
+        // 换 B 来验（A 正在 per-bot 暂停里，它本来就不会开）
+        before = cli->calls.size();
+        feed(eng, ib, 2.0, 110, 90, 4);
+        advance(60);
+        eng.tick("BBBUSDT", 116.0);
+        check(cli->calls.size() == before,
+              "  试探失败后要重新跳闸、重新冷却，不得连续试探");
+
+        // 故障恢复 + 冷却过 ⇒ 试探成功 ⇒ 完全复位
+        cli->ds_place_fails = false;
+        before = cli->calls.size();
+        feed(eng, ib, 2.0, 110, 90, 5);
+        advance(601);
+        eng.tick("BBBUSDT", 117.0);
+        check(cli->calls.size() > before, "故障恢复后试探得以成行");
+        check(bot_of(eng, "BBBUSDT").qty > 0, "  并且仓位开出来了");
+        check(cli->ds_count("place") >= 1, "  硬止损挂上了");
+        // 账户级熔断被一次成功解除 = 系统性故障已过去。被同一个故障暂停的 A
+        // 不该还各自等满它那 10~240 分钟
+        check(bot_of(eng, "AAAUSDT").ds_pause_until.time_since_epoch().count() == 0,
+              "  ⚠ 系统性故障恢复后，被它暂停的其它 bot 一并放回，不必各等满暂停期");
+
+        // 复位之后，另一个【没被 per-bot 熔断停掉】的 bot 立即恢复，
+        // 不必再等一个冷却周期
+        auto cc2 = mk_cfg("CCCUSDT");
+        cc2.use_disaster_stop = true; cc2.rule.reverse = trend::ReverseMode::None;
+        auto ic2 = eng.add_bot(cc2);
+        before = cli->calls.size();
+        feed(eng, ic2, 2.0, 110, 90, 6);
+        advance(5);
+        eng.tick("CCCUSDT", 110.0);
+        check(cli->calls.size() > before,
+              "  熔断已完全解除，其它 bot 立即恢复（不必再等一个冷却周期）");
     }
 
     // ── 保护单核对：交易所上那张单没了要能发现并重挂 ─────────────────────────

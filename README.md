@@ -197,7 +197,7 @@ xattr -dr com.apple.quarantine .
 
 ### Windows（GUI）
 
-依赖通过 [vcpkg](https://github.com/microsoft/vcpkg) manifest 模式自动安装（见 `vcpkg.json`）：CMake ≥ 3.20、Visual Studio（MSVC，C++20）、Qt6 Widgets、ixwebsocket / simdjson / curl / mbedtls。
+依赖通过 [vcpkg](https://github.com/microsoft/vcpkg) manifest 模式自动安装（见 `vcpkg.json`）：CMake ≥ 3.20、Visual Studio（MSVC，C++20）、Qt6 Widgets、simdjson / curl / mbedtls。
 
 ```powershell
 git clone https://github.com/MrF-crypto/CCBot.git
@@ -257,16 +257,21 @@ data/
 
 ## 测试
 
-14 套单元测试、888 条断言，覆盖引擎、网络、持久化、并发：
+14 套单元测试，约 870 条断言（其中 `ccg_trend_tests` 与 `ccg_indicator_tests` 只打一行汇总，
+它们的断言数按源码计），覆盖引擎、网络、持久化、并发，以及 GUI 与 headless 共用的应用层判定。
+全部测的是**生产路径上在跑的代码** —— v5.9.9 之前还有一套 128 条断言测的是已下线的
+WebSocket 行情，它让总数虚高了约 16%，已随被测代码一并删除。
+
+⚠ GUI 本身（`main_window.cpp` / `trend_panel.cpp`）仍然没有直接的自动化测试。其中最危险的
+几条判定已抽到 `src/core/app_logic.h` 由 `ccg_app_logic_tests` 覆盖，其余仍靠实盘日志把关。
 
 ```powershell
 cmake --build build --config Release
 for %t in (ccg_indicator_tests ccg_key_store_tests ccg_funding_tests ^
            ccg_rate_tests ccg_order_tests ccg_config_tests ^
-           ccg_price_tests ccg_timesync_tests ccg_pool_tests ^
-           ccg_atr_trail_tests ccg_risk_tests ccg_persist_tests ^
+           ccg_timesync_tests ccg_pool_tests ccg_rest_feed_tests ^
            ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests ^
-           ccg_trend_stress_tests) do ^
+           ccg_trend_stress_tests ccg_app_logic_tests) do ^
     build\Release\%t.exe
 ```
 
@@ -274,7 +279,8 @@ for %t in (ccg_indicator_tests ccg_key_store_tests ccg_funding_tests ^
 
 | 测试 | 守住什么 |
 |---|---|
-| `ccg_price_tests` | WebSocket 半开时冻结价不得流入引擎；两条流互不覆盖；REST 兜底要写回缓存 |
+| `ccg_rest_feed_tests` | 行情轮询：连续失败转「不健康」、切兜底通路时如实报出计价基准变了、陈旧价不得流入引擎 |
+| `ccg_app_logic_tests` | GUI 与 headless 共用的应用层判定：老配置的迁移不得静默改变语义；对账在拉取失败或快照过旧时必须跳过，不得清掉真实持仓 |
 | `ccg_order_tests` | 超时恢复 / 部分成交 / 零成交 / -1111 重试 |
 | `ccg_trend_stress_tests` | **并发状态撕裂**（真线程池，三个策略同时在跑，多线程同时 tick / 喂信号 / 读快照 / 对账 / 停开，交易所返回随机化）；闪崩、天地针、非法价格、ATR 缺失、连环反手。判据是**不变量**——`pos==Flat` 与 `qty==0` 必须同真同假，撕裂了就是"引擎以为空仓而交易所有仓"，下一个信号会再开一笔让净敞口翻倍 |
 | `ccg_timesync_tests` | 往返过长的测量必须丢弃；时间戳锚定单调钟 |

@@ -23,11 +23,12 @@ struct HeadlessConfig {
     std::string log_path;                // 空=只输出到 stdout，不落盘
     // 趋势策略（海龟 / 抛物线SAR / 纯裸K 三选一，见 TrendConfig::strategy）。
     //
-    // ⚠ 成员名与 JSON 键都保留 "sar_bots"，【故意不改】。引擎已经从 SarEngine
-    //   改名成 TrendEngine，但这个键是【对外契约】——改了名，所有在跑的部署
-    //   升级上来之后配置就失效了，而且是"进程正常启动、一个品种都不跑"的
-    //   静默失效。同理落盘路径仍是 <state_path>.sar
-    std::vector<TrendConfig> sar_bots;
+    // JSON 键 v5.9.9 起是 "trend_bots"；旧键 "sar_bots" 继续有效（会提示一句），
+    // 两个同时出现则报错。旧键是【对外契约】——直接改名会让在跑的部署升级后
+    // "进程正常启动、一个品种都不跑"，所以只加新键、不废旧键。
+    // ⚠ 落盘路径仍是 <state_path>.sar，【故意不改】：改了名，升级上来的部署
+    //   会读不到重启前的仓位状态，而那是比配置失效更危险的静默失效
+    std::vector<TrendConfig> trend_bots;
     std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 
 };

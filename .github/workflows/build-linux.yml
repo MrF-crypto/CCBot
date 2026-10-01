@@ -132,7 +132,8 @@ jobs:
                    ccg_funding_tests ccg_rate_tests ccg_order_tests \
                    ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests \
                    ccg_trend_stress_tests \
-                   ccg_config_tests ccg_price_tests ccg_timesync_tests ccg_pool_tests; do
+                   ccg_config_tests ccg_timesync_tests ccg_pool_tests \
+                   ccg_rest_feed_tests ccg_app_logic_tests; do
             echo "── $t ──"
             ./build/$t
           done

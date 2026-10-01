@@ -9,6 +9,7 @@
 //
 // 落盘文件名仍是 sar_bots.json（v4.x 留下的），改名会让升级的人丢掉全部配置。
 #include "gui/main_window.h"
+#include "core/app_logic.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -121,7 +122,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     //   空仓时显示"空仓"而不是"—"，好让这个差别在界面上看得出来
     auto* dir_it = mk(has_pos ? (is_long ? "多" : "空") : "空仓",
                       has_pos ? (is_long ? kGreen : kRed) : kGrey);
-    dir_it->setToolTip("趋势 SAR 没有方向配置：上破做多、下破做空由信号决定。\n"
+    dir_it->setToolTip("趋势策略没有方向配置：做多还是做空由信号决定。\n"
                        "这一格显示的是【当前持仓方向】，不是配置。");
     botTable_->setItem(row, ColDir, dir_it);
 
@@ -188,12 +189,16 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
         hs_tip = "未开启委托止损（配置里的 use_disaster_stop）。\n\n"
                  "⚠ 不开的话，守着这个仓位的就只有本地移动止损——\n"
                  "程序崩溃、断电、断网之后它一点都不剩，仓位完全裸奔。";
-    } else if (stopped && !has_pos && b.ds_fail_closes >= 2) {
-        // 熔断：连续两次因为挂不上而平仓，已经判定为系统性故障
+    } else if (!has_pos && b.ds_fail_closes >= 2) {
+        // 熔断：连续两次因为挂不上而平仓。v5.9.9 起不再停止 bot，而是递增退避地
+        // 暂停开仓（10、20、40 分钟…封顶 4 小时），到点自己试探。
+        // ⚠ 条件里去掉了 stopped：bot 现在保持 Running，留着那个条件这一格
+        //   永远不会显示"已熔断"
         hs_s = "已熔断"; hs_c = kRed;
-        hs_tip = QString("已连续 %1 次因挂不上委托止损而平仓，判定为系统性故障，"
-                         "该 bot 已停止。\n\n"
-                         "继续重试只会不断支付开平手续费。请检查：\n"
+        hs_tip = QString("已连续 %1 次因挂不上委托止损而兜底平仓，该品种暂停开新仓。\n"
+                         "到点会自动试探一笔：挂上就清零，还挂不上暂停时长翻倍"
+                         "（封顶 4 小时）。不需要人工点\"继续\"。\n\n"
+                         "持续出现请检查：\n"
                          "  · 账户是否有下条件单的权限\n"
                          "  · 该品种是否支持 closePosition\n"
                          "  · 止损触发价的精度与方向")
@@ -260,7 +265,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                       pnl_color(margin > 0 ? roe : 0));
     if (margin > 0)
         roe_it->setToolTip(QString("浮动盈亏 $%1 / 保证金 $%2（已按 %3x 杠杆放大）\n\n"
-                                   "趋势 SAR 没有固定止盈：收益全来自少数跑得很远的单子，\n"
+                                   "趋势策略没有固定止盈：收益全来自少数跑得很远的单子，\n"
                                    "所以这个数没有「该止盈了」的阈值，只看止损线跟到哪。")
                               .arg(upnl, 0, 'f', 2).arg(margin, 0, 'f', 2)
                               .arg(b.cfg.leverage));
@@ -365,7 +370,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                   "（裸K线模式不需要 ATR，所以 ATR 缺失不影响它）\n"
                 : "⚠ 尚未拉到 K 线：没有 ATR 就没有止损线，引擎不会开新仓。\n";
             tip += "刚添加的品种最多等一个信号周期；持续如此请看日志里的"
-                   "「SAR 信号拉取失败」告警";
+                   "「信号拉取失败」告警";
         } else if (b.atr_pct > 0) {
             tip += QString("%1 周期 ATR = %2%（跨品种可比口径）")
                        .arg(QString::fromStdString(b.cfg.interval))
@@ -442,7 +447,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
         connect(bc, &QPushButton::clicked, this, [this, id, sym]() {
             if (!trend_engine_) return;
             if (!confirmDanger("确认平仓",
-                               sym + " 将以市价立即平掉当前 SAR 仓位。", "平仓")) return;
+                               sym + " 将以市价立即平掉当前仓位。", "平仓")) return;
             trend_engine_->close_bot(id);
         });
         opl->addWidget(bc);
@@ -801,13 +806,13 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
     w->disStop = new QCheckBox("在交易所挂灾难止损单（强烈建议开启）");
     w->disStop->setChecked(c.use_disaster_stop);
     w->disStop->setToolTip(
-        "把棘轮止损线镜像成交易所上的一张 STOP_MARKET + closePosition 单。\n\n"
-        "为什么 SAR 比 DCA 更需要它：DCA 的保护是「名义 ≤ 权益 ⇒ 不可强平」，那是个\n"
-        "不依赖任何订单存在的数学不变量，进程死了仓位也扛得住；而趋势 SAR 的全部\n"
-        "保护就是那条活在【本进程里】的止损线。程序崩了、断电了、窗口被误关了，\n"
-        "这个仓位就是完全裸奔且没有任何底。\n\n"
-        "对 SAR 也不存在 DCA 那边「会把浮亏变实亏」的纠结——止损本来就是这套策略的\n"
-        "计划内动作，镜像到交易所只是让计划在进程死后仍然执行。");
+        "开仓成交时在交易所挂一张 STOP_MARKET + closePosition 单，价位在本地止损线\n"
+        "外侧一点（外扩缓冲）。此后【不随移动止损走】，直到仓位关闭才撤 —— 它的\n"
+        "职责是最大风险兜底，不是第二条移动止损。\n\n"
+        "为什么强烈建议开：趋势策略的全部保护就是那条活在【本进程里】的止损线。\n"
+        "程序崩了、断电了、断网了、窗口被误关了，没有这张单的仓位就完全裸奔、\n"
+        "没有任何底。\n\n"
+        "止损本来就是这套策略的计划内动作，挂在交易所只是让计划在进程死后仍然执行。");
     riskForm->addRow(w->disStop);
 
     w->disBuf = new QDoubleSpinBox();
@@ -1147,11 +1152,16 @@ void MainWindow::load_and_restore_trend() {
         // 迁移：v4.1.1 之前 SAR 的加品种框不补 USDT 后缀，存进来的可能是 "BTC"。
         // 这种条目永远拉不到 K 线、永远"等信号"。补全并明确告知，
         // 否则用户升级后还得自己找出来删掉重加
-        if (!sym.endsWith("USDT")) {
-            const QString fixed = sym + "USDT";
-            log(QString("趋势品种 %1 缺少 USDT 后缀，已自动更正为 %2"
-                        "（币安合约的代码形如 BTCUSDT）").arg(sym, fixed), "WARN");
-            sym = fixed;
+        // 规则在 app::normalize_symbol，headless 用的是同一个（之前 headless 完全
+        // 不处理这一条）。顺带不再把 ...USDC 误补成 ...USDCUSDT
+        {
+            const auto fx = app::normalize_symbol(sym.toStdString());
+            if (fx.suffixed)
+                log(QString("趋势品种 %1 缺少报价币后缀，已自动更正为 %2"
+                            "（币安合约的代码形如 BTCUSDT）")
+                        .arg(sym, QString::fromStdString(fx.symbol)), "WARN");
+            if (fx.changed) ++migrated;   // 规范化过的名字要落盘，下次启动不再提示
+            sym = QString::fromStdString(fx.symbol);
         }
 
         TrendBot b;
@@ -1205,18 +1215,14 @@ void MainWindow::load_and_restore_trend() {
                                      ? trend::ReverseMode::Immediate
                                      : trend::ReverseMode::None;
         } else {
-            // 旧默认是 allow_reverse=true + reverse_needs_signal=true，
-            // 即"反手但要等反向信号"。新枚举里没有这一档，最接近的是 None
-            // （平掉后回到正常入场流程，反向信号来了照样反向开）
-            const bool allow = o["allow_reverse"].toBool(true);
-            const bool needs = o["reverse_needs_signal"].toBool(true);
-            b.cfg.rule.reverse = (allow && !needs) ? trend::ReverseMode::Immediate
-                                                   : trend::ReverseMode::None;
-            if (allow && needs) {
-                log(QString("趋势 %1：旧的「反手需要反向信号」已合并进「只平掉，"
-                            "回到正常入场流程」。行为几乎不变，唯一差别是现在"
-                            "同向信号先来也会再进一次。").arg(sym), "WARN");
-            }
+            // 规则与文案都在 app::migrate_reverse_mode，headless 用的是同一个。
+            // ⚠ v5.9.9 之前两边各写一份，对同一种迁移（allow=true, needs=true）
+            //   这里说"行为几乎不变"、headless 说"行为有变化"。统一后的说法见那个函数
+            const auto m = app::migrate_reverse_mode(o["allow_reverse"].toBool(true),
+                                                     o["reverse_needs_signal"].toBool(true));
+            b.cfg.rule.reverse = m.mode;
+            if (m.effect == app::MigrationEffect::Changed)
+                log(QString("趋势 %1：%2").arg(sym, QString::fromStdString(m.note)), "WARN");
             ++migrated;   // 旧键存在本身就该落盘换成新键，不只是有告警的那几条
         }
         // PSAR 的定义就是 stop-and-reverse，不反手它就永远空仓

@@ -1,6 +1,7 @@
 #include "gui/main_window.h"
 #include "version.h"
 #include "core/key_store.h"
+#include "core/app_logic.h"
 #include "net/alert.h"
 
 #include <QApplication>
@@ -932,7 +933,7 @@ void MainWindow::buildUi() {
             "  $价格     已挂上，显示触发价\n"
             "  重试 N/13 挂单失败中，正在按退避重试\n"
             "  ⚠ 无保护  已连续失败 10 次，再失败 3 次会立即平掉该仓位\n"
-            "  已熔断    连续 2 次因挂不上而平仓，该 bot 已停止\n"
+            "  已熔断    连续 2 次因挂不上而平仓，该品种暂停开仓，到点自动试探\n"
             "  —        未开启（配置里的 use_disaster_stop）");
         botTable_->horizontalHeaderItem(ColTrailStop)->setToolTip(
             "移动止损 —— 本地棘轮止损线，只朝有利方向移动\n"
@@ -1066,8 +1067,11 @@ void MainWindow::onConnect() {
         // dual_mode_ 从进程启动到结束一直是默认的 false，等于把"单向持仓"写死了：
         //   · 账户是单向     → 恰好正确，一直没暴露问题
         //   · 账户是双向     → 每笔单都缺 positionSide 参数，交易所一律拒单 -4061
-        // 同时 add_bot 那道"单向模式下不许同品种双向 bot"的检查也依赖它，
-        // 读到假的 false 会把一个合法配置拦掉
+        // ⚠ 这里原本还写着"add_bot 那道『单向模式下不许同品种双向 bot』的检查也
+        //   依赖它"——【那道检查不存在】，is_dual_mode() 在整个 src/ 下零调用者。
+        //   dual_mode_ 的唯一用途就是决定订单要不要带 positionSide。
+        //   （本会话第三条"描述了不存在的东西"的注释。删功能时要连带搜一遍
+        //    谁在注释里依赖它，否则注释会比代码活得更久。）
         bool mode_ok = false;
         const bool dual = client->fetch_position_mode(&mode_ok);
         auto info = client->fetch_account();
@@ -1210,10 +1214,16 @@ void MainWindow::onConnect() {
                     ex.reserve(ex_pos.size());
                     for (const auto& p : ex_pos)
                         ex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-                    const qint64 age =
-                        QDateTime::currentMSecsSinceEpoch() - snapMs;
-                    auto issues = trend_engine_->reconcile_positions(
-                        ex, std::chrono::milliseconds(age < 0 ? 0 : age));
+                    // 判定规则在 app::reconcile_gate（有测试），headless 用的是同一个
+                    const auto gate = app::reconcile_gate(
+                        true, snapMs, QDateTime::currentMSecsSinceEpoch());
+                    if (!gate.ok()) {
+                        log("启动对账已跳过：持仓快照排队到界面线程时已经过旧，"
+                            "拿它比对可能把刚开的仓判成外部已平。下一轮周期对账会再试",
+                            "WARN");
+                        return;
+                    }
+                    auto issues = trend_engine_->reconcile_positions(ex, gate.age);
                     if (!issues.empty()) {
                         for (const auto& i : issues)
                             log("对账: " + QString::fromStdString(i), "WARN");
@@ -1463,9 +1473,9 @@ void MainWindow::onWatchlistContextMenu(const QPoint& pos) {
 // 把它装进一个带滚动区的对话框
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::openStrategyDialog(const std::string& symbol) {
-    auto sar_bots = trend_engine_ ? trend_engine_->get_bots() : std::vector<TrendBot>{};
+    auto bots = trend_engine_ ? trend_engine_->get_bots() : std::vector<TrendBot>{};
     const TrendBot* trendBot = nullptr;
-    for (const auto& b : sar_bots)
+    for (const auto& b : bots)
         if (b.cfg.symbol == symbol) { trendBot = &b; break; }
 
     QDialog dlg(this);
@@ -1678,14 +1688,14 @@ void MainWindow::onTick() {
                     trendSigFailed_ = std::move(now);
 
                     if (!fresh.isEmpty())
-                        log(QString("⚠ SAR 信号拉取失败：%1（本轮成功 %2 个）。"
+                        log(QString("⚠ 信号拉取失败：%1（本轮成功 %2 个）。"
                                     "拉不到 K 线 = 没有 ATR = 没有止损线，"
                                     "这些品种不会开新仓。"
                                     "最常见的原因是品种名不对——币安合约的代码形如 "
                                     "BTCUSDT，不是 BTC")
                                 .arg(fresh.join(", ")).arg(okn), "WARN");
                     if (!healed.isEmpty())
-                        log(QString("SAR 信号已恢复：%1").arg(healed.join(", ")), "OK");
+                        log(QString("信号已恢复：%1").arg(healed.join(", ")), "OK");
                     refreshBotTable();
                 }, Qt::QueuedConnection);
             });
@@ -1753,14 +1763,17 @@ void MainWindow::onTick() {
     // 同样是空的（或陈旧的），此时若当成"交易所无持仓"就会凭空清掉真实仓位。
     // refreshPositions 只在【真正成功】时才更新 posCacheMs_，所以这里
     // 只要求它足够新；拿不到新数据就这一轮不对账，宁可晚一分钟发现
-    const qint64 posAge = QDateTime::currentMSecsSinceEpoch() - posCacheMs_;
-    if (slowTickCount_ % 20 == 0 && trend_engine_ && posCacheMs_ > 0 && posAge < 30000) {
+    // 判定规则在 app::reconcile_gate（有测试）。posCacheMs_ 只在【真正成功】时才更新，
+    // 所以 fetched_ok 恒为 true：没拉成过 ⇒ posCacheMs_==0 ⇒ NeverFetched；
+    // 拉成过但这阵子一直失败 ⇒ 缓存越放越旧 ⇒ TooOld。两种都整轮不比
+    const auto rgate = app::reconcile_gate(true, posCacheMs_,
+                                           QDateTime::currentMSecsSinceEpoch());
+    if (slowTickCount_ % 20 == 0 && trend_engine_ && rgate.ok()) {
         std::vector<TrendEngine::ExchangePos> sex;
         sex.reserve(pos_cache_.size());
         for (const auto& [k, p] : pos_cache_)
             sex.push_back({p.symbol, p.direction, p.qty, p.entry_price});
-        auto issues = trend_engine_->reconcile_positions(
-            sex, std::chrono::milliseconds(posAge));
+        auto issues = trend_engine_->reconcile_positions(sex, rgate.age);
         if (!issues.empty()) {
             for (const auto& i : issues)
                 log("对账: " + QString::fromStdString(i), "WARN");

@@ -1,8 +1,10 @@
 #include "headless/headless_config.h"
+#include "core/app_logic.h"
 #include <simdjson.h>
 #include <fstream>
 #include <sstream>
 #include <set>
+#include <string>
 
 namespace ccbot {
 
@@ -99,7 +101,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 out.warnings.push_back(
                     "配置里有 " + std::to_string(n) + " 个 \"bots\"（网格DCA）条目，"
                     "但网格DCA 已在本版整体移除，这些条目【完全不会运行】。"
-                    "趋势策略请配在 \"sar_bots\" 里");
+                    "趋势策略请配在 \"trend_bots\" 里");
             }
         }
     }
@@ -121,20 +123,51 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         // 兼容旧键：仍然识别，但会迁移并显式告警（见下）
         "mode", "allow_reverse", "reverse_needs_signal",
     };
+    // ── 键名：trend_bots（v5.9.9 起）与 sar_bots（旧）──────────────────────
+    // 引擎跑三个策略，而旧键叫 sar_bots —— 配海龟的人会觉得自己配错了地方。
+    // 但旧键是【对外契约】：改名会让在跑的部署"进程正常启动、一个品种都不跑"，
+    // 所以旧键继续有效，只是提示一句。
+    // ⚠ 两个键同时出现必须报错，不能合并也不能任选一个：合并会让同一品种被
+    //   配两次，任选一个会让另一半配置【静默不运行】—— 正是上面那段要防的事
     simdjson::dom::array tarr;
-    if (root["sar_bots"].get(tarr) == simdjson::SUCCESS) {
+    simdjson::dom::array tarr_new, tarr_old;
+    const bool has_new = (root["trend_bots"].get(tarr_new) == simdjson::SUCCESS);
+    const bool has_old = (root["sar_bots"].get(tarr_old) == simdjson::SUCCESS);
+    if (has_new && has_old) {
+        err = "配置里同时有 \"trend_bots\" 和 \"sar_bots\"，不知道该跑哪一份。"
+              "\"sar_bots\" 是旧键名，请把它的内容并进 \"trend_bots\" 后删掉它";
+        return false;
+    }
+    if (has_old)
+        out.warnings.push_back("\"sar_bots\" 是旧键名，仍然有效；引擎跑的是三个趋势策略"
+                               "而不只是 SAR，建议改名为 \"trend_bots\"");
+    bool have_arr = false;
+    if (has_new)      { tarr = tarr_new; have_arr = true; }
+    else if (has_old) { tarr = tarr_old; have_arr = true; }
+    if (have_arr) {
         for (auto elem : tarr) {
             simdjson::dom::object so;
             if (elem.get(so) != simdjson::SUCCESS) continue;
 
             TrendConfig c;
-            c.symbol = get_str(so, "symbol", "");
+            // 品种名规范化与 GUI 共用一套规则（app::normalize_symbol）。
+            // ⚠ v5.9.9 之前 headless 完全不处理：手写成 "BTC" 或 "btcusdt" 的条目
+            //   永远拉不到 K 线、永远"等信号"，而进程照常运行 —— 静默失效。
+            //   GUI 那边从 v4.1.1 起就会补全并告警，两边不对称
+            {
+                const auto fx = app::normalize_symbol(get_str(so, "symbol", ""));
+                c.symbol = fx.symbol;
+                if (fx.suffixed)
+                    out.warnings.push_back("品种 \"" + get_str(so, "symbol", "") +
+                                           "\" 缺少报价币后缀，已按 " + c.symbol +
+                                           " 处理（币安合约的代码形如 BTCUSDT）");
+            }
             if (c.symbol.empty()) continue;
 
             for (auto field : so) {
                 std::string k(field.key);
                 if (!trend_keys.count(k))
-                    out.warnings.push_back(c.symbol + " sar_bots 配置里有无法识别的键 \"" +
+                    out.warnings.push_back(c.symbol + " 的策略配置里有无法识别的键 \"" +
                                            k + "\"（拼写错误?），该项被忽略、"
                                            "对应参数使用默认值");
             }
@@ -198,21 +231,16 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 else { err = c.symbol + "：reverse 只能是 immediate / none"; return false; }
             } else if (so["allow_reverse"].error() == simdjson::SUCCESS ||
                        so["reverse_needs_signal"].error() == simdjson::SUCCESS) {
-                const bool old_allow = get_bool(so, "allow_reverse", true);
-                const bool old_needs = get_bool(so, "reverse_needs_signal", true);
-                if (old_allow && !old_needs) {
-                    c.rule.reverse = trend::ReverseMode::Immediate;
-                    out.warnings.push_back(c.symbol + "：旧的反手配置已迁移为 reverse=immediate，行为不变");
-                } else {
-                    // ⚠ 行为变了。老的"等反向信号才反手"这一档【已经没有了】：
-                    //   映射到 none（平掉回到正常入场流程）是取保护性更强的那边，
-                    //   但原来会在反向信号成立时立刻反手，现在要等正常入场信号
-                    c.rule.reverse = trend::ReverseMode::None;
-                    out.warnings.push_back(
-                        c.symbol + "：旧的反手配置（等反向信号才反手）已迁移为 reverse=none。"
-                        "⚠ 行为【有变化】——原来反向信号成立时会立刻反手，现在是平掉之后"
-                        "走正常入场流程。想要立刻反手请显式配 reverse=immediate");
-                }
+                // 规则与文案都在 app::migrate_reverse_mode，GUI 用的是同一个。
+                // ⚠ v5.9.9 之前这里自己写了一份，而且和 GUI 不一致：allow_reverse=false
+                //   时也报"⚠ 行为有变化——原来反向信号成立时会立刻反手"，可那个配置
+                //   原来根本不反手；同一种迁移 GUI 说"几乎不变"、这里说"有变化"
+                const auto m = app::migrate_reverse_mode(
+                    get_bool(so, "allow_reverse", true),
+                    get_bool(so, "reverse_needs_signal", true));
+                c.rule.reverse = m.mode;
+                if (m.effect == app::MigrationEffect::Changed)
+                    out.warnings.push_back(c.symbol + "：" + m.note);
             }
             c.rule.max_consecutive_reverses =
                 (int)get_num(so, "max_consecutive_reverses", c.rule.max_consecutive_reverses);
@@ -281,15 +309,15 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                         "建议开 once_per_bar");
             }
 
-            out.sar_bots.push_back(c);
+            out.trend_bots.push_back(c);
         }
     }
 
     // v4.7.1 之前这里还要拦"同一品种被 bots 与 sar_bots 同时接管"（两个引擎各下
     // 各的单、互相平掉对方的仓）。网格DCA 移除后只剩一套策略，这类冲突不存在了。
 
-    if (out.sar_bots.empty()) {
-        err = "配置文件里 sar_bots 为空（或每一项都缺少 symbol），至少要配一个";
+    if (out.trend_bots.empty()) {
+        err = "配置文件里 trend_bots 为空（或每一项都缺少 symbol），至少要配一个";
         return false;
     }
 

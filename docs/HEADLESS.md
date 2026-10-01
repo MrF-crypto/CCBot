@@ -14,8 +14,8 @@ cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=<vcpkg根目录>/scripts/buildsystems
 cmake --build build --config Release --target ccbot_headless
 ```
 
-> `vcpkg.json` 里 Qt 依赖标了 `"platform": "windows"`，Linux 上不会尝试装 Qt，只会装
-> `ccbot_headless` 需要的 ixwebsocket / simdjson / curl / mbedtls，构建比图形界面版快很多。
+> `vcpkg.json` 里 Qt 依赖标了 `"platform": "windows | osx"`，Linux 上不会尝试装 Qt，只会装
+> `ccbot_headless` 需要的 simdjson / curl / mbedtls，构建比图形界面版快很多。
 
 生成的可执行文件在 `build/ccbot_headless`。
 
@@ -39,21 +39,24 @@ cmake --build build --config Release --target ccbot_headless
 | `max_open_positions` | 同时持仓的品种数上限，`0`=不限。与 `max_total_margin` 是两道不同的闸：前者管"总共投多少钱"，这个管"同时压在几个品种上" |
 | `state_path` | 仓位运行时状态落盘路径，重启续跑用，默认 `ccbot_state.json` |
 | `log_path` | 日志文件路径，留空则只输出到 stdout（配合 `journalctl`/`docker logs` 更方便） |
-| `sar_bots` | 策略数组，见下一节 |
+| `trend_bots` | 策略数组，见下一节（旧键名 `sar_bots` 仍然有效） |
 
 > ⚠ **v5.0.0：旧的 `bots` 数组（网格 DCA）不再运行。** 它不会被静默忽略——启动时会明确报出
 > "配置里有 N 个 bots 条目，但网格DCA 已整体移除，这些条目【完全不会运行】"。
 >
 > 静默忽略才是危险的：升级后配置文件原样放着、进程正常启动、日志一切正常，而那些品种其实
-> 一个都没在跑，要等到某天去交易所对账才发现。趋势策略请配在 `sar_bots` 里。
+> 一个都没在跑，要等到某天去交易所对账才发现。趋势策略请配在 `trend_bots` 里。
 > DCA 的实测结论见 [NEGATIVE_RESULTS.md](NEGATIVE_RESULTS.md)——代码删了，花钱买来的结论不删。
 
-## 趋势策略（`sar_bots`）
+## 趋势策略（`trend_bots`）
 
-本版有**三个趋势策略**，靠 `strategy` 字段选，一个 bot 一个策略。数组名 `sar_bots` 保留没改：
-老部署的配置文件里就是这个名字，改名等于让升级上来的人配置全失效。
+本版有**三个趋势策略**，靠 `strategy` 字段选，一个 bot 一个策略。
 
-状态落盘在 `<state_path>.sar`（后缀同理保留）。重启会恢复持仓、开仓价、止损线、加速因子、
+数组名 v5.9.9 起是 `trend_bots`。**旧名 `sar_bots` 继续有效**，启动时只提示一句建议改名 ——
+老部署的配置文件里就是这个名字，直接废掉等于让升级上来的人"进程正常启动、一个品种都不跑"。
+两个键**同时出现会报错**：合并会让同一品种被配两次，任选一个会让另一半静默不运行。
+
+状态落盘在 `<state_path>.sar`（后缀**故意保留**：改了名，升级上来的部署会读不到重启前的仓位状态）。重启会恢复持仓、开仓价、止损线、加速因子、
 连续反手计数与统计，并在启动时与交易所对账一次，运行中每分钟再对一次。
 
 三个策略共享同一套**出场语义**：只有追踪止损、**没有固定止盈**、止损线是棘轮的、
@@ -61,7 +64,7 @@ cmake --build build --config Release --target ccbot_headless
 盈利来自少数几笔跑很远的单子、致命场景是震荡市连续磨损**。判据是 `胜率 × 盈亏比`，不是胜率。
 
 ```json
-"sar_bots": [
+"trend_bots": [
   { "symbol": "BTCUSDT", "strategy": "turtle", "interval": "4h",
     "budget_usdt": 500, "leverage": 3,
     "donchian_period": 20, "atr_period": 14, "atr_mult": 3.0 }

@@ -105,11 +105,11 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     bots_[id] = std::move(snap);
     const auto& b = bots_[id];
     if (b.st.pos != trend::Pos::Flat)
-        log(b.cfg.symbol + " SAR 从落盘恢复：持" + trend::pos_name(b.st.pos) +
+        log(b.cfg.symbol + " 从落盘恢复：持" + trend::pos_name(b.st.pos) +
             " qty=" + fmt(b.qty, 8) + " 开仓价=$" + fmt(b.st.entry_price) +
             " 止损线=$" + fmt(b.st.stop));
     else
-        log(b.cfg.symbol + " SAR 从落盘恢复：空仓");
+        log(b.cfg.symbol + " 从落盘恢复：空仓");
     return id;
 }
 
@@ -503,9 +503,45 @@ std::string TrendEngine::open_gate_block(const TrendBot& self) const {
     //   端点不对、精度规则变了）。只有 per-bot 熔断时，N 个 bot 会各自烧满
     //   自己的额度才停下——9 个 bot 就是 18 轮"开仓→挂不上→平仓"、36 笔
     //   白付手续费的市价单，而第一轮结束时其实就已经能断定了
-    if (ds_account_broken_)
-        return "账户级熔断：已连续 " + std::to_string(ds_abandons_total_) +
-               " 次因挂不上交易所侧硬止损而兜底平仓，全局暂停开新仓";
+    // ⚠ 这道闸必须是【会自己打开】的，而且不能靠"挂上一次硬止损"来解除。
+    //
+    //   v5.9.8 之前它就是那样写的，而那是个死锁：解除点在 try_place_hard_stop
+    //   的成功分支里，可那个函数开头就要求【已有持仓且还没挂上】；而本闸封掉了
+    //   所有开仓，拿不到新仓位 ⇒ 永远进不去那个函数 ⇒ 标志永远不解除。
+    //   两次兜底平仓之后仓位都已被平掉，于是整套程序静默停止交易，
+    //   唯一出路是重启进程（标志不落盘）—— 而这一点没写在任何地方，
+    //   日志只会每轮重复"全局暂停开新仓"。
+    //
+    //   原注释的意图是对的（"要求人工干预才能复位是错的，故障往往是网络抖动，
+    //   恢复之后没有任何人会记得回来按一下"），只是实现达不到它。
+    //
+    //   改成标准的半开熔断：跳闸后冷却一段时间，然后【放行】让下一笔开仓去试探。
+    //   试探成功（硬止损挂上）⇒ 走 try_place_hard_stop 的成功分支完全复位；
+    //   试探失败 ⇒ 又一次兜底平仓，重新跳闸并【重置冷却】。
+    //   这样最坏情况是每个冷却周期白付一笔来回手续费，而不是永久停摆。
+    // per-bot 熔断的暂停。排在账户级前面：它说的是"这个品种自己有问题"，
+    // 比账户级的"全局暂停"更具体，界面上该显示更具体的那条原因
+    if (self.ds_pause_until.time_since_epoch().count() != 0 &&
+        host_.now_steady() < self.ds_pause_until) {
+        const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                              self.ds_pause_until - host_.now_steady()).count();
+        return "该品种已连续 " + std::to_string(self.ds_fail_closes) +
+               " 次因挂不上硬止损而兜底平仓，暂停开仓（" +
+               std::to_string(left / 60) + " 分 " + std::to_string(left % 60) +
+               " 秒后自动试探一笔）";
+    }
+
+    if (ds_account_broken_) {
+        const auto waited = host_.now_steady() - ds_break_time_;
+        if (waited < kDsBreakProbeAfter) {
+            const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                                  kDsBreakProbeAfter - waited).count();
+            return "账户级熔断：已连续 " + std::to_string(ds_abandons_total_) +
+                   " 次因挂不上交易所侧硬止损而兜底平仓，暂停开新仓（" +
+                   std::to_string(left) + " 秒后自动放行一笔试探）";
+        }
+        // 冷却已过 ⇒ 半开，放行这一笔。成败都会在上面那段里被重新判定
+    }
 
     if (max_total_margin_ <= 0 && max_open_positions_ <= 0) return {};
 
@@ -965,6 +1001,7 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                 b.ds_attempts    = 0;
                 b.ds_unprotected = false;
                 b.ds_fail_closes = 0; // 挂成功 = 不是系统性故障，熔断计数清零
+                b.ds_pause_until = {};   // per-bot 暂停一并解除
                 // 账户级熔断同理自动解除：能挂上就说明故障过去了。
                 // 要求人工干预才能复位是错的——故障往往是网络抖动或代理掉线，
                 // 恢复之后没有任何人会记得回来按一下
@@ -972,7 +1009,14 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                     const bool was_broken = ds_account_broken_;
                     ds_abandons_total_ = 0;
                     ds_account_broken_ = false;
-                    if (was_broken) unbroke = true;
+                    if (was_broken) {
+                        unbroke = true;
+                        // 账户级熔断被一次成功解除 = 系统性故障（网络/代理）已经过去。
+                        // 其它 bot 多半是被同一个故障暂停的，不该各自再等满
+                        // 10~240 分钟。放它们回来；真正属于某个品种自己的问题，
+                        // 下一次失败会让它带着累计的次数、以更长的暂停重新暂停
+                        for (auto& kv2 : bots_) kv2.second.ds_pause_until = {};
+                    }
                 }
             }
         // ⚠ 成功分支这里【不能 return】：孤儿单必须在锁外撤，return 会跳过那一步。
@@ -1050,8 +1094,15 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
                                       std::max(kDsAbandonCooldownBars,
                                                b.cfg.rule.cooldown_bars));
 
-        account_broken = (++ds_abandons_total_ >= kDsAccountBreak) && !ds_account_broken_;
-        if (account_broken) ds_account_broken_ = true;
+        ++ds_abandons_total_;
+        if (ds_abandons_total_ >= kDsAccountBreak) {
+            // 只有【第一次】跳闸才告警，否则每次兜底平仓都刷一条同样的
+            account_broken     = !ds_account_broken_;
+            ds_account_broken_ = true;
+            // ⚠ 每次都刷新跳闸时刻，不只是第一次。半开试探失败后必须【重新开始
+            //   冷却】，否则时间一到就会无限制地一笔接一笔试探下去
+            ds_break_time_     = host_.now_steady();
+        }
         total = ds_abandons_total_;
     }
 
@@ -1065,17 +1116,31 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
     // 熔断。持续性故障（账户受限、品种不支持 closePosition、参数系统性错误）
     // 会让 开仓→挂不上→平仓→等信号→开仓 无限循环，每轮付两次手续费，
     // 而单边行情里信号可能每根K线都来
+    //
+    // ⚠ 不再【永久停止】该 bot（v5.9.9 之前是 state=Stopped，只能人工恢复）。
+    //   持续性故障下每个 bot 都会先后撞上这道熔断，全停之后账户级的半开试探
+    //   就没有 Running 的 bot 可以拿来试，熔断照样解不开 —— 还是得人去一个个点。
+    //   改成递增退避的暂停：第 1 次跳闸停 10 分钟，之后每次翻倍，封顶 4 小时。
     if (fails >= kDsCircuitBreak) {
-        std::lock_guard<std::recursive_mutex> lk(mtx_);
-        auto it = bots_.find(bot_id);
-        if (it != bots_.end()) {
-            it->second.state = TrendBot::State::Stopped;
-            it->second.last_action = "⚠ 硬止损连续挂不上，已停止";
+        const int trips = fails - kDsCircuitBreak + 1;            // 第几次跳闸
+        auto pause = kDsBreakProbeAfter;
+        for (int i = 1; i < trips && pause < kDsBotPauseMax; ++i) pause *= 2;
+        const auto pause_dur = std::chrono::duration_cast<std::chrono::seconds>(
+            std::min<std::chrono::steady_clock::duration>(pause, kDsBotPauseMax));
+        {
+            std::lock_guard<std::recursive_mutex> lk(mtx_);
+            auto it = bots_.find(bot_id);
+            if (it != bots_.end()) {
+                it->second.ds_pause_until = host_.now_steady() + pause_dur;
+                it->second.last_action = "⚠ 硬止损连续挂不上，暂停开仓 " +
+                                         std::to_string(pause_dur.count() / 60) + " 分钟";
+            }
         }
         log("⚠⚠ " + sym + " 已连续 " + std::to_string(fails) +
-            " 次因挂不上硬止损而平仓，判定为系统性故障，**已停止该 bot**。"
-            "继续重试只会不断支付开平手续费——请检查账户权限、品种是否支持"
-            "closePosition、以及止损价精度");
+            " 次因挂不上硬止损而平仓，暂停该品种开仓 " +
+            std::to_string(pause_dur.count() / 60) + " 分钟，到点自动试探一笔"
+            "（每多失败一次暂停时长翻倍，封顶 4 小时；任意一次挂单成功即清零）。"
+            "持续出现请检查：账户权限、品种是否支持 closePosition、止损价精度");
     }
 
     // 账户级熔断只在【刚跨过阈值】那一次报。不去重的话，之后每个 bot 的每次
@@ -1090,7 +1155,8 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
             "    常见原因：① 网络到不了交易所（代理/DNS 把币安域名劫持到别处，"
             "此时响应往往不是 JSON 而是一张 HTML 错误页）；② 统一账户的条件单"
             "端点或权限不对；③ 止损价精度不符合该品种的 tickSize。\n"
-            "    修好之后任意一次挂单成功就会自动解除。");
+            "    不需要人工复位：10 分钟后会自动放行一笔开仓去试探，"
+            "它的硬止损挂上了就完全解除；还挂不上就再等 10 分钟。");
     }
 }
 

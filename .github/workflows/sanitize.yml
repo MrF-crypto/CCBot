@@ -1,7 +1,7 @@
 # Sanitizer 门禁。
 #
 # 为什么值得单独一条流水线：本项目 trend_engine.cpp 有 27 处 mutex/atomic，
-# book_ticker_stream.cpp 还多一个看门狗线程，而并发缺陷是所有缺陷里唯一会
+# rest_price_feed.cpp 还多一个轮询线程，而并发缺陷是所有缺陷里唯一会
 # "看起来一切正常、单元测试全绿，直到某天对不上账"的一类。
 # 单元测试证明不了它不存在，TSan 能。
 #
@@ -39,8 +39,8 @@ jobs:
             name: ASan+UBSan
             suites: all
           # TSan：数据竞争。只跑真正并发的那几套——其余是纯函数测试，
-          # 跑它们只是烧时间。ccg_price_tests 不跑：它碰 book_ticker_stream，
-          # 而 ixwebsocket 未 instrumentation，噪音大于价值
+          # 跑它们只是烧时间。（ccg_price_tests 与它测的 book_ticker_stream
+          # 已于 v5.9.9 一并删除）
           #
           # ccg_trend_stress_tests 接替了随网格DCA 一起删掉的 ccg_stress_tests。
           # 这个替换不能漏：那两套是本仓库【唯一】开真线程池多线程压引擎的测试，
@@ -140,8 +140,8 @@ jobs:
                     ccg_funding_tests ccg_rate_tests ccg_order_tests
                     ccg_trend_tests ccg_trend_engine_tests ccg_trend_stress_tests
                     ccg_trend_state_tests ccg_config_tests
-                    ccg_price_tests ccg_timesync_tests ccg_pool_tests
-                    ccg_rest_feed_tests"
+                    ccg_timesync_tests ccg_pool_tests
+                    ccg_rest_feed_tests ccg_app_logic_tests"
           else
             SUITES="${{ matrix.suites }}"
           fi

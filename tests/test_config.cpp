@@ -67,15 +67,15 @@ int main() {
     // ── ② 趋势SAR 配置（本版起是唯一的策略）─────────────────────────────────
     {
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
         HeadlessConfig hc; std::string err;
-        check(load_headless_config(path, hc, err), "最小 sar_bots 配置能加载: " + err);
-        check(hc.sar_bots.size() == 1, "应解析出 1 个 bot");
+        check(load_headless_config(path, hc, err), "最小 trend_bots 配置能加载: " + err);
+        check(hc.trend_bots.size() == 1, "应解析出 1 个 bot");
 
         // 漏填的字段必须落到引擎默认值。解析器用 c.rule.xxx 自身作兜底
         // （而不是抄一遍字面量），所以引擎改默认值时这里不会悄悄漂走
         const TrendConfig def;
-        const auto& g = hc.sar_bots[0];
+        const auto& g = hc.trend_bots[0];
         check(g.rule.strategy == def.rule.strategy,                "  策略默认是海龟");
         check(g.rule.donchian_period == def.rule.donchian_period, "  通道周期取默认值");
         check(g.rule.atr_period == def.rule.atr_period,           "  ATR周期取默认值");
@@ -91,10 +91,10 @@ int main() {
         // 这种沉默比启动失败危险得多
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"bots\":[{\"symbol\":\"BTCUSDT\"},{\"symbol\":\"ETHUSDT\"}],"
-                         "\"sar_bots\":[{\"symbol\":\"SOLUSDT\"}]}");
+                         "\"trend_bots\":[{\"symbol\":\"SOLUSDT\"}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "带旧版 bots 的配置仍能启动");
-        check(hc.sar_bots.size() == 1, "  只有 sar_bots 生效");
+        check(hc.trend_bots.size() == 1, "  只有 trend_bots 生效");
         bool warned = false;
         for (const auto& w : hc.warnings)
             if (w.find("网格DCA") != std::string::npos && w.find("2") != std::string::npos)
@@ -105,19 +105,54 @@ int main() {
         // 一个策略都没配 = 空转，应报错而不是静默启动
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\"}");
         HeadlessConfig hc; std::string err;
-        check(!load_headless_config(path, hc, err), "sar_bots 为空应被拒绝");
+        check(!load_headless_config(path, hc, err), "trend_bots 为空应被拒绝");
+    }
+
+    // ── 键名兼容：trend_bots（新）/ sar_bots（旧）──────────────────────────
+    // 旧键是对外契约：直接废掉会让在跑的部署升级后"进程正常启动、一个品种都不跑"
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "⚠ 旧键 sar_bots 必须继续能加载: " + err);
+        check(hc.trend_bots.size() == 1, "  而且品种真的被读进来了（不是静默空跑）");
+        bool noted = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("trend_bots") != std::string::npos) noted = true;
+        check(noted, "  提示一句建议改名，但不报错");
+    }
+    {
+        // 两个键同时出现：合并会让同一品种配两次，任选一个会让另一半静默不跑
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\"}],"
+                         "\"sar_bots\":[{\"symbol\":\"ETHUSDT\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err),
+              "⚠ trend_bots 与 sar_bots 同时出现必须报错 —— 任选一个都会让另一半静默不跑");
+        check(err.find("sar_bots") != std::string::npos, "  报错要点名是哪两个键");
+    }
+    {
+        // 新键：不该有任何改名提示
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "新键 trend_bots 能加载");
+        int rename_notes = 0;
+        for (const auto& w : hc.warnings)
+            if (w.find("sar_bots") != std::string::npos) ++rename_notes;
+        check(rename_notes == 0, "  用了新键就不该再提示改名");
     }
     {
         // k=0 等于没有止损线，必须拒绝
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mult\":0}]}");
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mult\":0}]}");
         HeadlessConfig hc; std::string err;
         check(!load_headless_config(path, hc, err), "atr_mult=0 应被拒绝");
     }
     {
         // SAR 段的拼写错误同样要告警
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mlut\":3}]}");
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mlut\":3}]}");
         HeadlessConfig hc; std::string err;
         load_headless_config(path, hc, err);
         bool warned = false;
@@ -128,14 +163,14 @@ int main() {
 
     // ── ②b 三个策略各自的解析与校验 ─────────────────────────────────────────
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\","
                          "\"af_start\":0.03,\"af_step\":0.01,\"af_max\":0.15,"
                          "\"max_consecutive_reverses\":3}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "strategy=psar 能加载: " + err);
-        if (hc.sar_bots.size() == 1) {
-            const auto& g = hc.sar_bots[0];
+        if (hc.trend_bots.size() == 1) {
+            const auto& g = hc.trend_bots[0];
             check(g.rule.strategy == trend::Strategy::ParabolicSar, "  策略=抛物线SAR");
             eqd(g.rule.af_start, 0.03, "  af_start");
             eqd(g.rule.af_step,  0.01, "  af_step");
@@ -149,18 +184,18 @@ int main() {
     {
         // 显式配 reverse=none 也要被 PSAR 的强制覆盖掉。
         // 不覆盖的话 bot 启动后一单也不开，而日志上完全正常
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\","
                          "\"reverse\":\"none\",\"max_consecutive_reverses\":2}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "PSAR + reverse=none 仍能加载");
-        if (hc.sar_bots.size() == 1)
-            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::Immediate,
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].rule.reverse == trend::ReverseMode::Immediate,
                   "PSAR 忽略 reverse=none，否则它会永远空仓");
     }
     {
         // PSAR 不设连续反手上限 = 震荡市里没有刹车，必须明确说一次
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\"}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "PSAR 不设上限仍能启动（不拦）");
@@ -170,7 +205,7 @@ int main() {
         check(warned, "  但必须告警「没有刹车」");
     }
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"psar\","
                          "\"af_start\":0.3,\"af_max\":0.2}]}");
         HeadlessConfig hc; std::string err;
@@ -178,14 +213,14 @@ int main() {
               "af_start > af_max 应被拒绝（起点就封顶，加速机制直接失效）");
     }
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
                          "\"bare_entry\":\"immediate\",\"once_per_bar\":true,"
                          "\"swing_bars\":5}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "strategy=bare_k 能加载: " + err);
-        if (hc.sar_bots.size() == 1) {
-            const auto& g = hc.sar_bots[0];
+        if (hc.trend_bots.size() == 1) {
+            const auto& g = hc.trend_bots[0];
             check(g.rule.strategy == trend::Strategy::BareK,          "  策略=纯裸K");
             check(g.rule.bare_entry == trend::BareEntry::Immediate,   "  入场=盘中即时");
             check(g.rule.once_per_bar,                                "  每根一次护栏已开");
@@ -194,7 +229,7 @@ int main() {
     }
     {
         // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
                          "\"bare_entry\":\"immediate\",\"reverse\":\"immediate\"}]}");
         HeadlessConfig hc; std::string err;
@@ -205,14 +240,14 @@ int main() {
         check(warned, "  必须告警并建议开 once_per_bar");
     }
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
                          "\"bare_entry\":\"whatever\"}]}");
         HeadlessConfig hc; std::string err;
         check(!load_headless_config(path, hc, err), "bare_entry 非法值应被拒绝");
     }
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"martingale\"}]}");
         HeadlessConfig hc; std::string err;
         check(!load_headless_config(path, hc, err), "未知 strategy 应被拒绝而不是默默跑海龟");
@@ -223,11 +258,11 @@ int main() {
         // 旧 mode=bar 的入场规则是"刚收盘那根是阳线就做多"，已删除。
         // 静默迁移的后果是信号数量骤变而用户毫不知情
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"mode\":\"bar\"}]}");
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"mode\":\"bar\"}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "旧 mode=bar 仍能加载");
-        if (hc.sar_bots.size() == 1)
-            check(hc.sar_bots[0].rule.strategy == trend::Strategy::BareK,
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].rule.strategy == trend::Strategy::BareK,
                   "  mode=bar 迁移为 strategy=bare_k");
         bool warned = false;
         for (const auto& w : hc.warnings)
@@ -237,43 +272,74 @@ int main() {
     {
         // 旧默认 allow_reverse=true + reverse_needs_signal=true 没有对应的新档位，
         // 映射到 none（保护性更强的那边）并说明差别
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\","
                          "\"allow_reverse\":true,\"reverse_needs_signal\":true}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "旧反手 bool 仍能加载");
-        if (hc.sar_bots.size() == 1)
-            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::None,
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].rule.reverse == trend::ReverseMode::None,
                   "  「反手需信号」映射到 reverse=none");
+        // 文案在 app::migrate_reverse_mode，与 GUI 共用。这里只认语义标记
+        // "行为有…变化"，不绑定具体措辞
         bool warned = false;
         for (const auto& w : hc.warnings)
-            if (w.find("reverse=none") != std::string::npos) warned = true;
+            if (w.find("行为有") != std::string::npos) warned = true;
         check(warned, "  必须告警这是行为变化");
     }
     {
+        // allow_reverse=false：原来就不反手，迁移到 none 行为【没变】。
+        // v5.9.9 之前 headless 在这里也报"⚠ 行为有变化——原来反向信号成立时会
+        // 立刻反手"—— 错，它原来根本不反手。与 GUI 不一致，抽成共用函数时发现
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"allow_reverse\":false}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "allow_reverse=false 能加载");
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].rule.reverse == trend::ReverseMode::None, "  ⇒ reverse=none");
+        int false_alarms = 0;
+        for (const auto& w : hc.warnings)
+            if (w.find("行为有") != std::string::npos) ++false_alarms;
+        check(false_alarms == 0, "  ⚠ 行为没变，不得误报「有变化」");
+    }
+    {
+        // 品种名规范化与 GUI 共用。v5.9.9 之前 headless 不处理："BTC" 永远拉不到
+        // K 线、永远"等信号"，进程照常运行 —— 静默失效
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"btc\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "缺后缀的品种能加载");
+        check(hc.trend_bots.size() == 1 && hc.trend_bots[0].symbol == "BTCUSDT",
+              "  ⚠ 'btc' 被规范化为 BTCUSDT，而不是原样当成品种名去拉 K 线");
+        bool noted = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("BTCUSDT") != std::string::npos) noted = true;
+        check(noted, "  并且告诉人改成了什么");
+    }
+    {
         // 旧的无条件反手（allow=true, needs=false）有精确对应，行为不变
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\","
                          "\"allow_reverse\":true,\"reverse_needs_signal\":false}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "旧无条件反手仍能加载");
-        if (hc.sar_bots.size() == 1)
-            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::Immediate,
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].rule.reverse == trend::ReverseMode::Immediate,
                   "  无条件反手精确映射到 reverse=immediate");
     }
     {
         // 新键在场时旧键必须【完全不起作用】——两套键同时被尊重是最难查的一类 bug
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"reverse\":\"immediate\","
                          "\"allow_reverse\":false,\"reverse_needs_signal\":true}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "新旧键并存仍能加载");
-        if (hc.sar_bots.size() == 1)
-            check(hc.sar_bots[0].rule.reverse == trend::ReverseMode::Immediate,
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].rule.reverse == trend::ReverseMode::Immediate,
                   "  新键 reverse 优先，旧 bool 被忽略");
     }
     {
-        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"sar_bots\":["
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"reverse\":\"maybe\"}]}");
         HeadlessConfig hc; std::string err;
         check(!load_headless_config(path, hc, err), "reverse 非法值应被拒绝");
@@ -282,12 +348,12 @@ int main() {
     // ── ③ 固定单笔风险下单 ──────────────────────────────────────────────────
     {
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\","
                          "\"size_mode\":\"risk\",\"risk_usdt\":100}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "固定单笔风险配置应能加载");
-        if (hc.sar_bots.size() == 1) {
-            const auto& g = hc.sar_bots[0];
+        if (hc.trend_bots.size() == 1) {
+            const auto& g = hc.trend_bots[0];
             check(g.size_mode == TrendConfig::SizeMode::RiskBased, "  size_mode=risk");
             eqd(g.risk_usdt, 100.0,                                "  risk_usdt");
         }
@@ -295,7 +361,7 @@ int main() {
     {
         // size_mode=risk 却没填 risk_usdt：算不出任何数量，必须拒绝启动
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\",\"size_mode\":\"risk\"}]}");
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"size_mode\":\"risk\"}]}");
         HeadlessConfig hc; std::string err;
         check(!load_headless_config(path, hc, err),
               "size_mode=risk 但缺 risk_usdt 应被拒绝");
@@ -304,7 +370,7 @@ int main() {
         // 金字塔已整体移除：老配置里的两个键必须落到【未知键告警】上，
         // 而不是被静默接受——静默接受的话用户会以为加仓还在生效
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\","
                          "\"pyramid_max_adds\":3,\"pyramid_step_atr\":0.5}]}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "带旧金字塔键的配置仍能启动");
@@ -316,11 +382,11 @@ int main() {
     {
         // 默认必须是固定名义：改变下单行为的东西不能悄悄生效
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"sar_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
         HeadlessConfig hc; std::string err;
         load_headless_config(path, hc, err);
-        if (hc.sar_bots.size() == 1)
-            check(hc.sar_bots[0].size_mode == TrendConfig::SizeMode::Notional,
+        if (hc.trend_bots.size() == 1)
+            check(hc.trend_bots[0].size_mode == TrendConfig::SizeMode::Notional,
                   "默认仓位算法必须是固定名义");
     }
 

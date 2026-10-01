@@ -16,8 +16,10 @@
 namespace ccbot {
 
 // ── HMAC-SHA256 via mbedtls ─────────────────────────────────────────────────────
-// 跨平台实现（Windows/Linux 通用）：项目本来就通过 ixwebsocket 的 TLS 后端间接
-// 依赖 mbedtls，这里直接复用它的 HMAC 接口，不用再额外区分 Windows CNG / Linux OpenSSL
+// 跨平台实现（Windows/Linux/macOS 通用）：mbedtls 是 vcpkg.json 里直接列出的依赖，
+// 用它的 HMAC 接口就不必再区分 Windows CNG / Linux OpenSSL / macOS CommonCrypto。
+// （v5.9.9 之前这里写的是"通过 ixwebsocket 的 TLS 后端间接依赖"—— ixwebsocket
+//   随 WebSocket 行情一并移除之后，那句话就不成立了）
 static std::string hmac_sha256(const std::string& key, const std::string& msg) {
     unsigned char result[32] = {};
     const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -127,7 +129,6 @@ const char* TradingClient::ep(Ep e) const {
     case Ep::PositionSideDual: return pm ? "/papi/v1/um/positionSide/dual" : "/fapi/v1/positionSide/dual";
     case Ep::Leverage:         return pm ? "/papi/v1/um/leverage"          : "/fapi/v1/leverage";
     // listenKey 在统一账户下**没有** um 前缀，是全账户一条流
-    case Ep::ListenKey:        return pm ? "/papi/v1/listenKey"            : "/fapi/v1/listenKey";
     case Ep::PmAccount:        return "/papi/v1/account";
     case Ep::CondOrder:        return "/papi/v1/um/conditional/order";
     // ⚠ 两边路径【不对称】，别照着一边推另一边：
@@ -908,17 +909,9 @@ bool TradingClient::fetch_position_mode(bool* ok) {
 
 
 
-bool TradingClient::close_all_positions() {
-    auto positions = fetch_positions();
-    bool all_ok = true;
-    for (const auto& pos : positions) {
-        std::string close_side = pos.direction == 1 ? "SELL" : "BUY";
-        auto r = place_market(pos.symbol, close_side, pos.qty, true);
-        if (!r.ok) all_ok = false;
-    }
-    return all_ok;
-}
-
+// close_all_positions 删于 v5.9.9：零调用者，而且里面是 fetch_positions() 不判 ok
+// ——"拉取失败当成确实没有"。v5.9.3 正是用这条理由删掉了 close_position，漏了它。
+// 埋着已知缺陷的死代码比没有代码更糟：下一个要"全平"的人会找到它并继承这个 bug。
 bool TradingClient::set_leverage(const std::string& sym, int lev) {
     auto resp = http_post(ep(Ep::Leverage),
         "symbol=" + sym + "&leverage=" + std::to_string(lev));
@@ -934,71 +927,10 @@ bool TradingClient::set_leverage(const std::string& sym, int lev) {
     return true;
 }
 
-// ── unsigned HTTP（listenKey 端点无需签名）────────────────────────────────────
-std::string TradingClient::http_post_unsigned(const std::string& path,
-                                               const std::string& body) {
-    std::string url = base_ + path;
-    std::string resp;
-    struct curl_slist* hdrs = nullptr;
-    CURL* c = make_curl(cfg_.api_key, resp, hdrs);
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_POST, 1L);
-    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
-    curl_easy_perform(c);
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(c);
-    return resp;
-}
-
-void TradingClient::http_put_unsigned(const std::string& path, const std::string& body) {
-    std::string url = base_ + path;
-    std::string resp;
-    struct curl_slist* hdrs = nullptr;
-    CURL* c = make_curl(cfg_.api_key, resp, hdrs);
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
-    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
-    curl_easy_perform(c);
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(c);
-}
-
-void TradingClient::http_del_unsigned(const std::string& path, const std::string& body) {
-    std::string url = base_ + path;
-    std::string resp;
-    struct curl_slist* hdrs = nullptr;
-    CURL* c = make_curl(cfg_.api_key, resp, hdrs);
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
-    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
-    curl_easy_perform(c);
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(c);
-}
-
-// ── ListenKey（UserData Stream 用）───────────────────────────────────────────
-std::string TradingClient::create_listen_key() {
-    auto resp = http_post_unsigned(ep(Ep::ListenKey));
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return "";
-    std::string_view key;
-    if (doc["listenKey"].get(key) != simdjson::SUCCESS) return "";
-    return std::string(key);
-}
-
-bool TradingClient::keepalive_listen_key(const std::string& key) {
-    http_put_unsigned(ep(Ep::ListenKey), "listenKey=" + key);
-    return true;
-}
-
-void TradingClient::delete_listen_key(const std::string& key) {
-    http_del_unsigned(ep(Ep::ListenKey), "listenKey=" + key);
-}
+// unsigned HTTP 三件套（http_post/put/del_unsigned）与 ListenKey 三件套
+// （create/keepalive/delete_listen_key）一并删于 v5.9.9：UserData Stream 从未
+// 被接上，六个函数全是零调用者，而前三个的唯一使用者就是后三个。
+// 要重新接 UserData Stream 的话，这些都是十几行的样板代码，重写比留着腐烂便宜。
 
 // ── LOT_SIZE / 价格精度缓存 ───────────────────────────────────────────────────
 bool TradingClient::try_get_symbol_info(const std::string& sym, SymbolInfo& out) const {
@@ -1484,20 +1416,8 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
     return out;
 }
 
-double TradingClient::fetch_atr(const std::string& sym, const std::string& interval,
-                               int period) {
-    if (period < 2) return 0;
-    // Wilder 平滑要预热：只喂 period+1 根拿到的是 seed 而非稳定值，
-    // 而止损距离直接由它决定。4 倍周期足够收敛
-    const int need = period * 4 + 5;
-    auto bars = fetch_klines(sym, interval, need);
-    if (bars.empty()) return 0;
-
-    std::vector<indicators::Ohlc> oh;
-    oh.reserve(bars.size());
-    for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
-    return indicators::atr(oh, period);
-}
+// fetch_atr 删于 v5.9.9：零调用者。它自己的注释写着"DCA 的 ATR 移动止损用"，
+// 而网格 DCA 在 v4.7.1 就整体移除了。趋势策略的 ATR 走 fetch_trend_signal。
 
 TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
         const std::string& sym, const std::string& interval, int swing_bars) {
@@ -1580,9 +1500,8 @@ TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) 
     return info;
 }
 
-double TradingClient::fetch_mark_price(const std::string& sym) {
-    return fetch_premium(sym).mark_price;
-}
+// fetch_mark_price 删于 v5.9.9：零调用者，v5.7.0 起行情走全市场批量端点
+// （fetch_all_mark_prices），逐品种查标记价已经没有使用场景。
 
 std::set<std::string> TradingClient::fetch_open_algo_ids(bool* ok) {
     std::set<std::string> out;

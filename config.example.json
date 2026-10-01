@@ -11,7 +11,7 @@
   "state_path": "ccbot_state.json",
   "log_path": "ccbot.log",
 
-  "sar_bots": [
+  "trend_bots": [
     {
       "symbol": "ETHUSDT",
       "budget_usdt": 500,
