@@ -734,6 +734,52 @@ int main() {
               "  错误里要写明「已经查过、不是模式变更导致」");
     }
 
+    std::printf("\n── 用例19：exchangeInfo 回的是别的品种 ⇒ 绝不能把它的精度当自己的 ──\n");
+    // 请求是 exchangeInfo?symbol=XXX，正常只回一条，所以"取 symbols[0]"平时看不出
+    // 问题。但参数不保证生效（代理改写 / 返回全量列表），一旦回的是全量列表，
+    // 就会把别人的 tickSize/stepSize 当成这个品种的 —— 而且完全静默。
+    // 实盘 2026-10-01：USUSDT 拿到了粗得多的 tickSize，止损触发价 0.0265 取整成 0，
+    // 引擎按"挂不上硬止损"把刚开的仓位兜底平掉了。
+    {
+        TradingClient tc(test_cfg());
+        tc.set_test_hook([&](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            // 故意无视 symbol= 参数，永远回这份只含 BTCUSDT 的列表
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
+            return false;
+        });
+        auto other = tc.get_symbol_info("USUSDT");
+        check(!other.valid, "⚠ 品种名对不上时不得判为 valid");
+        check(!other.tick_found,
+              "  更不得把 BTCUSDT 的 tickSize 当成 USUSDT 的 —— "
+              "错的精度比没有精度危险，它会静默把价格和数量都算错");
+        // 同一份应答里，名字对得上的那个照常解析（别把修复做成一刀切拒绝）
+        auto btc = tc.get_symbol_info("BTCUSDT");
+        check(btc.valid && btc.tick_found, "  名字对得上的品种仍要正常解析");
+        check(std::fabs(btc.tick_size - 0.10) < 1e-12, "  且 tickSize = 0.10");
+    }
+
+    std::printf("\n── 用例20：精度不可信 ⇒ 不挂硬止损，且必须【可重试】 ──\n");
+    // 两件事都要：
+    //  · 不挂 —— 按默认 tickSize=0.01 取整，USUSDT 的 0.0265 会变成 0.02（偏 25%），
+    //    而这张单会被交易所正常接受 ⇒ 日志打"已挂"、界面绿色，底线却在别的价位
+    //  · 可重试 —— 不可重试会让引擎立即兜底平仓，等于一次 exchangeInfo 抖动
+    //    就平掉一笔仓位
+    {
+        TradingClient tc(test_cfg());
+        tc.set_test_hook([&](const std::string&, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("exchangeInfo") != std::string::npos) { out.body = ""; return true; }
+            return false;   // 不该走到下单
+        });
+        auto sp = tc.place_disaster_stop("USUSDT", 0.0265, "BUY", 3718);
+        check(!sp.ok(), "精度拿不到时不得挂单");
+        check(sp.retryable,
+              "⚠ 必须可重试 —— 不可重试会让一次 exchangeInfo 抖动平掉一笔仓位");
+        check(sp.error.find("精度") != std::string::npos, "  错误里要点明是精度问题");
+        check(sp.order_id.empty(), "  不得留下单号");
+    }
+
     // ⚠ place_market 里还有一道 `if (r.uncertain) return r;`，没有对应用例：
     //   uncertain 只由"空响应/非 JSON + 查单也确认不了"那条分支产生，那时
     //   error 里不会有 -4061（压根没解析出 code），所以这两个条件【构造不出来】。

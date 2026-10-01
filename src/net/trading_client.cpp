@@ -1034,6 +1034,28 @@ TradingClient::SymbolInfo TradingClient::get_symbol_info(const std::string& sym)
             simdjson::dom::array symbols;
             if (doc["symbols"].get(symbols) == simdjson::SUCCESS) {
                 for (auto sym_elem : symbols) {
+                    // ⚠ 必须比对品种名，不能拿 symbols[0] 就走。
+                    //
+                    //   请求是 exchangeInfo?symbol=XXX，正常只回一条，所以"取第一条"
+                    //   平时看不出问题。但这个查询参数并不保证生效（代理改写、
+                    //   返回全量列表、币安忽略参数），一旦回的是全量列表，
+                    //   symbols[0] 就是列表里的第一个品种 —— 于是我们会把【别人的】
+                    //   tickSize / stepSize / minQty 当成这个品种的。
+                    //
+                    //   实盘 2026-10-01：USUSDT（价 $0.0269）拿到了一个粗得多的
+                    //   tickSize，止损触发价 0.0265 取整后变成 0，挂单前被自己拦下，
+                    //   而"挂不上硬止损"的设计动作是【立即平掉仓位】—— 刚开的多单
+                    //   在同一秒被平掉。日志：
+                    //     07:42:19 USUSDT 开多 qty=3718 @$0.0269 止损线=$0.0265
+                    //     07:42:19 ⚠⚠ 挂单被拒且重试无意义（止损触发价非法（取整后 <= 0））
+                    //     07:42:19 USUSDT 平多 @$0.0269（硬止损挂不上，兜底平仓）
+                    //
+                    //   错的精度比没有精度危险得多：没有精度会报错，错的精度会
+                    //   【静默地】把价格和数量都算错。
+                    std::string_view got_sym;
+                    if (sym_elem["symbol"].get(got_sym) != simdjson::SUCCESS) continue;
+                    if (got_sym != sym) continue;
+
                     simdjson::dom::array filters;
                     if (sym_elem["filters"].get(filters) != simdjson::SUCCESS) continue;
                     auto safe_stod = [](std::string_view sv) -> double {
@@ -1165,9 +1187,42 @@ TradingClient::StopPlacement
 TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
                                    const std::string& entry_side, double qty) {
     StopPlacement out;
+
+    // ⚠ 精度不可信就【不要挂】，而且必须是【可重试】的失败。
+    //
+    //   tickSize 拿不到时它停在默认的 0.01。对 BTC 这种价位无所谓，对便宜品种
+    //   是灾难：USUSDT 的止损线 0.0265 按 0.01 取整是 0.02 —— 偏了 25%，
+    //   而这张单会被交易所【正常接受】。于是日志打"硬止损已挂"、界面显示绿色，
+    //   实际那条底线在一个完全不同的价位上。这正是本文件里回读 triggerPrice
+    //   那道校验要防的同一类东西：看起来正常的假保护比没有保护更危险。
+    //
+    //   必须可重试：不可重试 ⇒ 引擎立即放弃 ⇒ 兜底平掉刚开的仓位。而精度拿不到
+    //   通常是 exchangeInfo 这一次没拉到（失败不写缓存，下次会重新拉），
+    //   是个会自己好的瞬时问题。把它判成死路，等于让一次网络抖动平掉一笔仓位。
+    //   重试阶梯跑完还是拿不到，才轮到兜底平仓 —— 那时"没有交易所侧的底"
+    //   这个结论是成立的。
+    const auto& pre = get_symbol_info(sym);
+    if (!pre.valid || !pre.tick_found || pre.lookup_failed) {
+        std::ostringstream d;
+        d << "拿不到 " << sym << " 的价格精度，不挂这张单（按不可信的 tickSize 取整"
+             "会挂出一张价位完全不对、却会被交易所接受的「假保护」单）。原因：";
+        if (pre.lookup_failed)   d << "本次 exchangeInfo 没拉到";
+        else if (!pre.valid)     d << "应答里没有该品种的 LOT_SIZE";
+        else                     d << "应答里没有该品种的 PRICE_FILTER";
+        d << "。下一次重试会重新拉取";
+        out.error     = d.str();
+        out.retryable = true;
+        return out;
+    }
+
+    const double raw_stop = stop_price;
     stop_price = round_price(sym, stop_price);
     if (stop_price <= 0) {
-        out.error     = "止损触发价非法（取整后 <= 0）";
+        // 精度是可信的，价格还是取整成 0 ⇒ 参数本身就错，重试没有意义
+        std::ostringstream d;
+        d << "止损触发价非法（" << raw_stop << " 按 tickSize=" << pre.tick_size
+          << " 取整后 <= 0）";
+        out.error     = d.str();
         out.retryable = false;
         return out;
     }
