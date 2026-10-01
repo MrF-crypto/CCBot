@@ -100,8 +100,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
             if (n > 0) {
                 out.warnings.push_back(
                     "配置里有 " + std::to_string(n) + " 个 \"bots\"（网格DCA）条目，"
-                    "但网格DCA 已在本版整体移除，这些条目【完全不会运行】。"
-                    "趋势策略请配在 \"trend_bots\" 里");
+                    "该功能已移除，不会运行；趋势策略请配在 \"trend_bots\" 里");
             }
         }
     }
@@ -139,8 +138,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         return false;
     }
     if (has_old)
-        out.warnings.push_back("\"sar_bots\" 是旧键名，仍然有效；引擎跑的是三个趋势策略"
-                               "而不只是 SAR，建议改名为 \"trend_bots\"");
+        out.warnings.push_back("\"sar_bots\" 是旧键名，仍然有效，建议改为 \"trend_bots\"");
     bool have_arr = false;
     if (has_new)      { tarr = tarr_new; have_arr = true; }
     else if (has_old) { tarr = tarr_old; have_arr = true; }
@@ -159,8 +157,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 c.symbol = fx.symbol;
                 if (fx.suffixed)
                     out.warnings.push_back("品种 \"" + get_str(so, "symbol", "") +
-                                           "\" 缺少报价币后缀，已按 " + c.symbol +
-                                           " 处理（币安合约的代码形如 BTCUSDT）");
+                                           "\" 缺少后缀，已按 " + c.symbol + " 处理");
             }
             if (c.symbol.empty()) continue;
 
@@ -200,12 +197,10 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                     //   老规则是"阳线就做多"，新默认是"收盘价突破上一根最高价"。
                     //   后者严格得多——下跌趋势里的一根阳线只是噪音，而突破前根
                     //   高点是真正的动能信号。同一份配置换上来之后开仓频率会
-                    //   明显下降。静默迁移的话用户会以为策略"突然不работ了"
+                    //   明显下降。静默迁移的话用户会以为策略"突然不工作了"
                     out.warnings.push_back(
-                        c.symbol + "：旧键 mode=bar 已迁移为 strategy=bare_k。"
-                        "⚠ 入场规则【同时变了】——从\"阳线做多\"改为\"收盘价突破"
-                        "上一根最高价\"，开仓会明显变少（这是有意收紧）。"
-                        "想回到盘中即时入场请显式配 bare_entry=immediate");
+                        c.symbol + "：旧键 mode=bar 已改为 strategy=bare_k，"
+                        "入场改为收盘突破前一根高点，信号会变少");
                 } else if (!md.empty()) {
                     strat = "turtle";
                     out.warnings.push_back(
@@ -287,9 +282,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 // 不设上限时明确说一次——不拦，但不能让它悄悄生效
                 if (c.rule.max_consecutive_reverses <= 0)
                     out.warnings.push_back(
-                        c.symbol + " 抛物线SAR：未设 max_consecutive_reverses（连续反手上限）。"
-                        "PSAR 触及即翻转，震荡市里会一直翻下去没有刹车——"
-                        "每次往返吃掉约 2k×ATR 的名义再加两笔手续费。建议设 2~3");
+                        c.symbol + " 抛物线SAR：未设 max_consecutive_reverses，"
+                        "震荡市会反复翻转，建议设 2~3");
             } else {   // BareK
                 const std::string be = get_str(so, "bare_entry", "break_prev");
                 if      (be == "immediate")  c.rule.bare_entry = trend::BareEntry::Immediate;
@@ -302,11 +296,12 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
                 if (c.rule.bare_entry == trend::BareEntry::Immediate &&
                     c.rule.reverse == trend::ReverseMode::Immediate && !c.rule.once_per_bar)
+                    // 新K线刚开盘时价格≈开盘价，多空条件会反复翻转。两条路都会来回开平：
+                    // 普通入场（once_per_bar 能拦）和立即反手（它拦不住，要靠
+                    // max_consecutive_reverses），所以两个都要建议
                     out.warnings.push_back(
-                        c.symbol + " 纯裸K：盘中即时入场 + 立即反手 + 未开每根一次护栏。"
-                        "新K线刚开盘时价格≈开盘价，微小波动会让多空条件反复翻转，"
-                        "一根K线内可能来回开平数次，每次两笔手续费。"
-                        "建议开 once_per_bar");
+                        c.symbol + " 纯裸K：立即顺势 + 立即反手，一根K线内可能来回开平。"
+                        "建议开 once_per_bar 并设 max_consecutive_reverses");
             }
 
             out.trend_bots.push_back(c);

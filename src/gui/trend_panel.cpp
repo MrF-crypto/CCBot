@@ -1007,9 +1007,8 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
         //   万一真拼错了会多等一会儿才发现（表现为一直"等信号"）
         if (info.lookup_failed) {
             log(QString::fromStdString(c.symbol) +
-                " 无法校验是否存在（拉取 exchangeInfo 失败，多半是网络/代理）。"
-                "已按你填的品种继续添加 —— 若它其实拼错了，表现会是一直「等信号」"
-                "且标记价那一列始终为空。", "WARN");
+                " 无法校验是否存在（网络问题），已照常添加；若一直「等信号」请检查拼写",
+                "WARN");
         } else if (!info.valid) {
             QMessageBox::warning(this, "品种不存在",
                 QString::fromStdString(c.symbol) +
@@ -1020,11 +1019,11 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
         }
     }
 
-    // 校验全过了才动状态：先删旧的再建新的。顺序不能反——add_bot 对同品种
-    // 已存在未停止的 bot 会直接返回空串
-    if (existing) trend_engine_->remove_bot(existing->bot_id);
-
-    const auto id = trend_engine_->add_bot(c);
+    // 校验全过了才动状态。改已有 bot 用 replace_bot：它保留已实现、笔数、胜率，
+    // 只换参数（v5.9.9 之前是 remove_bot + add_bot，每改一次参数统计就清零）。
+    // 删除后重新添加仍然从 0 开始 —— 那走的是 add_bot
+    const auto id = existing ? trend_engine_->replace_bot(existing->bot_id, c)
+                             : trend_engine_->add_bot(c);
     if (id.empty()) {
         QMessageBox::warning(this, "添加失败", "该品种已存在一个未停止的趋势 bot。");
         return false;
@@ -1157,8 +1156,7 @@ void MainWindow::load_and_restore_trend() {
         {
             const auto fx = app::normalize_symbol(sym.toStdString());
             if (fx.suffixed)
-                log(QString("趋势品种 %1 缺少报价币后缀，已自动更正为 %2"
-                            "（币安合约的代码形如 BTCUSDT）")
+                log(QString("趋势品种 %1 缺少后缀，已更正为 %2")
                         .arg(sym, QString::fromStdString(fx.symbol)), "WARN");
             if (fx.changed) ++migrated;   // 规范化过的名字要落盘，下次启动不再提示
             sym = QString::fromStdString(fx.symbol);
@@ -1199,10 +1197,8 @@ void MainWindow::load_and_restore_trend() {
             // 最接近的替代是"等收盘突破前一根高/低"——同样只在收盘判定，
             // 但严格得多。这是【行为变化】，必须说出来
             b.cfg.rule.bare_entry = trend::BareEntry::BreakPrevBar;
-            log(QString("趋势 %1：旧的「裸K线 阳线入场」规则已在 v5.1 移除，"
-                        "已迁移为「纯裸K · 等收盘突破前一根高/低」。"
-                        "入场条件比原来严格，信号会明显变少——"
-                        "这是有意的，旧规则在下跌趋势里会把一根反弹阳线当成做多信号。")
+            // 旧规则在下跌趋势里会把一根反弹阳线当成做多信号，所以收紧
+            log(QString("趋势 %1：旧的「阳线入场」已改为「等收盘突破前一根高/低」，信号会变少")
                     .arg(sym), "WARN");
             ++migrated;
         } else {

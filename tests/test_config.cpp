@@ -238,6 +238,10 @@ int main() {
         for (const auto& w : hc.warnings)
             if (w.find("once_per_bar") != std::string::npos) warned = true;
         check(warned, "  必须告警并建议开 once_per_bar");
+        bool cap = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("max_consecutive_reverses") != std::string::npos) cap = true;
+        check(cap, "  ⚠ 还要建议设连续反手上限 —— once_per_bar 只拦普通入场，拦不住立即反手");
     }
     {
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["

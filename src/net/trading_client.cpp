@@ -785,20 +785,17 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
     bool probe_ok = false;
     fetch_position_mode(&probe_ok);
     if (!probe_ok) {
-        r.error += "（重新探测持仓模式也失败了，无法确认是不是模式在连接之后被改过）";
+        r.error += "（重查持仓模式也失败）";
         return r;
     }
     if (dual_mode_.load() == before) {
-        r.error += std::string("（已重新探测：账户仍是") +
-                   (before ? "双向持仓" : "单向持仓") +
-                   "，与下单时一致，所以不是模式变更导致的）";
+        r.error += "（持仓模式与下单时一致）";
         return r;
     }
     auto r2 = place_market_once(sym, side, qty, reduce_only);
     if (!r2.ok)
-        r2.error += std::string("（账户持仓模式已在运行期改成") +
-                    (dual_mode_.load() ? "双向持仓" : "单向持仓") +
-                    "，已按新模式重发但仍失败）";
+        r2.error += std::string("（持仓模式已变为") +
+                    (dual_mode_.load() ? "双向" : "单向") + "，重发后仍失败）";
     return r2;
 }
 
@@ -1136,12 +1133,13 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
     const auto& pre = get_symbol_info(sym);
     if (!pre.valid || !pre.tick_found || pre.lookup_failed) {
         std::ostringstream d;
-        d << "拿不到 " << sym << " 的价格精度，不挂这张单（按不可信的 tickSize 取整"
-             "会挂出一张价位完全不对、却会被交易所接受的「假保护」单）。原因：";
-        if (pre.lookup_failed)   d << "本次 exchangeInfo 没拉到";
-        else if (!pre.valid)     d << "应答里没有该品种的 LOT_SIZE";
-        else                     d << "应答里没有该品种的 PRICE_FILTER";
-        d << "。下一次重试会重新拉取";
+        // 精度不可信时不挂：按默认 tickSize 取整会挂出价位不对、却被交易所接受的
+        // "假保护"单。提示保持简短
+        d << "拿不到价格精度，稍后重试（";
+        if (pre.lookup_failed)   d << "exchangeInfo 没拉到";
+        else if (!pre.valid)     d << "没有 LOT_SIZE";
+        else                     d << "没有 PRICE_FILTER";
+        d << "）";
         out.error     = d.str();
         out.retryable = true;
         return out;
@@ -1233,13 +1231,12 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
             fetch_position_mode(&probe_ok);
             if (probe_ok && dual_mode_.load() != before) {
                 out.retryable = true;
-                out.error += std::string("（账户持仓模式已在运行期改成") +
-                             (dual_mode_.load() ? "双向持仓" : "单向持仓") +
-                             "，已更新并重试）";
+                out.error += std::string("（持仓模式已变为") +
+                             (dual_mode_.load() ? "双向" : "单向") + "，已更新并重试）";
             } else if (probe_ok) {
-                out.error += "（已重新探测：持仓模式与挂单时一致，不是模式变更导致）";
+                out.error += "（持仓模式未变）";
             } else {
-                out.error += "（重新探测持仓模式失败，无法确认是不是模式变更导致）";
+                out.error += "（重查持仓模式也失败）";
             }
         }
         return out;
@@ -1273,8 +1270,7 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
         };
         out.error = "挂单被接受但回执里的触发价不对（我们要 " + px(stop_price) +
                     "，回执是 " + (got_trigger > 0 ? px(got_trigger) : std::string("缺失")) +
-                    "）。这种单【不会触发】，当挂单失败处理 —— "
-                    "静默的假保护比挂不上危险得多";
+                    "），这张单不会触发，已撤掉";
         out.retryable = false;   // 参数名/格式问题，重试结果一样
         // 单子已经在交易所上了，必须撤掉，否则留一张永不触发的孤儿单
         cancel_disaster_stop(sym, std::to_string(algo_id));
@@ -1619,6 +1615,56 @@ TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
         }
         if (!r.symbol.empty() && r.time > 0) out.push_back(r);
     }
+    return out;
+}
+
+std::vector<TradingClient::IncomeRecord>
+TradingClient::fetch_income(const std::string& income_type, int64_t start_ms, int64_t end_ms,
+                            const std::string& sym, int limit, bool* ok) {
+    if (ok) *ok = false;
+    std::vector<IncomeRecord> out;
+    std::string params = "incomeType=" + income_type +
+                         "&limit=" + std::to_string(std::clamp(limit, 1, 1000));
+    if (!sym.empty())   params += "&symbol=" + sym;
+    if (start_ms > 0)   params += "&startTime=" + std::to_string(start_ms);
+    if (end_ms   > 0)   params += "&endTime="   + std::to_string(end_ms);
+    params += "&recvWindow=5000";
+
+    auto resp = http_get(ep(Ep::Income), params);
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    if (doc.get(arr) != simdjson::SUCCESS) return out;   // 错误对象而非数组 ⇒ 没拉成
+
+    // 数字字段币安有时给数字有时给字符串，两种都收
+    auto get_i64 = [](simdjson::dom::element e, int64_t& v) {
+        if (e.get(v) == simdjson::SUCCESS) return true;
+        std::string_view sv;
+        if (e.get(sv) == simdjson::SUCCESS) {
+            try { v = std::stoll(std::string(sv)); return true; } catch (...) {}
+        }
+        return false;
+    };
+    for (auto e : arr) {
+        IncomeRecord r;
+        std::string_view sv;
+        if (e["symbol"].get(sv) == simdjson::SUCCESS) r.symbol = std::string(sv);
+        if (e["asset"].get(sv)  == simdjson::SUCCESS) r.asset  = std::string(sv);
+        if (e["income"].get(sv) == simdjson::SUCCESS) {
+            try { r.income = std::stod(std::string(sv)); } catch (...) { continue; }
+        } else {
+            double d = 0;
+            if (e["income"].get(d) != simdjson::SUCCESS) continue;
+            r.income = d;
+        }
+        get_i64(e["time"], r.time);
+        get_i64(e["tranId"], r.tran_id);
+        if (!r.symbol.empty() && r.time > 0) out.push_back(r);
+    }
+    if (ok) *ok = true;
     return out;
 }
 

@@ -25,6 +25,7 @@ class QVBoxLayout;
 
 #include "core/trend_engine.h"
 #include "core/funding_ledger.h"
+#include "core/fee_ledger.h"
 #include "core/thread_pool.h"
 #include "net/trading_client.h"
 #include "net/rest_price_feed.h"
@@ -133,6 +134,13 @@ private:
     // 危险操作的二次确认（默认按钮是取消，防误点后顺手回车）
     bool confirmDanger(const QString& title, const QString& body, const QString& okText);
     void refreshFunding();
+    // 手续费：对当前 bot 列表开/关时间段（纯内存，便宜，每拍都可以调）
+    void reconcileFeeSpans();
+    // 手续费：按计划向交易所同步流水（后台线程）
+    void syncFees();
+    // 手续费：第一次运行时，用成交明细补出各品种的时间段
+    void backfillFeeSpans();
+    void refreshFeeBadge();
     void refreshStats();
     void openTradeHistoryDialog();
     // 品种精度信息缓存未命中时，去后台线程取一次，绝不在 GUI 线程同步阻塞等待
@@ -157,10 +165,16 @@ private:
     std::string settings_path() const;
     std::string log_path()      const;
     std::string funding_path()  const;
+    std::string fee_path()      const;
+    std::string stats_path()    const;
     void save_credentials();
     void load_credentials();
     void save_trades(bool force = false);
     void load_trades();
+    // 盈利统计的累计值单独存一个文件：成交明细有 kMaxTrades 上限，超了丢最早的，
+    // 统计要是从明细现算，"累计盈亏"会跟着悄悄变小
+    void load_trade_stats();
+    void save_trade_stats() const;
     void save_settings();
     void load_settings();
 
@@ -205,7 +219,8 @@ private:
     QLabel*      mmrLabel_    = nullptr;   // uniMMR，顶部常驻（仅统一账户）
     QLabel*      rateLabel_   = nullptr;   // 限流状态，仅在被限速/封禁时显示
     QLabel*      fundLabel_   = nullptr;   // 累计资金费，顶部常驻（非零时才显示）
-    QLabel*      pnlBadge_    = nullptr;   // 累计已实现盈亏徽标，顶部常驻
+    // 顶部常驻：累计手续费（v5.9.10 之前这个位置是"盈亏"徽标）
+    QLabel*      feeBadge_    = nullptr;
 
     // NetworkError：曾经连接成功，但账户接口连续拉取失败（网络断了/VPN掉了这种），
     // 跟 Failed（一开始就没连上，比如密钥错）区分开，方便判断要不要报警、要不要重置计时
@@ -264,6 +279,15 @@ private:
     // 只记账不参与任何交易决策
     FundingLedger     funding_;
     bool              fundingBackfilled_ = false;
+    // 手续费账本（见 core/fee_ledger.h）。只记账不参与任何交易决策
+    FeeLedger         fees_;
+    bool              feesReady_     = false;   // 账本已读入、首次补算已做
+    qint64            nextFeeSyncMs_ = 0;       // 下次同步时刻；平仓后提前到约 1 分钟后
+    std::atomic<bool> feeFetchBusy_{false};
+    // 盈利统计的累计值（独立于成交明细，不受 kMaxTrades 上限影响）
+    double            statPnl_    = 0;
+    long long         statTrades_ = 0;
+    long long         statWins_   = 0;
 
     // 周期性拉取的防堆积守卫：上一批任务没跑完就跳过本批。没有守卫的话，
     // bot 数量多时（31个×每个~0.3s）批量任务的生产速度会超过消化速度，

@@ -32,6 +32,7 @@
 #include <thread>
 #include <future>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -126,6 +127,7 @@ MainWindow::MainWindow(QWidget* parent)
     migrate_appdata_if_needed();   // 老版本AppData数据一次性搬到程序目录data/
     load_credentials();
     load_trades();
+    load_trade_stats();   // 必须在 load_trades 之后：文件不存在时要用明细算初值
     load_settings();
     refreshStats();
 
@@ -175,8 +177,8 @@ MainWindow::~MainWindow() {
     // 直接结束进程，不跑析构、不跑 atexit。丢掉的只是优雅退出，换来的是
     // 绝不在已释放的对象上执行代码
     if (!drained) {
-        log("退出时仍有下单任务未完成，跳过清理直接结束进程（避免访问已释放内存）；"
-            "在途成交由下次启动的对账兜底", "WARN");
+        // 跳过清理直接结束进程，避免访问已释放内存
+        log("退出时仍有下单任务未完成，已直接退出；下次启动会对账核对", "WARN");
         std::_Exit(0);
     }
 }
@@ -259,6 +261,14 @@ std::string MainWindow::settings_path() const {
 
 std::string MainWindow::funding_path() const {
     return (portable_data_dir() + "/ccg_funding.json").toStdString();
+}
+
+std::string MainWindow::fee_path() const {
+    return (portable_data_dir() + "/ccg_fees.json").toStdString();
+}
+
+std::string MainWindow::stats_path() const {
+    return (portable_data_dir() + "/ccg_trade_stats.json").toStdString();
 }
 
 std::string MainWindow::log_path() const {
@@ -411,32 +421,75 @@ void MainWindow::load_trades() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 盈利统计
 // ─────────────────────────────────────────────────────────────────────────────
+// 金额显示统一走这两个函数：带正负号、各自按正负上色。
+// ⚠ v5.9.10 之前各处写的是 .arg(x >= 0 ? "+" : "").arg(std::abs(x))——负数时
+//   既不加 "+" 也不加 "-"，再取绝对值，于是亏 5U 显示成 "$5.00"，只能靠颜色分辨
+static QString signed_money(double v) {
+    if (std::abs(v) < 0.005) return "$0.00";
+    return QString("%1$%2").arg(v > 0 ? "+" : "-").arg(std::abs(v), 0, 'f', 2);
+}
+static QString money_color(double v) {
+    if (std::abs(v) < 0.005) return "#8b949e";
+    return v > 0 ? "#3fb950" : "#f85149";
+}
+static QString colored_money(double v) {
+    return QString("<span style=\"color:%1\">%2</span>").arg(money_color(v), signed_money(v));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 盈利统计的累计值
+//
+// 成交明细有 kMaxTrades 上限，超了丢最早的。统计要是从明细现算，"累计盈亏 / 笔数 /
+// 胜率"会在明细满了之后悄悄变小 —— 高频配置下一个多月就会到上限。
+// 所以累计值单独存一个文件，每平一笔加一笔，与明细保留多少条无关。
+// 文件不存在时（第一次运行新版本）用现有明细算出初值
+// ─────────────────────────────────────────────────────────────────────────────
+void MainWindow::load_trade_stats() {
+    QFile f(QString::fromStdString(stats_path()));
+    if (f.open(QIODevice::ReadOnly)) {
+        const auto doc = QJsonDocument::fromJson(f.readAll());
+        if (doc.isObject()) {
+            const auto o = doc.object();
+            statPnl_    = o["pnl"].toDouble(0);
+            statTrades_ = (long long)o["trades"].toDouble(0);
+            statWins_   = (long long)o["wins"].toDouble(0);
+            return;
+        }
+    }
+    statPnl_ = 0; statTrades_ = 0; statWins_ = 0;
+    for (const auto& t : trades_) {
+        statPnl_ += t.pnl;
+        ++statTrades_;
+        if (t.pnl > 0) ++statWins_;
+    }
+    save_trade_stats();
+}
+
+void MainWindow::save_trade_stats() const {
+    QJsonObject o;
+    o["pnl"]    = statPnl_;
+    o["trades"] = (double)statTrades_;
+    o["wins"]   = (double)statWins_;
+    QSaveFile f(QString::fromStdString(stats_path()));   // 原子写
+    if (!f.open(QIODevice::WriteOnly)) return;
+    f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+    f.commit();
+}
+
 void MainWindow::refreshStats() {
     if (!statsLabel_) return;
-    double totalPnl = 0;
-    int wins = 0;
-    for (const auto& t : trades_) {
-        totalPnl += t.pnl;
-        if (t.pnl > 0) ++wins;
-    }
-    double winRate = trades_.empty() ? 0.0 : (double)wins / trades_.size() * 100.0;
-    QColor c = (totalPnl >= 0) ? QColor("#3fb950") : QColor("#f85149");
+    const double winRate = statTrades_ > 0 ? (double)statWins_ / statTrades_ * 100.0 : 0.0;
+    statsLabel_->setTextFormat(Qt::RichText);
     statsLabel_->setText(
-        QString("盈利统计：共 %1 笔 | 胜率 %2% | 累计盈亏 %3$%4")
-        .arg(trades_.size())
+        QString("盈利统计：共 %1 笔 | 胜率 %2% | 累计盈亏 %3")
+        .arg(statTrades_)
         .arg(winRate, 0, 'f', 1)
-        .arg(totalPnl >= 0 ? "+" : "")
-        .arg(std::abs(totalPnl), 0, 'f', 2));
-    statsLabel_->setStyleSheet(QString("color:%1;font-size:11px;").arg(c.name()));
-
-    if (pnlBadge_) {
-        pnlBadge_->setText(QString("盈亏 %1$%2").arg(totalPnl >= 0 ? "+" : "")
-                            .arg(std::abs(totalPnl), 0, 'f', 2));
-        QString bg = (totalPnl > 0) ? "#1a3d1a" : (totalPnl < 0) ? "#3d1a1a" : "#21262d";
-        pnlBadge_->setStyleSheet(QString(
-            "QLabel{color:%1;font-size:11px;background:%2;border-radius:8px;padding:2px 8px;}")
-            .arg(c.name(), bg));
-    }
+        .arg(colored_money(statPnl_)));
+    statsLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
+    statsLabel_->setToolTip(
+        "所有 bot 的成交累计，包含已删除的 bot。\n"
+        "盈亏是毛盈亏：按成交价算，没有扣手续费和资金费（这两项见顶部栏）。\n"
+        "你在 App 上手动平仓、或被强平的仓位，程序拿不到成交价，不在这里。");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -827,12 +880,14 @@ void MainWindow::buildUi() {
         fundLabel_->setVisible(false);
         row->addWidget(fundLabel_);
 
-        pnlBadge_ = new QLabel("盈亏 $0.00");
-        pnlBadge_->setStyleSheet(
+        // 累计手续费：交易所实际扣掉的（资金流水 COMMISSION），只统计各品种
+        // 有 bot 的那些时间段。v5.9.10 之前这个位置是"盈亏"徽标
+        feeBadge_ = new QLabel("手续费 $0.00");
+        feeBadge_->setStyleSheet(
             "QLabel{color:#8b949e;font-size:11px;background:#21262d;"
             "border-radius:8px;padding:2px 8px;}");
         row->addSpacing(10);
-        row->addWidget(pnlBadge_);
+        row->addWidget(feeBadge_);
 
         row->addStretch();
 
@@ -1098,9 +1153,7 @@ void MainWindow::onConnect() {
             //   这个值决定每张订单要不要带 positionSide，报错了会让人
             //   在真正的原因（-4061 拒单）面前看着一条自信的错误结论
             if (!mode_ok)
-                log(QString("⚠ 拉取账户持仓模式失败，沿用上次的判断：%1。"
-                            "若实际是另一种，下单会被交易所以 -4061 拒掉 —— "
-                            "看到 -4061 就先回来核对这一行")
+                log(QString("⚠ 未查到账户持仓模式，沿用上次：%1（下单若报 -4061 会自动重查）")
                         .arg(dual ? "双向持仓" : "单向持仓"), "WARN");
             else
                 log(dual ? "账户持仓模式: 双向持仓（下单将带 positionSide）"
@@ -1123,8 +1176,15 @@ void MainWindow::onConnect() {
                     // 那层适配随 DCA 一起没了
                     trades_.push_back(tr);
                     save_trades();
+                    statPnl_ += tr.pnl;
+                    ++statTrades_;
+                    if (tr.pnl > 0) ++statWins_;
+                    save_trade_stats();
                     refreshStats();
                     save_trend_bots();
+                    // 平仓后约 1 分钟同步一次手续费，别让顶部数字等将近一小时才变
+                    const qint64 soon = QDateTime::currentMSecsSinceEpoch() + 60 * 1000;
+                    if (nextFeeSyncMs_ == 0 || soon < nextFeeSyncMs_) nextFeeSyncMs_ = soon;
                     // 交易所侧灾难止损触发时本地【收不到】这个回调——它在周期
                     // 对账里表现为一条"交易所已无此仓位"，告警走那条路
                 }, Qt::QueuedConnection);
@@ -1179,6 +1239,16 @@ void MainWindow::onConnect() {
             // 恢复上次保存的 Bot
             load_and_restore_trend();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
+            // 手续费账本。第一次运行新版本时用成交明细补出各品种的时间段，
+            // 之后由 reconcileFeeSpans 按当前 bot 列表开/关
+            if (!feesReady_) {
+                fees_.load(fee_path());
+                if (!fees_.backfilled()) backfillFeeSpans();
+                reconcileFeeSpans();
+                feesReady_     = true;
+                nextFeeSyncMs_ = QDateTime::currentMSecsSinceEpoch();   // 尽快同步一次
+                refreshFeeBadge();
+            }
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
             // 本地状态是错的，带着错误均价继续跑会把止盈止损全算错
@@ -1201,10 +1271,8 @@ void MainWindow::onConnect() {
                 const qint64 snapMs = QDateTime::currentMSecsSinceEpoch();
                 if (!pos_ok) {
                     QMetaObject::invokeMethod(this, [this]() {
-                        log("启动对账已跳过：拉取交易所持仓失败。"
-                            "宁可不对账，也不能把「拉取失败」当成「交易所没有仓位」——"
-                            "那会清掉本地跟踪而真实仓位还在。下一轮周期对账会再试",
-                            "WARN");
+                        // 宁可不对账：把"拉取失败"当成"交易所没有仓位"会清掉真实持仓
+                        log("启动对账已跳过：拉取持仓失败，下一轮再试", "WARN");
                     }, Qt::QueuedConnection);
                     return;
                 }
@@ -1218,9 +1286,8 @@ void MainWindow::onConnect() {
                     const auto gate = app::reconcile_gate(
                         true, snapMs, QDateTime::currentMSecsSinceEpoch());
                     if (!gate.ok()) {
-                        log("启动对账已跳过：持仓快照排队到界面线程时已经过旧，"
-                            "拿它比对可能把刚开的仓判成外部已平。下一轮周期对账会再试",
-                            "WARN");
+                        // 拿过旧的快照比对，可能把刚开的仓判成外部已平
+                        log("启动对账已跳过：持仓数据过旧，下一轮再试", "WARN");
                         return;
                     }
                     auto issues = trend_engine_->reconcile_positions(ex, gate.age);
@@ -1296,6 +1363,114 @@ void MainWindow::refreshFunding() {
             fundFetchBusy_.store(false);
         }, Qt::QueuedConnection);
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 手续费账本
+//
+// 口径见 core/fee_ledger.h：只统计各品种"有 bot 的那些时间段"里交易所实际扣掉的
+// 手续费。时间段不在删除按钮、清除按钮、改参数这几个入口里逐一维护 —— 入口多，
+// 漏一个就是一段永远不关的时间段。改成每拍拿当前 bot 列表对一遍：
+//   · 新出现的品种开一段，从列表里消失的品种关掉
+//   · 改策略参数是"删了再建"，在同一个函数里连续完成，对的时候品种一直在列表里，
+//     时间段不会被切断
+// ─────────────────────────────────────────────────────────────────────────────
+void MainWindow::reconcileFeeSpans() {
+    if (!trend_engine_) return;
+    std::set<std::string> active;
+    for (const auto& b : trend_engine_->get_bots()) active.insert(b.cfg.symbol);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (fees_.reconcile_active(active, now)) {
+        fees_.save(fee_path());
+        // 有品种刚被删掉：它的最后那笔平仓手续费要在删除后 kGraceMs 内补拉，
+        // 别等到下一个整点
+        const qint64 after_grace = now + FeeLedger::kGraceMs + 30 * 1000;
+        if (nextFeeSyncMs_ == 0 || after_grace < nextFeeSyncMs_) nextFeeSyncMs_ = after_grace;
+    }
+}
+
+// 第一次运行新版本：用成交明细补出各品种的时间段。
+//
+// ⚠ 不能用 bot 的启动时间：start_time 不落盘，每次启动恢复出来的 bot 启动时间都是
+//   "现在"。改用成交明细：每个品种以最早一笔平仓往前推 7 天作为起点（把第一笔的
+//   开仓手续费也包进去），已删除的 bot 以最后一笔平仓之后 1 分钟作为终点。
+//   代价是这 7 天里如果手动交易过同一品种，也会被算进来
+void MainWindow::backfillFeeSpans() {
+    constexpr qint64 kLead = 7LL * 24 * 3600 * 1000;
+    std::map<std::string, std::pair<qint64, qint64>> range;   // 品种 → (最早, 最晚) 平仓时刻
+    for (const auto& t : trades_) {
+        const qint64 ms = tp_to_ms(t.close_time);
+        if (ms <= 0 || t.symbol.empty()) continue;
+        auto it = range.find(t.symbol);
+        if (it == range.end()) range[t.symbol] = {ms, ms};
+        else { it->second.first = std::min(it->second.first, ms);
+               it->second.second = std::max(it->second.second, ms); }
+    }
+    std::set<std::string> active;
+    if (trend_engine_)
+        for (const auto& b : trend_engine_->get_bots()) active.insert(b.cfg.symbol);
+    for (const auto& [sym, r] : range) {
+        if (active.count(sym)) fees_.open_span(sym, r.first - kLead);
+        else                   fees_.add_closed_span(sym, r.first - kLead, r.second + 60 * 1000);
+    }
+    fees_.set_backfilled(true);
+    fees_.save(fee_path());
+    if (!range.empty())
+        log(QString("手续费账本：按成交明细补算 %1 个品种的历史手续费（最多往回约 90 天）")
+                .arg(range.size()));
+}
+
+void MainWindow::syncFees() {
+    if (!client_) return;
+    if (feeFetchBusy_.exchange(true)) return;   // 上一批没跑完就跳过
+    // 先排上下一次的常规同步；同步途中又有平仓的话，回调会把它提前
+    nextFeeSyncMs_ = QDateTime::currentMSecsSinceEpoch() + 3600LL * 1000;
+    run_async([this]() {
+        bool ok = true;
+        const int added = sync_fee_ledger(*client_, fees_, QDateTime::currentMSecsSinceEpoch(), &ok);
+        QMetaObject::invokeMethod(this, [this, added, ok]() {
+            fees_.save(fee_path());
+            refreshFeeBadge();
+            // 没拉全的品种不会被标成已同步（见 fee_ledger），这里只需要早点重试
+            if (!ok) {
+                const qint64 retry = QDateTime::currentMSecsSinceEpoch() + 5 * 60 * 1000;
+                if (retry < nextFeeSyncMs_) nextFeeSyncMs_ = retry;
+            }
+            (void)added;
+            feeFetchBusy_.store(false);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::refreshFeeBadge() {
+    if (!feeBadge_) return;
+    const double total = fees_.total();
+    feeBadge_->setText("手续费 " + signed_money(total));
+    const QString bg = (total < -0.005) ? "#3d1a1a" : "#21262d";
+    feeBadge_->setStyleSheet(QString(
+        "QLabel{color:%1;font-size:11px;background:%2;border-radius:8px;padding:2px 8px;}")
+        .arg(money_color(total), bg));
+
+    // 悬停：各品种明细，按付出的多少排序
+    std::vector<std::pair<double, std::string>> rows;
+    int skipped = 0;
+    for (const auto& s : fees_.symbols()) {
+        const auto e = fees_.get(s);
+        skipped += e.skipped_asset;
+        if (e.count > 0) rows.push_back({e.total, s});
+    }
+    std::sort(rows.begin(), rows.end());
+    QString tip = "交易所实际扣掉的手续费（资金流水），按 USDT 计。\n"
+                  "只统计每个品种有 bot 的那些时间段，删掉的 bot 也算在内；\n"
+                  "这些时间段里你在 App 上手动交易同一品种，手续费也会算进来。\n";
+    if (!rows.empty()) {
+        tip += "\n";
+        for (const auto& [v, s] : rows)
+            tip += QString("  %1  %2\n").arg(QString::fromStdString(s), -14).arg(signed_money(v));
+    }
+    if (skipped > 0)
+        tip += QString("\n另有 %1 条不是 USDT 计价的流水（如 BNB 抵扣），没有计入。").arg(skipped);
+    feeBadge_->setToolTip(tip.trimmed());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1688,11 +1863,8 @@ void MainWindow::onTick() {
                     trendSigFailed_ = std::move(now);
 
                     if (!fresh.isEmpty())
-                        log(QString("⚠ 信号拉取失败：%1（本轮成功 %2 个）。"
-                                    "拉不到 K 线 = 没有 ATR = 没有止损线，"
-                                    "这些品种不会开新仓。"
-                                    "最常见的原因是品种名不对——币安合约的代码形如 "
-                                    "BTCUSDT，不是 BTC")
+                        // 拉不到 K 线 = 没有止损线，所以这些品种不开新仓
+                        log(QString("⚠ 信号拉取失败：%1（本轮成功 %2 个），这些品种暂不开新仓")
                                 .arg(fresh.join(", ")).arg(okn), "WARN");
                     if (!healed.isEmpty())
                         log(QString("信号已恢复：%1").arg(healed.join(", ")), "OK");
@@ -1711,6 +1883,13 @@ void MainWindow::onTick() {
     // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
     if (fundTickCount_++ % 100 == 0) refreshFunding();
+
+    // 手续费：每拍都对一遍 bot 列表（纯内存），到点才向交易所同步
+    if (feesReady_) {
+        reconcileFeeSpans();
+        if (nextFeeSyncMs_ > 0 && QDateTime::currentMSecsSinceEpoch() >= nextFeeSyncMs_)
+            syncFees();
+    }
 
     // 成交明细的延迟落盘：save_trades 做了去抖，被压下的写在这里补上
     if (tradesDirty_) save_trades(true);
@@ -2078,8 +2257,7 @@ double MainWindow::tickSizeOf(const std::string& symbol) {
         // round_price(0.0015, 0.01) 取整成 0，便宜品种的限价单/止损单被拒。
         // 每品种只报一次：有就是有，没有就永久沉默
         if (!info.tick_found && tickWarned_.insert(symbol).second)
-            log(QString("⚠ %1 未取到 PRICE_FILTER，tick_size 用的是默认 0.01"
-                        "——该品种的限价单/交易所侧止损单价格可能被错误取整")
+            log(QString("⚠ %1 未取到价格精度，暂不挂硬止损，稍后重试")
                     .arg(QString::fromStdString(symbol)), "WARN");
         return info.tick_size;
     }
@@ -2210,17 +2388,18 @@ void MainWindow::refreshBotTable() {
     }
 
     // 汇总
-    QColor sum_c = (total_unreal + total_real >= 0) ? QColor("#3fb950") : QColor("#f85149");
+    // 未实现、已实现各自按正负上色。v5.9.10 之前整行只有一个颜色，看的是两数之和：
+    // 已实现亏了、未实现浮盈更大时，已实现会显示成绿色；而且负数不带负号。
+    // 已实现 = 当前列表里各 bot 的已实现之和（删掉的 bot 不算；改参数不清零）
+    summaryLabel_->setTextFormat(Qt::RichText);
     summaryLabel_->setText(
-        QString("运行中: %1   冷却: %2   已停止: %3   |   "
-                "未实现: %4$%5   已实现: %6$%7")
+        QString("运行中: %1&nbsp;&nbsp;&nbsp;冷却: %2&nbsp;&nbsp;&nbsp;已停止: %3"
+                "&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;未实现: %4&nbsp;&nbsp;&nbsp;已实现: %5")
         .arg(running).arg(cooling).arg(stopped)
-        .arg(total_unreal >= 0 ? "+" : "").arg(std::abs(total_unreal), 0, 'f', 2)
-        .arg(total_real   >= 0 ? "+" : "").arg(std::abs(total_real),   0, 'f', 2));
+        .arg(colored_money(total_unreal), colored_money(total_real)));
     summaryLabel_->setStyleSheet(
-        QString("QLabel{color:%1;font-size:11px;padding:4px 8px;"
-                "background:#161b22;border:1px solid #21262d;border-radius:3px;}")
-        .arg(sum_c.name()));
+        "QLabel{color:#8b949e;font-size:11px;padding:4px 8px;"
+        "background:#161b22;border:1px solid #21262d;border-radius:3px;}");
 
     // 顶部常驻：权益/可用
     if (equityLabel_) {

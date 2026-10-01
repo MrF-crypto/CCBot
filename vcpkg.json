@@ -1,6 +1,6 @@
 {
   "name": "ccg-monitor",
-  "version": "5.9.9",
+  "version": "5.9.10",
   "description": "TradingBot — Binance USDT-M 永续合约趋势策略交易程序：海龟/抛物线SAR/纯裸K 三策略，含 GUI 与 headless 两个可执行文件",
   "dependencies": [
     "simdjson",

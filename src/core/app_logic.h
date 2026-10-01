@@ -140,11 +140,10 @@ inline ReverseMigration migrate_reverse_mode(bool allow_reverse, bool needs_sign
     }
     m.mode   = trend::ReverseMode::None;
     m.effect = MigrationEffect::Changed;
-    m.note   = "旧的「止损时有反向信号才反手」这一档已不存在，已迁移为「只平掉，"
-               "回到正常入场流程」。⚠ 行为有两处变化：① 不再在止损的同一个动作里"
-               "反向开仓，而是由下一个正常入场信号开（反向信号成立的话，下一拍照样"
-               "会反向开）；② 同向信号先来也会再进一次。"
-               "想要止损即反手，请把反手方式设为「立即反手」（headless：reverse=immediate）";
+    // 两处变化：止损后不再在同一个动作里反向开仓，改由下一个正常入场信号开；
+    // 同向信号先来也会再进一次
+    m.note   = "旧的「有反向信号才反手」已改为「只平掉」，行为有变化：同向信号先来也会再进。"
+               "要止损即反手请设为「立即反手」";
     return m;
 }
 

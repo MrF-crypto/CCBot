@@ -165,8 +165,7 @@ int main(int argc, char** argv) {
              " | 持仓模式 " + (dual_mode ? "双向（带 positionSide）" : "单向") +
              // 没查成时必须说出来：这个值决定每张订单要不要带 positionSide，
              // 猜错会被交易所以 -4061 拒单，而那个码光看字面联想不到这里
-             (mode_ok ? "" : "（⚠ 未查到，沿用默认值；若下单出现 -4061"
-                             "就是这里猜错了）"), "OK");
+             (mode_ok ? "" : "（⚠ 未查到，沿用默认；报 -4061 时会自动重查）"), "OK");
     // 启动这一条保留：一次性的，而且本机与交易所的时差是排查任何时间戳问题的起点
     log_line(first_sync.to_log(), first_sync.accepted ? "OK" : "WARN");
 

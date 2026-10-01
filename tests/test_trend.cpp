@@ -244,8 +244,13 @@ static void test_turtle() {
 // ─────────────────────────────────────────────────────────────────────────────
 // ② 抛物线 SAR（Wilder）
 // ─────────────────────────────────────────────────────────────────────────────
+// newbar 默认 true：这个文件里的 PSAR 用例都是"每调用一次 = 过了一根K线"。
+// ⚠ 实盘不是这样 —— 引擎 3 秒调用一次，同一根K线里 new_bar 只有第一拍是 true。
+//   v5.9.10 之前这里默认 false 而 step 不看 new_bar，于是测试和实盘恰好用了两种
+//   不同的节奏，"每拍都递推"的 bug 就藏在这个差别里。同一根K线多次调用的情形
+//   见下面"同一根K线内多次调用"那组用例
 static Inputs psar_in(double price, double ph, double pl,
-                      double p2h = 0, double p2l = 0, bool newbar = false) {
+                      double p2h = 0, double p2l = 0, bool newbar = true) {
     Inputs in;
     in.price = price;
     in.bar_ok = true;
@@ -337,6 +342,43 @@ static void test_psar() {
             step(st, cfg, psar_in(100.0 + i, 90, 80, 89, 79));
         CHECK(near(st.af, cfg.af_max), "AF 必须封顶在 af_max，不能一直涨");
         CHECK(st.af <= cfg.af_max + 1e-12, "AF 绝不得超过上限");
+    }
+
+    // ── 同一根K线内多次调用：SAR 只递推一次（v5.9.10 修的实盘 bug）──────────
+    // 引擎 3 秒调用一次 step。v5.9.10 之前每次都递推，一根K线里推上百次，止损线
+    // 很快贴到前两根K线的低点。实测：SAR 起点 90，同一根K线调用 100 次后到 99，
+    // 按设计应约为 90.3
+    {
+        State st;
+        on_filled(st, Pos::Long, 100, 90, cfg, false);
+        // 新K线第一拍：结算一次
+        step(st, cfg, psar_in(105, 106, 101, 104, 99, /*newbar=*/true));
+        const double after_first = st.stop;
+        const double af_first    = st.af;
+        CHECK(after_first < 92.0, "新K线第一拍只递推一次（远离夹逼上限 99）");
+        // 同一根K线里再来 99 拍，价格还在涨
+        for (int i = 0; i < 99; ++i)
+            step(st, cfg, psar_in(105 + i * 0.01, 106, 101, 104, 99, /*newbar=*/false));
+        CHECK(near(st.stop, after_first),
+              "⚠ 同一根K线内不再递推 —— 否则 SAR 会一路贴到前两根K线低点");
+        CHECK(near(st.af, af_first),
+              "  AF 也不得在K线内随每个新高反复加速");
+        CHECK(st.peak > 105.9, "  但 EP 要照常跟到K线内的新高");
+
+        // 下一根K线开始：这根刷新过 EP ⇒ AF 加一档，SAR 再推一次
+        step(st, cfg, psar_in(106, 106.98, 104, 106, 101, /*newbar=*/true));
+        CHECK(near(st.af, af_first + cfg.af_step), "下一根开始时按「这根刷新过 EP」加速一次");
+        CHECK(st.stop > after_first, "  SAR 往上推一次");
+        CHECK(st.stop < 101.0, "  仍然受夹逼约束（前两根最低 101）");
+    }
+    {
+        // 恢复后 psar_ep_mark 为 0（不落盘）：第一根K线不能因为"跟 0 比"白加一次 AF
+        State st;
+        on_filled(st, Pos::Long, 100, 90, cfg, false);
+        st.psar_ep_mark = 0;
+        const double af0 = st.af;
+        step(st, cfg, psar_in(99, 106, 101, 104, 99, /*newbar=*/true));
+        CHECK(near(st.af, af0), "从落盘恢复后的第一根K线不得白加一次 AF");
     }
 
     // ── 初始止损 = 前一根的反向极值 ──────────────────────────────────────────

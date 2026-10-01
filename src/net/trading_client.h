@@ -213,6 +213,26 @@ public:
     std::vector<FundingRecord> fetch_funding_income(int64_t start_ms, int64_t end_ms,
                                                     const std::string& symbol = "");
 
+    // 通用资金流水（目前用于手续费 COMMISSION）。
+    //
+    // 与 fetch_funding_income 的两处不同，都是手续费才需要的：
+    //   · 带 tranId。一笔市价单分多次成交时，会在【同一毫秒】产生多条手续费记录，
+    //     资金费那种"时间戳不大于游标就是重复"的去重会把后面几条当重复丢掉
+    //   · 带 ok。没拉成和"这段时间确实没有手续费"必须分得开 —— 账本靠它决定
+    //     这一段算不算同步过；当成"没有"的话，那段手续费就永久漏掉了
+    // limit 最大 1000；一页满 1000 条时调用方要接着翻页（见 fee_ledger）
+    struct IncomeRecord {
+        std::string symbol;
+        std::string asset;
+        double      income  = 0;   // 带符号，手续费是负数
+        int64_t     time    = 0;
+        int64_t     tran_id = 0;
+    };
+    std::vector<IncomeRecord> fetch_income(const std::string& income_type,
+                                           int64_t start_ms, int64_t end_ms,
+                                           const std::string& symbol, int limit,
+                                           bool* ok);
+
     // 持仓模式检测（连接时调用一次）
     // 拉取账户的持仓模式（单向 / 双向）。ok 区分"查成了"与"没查成"。
     //

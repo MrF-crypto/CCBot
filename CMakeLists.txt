@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 5.9.9 LANGUAGES CXX)
+project(TradingBot VERSION 5.9.10 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,6 +98,7 @@ find_package(Threads REQUIRED)
 set(CORE_SOURCES
     src/core/trend_engine.cpp
     src/core/funding_ledger.cpp
+    src/core/fee_ledger.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
     # 行情源：REST 轮询。v5.7.0 起替代 book_ticker_stream（WebSocket）。
@@ -276,6 +277,7 @@ endif()
 
 # ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
 add_executable(ccg_funding_tests tests/test_funding.cpp src/core/funding_ledger.cpp
+                                 src/core/fee_ledger.cpp
                                  src/net/trading_client.cpp
                                  src/net/rate_gate.cpp)
 target_include_directories(ccg_funding_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -230,6 +230,56 @@ int main() {
         check(cli->leverage_calls == 1, "开仓前应设置一次杠杆");
     }
 
+    // ── 改策略参数保留已实现；删除再添加从 0 开始 ───────────────────────────
+    // v5.9.10 之前改参数在界面上走 remove_bot + add_bot，每改一次参数这个 bot 的
+    // 已实现、笔数、胜率就清零，汇总栏的"已实现"也跟着少掉一块
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);       // 开多，止损 104
+        advance(10);
+        feed(eng, id, 2.0, 110, 90, 2);
+        cli->fill_price = 103.0;
+        eng.tick("TESTUSDT", 103.0);       // 止损出场
+        const auto before = eng.get_bots()[0];
+        check(before.st.pos == trend::Pos::Flat && before.trade_count == 1 &&
+              before.realized_pnl < 0, "前提：做过一笔、已实现为负、当前空仓");
+
+        auto cfg2 = cfg;
+        cfg2.rule.atr_mult = 2.0;          // 改一个参数
+        const auto nid = eng.replace_bot(before.bot_id, cfg2);
+        check(!nid.empty(), "改参数成功");
+        check(eng.get_bots().size() == 1, "  仍然只有一个 bot");
+        const auto after = eng.get_bots()[0];
+        check(std::fabs(after.cfg.rule.atr_mult - 2.0) < 1e-12, "  新参数生效");
+        check(std::fabs(after.realized_pnl - before.realized_pnl) < 1e-12,
+              "⚠ 已实现不得因为改参数清零");
+        check(after.trade_count == before.trade_count && after.win_count == before.win_count,
+              "  笔数、胜率一并保留");
+
+        // 有持仓时不许换：换了会重建止损线基准
+        feed(eng, nid, 2.0, 110, 90, 3);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        const auto held = eng.get_bots()[0];
+        check(held.st.pos == trend::Pos::Long, "前提：又开了一笔");
+        check(eng.replace_bot(held.bot_id, cfg).empty(), "有持仓时改参数必须被拒");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  原仓位不受影响");
+
+        // 删除再添加：从 0 开始（这是用户要的口径）
+        TrendEngine e2(cli, inline_host());
+        auto a = e2.add_bot(cfg);
+        e2.remove_bot(a);
+        auto b2 = e2.add_bot(cfg);
+        check(e2.get_bots()[0].bot_id == b2 && e2.get_bots()[0].realized_pnl == 0 &&
+              e2.get_bots()[0].trade_count == 0, "删除再添加：已实现、笔数从 0 开始");
+    }
+
     // ── 零成交防幽灵仓：r.ok 但 executedQty=0，绝不能入账 ────────────────────
     {
         auto cli = std::make_shared<FakeClient>();

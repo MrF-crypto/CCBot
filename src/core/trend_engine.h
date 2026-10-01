@@ -253,6 +253,9 @@ public:
     TrendEngine(std::shared_ptr<ITradingClient> client, EngineHost host);
 
     std::string add_bot(const TrendConfig& cfg);   // 同品种已存在则返回空串
+    // 改策略参数：换成新配置，但保留已实现、笔数、胜率与起始时间。
+    // 旧 bot 有持仓时拒绝并返回空串（换参数会重建止损线基准）。old_id 不存在时等同 add_bot
+    std::string replace_bot(const std::string& old_id, const TrendConfig& cfg);
     // 从落盘快照恢复：cfg 用传入的最新配置，仓位/止损线/统计用快照里的值。
     // 与 add_bot 的区别是它【不清零持仓状态】——重启后本地跟踪必须对齐回
     // 重启前，否则引擎以为自己空仓，看到信号会再开一笔，变成双倍敞口

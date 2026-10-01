@@ -203,8 +203,7 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             note_once(TrendBot::Recon::Orphan,
                       b.cfg.symbol + " 交易所有仓位(" +
                       std::string(ex->direction > 0 ? "多" : "空") + " " +
-                      fmt(ex->qty, 8) + ")但本地无跟踪，已停止该bot。"
-                      "这笔仓位没有止损线守着，本程序也不会去平它，请手动核对");
+                      fmt(ex->qty, 8) + ")但本地无跟踪，已停止该bot，请手动处理这笔仓位");
             b.state = TrendBot::State::Stopped;
             b.last_action = "⚠ 孤儿仓，已停止待核对";
             continue;
@@ -240,9 +239,8 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             if (b.ext_gone_seen == 0) {
                 b.ext_gone_seen = 1;
                 note_once(TrendBot::Recon::ExtGoneSuspect,
-                          b.cfg.symbol + " 交易所侧查不到这笔仓位（存疑，第 1 次）。"
-                          "本地状态原样保留、bot 继续运行；连续两轮确认后才会清掉。"
-                          "若这是误报，下一轮会自动恢复正常");
+                          b.cfg.symbol + " 交易所查不到这笔仓位（存疑，第 1 次），"
+                          "先不处理，下一轮再确认");
                 continue;
             }
             note_once(TrendBot::Recon::ExtGone,
@@ -281,10 +279,9 @@ std::vector<std::string> TrendEngine::reconcile_positions(
         //   反向腿）已经由上面那条报过了，在那里再报一次反向腿是同一件事说两遍
         if (opp && !b.opp_leg_noted) {
             b.opp_leg_noted = true;
-            issues.push_back(b.cfg.symbol + " 交易所上还有一条【本程序没有跟踪】的反向腿(" +
+            issues.push_back(b.cfg.symbol + " 交易所上还有一条本程序没有跟踪的反向腿(" +
                              std::string(opp->direction > 0 ? "多" : "空") + " " +
-                             fmt(opp->qty, 8) + ")。它没有止损线守着，也不会被本"
-                             "程序平掉，请手动核对处理");
+                             fmt(opp->qty, 8) + ")，没有止损保护，请手动处理");
         }
         if (!opp) b.opp_leg_noted = false;
 
@@ -330,9 +327,8 @@ std::vector<std::string> TrendEngine::reconcile_stop_orders(
         // ⚠ 也要复位重试状态：不复位的话 ds_attempts 可能已经接近上限，
         //   重挂一两次失败就直接触发兜底平仓 —— 而这是一次全新的挂单机会，
         //   应该拿到完整的重试阶梯
-        issues.push_back(b.cfg.symbol + " 交易所侧硬止损单(" + b.disaster_stop_id +
-                         ")已不在活跃列表里 —— 可能被手动撤掉、被交易所撤掉，"
-                         "或落盘里是个过期单号。已清空本地记录，下一拍会重新挂一张");
+        // 可能被手动撤掉、被交易所撤掉，或落盘里是个过期单号
+        issues.push_back(b.cfg.symbol + " 交易所上的硬止损单不见了，下一拍重新挂");
         b.disaster_stop_id.clear();
         b.disaster_stop_price = 0;
         b.ds_attempts    = 0;
@@ -376,6 +372,36 @@ void TrendEngine::close_bot(const std::string& id) {
 void TrendEngine::remove_bot(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     bots_.erase(id);
+}
+
+std::string TrendEngine::replace_bot(const std::string& old_id, const TrendConfig& cfg) {
+    // 整个过程持锁：删旧、建新、搬统计之间不能被 tick 插进来
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(old_id);
+    if (it == bots_.end()) return add_bot(cfg);
+    // 有持仓时不许换（界面也拦了）：换了会重建止损线基准，线可能瞬间跳到现价
+    // 另一侧而立即触发平仓。这里再拦一道，不信任调用方
+    if (it->second.st.pos != trend::Pos::Flat || it->second.qty > 0) return {};
+
+    // ⚠ 改策略参数在界面上是"同一个 bot 换了参数"，用户看到的已实现、笔数、胜率
+    //   不该因此清零。v5.9.9 之前这里是 remove_bot + add_bot，于是每改一次参数，
+    //   这个 bot 的已实现就归零，汇总栏的"已实现"也跟着少掉这一块。
+    //   只搬统计和 bot 的起始时间（笔/周 这类按时间摊的指标要和笔数口径一致）。
+    //   熔断计数、暂停时刻【不搬】：改参数本身就是用户处理过这个品种的信号
+    const double realized = it->second.realized_pnl;
+    const int    trades   = it->second.trade_count;
+    const int    wins     = it->second.win_count;
+    const auto   started  = it->second.start_time;
+    bots_.erase(it);
+
+    const std::string id = add_bot(cfg);
+    if (id.empty()) return id;
+    auto& b = bots_[id];
+    b.realized_pnl = realized;
+    b.trade_count  = trades;
+    b.win_count    = wins;
+    b.start_time   = started;
+    return id;
 }
 
 void TrendEngine::stop_all() {
@@ -525,10 +551,8 @@ std::string TrendEngine::open_gate_block(const TrendBot& self) const {
         host_.now_steady() < self.ds_pause_until) {
         const auto left = std::chrono::duration_cast<std::chrono::seconds>(
                               self.ds_pause_until - host_.now_steady()).count();
-        return "该品种已连续 " + std::to_string(self.ds_fail_closes) +
-               " 次因挂不上硬止损而兜底平仓，暂停开仓（" +
-               std::to_string(left / 60) + " 分 " + std::to_string(left % 60) +
-               " 秒后自动试探一笔）";
+        return "硬止损连续挂不上，暂停开仓（" + std::to_string(left / 60) + " 分 " +
+               std::to_string(left % 60) + " 秒后自动试探）";
     }
 
     if (ds_account_broken_) {
@@ -536,9 +560,7 @@ std::string TrendEngine::open_gate_block(const TrendBot& self) const {
         if (waited < kDsBreakProbeAfter) {
             const auto left = std::chrono::duration_cast<std::chrono::seconds>(
                                   kDsBreakProbeAfter - waited).count();
-            return "账户级熔断：已连续 " + std::to_string(ds_abandons_total_) +
-                   " 次因挂不上交易所侧硬止损而兜底平仓，暂停开新仓（" +
-                   std::to_string(left) + " 秒后自动放行一笔试探）";
+            return "账户级熔断：暂停开新仓（" + std::to_string(left) + " 秒后自动放行一笔试探）";
         }
         // 冷却已过 ⇒ 半开，放行这一笔。成败都会在上面那段里被重新判定
     }
@@ -863,18 +885,19 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 b.state = TrendBot::State::Stopped;
                 b.last_action = "⚠ 开仓状态不明，已停止待核对";
                 log("⚠ " + cfg.symbol + " 开仓状态不明（" + r.error +
-                    "），已停止该bot，请核对交易所仓位后手动恢复");
+                    "），已停止，请核对交易所仓位后手动恢复");
             } else {
                 b.last_action = "开仓失败";
                 log(cfg.symbol + " 开仓失败: " + r.error);
             }
             }   // ← mtx_ 在此释放，下面才敢做 HTTP
+            // 用户嫌原句太长（2026-10-01）。原来括号里那段"落盘恢复的 bot 默认关、
+            // 弹窗默认开"是开发者说明，不该进日志。核实过：GUI 每次落盘都会写出
+            // use_disaster_stop，恢复路径的默认值 false 只在【读到缺这个键的老存档】
+            // 时才起作用（v4.7.0 之前存的、且之后一次都没再保存过），现在基本不会发生
             if (no_ds_notice)
-                log("⚠ " + cfg.symbol + " 未开启「在交易所挂灾难止损单」——"
-                    "这个仓位只有活在本进程里的移动止损，程序崩了/断电/窗口被误关"
-                    "就完全没有底。要开在右键→策略配置→进程外保护。\n"
-                    "    （从落盘恢复的 bot 这一项默认是关的，而弹窗里默认是开的，"
-                    "所以老 bot 与新配的 bot 会跑出两套风险模型）");
+                log("⚠ " + cfg.symbol + " 未开启交易所灾难止损：程序崩溃或断电时这个仓位"
+                    "没有保护（右键 → 策略配置 → 进程外保护）");
             if (need_ds_sync) try_place_hard_stop(id);
         } catch (const std::exception& e) {
             clear_pending_after_throw(id, "submit_open 异常: " + std::string(e.what()));
@@ -987,17 +1010,15 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
             if (b.st.pos == trend::Pos::Flat || b.qty <= 0 ||
                 !(b.disaster_stop_price > 0)) {
                 orphan_to_cancel = placed.order_id;
-                log(sym + " 硬止损挂上时仓位已不在，撤掉这张孤儿单"
-                          "（单号 " + placed.order_id + "）");
+                log(sym + " 硬止损挂上时仓位已平，撤掉这张孤儿单");
             } else {
                 b.disaster_stop_id = placed.order_id;
                 if (b.ds_unprotected)
-                    log("✅ " + sym + " 硬止损已补挂成功（第 " + std::to_string(attempt) +
-                        " 次），该仓位重新获得进程外保护");
+                    log("✅ " + sym + " 硬止损补挂成功（第 " + std::to_string(attempt) + " 次）");
                 else
                     log(sym + " 硬止损已挂 @" + fmt(target) + "（止损线 " +
                         fmt(b.st.stop) + " 外扩 " +
-                        fmt(b.cfg.disaster_stop_buffer_pct, 2) + "%，进程死了也在）");
+                        fmt(b.cfg.disaster_stop_buffer_pct, 2) + "%）");
                 b.ds_attempts    = 0;
                 b.ds_unprotected = false;
                 b.ds_fail_closes = 0; // 挂成功 = 不是系统性故障，熔断计数清零
@@ -1029,11 +1050,11 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
         // 二十多秒的阶梯只是让仓位多裸二十多秒，结果一样——直接走兜底
         if (!placed.retryable) {
             give_up = true;
-            give_up_why = "挂单被拒且重试无意义（" + placed.error + "）";
+            give_up_why = "硬止损挂不上（" + placed.error + "）";
         } else if (attempt >= kDsMaxTries) {
             give_up = true;
-            give_up_why = "连续 " + std::to_string(kDsMaxTries) +
-                          " 次挂单失败（最后一次：" + placed.error + "）";
+            give_up_why = "硬止损连续 " + std::to_string(kDsMaxTries) +
+                          " 次挂不上（" + placed.error + "）";
         } else {
             b.ds_next_try = host_.now_steady() +
                             std::chrono::milliseconds(ds_backoff_ms(attempt));
@@ -1047,10 +1068,9 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                     "此刻该仓位【没有进程外保护】，本地移动止损仍在工作");
             } else if (attempt == kDsBackoffEnd && !b.ds_unprotected) {
                 b.ds_unprotected = true;
-                log("⚠⚠ " + sym + " 硬止损挂单已失败 " + std::to_string(attempt) +
-                    " 次（" + placed.error + "）。该仓位【无交易所侧保护】——"
-                    "再试 " + std::to_string(kDsMaxTries - kDsBackoffEnd) +
-                    " 次仍失败将立即平掉该仓位");
+                log("⚠⚠ " + sym + " 硬止损已失败 " + std::to_string(attempt) +
+                    " 次（" + placed.error + "），仓位暂无交易所保护；再失败 " +
+                    std::to_string(kDsMaxTries - kDsBackoffEnd) + " 次将平仓");
             }
         }
         }   // ← else（挂单失败）结束
@@ -1106,8 +1126,8 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
         total = ds_abandons_total_;
     }
 
-    log("⚠⚠ " + sym + " " + why + " —— 立即平掉该仓位。"
-        "开仓的前提是「断电断网也有交易所侧的底」，这个前提不成立了");
+    // 理由：开仓的前提是"断电断网也有交易所侧的底"，挂不上就不该继续持有
+    log("⚠⚠ " + sym + " " + why + "，按规则立即平仓");
 
     // 走正常的平仓路径：它自带幂等下单、部分成交续平、-2022（交易所侧已无仓位）
     // 的处理。reverse_to=Flat —— 这是兜底平仓，不是策略出场，不该触发反手
@@ -1136,27 +1156,20 @@ void TrendEngine::abandon_and_close(const std::string& bot_id, const std::string
                                          std::to_string(pause_dur.count() / 60) + " 分钟";
             }
         }
-        log("⚠⚠ " + sym + " 已连续 " + std::to_string(fails) +
-            " 次因挂不上硬止损而平仓，暂停该品种开仓 " +
-            std::to_string(pause_dur.count() / 60) + " 分钟，到点自动试探一笔"
-            "（每多失败一次暂停时长翻倍，封顶 4 小时；任意一次挂单成功即清零）。"
-            "持续出现请检查：账户权限、品种是否支持 closePosition、止损价精度");
+        // 提示保持一行（用户要求简洁）。暂停时长翻倍、封顶 4 小时、挂单成功即清零
+        // 这些规则见 kDsBotPauseMax 的注释
+        log("⚠⚠ " + sym + " 连续 " + std::to_string(fails) + " 次挂不上硬止损，暂停开仓 " +
+            std::to_string(pause_dur.count() / 60) + " 分钟后自动试探（再失败时长翻倍）");
     }
 
     // 账户级熔断只在【刚跨过阈值】那一次报。不去重的话，之后每个 bot 的每次
-    // 兜底平仓都会再刷一条同样的话
+    // 兜底平仓都会再刷一条同样的话。
+    // 提示保持一行。挂不上硬止损几乎总是系统性的（网络/代理把币安域名劫持到
+    // 别处时响应是 HTML 错误页；统一账户的条件单端点或权限不对；止损价精度不符），
+    // 所以全局暂停而不是让每个 bot 各自烧满重试额度。已有仓位不受影响
     if (account_broken) {
         log("⛔ 全局暂停开新仓：已累计 " + std::to_string(total) +
-            " 次因挂不上交易所侧硬止损而兜底平仓，判定为账户级/网络级故障。"
-            "挂不上硬止损几乎总是系统性的，让每个 bot 各自烧满自己的重试额度"
-            "只是在重复付手续费。\n"
-            "    已有仓位【不受影响】，移动止损照常工作、平仓照常执行；"
-            "只是不再开新仓。\n"
-            "    常见原因：① 网络到不了交易所（代理/DNS 把币安域名劫持到别处，"
-            "此时响应往往不是 JSON 而是一张 HTML 错误页）；② 统一账户的条件单"
-            "端点或权限不对；③ 止损价精度不符合该品种的 tickSize。\n"
-            "    不需要人工复位：10 分钟后会自动放行一笔开仓去试探，"
-            "它的硬止损挂上了就完全解除；还挂不上就再等 10 分钟。");
+            " 次挂不上交易所硬止损。已有仓位不受影响，10 分钟后自动试探一笔，挂上即恢复");
     }
 }
 
@@ -1327,11 +1340,9 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                     //   触发平仓没有任何区别，唯一的差别是谁先动手。
                     //   停掉等于让用户去点"继续"才能恢复交易
                     b.last_action = "交易所硬止损出场 " + fmt(pnl, 2) + "U";
-                    log("⚠ " + cfg.symbol + " 本地平仓被拒(-2022)，核对后确认是"
-                        "【我们自己挂的硬止损先触发了】—— 交易所用标记价连续触发，"
-                        "本地是 3 秒采样，快速行情下它会抢在本地前面。"
-                        "这是计划内的止损出场，已按出场记账，bot 继续运行等下一个信号。"
-                        "盈亏按触发价 " + fmt(px) + " 估算（实际成交有滑点）");
+                    // 一行即可。为什么会先触发：交易所用标记价连续触发、本地 3 秒采样
+                    log(cfg.symbol + " 交易所硬止损先触发，按止损出场记账（价格按触发价 " +
+                        fmt(px) + " 估算），bot 继续运行");
                     ds_only_cancel = true;   // 跳过后续的常规平仓分支
                 } else if (external_gone) {
                     // 确实解释不了：没挂过硬止损、或那张单还在挂着（说明不是它平的）、
@@ -1346,11 +1357,8 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                     b.pending = false;
                     b.state = TrendBot::State::Stopped;
                     b.last_action = "⚠ 交易所侧已无仓位，已停止待核对";
-                    log("⚠ " + cfg.symbol + " 平仓被拒(-2022)：交易所侧已无该仓位，"
-                        "且【不是】我们的硬止损触发的（" +
-                        (ds_id_snap.empty() ? std::string("本仓位没挂硬止损")
-                                            : std::string("那张单还在挂着，或查不到委托列表")) +
-                        "）。可能是手动平仓或强平，已清空本地状态并停止，请核对后手动恢复");
+                    log("⚠ " + cfg.symbol + " 交易所已无该仓位，且不是硬止损触发的"
+                        "（可能是手动平仓或强平）。已停止，请核对后手动恢复");
                     ds_only_cancel = true;   // 不能在这里 return：撤单要在锁外
                 }
                 if (!ds_only_cancel) {

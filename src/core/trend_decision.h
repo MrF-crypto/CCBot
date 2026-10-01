@@ -115,6 +115,9 @@ struct State {
     double stop        = 0;
     // ② 专用：当前加速因子。只有 PSAR 用得上，别的策略恒为 0
     double af          = 0;
+    // ② 专用：上一次【K线边界】结算时的 EP。AF 是否加速看的是"这根K线有没有
+    //    刷新 EP"，所以要记下上一根结算时的值。不落盘：恢复后为 0，见 step 里的处理
+    double psar_ep_mark = 0;
     int    consec_reverses = 0;
     int    cooldown_left   = 0;   // 剩余冷却K线数
     // ③ 专用：最后一次开仓所在K线的开盘时间。once_per_bar 靠它判"这根开过了"
@@ -289,19 +292,35 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
     if (st.pos != Pos::Flat) {
         const bool is_long = (st.pos == Pos::Long);
 
-        const double old_peak = st.peak;
         st.peak = is_long ? std::max(st.peak, in.price)
                           : std::min(st.peak, in.price);
 
-        // ② PSAR 的加速因子：【只在刷新 EP 时】才递增。
-        //    每根都加的话 AF 会迅速封顶，SAR 立刻贴上价格，一点回撤就出场
+        // ② PSAR：递推与 AF 加速【每根K线只做一次】，在新K线开始的那一拍。
+        //
+        // ⚠ v5.9.10 之前这里每个 tick 都递推（引擎 3 秒一拍）。SAR 公式是"每根K线
+        //   朝 EP 靠近 AF"，一根K线里被递推上百次，止损线很快就贴到夹逼上限
+        //   ——前两根K线的最低价（做空时最高价）。"刚开仓时每根只靠拢 2%，给趋势
+        //   留呼吸空间"这个机制在实盘里完全失效；AF 也会因为K线内每个新高都 +step
+        //   而远快于设计地封顶。单元测试一直是"每根K线调用一次"，所以没抓到。
+        //   实测（同一根K线内调用 100 次）：SAR 从 90 到 99，按设计应为 ≈ 90.3。
+        //
+        //   EP 仍然每拍更新（K线内的新高要算进去），只是 AF 是否加速、SAR 推多少，
+        //   留到下一根K线开始时按"这根K线有没有刷新 EP"一次性结算。
+        //   新K线那一拍的价格会先并进 EP 再结算——只差一个 3 秒的采样，可以忽略
         if (cfg.strategy == Strategy::ParabolicSar) {
-            const bool new_ep = is_long ? (st.peak > old_peak) : (st.peak < old_peak);
-            if (new_ep) st.af = std::min(cfg.af_max, st.af + cfg.af_step);
-        }
-
-        // 数据缺失时不推新线，沿用上一条有效止损线——绝不因为数据断流就撤掉保护
-        if (const double cand = stop_candidate(st.pos, st, cfg, in); cand > 0) {
+            if (in.new_bar) {
+                // 标记为 0：刚从落盘恢复（这个字段不落盘），以当前 EP 起算，
+                // 不因为"跟 0 比"就白加一次 AF
+                if (!(st.psar_ep_mark > 0)) st.psar_ep_mark = st.peak;
+                const bool new_ep = is_long ? (st.peak > st.psar_ep_mark)
+                                            : (st.peak < st.psar_ep_mark);
+                if (new_ep) st.af = std::min(cfg.af_max, st.af + cfg.af_step);
+                st.psar_ep_mark = st.peak;
+                if (const double cand = stop_candidate(st.pos, st, cfg, in); cand > 0)
+                    st.stop = is_long ? std::max(st.stop, cand) : std::min(st.stop, cand);
+            }
+        } else if (const double cand = stop_candidate(st.pos, st, cfg, in); cand > 0) {
+            // 数据缺失时不推新线，沿用上一条有效止损线——绝不因为数据断流就撤掉保护
             st.stop = is_long ? std::max(st.stop, cand)    // 棘轮：只上不下
                               : std::min(st.stop, cand);
         }
@@ -398,6 +417,7 @@ inline void on_filled(State& st, Pos p, double fill_price, double stop_price,
     // 新一轮的 AF 从初始值重新加速。反手开出来的仓位同样——上一轮攒到的
     // 加速度属于上一段趋势，带过来会让新仓一开始就被贴得很紧
     st.af = (cfg.strategy == Strategy::ParabolicSar) ? cfg.af_start : 0.0;
+    st.psar_ep_mark = fill_price;   // 建仓那一刻的 EP 就是成交价
     if (bar_open_ms != 0) st.last_entry_bar_ms = bar_open_ms;
 }
 
@@ -405,6 +425,7 @@ inline void on_closed(State& st) {
     st.pos = Pos::Flat;
     st.entry_price = st.peak = st.stop = 0;
     st.af = 0;
+    st.psar_ep_mark = 0;
     // ⚠ 不清 last_entry_bar_ms：once_per_bar 的语义正是"这一根【开过了】"，
     //   平仓后清掉的话同一根里会立刻再开一次，护栏等于没有
 }
