@@ -93,6 +93,18 @@ public:
         stop_log.push_back({"cancel", 0, id});
         return true;
     }
+    // 硬止损单是否还在活跃委托里。三种状态都要能构造：
+    //   ds_live_known=false              → 查不到（必须走保守路径）
+    //   ds_live_known=true,  live=true   → 还挂着（不是它平的）
+    //   ds_live_known=true,  live=false  → 已经不在了（它触发了）
+    bool ds_live_known = false;
+    bool ds_live       = true;
+    int  ds_live_calls = 0;
+    bool is_disaster_stop_live(const std::string&, const std::string&, bool* ok) override {
+        ++ds_live_calls;
+        if (ok) *ok = ds_live_known;
+        return ds_live;
+    }
     int ds_count(const std::string& kind) const {
         int n = 0;
         for (const auto& c : stop_log) if (c.kind == kind) ++n;
@@ -365,6 +377,95 @@ int main() {
         check(b.qty == 0, "-2022 应清空数量");
         check(b.state == TrendBot::State::Stopped, "-2022 应停止该bot待人工核对");
         check(cli->calls.size() == 2, "-2022 之后绝不能反手");
+    }
+
+    // ── -2022 但是【我们自己的硬止损触发了】⇒ 计划内出场，bot 必须继续跑 ─────
+    //
+    // 这是实盘最劝退的一处（2026-10-01）：
+    //   08:50:17 QNTUSDT 开空 @288.69 止损线=292.36
+    //   08:50:17 硬止损已挂 @292.9447          ← 只高出 0.20%
+    //   08:56:07 平仓被拒(-2022) ⇒ 清空本地状态并【停止该bot】
+    // 交易所那张单用【标记价】连续触发，本地止损线是 3 秒采样 —— 价格快速穿过时
+    // 交易所几乎必然抢先。于是一次完全正常的止损出场，变成了要人工点"继续"。
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        cfg.rule.reverse = trend::ReverseMode::None;   // 只看出场，不看反手
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);                   // 开多，止损线 104
+        check(cli->ds_count("place") == 1, "硬止损已挂（前提成立）");
+
+        // 交易所那张单已经不在活跃委托里 ⇒ 它触发了
+        cli->ds_live_known = true;
+        cli->ds_live       = false;
+        cli->fail_next  = true;
+        cli->error_next = "order would not reduce position [-2022]";
+        eng.tick("TESTUSDT", 104.0);
+
+        auto b = eng.get_bots()[0];
+        check(cli->ds_live_calls >= 1, "必须去核对那张单还在不在");
+        check(b.st.pos == trend::Pos::Flat && b.qty == 0, "仓位状态应清空（它确实没了）");
+        check(b.state == TrendBot::State::Running,
+              "⚠ bot 必须【继续运行】—— 这是计划内的止损出场，和本地止损线触发"
+              "没有任何区别，唯一差别是谁先动手。停掉等于让用户去点「继续」");
+        check(b.trade_count == 1, "  必须记成一笔交易，不能把这次出场漏掉账");
+        // 触发价 = 104 × (1 − 0.2%) = 103.792；用它当成交价的近似
+        check(b.realized_pnl < 0, "  多头在 103.792 出场是亏的，盈亏要记进去");
+        check(cli->ds_count("cancel") == 0,
+              "  不得去撤那张单 —— 它已经成交了，撤它只会白报一个错");
+    }
+
+    // ── -2022 且那张单【还挂着】⇒ 不是它平的，仍须停下来让人核对 ─────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+
+        cli->ds_live_known = true;
+        cli->ds_live       = true;    // 还挂着 ⇒ 平仓的不是它
+        cli->fail_next  = true;
+        cli->error_next = "order would not reduce position [-2022]";
+        eng.tick("TESTUSDT", 104.0);
+
+        auto b = eng.get_bots()[0];
+        check(b.state == TrendBot::State::Stopped,
+              "那张单还在 ⇒ 是人工平的或被强平，必须停下来让人核对");
+        check(b.trade_count == 0, "  成因不明，不该凭空记一笔盈亏");
+    }
+
+    // ── -2022 且【查不到】活跃委托 ⇒ 不敢认，走保守路径 ──────────────────────
+    // 拉取失败时活跃列表是空的，"这张单不在里面"会成立 —— 若不判 ok，
+    // 任何一次 -2022 都会被认成"我们的止损触发了"，真正的强平就被放过去了。
+    // 又是"没拿到当成没有"那个老毛病，这里钉住它
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.use_disaster_stop = true;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+
+        cli->ds_live_known = false;   // 查不到
+        cli->ds_live       = false;   // 返回值故意是"不在了"，但 ok=false
+        cli->fail_next  = true;
+        cli->error_next = "order would not reduce position [-2022]";
+        eng.tick("TESTUSDT", 104.0);
+
+        auto b = eng.get_bots()[0];
+        check(b.state == TrendBot::State::Stopped,
+              "⚠ 查不到就不许认成「我们的止损触发了」—— 否则强平会被当成计划内出场");
+        check(b.trade_count == 0, "  同样不该记账");
     }
 
     // ── 残量取整后归零：不得无限空转发0数量单 ────────────────────────────────

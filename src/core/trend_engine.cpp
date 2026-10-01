@@ -1157,6 +1157,50 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
             double exit_px = price, closed_qty = 0;
             bool external_gone =
                 (!r.ok && r.error.find("[-2022]") != std::string::npos);
+
+            // ⚠ -2022 最常见的成因其实是【我们自己挂的那张硬止损被触发了】，
+            //   而那是一次【计划内的出场】，不是异常。
+            //
+            //   为什么它会先触发：交易所那张单用【标记价】连续触发，本地止损线
+            //   用的是 3 秒一次的采样价。硬止损挂在本地线之外一点点（实盘那次
+            //   只有 0.20%），价格快速穿过时，标记价往往已经走到硬止损上，
+            //   而我们这一拍才刚看到本地线被破。于是：交易所先平 ⇒ 本地再去
+            //   reduceOnly 平仓 ⇒ -2022。
+            //
+            //   实盘 2026-10-01：
+            //     08:50:17 QNTUSDT 开空 @288.69 止损线=292.36
+            //     08:50:17 硬止损已挂 @292.9447（只高出 0.20%）
+            //     08:56:07 平仓被拒(-2022) ⇒ 清空本地状态并【停止该bot】
+            //
+            //   把自己计划内的止损出场当成"需要人工核对的异常"并停掉 bot，
+            //   是这套设计里最劝退的一处：策略本该止损出场、等下一个信号，
+            //   结果变成要人去点一下"继续"。
+            //
+            //   判据：挂过硬止损，而它现在已经不在活跃委托列表里 ⇒ 它触发了。
+            //   ⚠ 必须判 ok —— 拉取失败时列表是空的，那会让【任何】一次 -2022
+            //     都被认成"我们的止损触发了"，于是真正的手动平仓/强平也被当成
+            //     计划内出场而让 bot 继续跑。又是"没拿到当成没有"那个老毛病。
+            bool own_stop_fired = false;
+            std::string ds_id_snap;
+            double ds_trigger_snap = 0;
+            if (external_gone) {
+                {
+                    std::lock_guard<std::recursive_mutex> lk(mtx_);
+                    auto it0 = bots_.find(id);
+                    if (it0 != bots_.end()) {
+                        ds_id_snap      = it0->second.disaster_stop_id;
+                        ds_trigger_snap = it0->second.disaster_stop_price;
+                    }
+                }
+                if (!ds_id_snap.empty()) {
+                    bool live_ok = false;
+                    const bool still_live =
+                        client_->is_disaster_stop_live(cfg.symbol, ds_id_snap, &live_ok);
+                    // 查到了、而且它已经不在活跃委托里 ⇒ 它触发了
+                    own_stop_fired = (live_ok && !still_live);
+                }
+            }
+
             if (r.ok) {
                 closed_qty = r.executed_qty;
                 closed_ok  = closed_qty > 0;
@@ -1177,8 +1221,56 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 if (it == bots_.end()) return;
                 auto& b = it->second;
 
-                if (external_gone) {
-                    // reduceOnly 被拒 = 交易所侧已无仓位（手动平过/被强平）。
+                if (external_gone && own_stop_fired) {
+                    // 我们自己那张硬止损触发了 ⇒ 计划内的止损出场。
+                    // 按正常出场记一笔账，然后【让 bot 继续跑】去等下一个信号。
+                    //
+                    // 成交价拿触发价当近似：STOP_MARKET 触发后以市价成交，
+                    // 实际价会有滑点。这里不去查真实成交明细（要多一条
+                    // 算法单历史的接口），但【必须在日志和原因里标明是近似】，
+                    // 否则这笔盈亏看起来和本地平仓一样精确
+                    const double ds_entry = b.st.entry_price;
+                    const double ds_sign  = (pos == trend::Pos::Long) ? 1.0 : -1.0;
+                    const double px       = (ds_trigger_snap > 0) ? ds_trigger_snap : price;
+                    const double q        = b.qty;
+                    const double pnl      = (px - ds_entry) * q * ds_sign;
+
+                    tr.symbol      = cfg.symbol;
+                    tr.side        = pos;
+                    tr.entry_price = ds_entry;
+                    tr.exit_price  = px;
+                    tr.qty         = q;
+                    tr.pnl         = pnl;
+                    tr.reason      = "交易所硬止损触发（成交价为近似值）";
+                    tr.reversed    = false;
+                    tr.close_time  = host_.now_wall();
+                    emit_trade = true;
+
+                    b.realized_pnl += pnl;
+                    ++b.trade_count;
+                    if (pnl > 0) ++b.win_count;
+
+                    // 那张单已经成交了，不用撤（撤一张已成交的单只会白报一个错）
+                    need_ds_cancel = false;
+                    trend::on_closed(b.st);
+                    clear_ds_runtime(b);
+                    b.qty = 0;
+                    b.last_pos_change = host_.now_steady();
+                    b.pending = false;
+                    // ⚠ 关键：【不停 bot】。这是计划内的止损出场，和本地止损线
+                    //   触发平仓没有任何区别，唯一的差别是谁先动手。
+                    //   停掉等于让用户去点"继续"才能恢复交易
+                    b.last_action = "交易所硬止损出场 " + fmt(pnl, 2) + "U";
+                    log("⚠ " + cfg.symbol + " 本地平仓被拒(-2022)，核对后确认是"
+                        "【我们自己挂的硬止损先触发了】—— 交易所用标记价连续触发，"
+                        "本地是 3 秒采样，快速行情下它会抢在本地前面。"
+                        "这是计划内的止损出场，已按出场记账，bot 继续运行等下一个信号。"
+                        "盈亏按触发价 " + fmt(px) + " 估算（实际成交有滑点）");
+                    ds_only_cancel = true;   // 跳过后续的常规平仓分支
+                } else if (external_gone) {
+                    // 确实解释不了：没挂过硬止损、或那张单还在挂着（说明不是它平的）、
+                    // 或者查不到活跃委托列表（拿不到就不敢认）。
+                    // 手动平过 / 被强平都落在这里 —— 分不清就停下来让人看。
                     // 本地留着幽灵仓会每 tick 重试一次 -2022，无限循环
                     need_ds_cancel = !b.disaster_stop_id.empty();
                     trend::on_closed(b.st);
@@ -1189,7 +1281,10 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                     b.state = TrendBot::State::Stopped;
                     b.last_action = "⚠ 交易所侧已无仓位，已停止待核对";
                     log("⚠ " + cfg.symbol + " 平仓被拒(-2022)：交易所侧已无该仓位，"
-                        "已清空本地状态并停止，请核对后手动恢复");
+                        "且【不是】我们的硬止损触发的（" +
+                        (ds_id_snap.empty() ? std::string("本仓位没挂硬止损")
+                                            : std::string("那张单还在挂着，或查不到委托列表")) +
+                        "）。可能是手动平仓或强平，已清空本地状态并停止，请核对后手动恢复");
                     ds_only_cancel = true;   // 不能在这里 return：撤单要在锁外
                 }
                 if (!ds_only_cancel) {

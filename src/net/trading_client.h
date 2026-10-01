@@ -368,6 +368,8 @@ public:
                                       double qty = 0) override;
     bool cancel_disaster_stop(const std::string& symbol,
                               const std::string& order_id) override;
+    bool is_disaster_stop_live(const std::string& symbol,
+                               const std::string& order_id, bool* ok) override;
 
 private:
     // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换（listenKey 就没有

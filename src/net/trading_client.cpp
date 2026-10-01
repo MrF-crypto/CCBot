@@ -1378,6 +1378,19 @@ bool TradingClient::cancel_disaster_stop(const std::string& sym,
     return true;
 }
 
+bool TradingClient::is_disaster_stop_live(const std::string& /*sym*/,
+                                         const std::string& order_id, bool* ok) {
+    if (ok) *ok = false;
+    if (order_id.empty()) return false;
+    bool list_ok = false;
+    const auto live = fetch_open_algo_ids(&list_ok);
+    // ⚠ 拉取失败就老老实实说"不知道"。活跃列表在失败时是空的，而空集合会让
+    //   "这张单不在里面"成立 —— 调用方据此会把一次强平认成"我们的止损触发了"
+    if (!list_ok) return false;
+    if (ok) *ok = true;
+    return live.find(order_id) != live.end();
+}
+
 // ── K线拉取+解析（统一入口）─────────────────────────────────────────────────
 // 原先 fetch_indicators / fetch_trend 等几处各自拼一遍
 // URL、各自解析一遍数组，四份几乎相同的代码。改动 K 线口径时漏掉一处就会出现
