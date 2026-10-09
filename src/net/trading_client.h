@@ -112,6 +112,8 @@ public:
         bool    dc_ok   = false;
         double  dc_up   = 0;
         double  dc_dn   = 0;
+        double  box_atr   = 0;     // 通道宽度 ÷ 已收盘K线的 ATR，0=算不出
+        double  vol_ratio = 0;     // 当前根已成交量 ÷ 通道窗口内均量，0=算不出或尚无成交
         int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
     };
     TrendSnapshot fetch_trend_signal(const std::string& symbol, const std::string& interval,

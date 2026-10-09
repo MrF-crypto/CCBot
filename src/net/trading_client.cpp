@@ -1408,6 +1408,22 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
     out.dc_up = d.up;
     out.dc_dn = d.dn;
 
+    // 横盘突破过滤的两个读数。不管开没开过滤都算：K线已经在手上，多算几个数
+    // 不多一次请求，界面上也能直接看到这两个数，调阈值时有依据。
+    //   ATR 去掉当前根再算一次：爆拉那根的真实波幅会把 ATR 撑大、把箱体倍数读小
+    //   均量取通道窗口那几根（已收盘），和"箱体"是同一段
+    if (d.ok && bars.size() >= 2) {
+        const std::vector<indicators::Ohlc> closed(oh.begin(), oh.end() - 1);
+        const double atr_closed = indicators::atr(closed, atr_period);
+        if (atr_closed > 0 && d.up > d.dn) out.box_atr = (d.up - d.dn) / atr_closed;
+
+        const int end = (int)bars.size() - 1;   // 不含当前根
+        double sum = 0;
+        for (int i = end - donchian_period; i < end; ++i) sum += bars[i].volume;
+        const double avg = sum / donchian_period;
+        if (avg > 0) out.vol_ratio = bars.back().volume / avg;
+    }
+
     out.ok = (out.atr > 0 && d.ok && out.price > 0);
     return out;
 }

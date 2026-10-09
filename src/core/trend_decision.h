@@ -55,13 +55,33 @@ enum class ReverseMode {
     None,        // 只平掉，回到正常入场流程（方向不限，等下一个信号）
 };
 
+// 允许的开仓方向（三个策略共用）。只管【开新仓】与【反手的开仓腿】：
+//   · 不允许的方向上来了信号 ⇒ 不开
+//   · 要反手到不允许的方向 ⇒ 只平不反手（PSAR 的 stop-and-reverse 也一样）
+//   · 已经持有的仓位照常用止损线管着，不因为改了方向就强平
+enum class Direction { Both, LongOnly, ShortOnly };
+
 struct Config {
     Strategy strategy = Strategy::Turtle;
+    Direction direction = Direction::Both;
 
     // ── ① 海龟 ──────────────────────────────────────────────────────────────
     int    donchian_period = 20;    // 入场通道周期（海龟原版 20）
     int    atr_period      = 14;    // ATR 周期
     double atr_mult        = 3.0;   // Chandelier k：止损距离 = k×ATR
+
+    // 横盘突破过滤（两项各自独立，0 = 关，默认都关）。只拦【通道突破入场】，
+    // 不拦亏损止损后的立即反手——反手不是突破信号，它是"方向被证伪"的延续。
+    //
+    //   squeeze_box_atr：突破前的箱体（通道上沿 − 下沿）≤ 这么多倍 ATR 才算横盘。
+    //     山寨币"横盘吸筹 → 瞬间爆拉"的形态里，爆拉前的箱体很窄；箱体本来就宽的
+    //     突破多半是震荡里来回扫，正是手续费磨损的来源
+    //   breakout_vol_ratio：当前这根的成交量 ≥ 箱体内各根均量的这么多倍才算放量。
+    //     ⚠ 用的是当前根【已成交】的量，不按剩余时间外推。外推在刚开盘几分钟时
+    //       会把一点量放大十几倍，反而最容易放进假突破。不外推的代价是晚一点：
+    //       价格一直站在通道外，量攒够那一刻才入场
+    double squeeze_box_atr    = 0;
+    double breakout_vol_ratio = 0;
 
     // ── ② 抛物线 SAR ────────────────────────────────────────────────────────
     // SAR(下一根) = SAR(本根) + AF × (EP − SAR(本根))
@@ -130,6 +150,12 @@ struct Inputs {
     bool   dc_ok  = false;   // 唐奇安通道是否可用
     double dc_up  = 0;
     double dc_dn  = 0;
+    // ① 横盘突破过滤的两个读数（0 = 拿不到）。
+    //   box_atr：通道宽度 ÷ ATR，ATR 只用已收盘的K线——当前这根如果正在爆拉，
+    //            把它算进 ATR 会把"箱体有多窄"读小，等于放宽了门槛
+    //   vol_ratio：当前根已成交量 ÷ 通道窗口内各根的平均量
+    double box_atr   = 0;
+    double vol_ratio = 0;
     bool   new_bar = false;  // 本 tick 是否跨入新K线（冷却按K线计数）
     int64_t bar_open_ms = 0; // 当前这根K线的开盘时间
 
@@ -160,6 +186,7 @@ struct Verdict {
     const char* reason = "";
     double      stop   = 0;   // 本 tick 结束后的止损线（供 UI/日志显示）
     bool        profitable_exit = false;   // 本次出场是否 >= 成本价
+    bool        filtered = false;          // 有突破信号，但被横盘突破过滤拦下
 };
 
 // 数据是否足以【开新仓】。三个策略要的东西不同：
@@ -191,6 +218,12 @@ inline bool break_down(const Inputs& in) { return in.dc_ok && in.price <= in.dc_
 inline bool bar_already_used(const State& st, const Config& cfg, const Inputs& in) {
     return cfg.strategy == Strategy::BareK && cfg.once_per_bar &&
            in.bar_open_ms != 0 && st.last_entry_bar_ms == in.bar_open_ms;
+}
+
+inline bool allows(const Config& cfg, Pos p) {
+    if (p == Pos::Long)  return cfg.direction != Direction::ShortOnly;
+    if (p == Pos::Short) return cfg.direction != Direction::LongOnly;
+    return false;
 }
 
 // 入场信号（策略无关的统一入口）。
@@ -227,6 +260,26 @@ inline bool entry_short(const Inputs& in, const Config& cfg) {
     default:
         return break_down(in);
     }
+}
+
+// ① 横盘突破过滤：突破成立之后再问一句"这是不是从横盘里放量冲出来的"。
+// 返回 nullptr = 放行；否则是拦截原因。多空对称。
+// 读数拿不到（0）时【拦】：开了过滤却因为数据缺失而放行，等于这个选项静默失效
+inline bool squeeze_filter_on(const Config& cfg) {
+    return cfg.strategy == Strategy::Turtle &&
+           (cfg.squeeze_box_atr > 0 || cfg.breakout_vol_ratio > 0);
+}
+inline const char* squeeze_block(const Inputs& in, const Config& cfg) {
+    if (!squeeze_filter_on(cfg)) return nullptr;
+    if (cfg.squeeze_box_atr > 0) {
+        if (!(in.box_atr > 0))                 return "突破，但箱体读数缺失";
+        if (in.box_atr > cfg.squeeze_box_atr)  return "突破，但箱体过宽（非横盘）";
+    }
+    if (cfg.breakout_vol_ratio > 0) {
+        if (!(in.vol_ratio > 0))                    return "突破，等放量";
+        if (in.vol_ratio < cfg.breakout_vol_ratio)  return "突破，等放量";
+    }
+    return nullptr;
 }
 
 // Chandelier 止损线。多头挂在极值下方，空头挂在极值上方
@@ -352,6 +405,12 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             v.reason = v.profitable_exit ? "触线出场（不反手）" : "止损出场（不反手）";
             return v;
         }
+        // 反手的目标方向不允许 ⇒ 只平。不动连续反手计数：这一次本来就没有反手
+        if (!allows(cfg, is_long ? Pos::Short : Pos::Long)) {
+            v.action = Action::Close;
+            v.reason = is_long ? "出场（仅做多，不反手）" : "出场（仅做空，不反手）";
+            return v;
+        }
         // 连续反手上限（0 = 不限）。震荡市里这是唯一的刹车
         if (cfg.max_consecutive_reverses > 0 &&
             st.consec_reverses >= cfg.max_consecutive_reverses) {
@@ -379,8 +438,18 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
     // 每根K线最多开一次：被止损出场后不在同一根里重新入场
     if (bar_already_used(st, cfg, in)) { v.reason = "本根已开过（每根一次）"; return v; }
 
-    if (entry_long(in, cfg))  { v.action = Action::OpenLong;  v.reason = "多头信号"; return v; }
-    if (entry_short(in, cfg)) { v.action = Action::OpenShort; v.reason = "空头信号"; return v; }
+    const bool up = allows(cfg, Pos::Long) && entry_long(in, cfg);
+    const bool dn = !up && allows(cfg, Pos::Short) && entry_short(in, cfg);
+    if (up || dn) {
+        if (const char* why = squeeze_block(in, cfg)) {
+            v.reason = why;
+            v.filtered = true;
+            return v;
+        }
+        v.action = up ? Action::OpenLong : Action::OpenShort;
+        v.reason = up ? "多头信号" : "空头信号";
+        return v;
+    }
 
     v.reason = "无信号";
     return v;
@@ -432,6 +501,15 @@ inline void on_closed(State& st) {
 
 inline const char* pos_name(Pos p) {
     return p == Pos::Long ? "多" : (p == Pos::Short ? "空" : "空仓");
+}
+
+inline const char* direction_name(Direction d) {
+    switch (d) {
+    case Direction::LongOnly:  return "仅多";
+    case Direction::ShortOnly: return "仅空";
+    case Direction::Both:
+    default:                   return "多空";
+    }
 }
 
 inline const char* strategy_name(Strategy s) {

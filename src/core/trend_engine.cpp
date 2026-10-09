@@ -74,8 +74,14 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg) {
         params = "通道" + std::to_string(cfg.rule.donchian_period) +
                  " / ATR" + std::to_string(cfg.rule.atr_period) +
                  " / k=" + fmt(cfg.rule.atr_mult, 1);
+        if (cfg.rule.squeeze_box_atr > 0)
+            params += " / 横盘≤" + fmt(cfg.rule.squeeze_box_atr, 1) + "ATR";
+        if (cfg.rule.breakout_vol_ratio > 0)
+            params += " / 量比≥" + fmt(cfg.rule.breakout_vol_ratio, 1) + "x";
         break;
     }
+    if (cfg.rule.direction != trend::Direction::Both)
+        params += std::string(" / ") + trend::direction_name(cfg.rule.direction);
     log(cfg.symbol + " " + trend::strategy_name(cfg.rule.strategy) +
         " bot 已创建（" + params + " / " + cfg.interval + "）");
     return b.bot_id;
@@ -95,6 +101,7 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.sig_ok  = false;
     snap.atr = snap.atr_pct = 0;
     snap.dc_ok = false;
+    snap.box_atr = snap.vol_ratio = 0;
     snap.sig_time = {};
     // 冷却与"这根K线数过没有"跨重启都失去意义：bar_open_ms 对不上新拉的K线
     snap.bar_open_ms = snap.last_counted_bar_ms = 0;
@@ -428,7 +435,7 @@ void TrendEngine::set_pending_for_test(const std::string& id, bool v) {
 
 void TrendEngine::update_signal(const std::string& id, double atr, double atr_pct,
                               bool dc_ok, double dc_up, double dc_dn,
-                              int64_t bar_open_ms) {
+                              int64_t bar_open_ms, double box_atr, double vol_ratio) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);
     if (it == bots_.end()) return;
@@ -438,6 +445,8 @@ void TrendEngine::update_signal(const std::string& id, double atr, double atr_pc
     b.dc_ok   = dc_ok;
     b.dc_up   = dc_up;
     b.dc_dn   = dc_dn;
+    b.box_atr   = box_atr;
+    b.vol_ratio = vol_ratio;
     b.sig_time = host_.now_steady();
     // ⚠ 只有海龟的 sig_ok 由这里决定。裸K 与 抛物线SAR 根本不算通道也不用 ATR，
     //   它们的 sig_ok 由 update_bars 设——这里若一并覆盖，会把刚设好的 true
@@ -634,6 +643,8 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             in.dc_ok = fresh && b.dc_ok;
             in.dc_up = b.dc_up;
             in.dc_dn = b.dc_dn;
+            in.box_atr   = fresh ? b.box_atr : 0;
+            in.vol_ratio = fresh ? b.vol_ratio : 0;
             in.bar_ok      = fresh && b.bar_ok;
             in.bar_open    = b.bar_open;
             in.prev_close  = b.prev_close;
@@ -661,9 +672,29 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                 else if (b.cfg.rule.strategy == trend::Strategy::ParabolicSar && in.bar_ok)
                     d << " 前根[" << fmt(in.psar_prev_low) << "," << fmt(in.psar_prev_high) << "]";
                 else if (in.dc_ok) d << " 通道[" << fmt(in.dc_dn) << "," << fmt(in.dc_up) << "]";
+                if (b.st.pos == trend::Pos::Flat && trend::squeeze_filter_on(b.cfg.rule))
+                    d << " 箱体" << fmt(in.box_atr, 1) << "ATR 量比" << fmt(in.vol_ratio, 1) << "x";
                 if (!fresh) d << " 信号过期";
                 d << " | " << v.reason;
                 b.last_decision = d.str();
+            }
+
+            // 突破被过滤：每根K线记一次，看得到过滤在起作用、拦的是哪一条
+            // 箱体在一根K线内是定的（通道和已收盘的 ATR 都不变），被箱体拦了这根
+            // 就不会再开；量比会随成交增长，所以只拦在量上时说"放量仍会入场"
+            if (v.filtered && b.squeeze_noted_bar_ms != b.bar_open_ms) {
+                b.squeeze_noted_bar_ms = b.bar_open_ms;
+                const auto& r = b.cfg.rule;
+                const bool box_fail = r.squeeze_box_atr > 0 &&
+                                      !(in.box_atr > 0 && in.box_atr <= r.squeeze_box_atr);
+                std::string m = b.cfg.symbol + " 突破未开仓：";
+                if (r.squeeze_box_atr > 0)
+                    m += "箱体 " + fmt(in.box_atr, 1) + "ATR（限≤" + fmt(r.squeeze_box_atr, 1) + "）";
+                if (r.breakout_vol_ratio > 0)
+                    m += std::string(r.squeeze_box_atr > 0 ? " / " : "") + "量比 " +
+                         fmt(in.vol_ratio, 1) + "x（需≥" + fmt(r.breakout_vol_ratio, 1) + "）";
+                m += box_fail ? "，本根不再开" : "，本根内放量仍会入场";
+                log(m);
             }
 
             // 硬止损的【重试驱动】。固定语义下，挂上了就再也不碰——所以这里

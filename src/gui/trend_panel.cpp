@@ -140,6 +140,8 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
         QString tip = QString("%1　信号周期 %2\n")
                           .arg(trend::strategy_name(strat))
                           .arg(QString::fromStdString(b.cfg.interval));
+        if (b.cfg.rule.direction != trend::Direction::Both)
+            tip += QString("方向：%1\n").arg(trend::direction_name(b.cfg.rule.direction));
         switch (strat) {
         case trend::Strategy::Turtle:
             tip += QString("唐奇安突破入场 + Chandelier ATR 追踪止损\n"
@@ -147,6 +149,14 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                        .arg(b.cfg.rule.donchian_period)
                        .arg(b.cfg.rule.atr_period)
                        .arg(b.cfg.rule.atr_mult, 0, 'f', 1);
+            if (b.cfg.rule.squeeze_box_atr > 0)
+                tip += QString("横盘过滤：箱体 ≤ %1 ATR（当前 %2）\n")
+                           .arg(b.cfg.rule.squeeze_box_atr, 0, 'f', 1)
+                           .arg(b.box_atr, 0, 'f', 1);
+            if (b.cfg.rule.breakout_vol_ratio > 0)
+                tip += QString("放量过滤：量比 ≥ %1 倍（当前 %2）\n")
+                           .arg(b.cfg.rule.breakout_vol_ratio, 0, 'f', 1)
+                           .arg(b.vol_ratio, 0, 'f', 1);
             break;
         case trend::Strategy::ParabolicSar:
             tip += QString("抛物线 SAR：SAR 值既是入场也是止损也是反转点\n"
@@ -486,6 +496,7 @@ struct TrendFormWidgets {
     QComboBox*      strategy = nullptr;
     QStackedWidget* pages    = nullptr;   // 三个策略各自的参数页，只显示当前这个
     QComboBox*      interval = nullptr;
+    QComboBox*      direction = nullptr;
     QComboBox*      sizeMode = nullptr;
     QDoubleSpinBox* budget   = nullptr;
     QDoubleSpinBox* risk     = nullptr;
@@ -501,6 +512,8 @@ struct TrendFormWidgets {
     QSpinBox*       dcPeriod  = nullptr;
     QSpinBox*       atrPeriod = nullptr;
     QDoubleSpinBox* k         = nullptr;
+    QDoubleSpinBox* boxAtr    = nullptr;   // 横盘过滤：箱体 ≤ x ATR，0=关
+    QDoubleSpinBox* volRatio  = nullptr;   // 放量过滤：量比 ≥ x，0=关
 
     // ── ② 抛物线 SAR ──
     QDoubleSpinBox* afStart = nullptr;
@@ -579,6 +592,17 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
                             "⚠ 1m/3m 上单笔手续费（来回 0.10% + 滑点）会吃掉大半边缘。");
     sigForm->addRow("信号周期", w->interval);
 
+    w->direction = new QComboBox();
+    w->direction->addItem("多空", (int)trend::Direction::Both);
+    w->direction->addItem("仅多", (int)trend::Direction::LongOnly);
+    w->direction->addItem("仅空", (int)trend::Direction::ShortOnly);
+    w->direction->setCurrentIndex(w->direction->findData((int)c.rule.direction));
+    w->direction->setToolTip("允许开仓的方向，三个策略通用。\n"
+                             "仅多：空头信号不开；止损后要反手做空时只平不反手。\n"
+                             "仅空：反过来。\n"
+                             "已有的仓位照常用止损线管着，不会因为改了方向被平掉。");
+    sigForm->addRow("方向", w->direction);
+
     // 三页参数
     w->pages = new QStackedWidget();
     auto mkPage = [](QStackedWidget* st) {
@@ -619,6 +643,30 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
                      "k 越小假突破越多，越大回吐越多。经典值 2.5~3.5。\n"
                      "表格「状态」列悬停可看当前 k 对应的实际止损距离%。");
     p1->addRow("ATR 倍数 k", w->k);
+
+    w->boxAtr = new QDoubleSpinBox();
+    w->boxAtr->setRange(0.0, 20.0);
+    w->boxAtr->setSingleStep(0.5);
+    w->boxAtr->setDecimals(1);
+    w->boxAtr->setSpecialValueText("关");
+    w->boxAtr->setValue(c.rule.squeeze_box_atr);
+    w->boxAtr->setToolTip("横盘过滤：突破时通道宽度（上沿 − 下沿）≤ 这么多倍 ATR 才开仓。\n"
+                          "箱体窄 = 突破前在横盘吸筹；箱体本来就宽的突破多半是震荡里来回扫。\n"
+                          "ATR 只用已收盘K线，正在爆拉的那根不会把门槛放宽。0 = 关。\n"
+                          "表格「状态」列会显示当前箱体倍数，调阈值时可参考。");
+    p1->addRow("横盘 箱体≤", w->boxAtr);
+
+    w->volRatio = new QDoubleSpinBox();
+    w->volRatio->setRange(0.0, 20.0);
+    w->volRatio->setSingleStep(0.1);
+    w->volRatio->setDecimals(1);
+    w->volRatio->setSpecialValueText("关");
+    w->volRatio->setSuffix(" 倍");
+    w->volRatio->setValue(c.rule.breakout_vol_ratio);
+    w->volRatio->setToolTip("放量过滤：当前这根【已成交】的量 ≥ 通道内各根均量的这么多倍才开仓。\n"
+                            "不按剩余时间外推：价格一直站在通道外、量攒够的那一刻入场。\n"
+                            "两项过滤各自独立；只拦突破入场，不拦亏损止损后的立即反手。0 = 关。");
+    p1->addRow("突破量比≥", w->volRatio);
 
     // ── ② 抛物线 SAR ──
     w->afStart = new QDoubleSpinBox();
@@ -924,6 +972,7 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
     out.disaster_stop_buffer_pct      = w->disBuf->value();
 
     out.rule.strategy = (trend::Strategy)w->strategy->currentData().toInt();
+    out.rule.direction = (trend::Direction)w->direction->currentData().toInt();
 
     // ⚠ 每个策略【只回读自己那一页】的参数，其余从 base 继承原样带走。
     // 不这么做的话，切到 SAR 保存一次，海龟的通道周期就会被这一页上那个
@@ -933,6 +982,8 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.donchian_period = w->dcPeriod->value();
             out.rule.atr_period      = w->atrPeriod->value();
             out.rule.atr_mult        = w->k->value();
+            out.rule.squeeze_box_atr    = w->boxAtr->value();
+            out.rule.breakout_vol_ratio = w->volRatio->value();
             break;
         case trend::Strategy::ParabolicSar:
             out.rule.af_start = w->afStart->value();
@@ -1037,6 +1088,10 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
             params = QString("海龟 唐奇安%1 ATR%2 k=%3")
                          .arg(c.rule.donchian_period).arg(c.rule.atr_period)
                          .arg(c.rule.atr_mult, 0, 'f', 1);
+            if (c.rule.squeeze_box_atr > 0)
+                params += QString(" 横盘≤%1ATR").arg(c.rule.squeeze_box_atr, 0, 'f', 1);
+            if (c.rule.breakout_vol_ratio > 0)
+                params += QString(" 量比≥%1x").arg(c.rule.breakout_vol_ratio, 0, 'f', 1);
             break;
         case trend::Strategy::ParabolicSar:
             params = QString("趋势SAR AF %1/%2/%3")
@@ -1052,6 +1107,8 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
                          .arg(c.rule.once_per_bar ? " 每根限一次" : "");
             break;
     }
+    if (c.rule.direction != trend::Direction::Both)
+        params += QString(" %1").arg(trend::direction_name(c.rule.direction));
     log(QString("趋势 %1 已配置：%2 / %3 / %4")
             .arg(QString::fromStdString(c.symbol))
             .arg(params)
@@ -1081,9 +1138,12 @@ void MainWindow::save_trend_bots() {
         o["leverage"]    = b.cfg.leverage;
         o["interval"]    = QString::fromStdString(b.cfg.interval);
         o["strategy"]        = (int)b.cfg.rule.strategy;
+        o["direction"]       = (int)b.cfg.rule.direction;
         o["donchian_period"] = b.cfg.rule.donchian_period;
         o["atr_period"]      = b.cfg.rule.atr_period;
         o["atr_mult"]        = b.cfg.rule.atr_mult;
+        o["squeeze_box_atr"]    = b.cfg.rule.squeeze_box_atr;
+        o["breakout_vol_ratio"] = b.cfg.rule.breakout_vol_ratio;
         o["af_start"]        = b.cfg.rule.af_start;
         o["af_step"]         = b.cfg.rule.af_step;
         o["af_max"]          = b.cfg.rule.af_max;
@@ -1170,6 +1230,8 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.donchian_period = o["donchian_period"].toInt(20);
         b.cfg.rule.atr_period      = o["atr_period"].toInt(14);
         b.cfg.rule.atr_mult        = o["atr_mult"].toDouble(3.0);
+        b.cfg.rule.squeeze_box_atr    = std::max(0.0, o["squeeze_box_atr"].toDouble(0));
+        b.cfg.rule.breakout_vol_ratio = std::max(0.0, o["breakout_vol_ratio"].toDouble(0));
         b.cfg.rule.af_start        = o["af_start"].toDouble(0.02);
         b.cfg.rule.af_step         = o["af_step"].toDouble(0.02);
         b.cfg.rule.af_max          = o["af_max"].toDouble(0.20);
@@ -1179,6 +1241,13 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.cooldown_bars   = o["cooldown_bars"].toInt(0);
         b.cfg.size_mode = (TrendConfig::SizeMode)o["size_mode"].toInt(0);
         b.cfg.risk_usdt = o["risk_usdt"].toDouble(0);
+        {
+            // 老存档没有这个键 ⇒ 多空（原来的行为）。认不出的值也按多空
+            const int d = o["direction"].toInt(0);
+            b.cfg.rule.direction = (d == (int)trend::Direction::LongOnly)  ? trend::Direction::LongOnly
+                                 : (d == (int)trend::Direction::ShortOnly) ? trend::Direction::ShortOnly
+                                                                           : trend::Direction::Both;
+        }
 
         // ── 迁移：v5.0.x 的 sar_mode(0=唐奇安,1=裸K) → strategy ────────────
         // 旧存档里没有 strategy 键。默认值不能拍脑袋填 Turtle：旧的 mode=1

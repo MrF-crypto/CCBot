@@ -88,6 +88,7 @@ cmake --build build --config Release --target ccbot_headless
 | `budget_usdt` | `1000` | 每笔仓位的**名义价值**。三个策略都是单仓位、都不加仓，这就是全部 |
 | `leverage` | `3` | |
 | `interval` | `4h` | 信号K线周期。可选 `1m` `3m` `5m` `15m` `30m` `1h` `2h` `4h` `6h` `8h` `12h` `1d`（币安没有 10m 这一档） |
+| `direction` | `both` | 允许开仓的方向：`both`=多空 / `long`=仅多 / `short`=仅空。不允许的方向不开仓；要反手到不允许的方向时只平不反手（`psar` 同样）。已有仓位照常用止损线管着 |
 | `reverse` | `none` | 亏损止损后怎么办。`none`=只平掉，回到正常入场流程（方向不限，同向信号先来就同向再进）；`immediate`=立即反手开反向仓，不查信号。**盈利出场永不反手**——力竭不等于反转（`psar` 例外，见下）|
 | `max_consecutive_reverses` | `0` | 连续反手上限，`0`=不限。真趋势不需要连续反手，连续反手本身就是「现在是震荡市」的信号 |
 | `cooldown_bars` | `0` | 触顶后冷却多少根**K线**（不是 tick） |
@@ -108,6 +109,10 @@ cmake --build build --config Release --target ccbot_headless
 | `donchian_period` | `20` | 唐奇安通道周期（海龟原版 20）。上破 N 根最高→做多，下破 N 根最低→做空。通道**排除当前未收盘K线**，否则「价格≥上沿」恒成立、信号恒真 |
 | `atr_period` | `14` | ATR 周期，Wilder 平滑（与 TradingView/币安同口径）。**只有这个策略用 ATR** |
 | `atr_mult` | `3.0` | **止损距离 = k × ATR**（Chandelier Exit）。棘轮，只朝有利方向移动。k 越小假突破越多，越大回吐越多。经典值 2.5~3.5 |
+| `squeeze_box_atr` | `0`（关） | 横盘过滤：突破时通道宽度（上沿−下沿）≤ 这么多倍 ATR 才开仓。ATR 只用已收盘K线。例 `4` |
+| `breakout_vol_ratio` | `0`（关） | 放量过滤：当前根**已成交**量 ≥ 通道内各根均量的这么多倍才开仓（不按剩余时间外推，量攒够那一刻入场）。例 `1.5` |
+
+两项各自独立，可只开一项。只拦通道突破入场，不拦亏损止损后的立即反手。
 
 **选 `atr_mult` 前先看实测 ATR**：GUI 版的表有一列 ATR%，悬停即给出当前 k 对应的实际止损距离。
 跨品种唯一可比的口径是 `atr/price`，所以 BTC 和新上山寨能共用同一组参数。

@@ -150,6 +150,44 @@ int main() {
         check(!load_headless_config(path, hc, err), "atr_mult=0 应被拒绝");
     }
     {
+        // 横盘突破过滤：两个键能读进来，且不触发拼写告警
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"interval\":\"1h\","
+                         "\"squeeze_box_atr\":4,\"breakout_vol_ratio\":1.5}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "横盘过滤配置能加载");
+        if (hc.trend_bots.size() == 1) {
+            check(std::fabs(hc.trend_bots[0].rule.squeeze_box_atr - 4.0) < 1e-12, "  箱体阈值读入");
+            check(std::fabs(hc.trend_bots[0].rule.breakout_vol_ratio - 1.5) < 1e-12, "  量比阈值读入");
+        }
+        bool typo = false;
+        for (const auto& w : hc.warnings)
+            if (w.find("squeeze_box_atr") != std::string::npos ||
+                w.find("breakout_vol_ratio") != std::string::npos) typo = true;
+        check(!typo, "  新键不该被当成拼写错误");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"breakout_vol_ratio\":-1}]}");
+        HeadlessConfig hc2; std::string err2;
+        check(!load_headless_config(path, hc2, err2), "量比阈值为负应被拒绝");
+    }
+    {
+        // 方向：默认多空；long 读入；拼错拒绝启动
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\"},"
+                         "{\"symbol\":\"ETHUSDT\",\"direction\":\"long\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "方向配置能加载");
+        if (hc.trend_bots.size() == 2) {
+            check(hc.trend_bots[0].rule.direction == trend::Direction::Both, "  不写默认多空");
+            check(hc.trend_bots[1].rule.direction == trend::Direction::LongOnly, "  long ⇒ 仅多");
+        }
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"direction\":\"longg\"}]}");
+        HeadlessConfig hc2; std::string err2;
+        check(!load_headless_config(path, hc2, err2), "方向拼错应拒绝启动");
+    }
+    {
         // SAR 段的拼写错误同样要告警
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"atr_mlut\":3}]}");

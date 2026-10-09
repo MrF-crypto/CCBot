@@ -230,6 +230,48 @@ int main() {
         check(cli->leverage_calls == 1, "开仓前应设置一次杠杆");
     }
 
+    // ── 横盘突破过滤：没放量不开、每根只记一次日志、同一根里放量后入场 ────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<std::string> logs;
+        eng.set_log_cb([&](const std::string& m) { logs.push_back(m); });
+        auto cfg = mk_cfg();
+        cfg.rule.squeeze_box_atr = 4.0;
+        cfg.rule.breakout_vol_ratio = 1.5;
+        auto id = eng.add_bot(cfg);
+
+        auto noted = [&]() {
+            int n = 0;
+            for (const auto& m : logs)
+                if (m.find("突破未开仓") != std::string::npos) ++n;
+            return n;
+        };
+
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 3.0, 1.0);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        eng.tick("TESTUSDT", 111.5);
+        check(cli->calls.empty(), "量比 1.0 < 1.5：突破不开仓");
+        check(noted() == 1, "  同一根里拦了两次，日志只记一次");
+        check(eng.get_bots()[0].last_decision.find("量比1.0x") != std::string::npos,
+              "  状态里显示当前量比");
+
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 3.0, 1.8);
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->calls.size() == 1 && eng.get_bots()[0].st.pos == trend::Pos::Long,
+              "  同一根里量比涨到 1.8 ⇒ 开多");
+
+        // 不传读数（老调用方式）：开了过滤的 bot 宁拦勿放
+        auto cli2 = std::make_shared<FakeClient>();
+        TrendEngine eng2(cli2, inline_host());
+        auto id2 = eng2.add_bot(cfg);
+        feed(eng2, id2, 2.0, 110, 90);
+        cli2->fill_price = 111.0;
+        eng2.tick("TESTUSDT", 111.0);
+        check(cli2->calls.empty(), "  读数缺失时不开仓");
+    }
+
     // ── 改策略参数保留已实现；删除再添加从 0 开始 ───────────────────────────
     // v5.9.10 之前改参数在界面上走 remove_bot + add_bot，每改一次参数这个 bot 的
     // 已实现、笔数、胜率就清零，汇总栏的"已实现"也跟着少掉一块

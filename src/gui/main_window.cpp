@@ -1842,7 +1842,8 @@ void MainWindow::onTick() {
                     ++okn;
                     trend_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
-                                               snap.bar_open_ms);
+                                               snap.bar_open_ms, snap.box_atr,
+                                               snap.vol_ratio);
                 }
                 trendSigBusy_.store(false);
                 QMetaObject::invokeMethod(this, [this, failed, okn]() {

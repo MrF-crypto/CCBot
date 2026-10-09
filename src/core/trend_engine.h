@@ -131,6 +131,10 @@ struct TrendBot {
     bool    dc_ok   = false;
     double  dc_up   = 0;
     double  dc_dn   = 0;
+    double  box_atr   = 0;     // ① 横盘突破过滤：通道宽度 ÷ ATR
+    double  vol_ratio = 0;     // ① 横盘突破过滤：当前根量比
+    // 突破被过滤时日志每根K线只记一次（拦截每 3 秒都会命中）。不落盘
+    int64_t squeeze_noted_bar_ms = 0;
     // ── K线快照（裸K 与 抛物线SAR 用；海龟只用上面的 ATR + 通道）──────────
     bool    bar_ok      = false;
     double  bar_open    = 0;    // 当前这根【未收盘】的开盘价（裸K·立即顺势用）
@@ -286,9 +290,12 @@ public:
     void set_max_total_margin(double usdt);
     void set_max_open_positions(int n);
 
-    // 应用层拉到K线后喂入信号快照（ATR + 唐奇安通道 + 当前K线开盘时间）
+    // 应用层拉到K线后喂入信号快照（ATR + 唐奇安通道 + 当前K线开盘时间）。
+    // box_atr / vol_ratio 是横盘突破过滤的读数；不传就是 0，开了过滤的 bot 会因此
+    // 一单不开（宁拦勿放），没开过滤的不受影响
     void update_signal(const std::string& bot_id, double atr, double atr_pct,
-                       bool dc_ok, double dc_up, double dc_dn, int64_t bar_open_ms);
+                       bool dc_ok, double dc_up, double dc_dn, int64_t bar_open_ms,
+                       double box_atr = 0, double vol_ratio = 0);
     // K线快照（裸K 与 抛物线SAR 用）。与 update_signal 分开：海龟要的是
     // ATR+通道，这两个要的是原始高低点，合成一个大函数会让调用方被迫为
     // 用不到的参数填占位值。

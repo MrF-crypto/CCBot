@@ -108,9 +108,10 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     // ── 趋势策略（海龟 / 抛物线SAR / 纯裸K 三选一）──────────────────────────
     static const std::set<std::string> trend_keys = {
         "symbol", "budget_usdt", "leverage", "interval",
-        "strategy",
+        "strategy", "direction",
         // ① 海龟
         "donchian_period", "atr_period", "atr_mult",
+        "squeeze_box_atr", "breakout_vol_ratio",
         // ② 抛物线SAR
         "af_start", "af_step", "af_max",
         // ③ 纯裸K
@@ -217,6 +218,18 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 return false;
             }
 
+            // ── 方向（三个策略共用），默认多空 ──────────────────────────────
+            {
+                const std::string d = get_str(so, "direction", "both");
+                if      (d == "both")  c.rule.direction = trend::Direction::Both;
+                else if (d == "long")  c.rule.direction = trend::Direction::LongOnly;
+                else if (d == "short") c.rule.direction = trend::Direction::ShortOnly;
+                else {
+                    err = c.symbol + "：direction 只能是 both / long / short，收到 \"" + d + "\"";
+                    return false;
+                }
+            }
+
             // ── 反手模式 ────────────────────────────────────────────────────
             // 新键 reverse=immediate|none；旧的两个 bool 仍然认（带迁移告警）
             const std::string rv = get_str(so, "reverse", "");
@@ -262,6 +275,13 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 if (c.rule.atr_period < 2)      { err = c.symbol + " 海龟: atr_period 至少为2";      return false; }
                 if (c.rule.atr_mult <= 0) {
                     err = c.symbol + " 海龟: atr_mult 必须大于0（它是止损距离的倍数）";
+                    return false;
+                }
+                // 横盘突破过滤：0 = 关
+                c.rule.squeeze_box_atr    = get_num(so, "squeeze_box_atr", c.rule.squeeze_box_atr);
+                c.rule.breakout_vol_ratio = get_num(so, "breakout_vol_ratio", c.rule.breakout_vol_ratio);
+                if (!(c.rule.squeeze_box_atr >= 0) || !(c.rule.breakout_vol_ratio >= 0)) {
+                    err = c.symbol + " 海龟: squeeze_box_atr / breakout_vol_ratio 不能为负（0 = 关）";
                     return false;
                 }
             } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {

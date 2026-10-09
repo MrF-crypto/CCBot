@@ -797,8 +797,169 @@ static void test_bare_k() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ① 海龟 · 横盘突破过滤（箱体 ≤ x ATR、突破量比 ≥ y）
+// ─────────────────────────────────────────────────────────────────────────────
+static Inputs sq_in(double price, double box_atr, double vol_ratio) {
+    Inputs in = mk(price);          // 通道 [90, 110]，ATR 2
+    in.box_atr = box_atr;
+    in.vol_ratio = vol_ratio;
+    return in;
+}
+
+static void test_squeeze_filter() {
+    // 默认关：读数全是 0 也照常突破入场——老配置的行为不变
+    {
+        Config c; State st;
+        CHECK(!squeeze_filter_on(c), "默认两项都是 0，过滤关闭");
+        CHECK(step(st, c, sq_in(111, 0, 0)).action == Action::OpenLong,
+              "过滤关闭时读数缺失不影响开仓");
+    }
+
+    Config c;
+    c.squeeze_box_atr = 4.0;
+    c.breakout_vol_ratio = 1.5;
+
+    {
+        State st;
+        CHECK(step(st, c, sq_in(111, 3.5, 2.0)).action == Action::OpenLong,
+              "横盘(3.5≤4) + 放量(2.0≥1.5) ⇒ 开多");
+    }
+    {
+        State st;
+        CHECK(step(st, c, sq_in(111, 4.0, 1.5)).action == Action::OpenLong,
+              "两项都恰好等于阈值 ⇒ 放行（≤ / ≥）");
+    }
+    {
+        State st;
+        const auto v = step(st, c, sq_in(111, 5.0, 3.0));
+        CHECK(v.action == Action::Hold && v.filtered, "箱体 5ATR > 4 ⇒ 拦，标记 filtered");
+        CHECK(std::string(v.reason).find("箱体过宽") != std::string::npos, "原因写明箱体过宽");
+    }
+    {
+        // 同一根K线：先突破没量被拦，量攒够之后入场
+        State st;
+        const auto v1 = step(st, c, sq_in(111, 3.0, 1.2));
+        CHECK(v1.action == Action::Hold && v1.filtered, "量比 1.2 < 1.5 ⇒ 拦");
+        CHECK(std::string(v1.reason).find("等放量") != std::string::npos, "原因写明等放量");
+        CHECK(step(st, c, sq_in(112, 3.0, 1.6)).action == Action::OpenLong,
+              "同一根里量比涨到 1.6 ⇒ 入场");
+    }
+    {
+        State st;
+        CHECK(step(st, c, sq_in(111, 0, 2.0)).action == Action::Hold,
+              "开了箱体过滤但读数缺失 ⇒ 拦（宁拦勿放）");
+        CHECK(step(st, c, sq_in(111, 3.0, 0)).action == Action::Hold,
+              "开了量比过滤但读数缺失 ⇒ 拦");
+    }
+    {
+        // 多空对称
+        State st;
+        CHECK(step(st, c, sq_in(89, 3.0, 2.0)).action == Action::OpenShort, "下破 + 横盘 + 放量 ⇒ 开空");
+        State st2;
+        CHECK(step(st2, c, sq_in(89, 3.0, 1.0)).action == Action::Hold, "下破但没放量 ⇒ 拦");
+    }
+    {
+        // 没突破就不是"被过滤"
+        State st;
+        const auto v = step(st, c, sq_in(100, 9.0, 0.1));
+        CHECK(v.action == Action::Hold && !v.filtered, "通道内无信号，不算被过滤");
+    }
+    {
+        // 只开量比：箱体读数缺失不影响
+        Config cv; cv.breakout_vol_ratio = 1.5;
+        State st;
+        CHECK(step(st, cv, sq_in(111, 0, 2.0)).action == Action::OpenLong,
+              "只开量比时不看箱体");
+        Config cb; cb.squeeze_box_atr = 4.0;
+        State st2;
+        CHECK(step(st2, cb, sq_in(111, 3.0, 0)).action == Action::OpenLong,
+              "只开箱体时不看量比");
+    }
+    {
+        // 亏损止损后的立即反手不经过过滤：它不是突破信号
+        Config cr = c;
+        cr.reverse = ReverseMode::Immediate;
+        State st;
+        on_filled(st, Pos::Long, 100, 94, cr, false);
+        CHECK(step(st, cr, sq_in(93, 9.0, 0)).action == Action::CloseReverseShort,
+              "立即反手不受横盘/量比过滤影响");
+    }
+    {
+        // 其它策略即便字段里有值也不生效
+        Config ck = c;
+        ck.strategy = Strategy::BareK;
+        CHECK(!squeeze_filter_on(ck), "过滤只属于海龟");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 方向选项（三个策略共用）：仅多 / 仅空 / 多空
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_direction() {
+    {
+        Config c; State st;
+        CHECK(c.direction == Direction::Both, "默认多空");
+        CHECK(step(st, c, mk(89)).action == Action::OpenShort, "多空：下破开空");
+    }
+    {
+        Config c; c.direction = Direction::LongOnly;
+        State st;
+        CHECK(step(st, c, mk(89)).action == Action::Hold, "仅多：下破不开空");
+        CHECK(step(st, c, mk(111)).action == Action::OpenLong, "仅多：上破照常开多");
+    }
+    {
+        Config c; c.direction = Direction::ShortOnly;
+        State st;
+        CHECK(step(st, c, mk(111)).action == Action::Hold, "仅空：上破不开多");
+        CHECK(step(st, c, mk(89)).action == Action::OpenShort, "仅空：下破照常开空");
+    }
+    {
+        // 立即反手到不允许的方向 ⇒ 只平
+        Config c; c.direction = Direction::LongOnly; c.reverse = ReverseMode::Immediate;
+        State st;
+        on_filled(st, Pos::Long, 100, 94, c, false);
+        const auto v = step(st, c, mk(93));
+        CHECK(v.action == Action::Close, "仅多：亏损止损要反手做空 ⇒ 只平");
+        CHECK(std::string(v.reason).find("仅做多") != std::string::npos, "  原因写明仅做多");
+
+        Config cs = c; cs.direction = Direction::ShortOnly;
+        State st2;
+        on_filled(st2, Pos::Short, 100, 106, cs, false);
+        CHECK(step(st2, cs, mk(107)).action == Action::Close, "仅空：亏损止损要反手做多 ⇒ 只平");
+
+        Config cb = c; cb.direction = Direction::Both;
+        State st3;
+        on_filled(st3, Pos::Long, 100, 94, cb, false);
+        CHECK(step(st3, cb, mk(93)).action == Action::CloseReverseShort, "多空：照常反手");
+    }
+    {
+        // PSAR 的 stop-and-reverse 同样受方向约束
+        Config c;
+        c.strategy = Strategy::ParabolicSar;
+        c.reverse = ReverseMode::Immediate;
+        c.direction = Direction::LongOnly;
+        State st;
+        on_filled(st, Pos::Long, 100, 95, c, false);
+        CHECK(step(st, c, psar_in(94, 101, 96)).action == Action::Close,
+              "PSAR 仅多：触线不翻空，只平");
+        State st2;
+        CHECK(step(st2, c, psar_in(90, 101, 96)).action == Action::Hold,
+              "PSAR 仅多：空仓时跌破前低不开空");
+    }
+    {
+        // 改成仅多时手里恰好有空单：照常用止损线管，不强平
+        Config c; c.direction = Direction::LongOnly;
+        State st;
+        on_filled(st, Pos::Short, 100, 106, c, false);
+        CHECK(step(st, c, mk(99)).action == Action::Hold, "仅多：已有空单照常持有");
+    }
+}
+
 int main() {
     test_turtle();
+    test_squeeze_filter();
+    test_direction();
     test_psar();
     test_bare_k();
 

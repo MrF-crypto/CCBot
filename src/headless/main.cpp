@@ -486,7 +486,8 @@ int main(int argc, char** argv) {
                         if (!snap.ok) continue;
                         trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                   snap.dc_ok, snap.dc_up, snap.dc_dn,
-                                                  snap.bar_open_ms);
+                                                  snap.bar_open_ms, snap.box_atr,
+                                                  snap.vol_ratio);
                     }
                     trend_sig_busy.store(false);
                 });
