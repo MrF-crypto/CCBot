@@ -149,10 +149,16 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                        .arg(b.cfg.rule.donchian_period)
                        .arg(b.cfg.rule.atr_period)
                        .arg(b.cfg.rule.atr_mult, 0, 'f', 1);
-            if (b.cfg.rule.squeeze_box_atr > 0)
+            if (b.cfg.rule.squeeze_box_atr > 0) {
                 tip += QString("横盘过滤：箱体 ≤ %1 ATR（当前 %2）\n")
                            .arg(b.cfg.rule.squeeze_box_atr, 0, 'f', 1)
                            .arg(b.box_atr, 0, 'f', 1);
+                if (b.cfg.rule.trend_er_min > 0)
+                    tip += QString("　或效率比 ≥ %1 且与突破同向（当前 %2%3）\n")
+                               .arg(b.cfg.rule.trend_er_min, 0, 'f', 2)
+                               .arg(b.er >= 0 ? "+" : "")
+                               .arg(b.er, 0, 'f', 2);
+            }
             if (b.cfg.rule.breakout_vol_ratio > 0)
                 tip += QString("放量过滤：量比 ≥ %1 倍（当前 %2）\n")
                            .arg(b.cfg.rule.breakout_vol_ratio, 0, 'f', 1)
@@ -173,6 +179,10 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                                 : "等收盘突破上一根高/低点")
                        .arg(b.cfg.rule.swing_bars)
                        .arg(b.cfg.rule.once_per_bar ? "开" : "关");
+            if (trend::bare_vol_filter_on(b.cfg.rule))
+                tip += QString("突破量比：信号K ≥ %1 倍（上根 %2）\n")
+                           .arg(b.cfg.rule.bare_vol_ratio, 0, 'f', 1)
+                           .arg(b.signal_vol_ratio, 0, 'f', 1);
             break;
         }
         tip += (b.cfg.size_mode == TrendConfig::SizeMode::RiskBased)
@@ -514,6 +524,7 @@ struct TrendFormWidgets {
     QDoubleSpinBox* k         = nullptr;
     QDoubleSpinBox* boxAtr    = nullptr;   // 横盘过滤：箱体 ≤ x ATR，0=关
     QDoubleSpinBox* volRatio  = nullptr;   // 放量过滤：量比 ≥ x，0=关
+    QDoubleSpinBox* erMin     = nullptr;   // 箱体过宽时的例外：效率比 ≥ x，0=关
 
     // ── ② 抛物线 SAR ──
     QDoubleSpinBox* afStart = nullptr;
@@ -524,6 +535,7 @@ struct TrendFormWidgets {
     QComboBox*      bareEntry  = nullptr;
     QCheckBox*      oncePerBar = nullptr;
     QSpinBox*       swing      = nullptr;
+    QDoubleSpinBox* bareVol    = nullptr;   // 信号K量比 ≥ x，0=关；只对「等收盘突破」
     QSpinBox*       maxRev     = nullptr;
     QSpinBox*       cooldown   = nullptr;
 
@@ -656,6 +668,20 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
                           "表格「状态」列会显示当前箱体倍数，调阈值时可参考。");
     p1->addRow("横盘 箱体≤", w->boxAtr);
 
+    w->erMin = new QDoubleSpinBox();
+    w->erMin->setRange(0.0, 1.0);
+    w->erMin->setSingleStep(0.05);
+    w->erMin->setDecimals(2);
+    w->erMin->setSpecialValueText("关");
+    w->erMin->setValue(c.rule.trend_er_min);
+    w->erMin->setToolTip("箱体过宽时的例外：趋势延续照样放行。\n"
+                         "效率比 = 通道窗口里 净涨跌 ÷ 来回总路程，1 = 一条直线，接近 0 = 来回扫。\n"
+                         "箱体宽但效率比 ≥ 这个值、且净走向与突破同向 ⇒ 当作趋势延续，放行；\n"
+                         "箱体宽且效率比低 ⇒ 震荡里的上冲，拦下。\n"
+                         "随机走 12 根平均约 0.23，建议从 0.4 起步。\n"
+                         "只在「横盘 箱体≤」开着时有用。0 = 关（箱体宽一律拦）。");
+    p1->addRow("趋势 效率比≥", w->erMin);
+
     w->volRatio = new QDoubleSpinBox();
     w->volRatio->setRange(0.0, 20.0);
     w->volRatio->setSingleStep(0.1);
@@ -739,6 +765,31 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
         "⚠ 这个数直接决定持仓时长和交易频率：随机游走下平均持仓约 N+1 根。\n"
         "N=3 ⇒ 4 根就被打掉一次。配短周期时交易次数会非常高。");
     p3->addRow("摆动止损根数", w->swing);
+
+    w->bareVol = new QDoubleSpinBox();
+    w->bareVol->setRange(0.0, 20.0);
+    w->bareVol->setSingleStep(0.1);
+    w->bareVol->setDecimals(1);
+    w->bareVol->setSpecialValueText("关");
+    w->bareVol->setSuffix(" 倍");
+    w->bareVol->setValue(c.rule.bare_vol_ratio);
+    w->bareVol->setToolTip(
+        "只对「等收盘突破」生效：收盘突破前一根高/低点时，这根K线的量\n"
+        "≥ 前 20 根均量的这么多倍才开仓。横盘里收盘刚好蹭过前高、量平平的\n"
+        "小阳线会被挡掉。5m 的量比较跳，建议从 1.5~2.0 起步。0 = 关。\n\n"
+        "⚠ 不拦止损后的反手（反手在盘中触发，没有收好的K线可判）。\n"
+        "   横盘里反手磨损大的话，配合「止损后只平掉，等信号」或「连续反手上限」。");
+    p3->addRow("突破量比≥", w->bareVol);
+    // 「立即顺势」不用量比（开盘几秒成交量≈0），选它时置灰，免得以为调了有用
+    {
+        auto syncBareVol = [w]() {
+            w->bareVol->setEnabled((trend::BareEntry)w->bareEntry->currentData().toInt() ==
+                                   trend::BareEntry::BreakPrevBar);
+        };
+        syncBareVol();
+        connect(w->bareEntry, QOverload<int>::of(&QComboBox::currentIndexChanged), w->bareVol,
+                [syncBareVol](int) { syncBareVol(); });
+    }
 
     w->maxRev = new QSpinBox();
     w->maxRev->setRange(0, 20);
@@ -984,6 +1035,7 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.atr_mult        = w->k->value();
             out.rule.squeeze_box_atr    = w->boxAtr->value();
             out.rule.breakout_vol_ratio = w->volRatio->value();
+            out.rule.trend_er_min       = w->erMin->value();
             break;
         case trend::Strategy::ParabolicSar:
             out.rule.af_start = w->afStart->value();
@@ -994,6 +1046,7 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.bare_entry   = (trend::BareEntry)w->bareEntry->currentData().toInt();
             out.rule.once_per_bar = w->oncePerBar->isChecked();
             out.rule.swing_bars   = w->swing->value();
+            out.rule.bare_vol_ratio = w->bareVol->value();
             out.rule.max_consecutive_reverses = w->maxRev->value();
             out.rule.cooldown_bars            = w->cooldown->value();
             break;
@@ -1089,7 +1142,10 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
                          .arg(c.rule.donchian_period).arg(c.rule.atr_period)
                          .arg(c.rule.atr_mult, 0, 'f', 1);
             if (c.rule.squeeze_box_atr > 0)
-                params += QString(" 横盘≤%1ATR").arg(c.rule.squeeze_box_atr, 0, 'f', 1);
+                params += QString(" 横盘≤%1ATR").arg(c.rule.squeeze_box_atr, 0, 'f', 1) +
+                          (c.rule.trend_er_min > 0
+                               ? QString("（或效率比≥%1）").arg(c.rule.trend_er_min, 0, 'f', 2)
+                               : QString());
             if (c.rule.breakout_vol_ratio > 0)
                 params += QString(" 量比≥%1x").arg(c.rule.breakout_vol_ratio, 0, 'f', 1);
             break;
@@ -1105,6 +1161,8 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
                                   ? "立即顺势" : "等收盘突破")
                          .arg(c.rule.swing_bars)
                          .arg(c.rule.once_per_bar ? " 每根限一次" : "");
+            if (trend::bare_vol_filter_on(c.rule))
+                params += QString(" 量比≥%1x").arg(c.rule.bare_vol_ratio, 0, 'f', 1);
             break;
     }
     if (c.rule.direction != trend::Direction::Both)
@@ -1144,6 +1202,7 @@ void MainWindow::save_trend_bots() {
         o["atr_mult"]        = b.cfg.rule.atr_mult;
         o["squeeze_box_atr"]    = b.cfg.rule.squeeze_box_atr;
         o["breakout_vol_ratio"] = b.cfg.rule.breakout_vol_ratio;
+        o["trend_er_min"]       = b.cfg.rule.trend_er_min;
         o["af_start"]        = b.cfg.rule.af_start;
         o["af_step"]         = b.cfg.rule.af_step;
         o["af_max"]          = b.cfg.rule.af_max;
@@ -1155,6 +1214,7 @@ void MainWindow::save_trend_bots() {
         o["size_mode"]       = (int)b.cfg.size_mode;
         o["risk_usdt"]       = b.cfg.risk_usdt;
         o["swing_bars"]      = b.cfg.rule.swing_bars;
+        o["bare_vol_ratio"]  = b.cfg.rule.bare_vol_ratio;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
         o["use_disaster_stop"]  = b.cfg.use_disaster_stop;
         o["disaster_stop_buffer_pct"] = b.cfg.disaster_stop_buffer_pct;
@@ -1232,10 +1292,12 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.atr_mult        = o["atr_mult"].toDouble(3.0);
         b.cfg.rule.squeeze_box_atr    = std::max(0.0, o["squeeze_box_atr"].toDouble(0));
         b.cfg.rule.breakout_vol_ratio = std::max(0.0, o["breakout_vol_ratio"].toDouble(0));
+        b.cfg.rule.trend_er_min       = std::clamp(o["trend_er_min"].toDouble(0), 0.0, 1.0);
         b.cfg.rule.af_start        = o["af_start"].toDouble(0.02);
         b.cfg.rule.af_step         = o["af_step"].toDouble(0.02);
         b.cfg.rule.af_max          = o["af_max"].toDouble(0.20);
         b.cfg.rule.swing_bars      = o["swing_bars"].toInt(3);
+        b.cfg.rule.bare_vol_ratio  = std::max(0.0, o["bare_vol_ratio"].toDouble(0));
         b.cfg.rule.once_per_bar    = o["once_per_bar"].toBool(false);
         b.cfg.rule.max_consecutive_reverses = o["max_consecutive_reverses"].toInt(0);
         b.cfg.rule.cooldown_bars   = o["cooldown_bars"].toInt(0);

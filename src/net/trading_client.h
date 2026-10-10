@@ -114,6 +114,8 @@ public:
         double  dc_dn   = 0;
         double  box_atr   = 0;     // 通道宽度 ÷ 已收盘K线的 ATR，0=算不出
         double  vol_ratio = 0;     // 当前根已成交量 ÷ 通道窗口内均量，0=算不出或尚无成交
+        bool    er_ok = false;     // 通道窗口的效率比算得出来
+        double  er    = 0;         // 带符号，正 = 净上涨
         int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
     };
     TrendSnapshot fetch_trend_signal(const std::string& symbol, const std::string& interval,
@@ -143,8 +145,12 @@ public:
         double  prev2_high = 0, prev2_low = 0;  // 再前一根（PSAR 夹逼用）
         double  swing_low  = 0;     // bar 1..N 的最低价
         double  swing_high = 0;     // bar 1..N 的最高价
+        double  signal_vol_ratio = 0;   // 刚收盘那根的量 ÷ 它之前 kSignalVolWindow 根均量，0=拿不到
         int64_t bar_open_ms = 0;    // 当前未收盘根的开盘时间
     };
+    // 裸K信号根量比的均量窗口。固定 20 根：5m 下约 100 分钟，能跟上时段性的
+    // 放量缩量；摆动根数只有 3 左右，拿它当窗口太短，一根大量就把均量带偏
+    static constexpr int kSignalVolWindow = 20;
     BarSnapshot fetch_bar_pattern(const std::string& symbol,
                                   const std::string& interval, int swing_bars);
 

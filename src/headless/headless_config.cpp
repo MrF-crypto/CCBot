@@ -111,11 +111,11 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "strategy", "direction",
         // ① 海龟
         "donchian_period", "atr_period", "atr_mult",
-        "squeeze_box_atr", "breakout_vol_ratio",
+        "squeeze_box_atr", "breakout_vol_ratio", "trend_er_min",
         // ② 抛物线SAR
         "af_start", "af_step", "af_max",
         // ③ 纯裸K
-        "bare_entry", "once_per_bar", "swing_bars",
+        "bare_entry", "once_per_bar", "swing_bars", "bare_vol_ratio",
         // 共享
         "reverse", "max_consecutive_reverses", "cooldown_bars",
         "signal_max_age_sec", "use_disaster_stop", "disaster_stop_buffer_pct",
@@ -284,6 +284,13 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                     err = c.symbol + " 海龟: squeeze_box_atr / breakout_vol_ratio 不能为负（0 = 关）";
                     return false;
                 }
+                c.rule.trend_er_min = get_num(so, "trend_er_min", c.rule.trend_er_min);
+                if (!(c.rule.trend_er_min >= 0 && c.rule.trend_er_min <= 1)) {
+                    err = c.symbol + " 海龟: trend_er_min 要在 0~1 之间（0 = 关）";
+                    return false;
+                }
+                if (c.rule.trend_er_min > 0 && !(c.rule.squeeze_box_atr > 0))
+                    out.warnings.push_back(c.symbol + " 海龟：trend_er_min 只在 squeeze_box_atr > 0 时生效，现在不起作用");
             } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {
                 c.rule.af_start = get_num(so, "af_start", c.rule.af_start);
                 c.rule.af_step  = get_num(so, "af_step",  c.rule.af_step);
@@ -313,6 +320,13 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 c.rule.once_per_bar = get_bool(so, "once_per_bar", c.rule.once_per_bar);
                 c.rule.swing_bars   = (int)get_num(so, "swing_bars", c.rule.swing_bars);
                 if (c.rule.swing_bars < 1) { err = c.symbol + " 纯裸K: swing_bars 至少为1"; return false; }
+                c.rule.bare_vol_ratio = get_num(so, "bare_vol_ratio", c.rule.bare_vol_ratio);
+                if (!(c.rule.bare_vol_ratio >= 0)) {
+                    err = c.symbol + " 纯裸K: bare_vol_ratio 不能为负（0 = 关）";
+                    return false;
+                }
+                if (c.rule.bare_vol_ratio > 0 && c.rule.bare_entry == trend::BareEntry::Immediate)
+                    out.warnings.push_back(c.symbol + " 纯裸K：bare_vol_ratio 只对 break_prev 生效，immediate 下不起作用");
                 // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
                 if (c.rule.bare_entry == trend::BareEntry::Immediate &&
                     c.rule.reverse == trend::ReverseMode::Immediate && !c.rule.once_per_bar)

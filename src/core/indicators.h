@@ -158,4 +158,43 @@ inline DonchianResult donchian(const std::vector<Ohlc>& bars, int period,
     return r;
 }
 
+// 量比：vols[idx] ÷ 它之前 window 根的平均量（不含 idx 自己）。
+// 海龟拿【当前未收盘根的已成交量】去比（idx = 最后一根），裸K拿【刚收盘那根】去比
+// （idx = 倒数第二根）。数据不足或均量为 0 时返回 0（= 拿不到）
+inline double volume_ratio(const std::vector<double>& vols, int idx, int window) {
+    if (window <= 0 || idx < window || idx >= (int)vols.size()) return 0;
+    double sum = 0;
+    for (int i = idx - window; i < idx; ++i) sum += vols[i];
+    const double avg = sum / window;
+    return avg > 0 ? vols[idx] / avg : 0;
+}
+
+struct ErResult {
+    bool   ok = false;
+    double er = 0;   // 带符号，[-1, 1]。正 = 净上涨
+};
+
+// 效率比（Kaufman）：净变化 ÷ 逐根收盘价变化的绝对值之和。
+// 1 = 一条直线，接近 0 = 走了很多路又回到原地（来回扫）。
+//
+// 窗口与唐奇安通道对齐：同样排除最后 exclude_last 根，取通道那 period 根的
+// 收盘价，再加上它们之前一根的收盘价作起点——这样 period 根K线自己的涨跌
+// 全部算进去（period 个差值），而不是少掉第一根。
+// 数据不足或总路程为 0（一动不动）时 ok=false
+inline ErResult efficiency_ratio(const std::vector<Ohlc>& bars, int period,
+                                 int exclude_last = 1) {
+    ErResult r;
+    if (period <= 0 || exclude_last < 0) return r;
+    const int end = (int)bars.size() - exclude_last;   // 不含 end
+    const int start = end - period - 1;                // 起点那根的收盘价
+    if (start < 0) return r;
+
+    double path = 0;
+    for (int i = start + 1; i < end; ++i) path += std::fabs(bars[i].close - bars[i - 1].close);
+    if (!(path > 0)) return r;
+    r.er = (bars[end - 1].close - bars[start].close) / path;
+    r.ok = true;
+    return r;
+}
+
 } // namespace ccbot::indicators

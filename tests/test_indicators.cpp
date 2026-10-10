@@ -173,6 +173,43 @@ int main() {
         CHECK(near(d4.dn, 31.0),  "唐奇安: 下沿取区间内真实最低");
     }
 
+    // ── 量比 ──────────────────────────────────────────────────────────────
+    {
+        const std::vector<double> v = {10, 10, 10, 10, 30, 5};
+        CHECK(near(volume_ratio(v, 4, 4), 3.0), "量比: 30 ÷ 前4根均量10 = 3");
+        CHECK(near(volume_ratio(v, 5, 2), 5.0 / 20.0), "量比: 5 ÷ (10+30)/2 = 0.25");
+        CHECK(volume_ratio(v, 2, 4) == 0, "量比: 前面不够 window 根 ⇒ 0");
+        CHECK(volume_ratio(v, 6, 2) == 0, "量比: 越界 ⇒ 0");
+        CHECK(volume_ratio({0, 0, 5}, 2, 2) == 0, "量比: 均量为 0 ⇒ 0（拿不到，不是无穷大）");
+    }
+
+    // ── 效率比 ────────────────────────────────────────────────────────────
+    {
+        auto bars_of = [](const std::vector<double>& closes) {
+            std::vector<Ohlc> v;
+            for (double c : closes) v.push_back(Ohlc{c, c, c});
+            v.push_back(Ohlc{999, 999, 999});   // 被排除的当前根，不得参与
+            return v;
+        };
+        // 一路涨（有小回调）：净 10，总路程 2+1+3+2+1+3+2 = 14
+        auto a = efficiency_ratio(bars_of({100, 102, 101, 104, 106, 105, 108, 110}), 7);
+        CHECK(a.ok && near(a.er, 10.0 / 14.0), "效率比: 趋势样例 = 10/14");
+        // 来回扫：净 10，总路程 52
+        auto b = efficiency_ratio(bars_of({100, 108, 101, 109, 100, 107, 102, 110}), 7);
+        CHECK(b.ok && near(b.er, 10.0 / 52.0), "效率比: 震荡样例 = 10/52");
+        // 一路跌：带负号
+        auto c = efficiency_ratio(bars_of({110, 108, 109, 105, 100}), 4);
+        CHECK(c.ok && near(c.er, -10.0 / 12.0), "效率比: 净跌为负");
+        // 窗口只取最后 period 根 + 起点：前面的大波动不算
+        auto d = efficiency_ratio(bars_of({50, 200, 100, 101, 102}), 2);
+        CHECK(d.ok && near(d.er, 1.0), "效率比: 只看窗口内（100→101→102 = 1）");
+        // 一动不动：总路程 0 ⇒ 算不出
+        CHECK(!efficiency_ratio(bars_of({100, 100, 100}), 2).ok, "效率比: 一动不动 ok=false");
+        // 数据不足（要 period+1 根已收盘 + 当前根）
+        CHECK(!efficiency_ratio(bars_of({100, 101}), 2).ok, "效率比: 数据不足 ok=false");
+        CHECK(efficiency_ratio(bars_of({100, 101, 102}), 2).ok, "效率比: 恰好够");
+    }
+
     if (g_fail == 0) {
         std::printf("OK: 全部指标单元测试通过\n");
         return 0;

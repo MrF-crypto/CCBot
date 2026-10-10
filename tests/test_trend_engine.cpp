@@ -244,7 +244,7 @@ int main() {
         auto noted = [&]() {
             int n = 0;
             for (const auto& m : logs)
-                if (m.find("突破未开仓") != std::string::npos) ++n;
+                if (m.find("突破待放量") != std::string::npos) ++n;
             return n;
         };
 
@@ -254,6 +254,8 @@ int main() {
         eng.tick("TESTUSDT", 111.5);
         check(cli->calls.empty(), "量比 1.0 < 1.5：突破不开仓");
         check(noted() == 1, "  同一根里拦了两次，日志只记一次");
+        check(!logs.empty() && logs.back().find("本根内量够即入场") != std::string::npos,
+              "  只卡在量上：日志说这根里量够仍会入场");
         check(eng.get_bots()[0].last_decision.find("量比1.0x") != std::string::npos,
               "  状态里显示当前量比");
 
@@ -270,6 +272,65 @@ int main() {
         cli2->fill_price = 111.0;
         eng2.tick("TESTUSDT", 111.0);
         check(cli2->calls.empty(), "  读数缺失时不开仓");
+
+        // 卡在箱体上：日志说"这次突破不做"，带上效率比
+        auto cli3 = std::make_shared<FakeClient>();
+        TrendEngine eng3(cli3, inline_host());
+        std::vector<std::string> logs3;
+        eng3.set_log_cb([&](const std::string& m) { logs3.push_back(m); });
+        auto cfg3 = cfg;
+        cfg3.rule.trend_er_min = 0.4;
+        auto id3 = eng3.add_bot(cfg3);
+        eng3.update_signal(id3, 2.0, 2.0, true, 110, 90, 1, 6.0, 1.7, true, 0.25);
+        cli3->fill_price = 111.0;
+        eng3.tick("TESTUSDT", 111.0);
+        check(cli3->calls.empty(), "  箱体宽、效率比低：不开仓");
+        bool box_line = false;
+        for (const auto& m : logs3)
+            if (m.find("向上突破不做") != std::string::npos &&
+                m.find("6.0ATR") != std::string::npos && m.find("+0.25") != std::string::npos)
+                box_line = true;
+        check(box_line, "  日志：向上突破不做，带箱体倍数与效率比");
+        check(eng3.get_bots()[0].last_decision.find("效率比+0.25") != std::string::npos,
+              "  状态里显示效率比");
+
+        // 同一根，效率比读数变了（实盘不会，这里只验证放行路径）：放行开仓
+        eng3.update_signal(id3, 2.0, 2.0, true, 110, 90, 1, 6.0, 1.7, true, 0.6);
+        eng3.tick("TESTUSDT", 111.0);
+        check(cli3->calls.size() == 1, "  箱体宽但效率比 0.6：当趋势延续开仓");
+    }
+
+    // ── 裸K「等收盘突破」的信号K量比：没放量不开、日志说这次不做 ────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<std::string> logs;
+        eng.set_log_cb([&](const std::string& m) { logs.push_back(m); });
+        auto cfg = mk_bare_cfg();
+        cfg.rule.bare_vol_ratio = 1.8;
+        auto id = eng.add_bot(cfg);
+
+        auto s = bars_break_up(95, 115, 1);
+        s.signal_vol_ratio = 1.1;
+        eng.update_bars(id, s);
+        cli->fill_price = 112.0;
+        eng.tick("TESTUSDT", 112.0);
+        check(cli->calls.empty(), "裸K 量比 1.1 < 1.8：收盘突破不开仓");
+        bool line = false;
+        for (const auto& m : logs)
+            if (m.find("向上突破不做：信号K量比 1.1x") != std::string::npos) line = true;
+        check(line, "  日志：向上突破不做，带信号K量比");
+        check(eng.get_bots()[0].last_decision.find("上根量比1.1x") != std::string::npos,
+              "  状态里显示上根量比");
+
+        // 下一根收盘再突破，这次放量
+        advance(10);
+        auto s2 = bars_break_up(95, 115, 2);
+        s2.signal_vol_ratio = 2.4;
+        eng.update_bars(id, s2);
+        eng.tick("TESTUSDT", 112.0);
+        check(cli->calls.size() == 1 && eng.get_bots()[0].st.pos == trend::Pos::Long,
+              "  下一根放量 2.4x 突破 ⇒ 开多");
     }
 
     // ── 改策略参数保留已实现；删除再添加从 0 开始 ───────────────────────────

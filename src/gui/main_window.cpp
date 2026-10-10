@@ -1828,6 +1828,7 @@ void MainWindow::onTick() {
                         s.prev2_low   = bp.prev2_low;
                         s.swing_low   = bp.swing_low;
                         s.swing_high  = bp.swing_high;
+                        s.signal_vol_ratio = bp.signal_vol_ratio;
                         s.bar_open_ms = bp.bar_open_ms;
                         trend_engine_->update_bars(b.bot_id, s);
                         continue;
@@ -1843,7 +1844,7 @@ void MainWindow::onTick() {
                     trend_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                snap.bar_open_ms, snap.box_atr,
-                                               snap.vol_ratio);
+                                               snap.vol_ratio, snap.er_ok, snap.er);
                 }
                 trendSigBusy_.store(false);
                 QMetaObject::invokeMethod(this, [this, failed, okn]() {

@@ -1417,11 +1417,14 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         const double atr_closed = indicators::atr(closed, atr_period);
         if (atr_closed > 0 && d.up > d.dn) out.box_atr = (d.up - d.dn) / atr_closed;
 
-        const int end = (int)bars.size() - 1;   // 不含当前根
-        double sum = 0;
-        for (int i = end - donchian_period; i < end; ++i) sum += bars[i].volume;
-        const double avg = sum / donchian_period;
-        if (avg > 0) out.vol_ratio = bars.back().volume / avg;
+        std::vector<double> vols;
+        vols.reserve(bars.size());
+        for (const auto& b : bars) vols.push_back(b.volume);
+        out.vol_ratio = indicators::volume_ratio(vols, (int)vols.size() - 1, donchian_period);
+
+        const auto e = indicators::efficiency_ratio(oh, donchian_period);
+        out.er_ok = e.ok;
+        out.er    = e.er;
     }
 
     out.ok = (out.atr > 0 && d.ok && out.price > 0);
@@ -1436,8 +1439,9 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
     BarSnapshot out;
     if (swing_bars < 1) return out;
 
-    // 需要：未收盘根(1) + 信号根(1) + 摆动窗口(N)，再多拿几根兜底
-    const int need = swing_bars + 2 + 3;
+    // 需要：未收盘根(1) + 信号根(1) + 摆动窗口(N)，再多拿几根兜底。
+    // 信号根量比的均量窗口要 kSignalVolWindow 根，两者取大
+    const int need = std::max(swing_bars, kSignalVolWindow) + 2 + 3;
     auto bars = fetch_klines(sym, interval, need);
     if ((int)bars.size() < swing_bars + 2) return out;
 
@@ -1459,6 +1463,16 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
     }
     out.swing_low  = lo;
     out.swing_high = hi;
+
+    // 刚收盘那根（信号根）的量比：整根对整根，口径干净。拿不到是 0，
+    // 不影响 ok——只有开了量比过滤的裸K才用它，由决策层按"缺失就拦"处理
+    {
+        std::vector<double> vols;
+        vols.reserve(bars.size());
+        for (const auto& b : bars) vols.push_back(b.volume);
+        out.signal_vol_ratio = indicators::volume_ratio(vols, n - 2, kSignalVolWindow);
+    }
+
     out.ok = (out.price > 0 && out.cur_open > 0 && out.prev_close > 0 &&
               out.prev_high > 0 && out.prev_low > 0 && lo > 0 && hi > 0 && hi >= lo);
     return out;

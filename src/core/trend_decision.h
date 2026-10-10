@@ -80,8 +80,13 @@ struct Config {
     //     ⚠ 用的是当前根【已成交】的量，不按剩余时间外推。外推在刚开盘几分钟时
     //       会把一点量放大十几倍，反而最容易放进假突破。不外推的代价是晚一点：
     //       价格一直站在通道外，量攒够那一刻才入场
+    //   trend_er_min：箱体过宽时的例外。箱体只量宽度，分不清"宽"是来回扫出来的
+    //     还是一路涨出来的——后者是趋势延续，正是海龟最赚钱的那类入场。
+    //     通道窗口的效率比（净变化 ÷ 来回总路程）≥ 这个值、且净走向与突破同向，
+    //     就当趋势延续放行。只在 squeeze_box_atr > 0 时有意义；0 = 没有例外
     double squeeze_box_atr    = 0;
     double breakout_vol_ratio = 0;
+    double trend_er_min       = 0;
 
     // ── ② 抛物线 SAR ────────────────────────────────────────────────────────
     // SAR(下一根) = SAR(本根) + AF × (EP − SAR(本根))
@@ -110,6 +115,12 @@ struct Config {
     //     ② 引擎按 tick 采样价格，而K线的 low 记录的是连续极值。
     //        一根两秒的插针采样看不见，但下一根K线的 low 会记下来
     int    swing_bars = 3;
+    // 信号根量比过滤（0 = 关）。只对「等收盘突破」生效：收盘那一刻整根K线的量
+    // 已经定了，和前 20 根均量是整根对整根。横盘里最常见的假信号是一根小阳线
+    // 收盘刚好蹭过前高、量平平——这一条专门挡它。
+    // ⚠ 「立即顺势」不用：新K线开盘几秒成交量≈0，累计量比每根开头都过不了，
+    //   外推又会把一点量放大几十倍。也不拦止损后的反手（盘中触发，没有收好的K线）
+    double bare_vol_ratio = 0;
 
     // ── 反手（共享）─────────────────────────────────────────────────────────
     ReverseMode reverse = ReverseMode::None;
@@ -156,6 +167,9 @@ struct Inputs {
     //   vol_ratio：当前根已成交量 ÷ 通道窗口内各根的平均量
     double box_atr   = 0;
     double vol_ratio = 0;
+    //   er：通道窗口的效率比，带符号（正 = 净上涨）。0 是合法值，所以另带 er_ok
+    bool   er_ok = false;
+    double er    = 0;
     bool   new_bar = false;  // 本 tick 是否跨入新K线（冷却按K线计数）
     int64_t bar_open_ms = 0; // 当前这根K线的开盘时间
 
@@ -167,6 +181,7 @@ struct Inputs {
     double prev_low    = 0;      // 上一根的最低价
     double swing_low   = 0;      // bar 0 之前 N 根的最低价
     double swing_high  = 0;      // bar 0 之前 N 根的最高价
+    double signal_vol_ratio = 0; // 刚收盘那根（bar 0）的量比，0 = 拿不到
     // ② PSAR 需要【前两根】的高低点做夹逼（Wilder 原版规则）
     double psar_prev_high  = 0, psar_prev_low  = 0;
     double psar_prev2_high = 0, psar_prev2_low = 0;
@@ -187,6 +202,7 @@ struct Verdict {
     double      stop   = 0;   // 本 tick 结束后的止损线（供 UI/日志显示）
     bool        profitable_exit = false;   // 本次出场是否 >= 成本价
     bool        filtered = false;          // 有突破信号，但被横盘突破过滤拦下
+    bool        filtered_long = false;     // 被拦的是向上突破（日志要按方向解读效率比）
 };
 
 // 数据是否足以【开新仓】。三个策略要的东西不同：
@@ -269,17 +285,48 @@ inline bool squeeze_filter_on(const Config& cfg) {
     return cfg.strategy == Strategy::Turtle &&
            (cfg.squeeze_box_atr > 0 || cfg.breakout_vol_ratio > 0);
 }
-inline const char* squeeze_block(const Inputs& in, const Config& cfg) {
+// 箱体这一关：箱体够窄（横盘），或者箱体宽但走得够直且与突破同向（趋势延续）。
+// ⚠ 箱体与效率比都只用已收盘K线，一根K线之内是定值——这一关没过，这根里就不会再过
+inline bool squeeze_box_pass(const Inputs& in, const Config& cfg, bool is_long) {
+    if (!(cfg.strategy == Strategy::Turtle && cfg.squeeze_box_atr > 0)) return true;
+    if (in.box_atr > 0 && in.box_atr <= cfg.squeeze_box_atr) return true;
+    if (cfg.trend_er_min > 0 && in.er_ok) {
+        const double e = is_long ? in.er : -in.er;
+        if (e >= cfg.trend_er_min) return true;
+    }
+    return false;
+}
+// 量比这一关：随成交增长，一根K线之内可能从不过变成过
+inline bool squeeze_vol_pass(const Inputs& in, const Config& cfg) {
+    if (!(cfg.strategy == Strategy::Turtle && cfg.breakout_vol_ratio > 0)) return true;
+    return in.vol_ratio > 0 && in.vol_ratio >= cfg.breakout_vol_ratio;
+}
+inline const char* squeeze_block(const Inputs& in, const Config& cfg, bool is_long) {
     if (!squeeze_filter_on(cfg)) return nullptr;
-    if (cfg.squeeze_box_atr > 0) {
-        if (!(in.box_atr > 0))                 return "突破，但箱体读数缺失";
-        if (in.box_atr > cfg.squeeze_box_atr)  return "突破，但箱体过宽（非横盘）";
+    if (!squeeze_box_pass(in, cfg, is_long)) {
+        if (!(in.box_atr > 0)) return "突破，但箱体读数缺失";
+        return cfg.trend_er_min > 0 ? "突破，但箱体过宽且来回震荡"
+                                    : "突破，但箱体过宽（非横盘）";
     }
-    if (cfg.breakout_vol_ratio > 0) {
-        if (!(in.vol_ratio > 0))                    return "突破，等放量";
-        if (in.vol_ratio < cfg.breakout_vol_ratio)  return "突破，等放量";
-    }
+    if (!squeeze_vol_pass(in, cfg)) return "突破，等放量";
     return nullptr;
+}
+
+// ③ 裸K「等收盘突破」的信号根量比过滤。信号只在收盘那一拍成立，被拦就是这次不做
+inline bool bare_vol_filter_on(const Config& cfg) {
+    return cfg.strategy == Strategy::BareK && cfg.bare_entry == BareEntry::BreakPrevBar &&
+           cfg.bare_vol_ratio > 0;
+}
+inline const char* bare_vol_block(const Inputs& in, const Config& cfg) {
+    if (!bare_vol_filter_on(cfg)) return nullptr;
+    if (in.signal_vol_ratio > 0 && in.signal_vol_ratio >= cfg.bare_vol_ratio) return nullptr;
+    return "突破，但信号K未放量";
+}
+
+// 开仓前的过滤，按策略分派。返回 nullptr = 放行
+inline const char* entry_block(const Inputs& in, const Config& cfg, bool is_long) {
+    if (const char* w = squeeze_block(in, cfg, is_long)) return w;
+    return bare_vol_block(in, cfg);
 }
 
 // Chandelier 止损线。多头挂在极值下方，空头挂在极值上方
@@ -441,9 +488,10 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
     const bool up = allows(cfg, Pos::Long) && entry_long(in, cfg);
     const bool dn = !up && allows(cfg, Pos::Short) && entry_short(in, cfg);
     if (up || dn) {
-        if (const char* why = squeeze_block(in, cfg)) {
+        if (const char* why = entry_block(in, cfg, up)) {
             v.reason = why;
             v.filtered = true;
+            v.filtered_long = up;
             return v;
         }
         v.action = up ? Action::OpenLong : Action::OpenShort;

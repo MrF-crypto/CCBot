@@ -886,6 +886,86 @@ static void test_squeeze_filter() {
               "立即反手不受横盘/量比过滤影响");
     }
     {
+        // 效率比：箱体宽时的例外（趋势延续）
+        Config ce = c;
+        ce.trend_er_min = 0.4;
+        auto with_er = [](Inputs in, double er) { in.er_ok = true; in.er = er; return in; };
+        State s1;
+        CHECK(step(s1, ce, with_er(sq_in(111, 6.0, 1.7), 0.62)).action == Action::OpenLong,
+              "箱体 6ATR 但效率比 +0.62（一路涨上来）⇒ 当趋势延续放行");
+        State s2;
+        const auto v2 = step(s2, ce, with_er(sq_in(111, 6.0, 1.7), 0.25));
+        CHECK(v2.action == Action::Hold && v2.filtered && v2.filtered_long,
+              "箱体宽、效率比 0.25（来回扫）⇒ 拦");
+        CHECK(std::string(v2.reason).find("来回震荡") != std::string::npos, "  原因写明来回震荡");
+        State s3;
+        CHECK(step(s3, ce, with_er(sq_in(111, 6.0, 1.7), -0.62)).action == Action::Hold,
+              "净跌的窗口里向上突破 ⇒ 方向不一致，拦");
+        State s4;
+        CHECK(step(s4, ce, with_er(sq_in(89, 6.0, 1.7), -0.62)).action == Action::OpenShort,
+              "净跌 + 向下突破 ⇒ 放行开空");
+        State s5;
+        CHECK(step(s5, ce, with_er(sq_in(111, 6.0, 1.7), 0.40)).action == Action::OpenLong,
+              "效率比恰好等于阈值 ⇒ 放行");
+        State s6;
+        CHECK(step(s6, ce, sq_in(111, 6.0, 1.7)).action == Action::Hold,
+              "效率比读数缺失 ⇒ 没有例外，按箱体拦");
+        State s7;
+        CHECK(step(s7, ce, with_er(sq_in(111, 6.0, 1.0), 0.8)).action == Action::Hold,
+              "效率比放行了箱体，量比照样要过");
+        State s8;
+        CHECK(step(s8, c, with_er(sq_in(111, 6.0, 1.7), 0.9)).action == Action::Hold,
+              "效率比阈值为 0（关）⇒ 箱体宽一律拦（原行为）");
+        Config cnobox = ce; cnobox.squeeze_box_atr = 0;
+        State s9;
+        CHECK(step(s9, cnobox, with_er(sq_in(111, 9.0, 1.7), 0.0)).action == Action::OpenLong,
+              "箱体关时效率比不起作用");
+    }
+    {
+        // ③ 裸K「等收盘突破」的信号K量比
+        Config cb;
+        cb.strategy = Strategy::BareK;
+        cb.bare_entry = BareEntry::BreakPrevBar;
+        cb.bare_vol_ratio = 1.8;
+        auto brk = [](double vr) {
+            Inputs in = bare_in(112, 94, 114);
+            in.prev_close = 112; in.prev_high = 110; in.prev_low = 100;
+            in.new_bar = true;
+            in.signal_vol_ratio = vr;
+            return in;
+        };
+        State b1;
+        CHECK(step(b1, cb, brk(2.0)).action == Action::OpenLong, "裸K：收盘突破 + 量比 2.0 ⇒ 开多");
+        State b2;
+        const auto vb = step(b2, cb, brk(1.1));
+        CHECK(vb.action == Action::Hold && vb.filtered, "裸K：量比 1.1 < 1.8 ⇒ 拦");
+        CHECK(std::string(vb.reason).find("未放量") != std::string::npos, "  原因写明未放量");
+        State b3;
+        CHECK(step(b3, cb, brk(1.8)).action == Action::OpenLong, "裸K：恰好等于阈值 ⇒ 放行");
+        State b4;
+        CHECK(step(b4, cb, brk(0)).action == Action::Hold, "裸K：量比拿不到 ⇒ 拦");
+
+        Config ci = cb;
+        ci.bare_entry = BareEntry::Immediate;
+        State b5;
+        Inputs im = bare_in(105, 94, 114);
+        im.bar_open = 100;
+        CHECK(!bare_vol_filter_on(ci), "立即顺势下量比过滤不生效");
+        CHECK(step(b5, ci, im).action == Action::OpenLong, "立即顺势：量比读数为 0 也照常开");
+
+        Config cr = cb;
+        cr.reverse = ReverseMode::Immediate;
+        State b6;
+        on_filled(b6, Pos::Long, 110, 100, cr, false);
+        Inputs hit = bare_in(99, 100, 114);
+        CHECK(step(b6, cr, hit).action == Action::CloseReverseShort,
+              "裸K：止损后的立即反手不受量比过滤影响");
+
+        Config cz = cb; cz.bare_vol_ratio = 0;
+        State b7;
+        CHECK(step(b7, cz, brk(0)).action == Action::OpenLong, "裸K：量比 0（关）⇒ 原行为");
+    }
+    {
         // 其它策略即便字段里有值也不生效
         Config ck = c;
         ck.strategy = Strategy::BareK;

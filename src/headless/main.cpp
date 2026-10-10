@@ -476,6 +476,7 @@ int main(int argc, char** argv) {
                             s.prev2_low   = bp.prev2_low;
                             s.swing_low   = bp.swing_low;
                             s.swing_high  = bp.swing_high;
+                            s.signal_vol_ratio = bp.signal_vol_ratio;
                             s.bar_open_ms = bp.bar_open_ms;
                             trend_engine->update_bars(b.bot_id, s);
                             continue;
@@ -487,7 +488,7 @@ int main(int argc, char** argv) {
                         trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                   snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                   snap.bar_open_ms, snap.box_atr,
-                                                  snap.vol_ratio);
+                                                  snap.vol_ratio, snap.er_ok, snap.er);
                     }
                     trend_sig_busy.store(false);
                 });

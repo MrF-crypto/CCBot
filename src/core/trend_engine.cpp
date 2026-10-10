@@ -67,7 +67,9 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg) {
         params = std::string(cfg.rule.bare_entry == trend::BareEntry::Immediate
                                  ? "立即顺势" : "等收盘突破") +
                  " / 摆动N=" + std::to_string(cfg.rule.swing_bars) +
-                 (cfg.rule.once_per_bar ? " / 每根限一次" : "");
+                 (cfg.rule.once_per_bar ? " / 每根限一次" : "") +
+                 (trend::bare_vol_filter_on(cfg.rule)
+                      ? " / 量比≥" + fmt(cfg.rule.bare_vol_ratio, 1) + "x" : std::string());
         break;
     case trend::Strategy::Turtle:
     default:
@@ -75,7 +77,9 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg) {
                  " / ATR" + std::to_string(cfg.rule.atr_period) +
                  " / k=" + fmt(cfg.rule.atr_mult, 1);
         if (cfg.rule.squeeze_box_atr > 0)
-            params += " / 横盘≤" + fmt(cfg.rule.squeeze_box_atr, 1) + "ATR";
+            params += " / 横盘≤" + fmt(cfg.rule.squeeze_box_atr, 1) + "ATR" +
+                      (cfg.rule.trend_er_min > 0
+                           ? "（或效率比≥" + fmt(cfg.rule.trend_er_min, 2) + "）" : "");
         if (cfg.rule.breakout_vol_ratio > 0)
             params += " / 量比≥" + fmt(cfg.rule.breakout_vol_ratio, 1) + "x";
         break;
@@ -101,7 +105,8 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.sig_ok  = false;
     snap.atr = snap.atr_pct = 0;
     snap.dc_ok = false;
-    snap.box_atr = snap.vol_ratio = 0;
+    snap.box_atr = snap.vol_ratio = snap.er = 0;
+    snap.er_ok = false;
     snap.sig_time = {};
     // 冷却与"这根K线数过没有"跨重启都失去意义：bar_open_ms 对不上新拉的K线
     snap.bar_open_ms = snap.last_counted_bar_ms = 0;
@@ -435,7 +440,8 @@ void TrendEngine::set_pending_for_test(const std::string& id, bool v) {
 
 void TrendEngine::update_signal(const std::string& id, double atr, double atr_pct,
                               bool dc_ok, double dc_up, double dc_dn,
-                              int64_t bar_open_ms, double box_atr, double vol_ratio) {
+                              int64_t bar_open_ms, double box_atr, double vol_ratio,
+                              bool er_ok, double er) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);
     if (it == bots_.end()) return;
@@ -447,6 +453,8 @@ void TrendEngine::update_signal(const std::string& id, double atr, double atr_pc
     b.dc_dn   = dc_dn;
     b.box_atr   = box_atr;
     b.vol_ratio = vol_ratio;
+    b.er_ok     = er_ok;
+    b.er        = er;
     b.sig_time = host_.now_steady();
     // ⚠ 只有海龟的 sig_ok 由这里决定。裸K 与 抛物线SAR 根本不算通道也不用 ATR，
     //   它们的 sig_ok 由 update_bars 设——这里若一并覆盖，会把刚设好的 true
@@ -479,6 +487,7 @@ void TrendEngine::update_bars(const std::string& id, const BarSnap& s) {
     b.psar_prev2_low  = s.prev2_low;
     b.swing_low       = s.swing_low;
     b.swing_high      = s.swing_high;
+    b.signal_vol_ratio = s.signal_vol_ratio;
     // "K线数据就绪"必须按【这个策略真正用到的字段】判定，不能一刀切成
     // "前一根高低点都在"。③ 盘中即时入场只用本根开盘价，前一根的高低点对它
     // 毫无意义——一刀切的话，数据层哪天少给一个它用不到的字段，这个 bot 就会
@@ -645,6 +654,8 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             in.dc_dn = b.dc_dn;
             in.box_atr   = fresh ? b.box_atr : 0;
             in.vol_ratio = fresh ? b.vol_ratio : 0;
+            in.er_ok     = fresh && b.er_ok;
+            in.er        = b.er;
             in.bar_ok      = fresh && b.bar_ok;
             in.bar_open    = b.bar_open;
             in.prev_close  = b.prev_close;
@@ -652,6 +663,7 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             in.prev_low    = b.prev_low;
             in.swing_low   = b.swing_low;
             in.swing_high  = b.swing_high;
+            in.signal_vol_ratio = b.signal_vol_ratio;
             in.psar_prev_high  = b.psar_prev_high;
             in.psar_prev_low   = b.psar_prev_low;
             in.psar_prev2_high = b.psar_prev2_high;
@@ -667,33 +679,56 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                 std::ostringstream d;
                 d << trend::pos_name(b.st.pos);
                 if (b.st.pos != trend::Pos::Flat) d << " 止损线=" << fmt(b.st.stop);
-                else if (b.cfg.rule.strategy == trend::Strategy::BareK && in.bar_ok)
+                else if (b.cfg.rule.strategy == trend::Strategy::BareK && in.bar_ok) {
                     d << " 摆动[" << fmt(in.swing_low) << "," << fmt(in.swing_high) << "]";
+                    if (trend::bare_vol_filter_on(b.cfg.rule))
+                        d << " 上根量比" << fmt(in.signal_vol_ratio, 1) << "x";
+                }
                 else if (b.cfg.rule.strategy == trend::Strategy::ParabolicSar && in.bar_ok)
                     d << " 前根[" << fmt(in.psar_prev_low) << "," << fmt(in.psar_prev_high) << "]";
                 else if (in.dc_ok) d << " 通道[" << fmt(in.dc_dn) << "," << fmt(in.dc_up) << "]";
-                if (b.st.pos == trend::Pos::Flat && trend::squeeze_filter_on(b.cfg.rule))
-                    d << " 箱体" << fmt(in.box_atr, 1) << "ATR 量比" << fmt(in.vol_ratio, 1) << "x";
+                if (b.st.pos == trend::Pos::Flat && trend::squeeze_filter_on(b.cfg.rule)) {
+                    d << " 箱体" << fmt(in.box_atr, 1) << "ATR";
+                    // 效率比带符号：+ 净涨，− 净跌
+                    if (b.cfg.rule.squeeze_box_atr > 0 && b.cfg.rule.trend_er_min > 0 && in.er_ok)
+                        d << " 效率比" << (in.er >= 0 ? "+" : "") << fmt(in.er, 2);
+                    d << " 量比" << fmt(in.vol_ratio, 1) << "x";
+                }
                 if (!fresh) d << " 信号过期";
                 d << " | " << v.reason;
                 b.last_decision = d.str();
             }
 
             // 突破被过滤：每根K线记一次，看得到过滤在起作用、拦的是哪一条
-            // 箱体在一根K线内是定的（通道和已收盘的 ATR 都不变），被箱体拦了这根
-            // 就不会再开；量比会随成交增长，所以只拦在量上时说"放量仍会入场"
+            // 箱体与效率比在一根K线内是定值（都只用已收盘K线），卡在这一关就是
+            // 这次突破不做；量比随成交增长，卡在量上则这根里量够了仍会入场。
+            // 用户反馈过旧措辞"本根不再开"读起来像"等下一根"，所以两种分开说
             if (v.filtered && b.squeeze_noted_bar_ms != b.bar_open_ms) {
                 b.squeeze_noted_bar_ms = b.bar_open_ms;
                 const auto& r = b.cfg.rule;
-                const bool box_fail = r.squeeze_box_atr > 0 &&
-                                      !(in.box_atr > 0 && in.box_atr <= r.squeeze_box_atr);
-                std::string m = b.cfg.symbol + " 突破未开仓：";
-                if (r.squeeze_box_atr > 0)
-                    m += "箱体 " + fmt(in.box_atr, 1) + "ATR（限≤" + fmt(r.squeeze_box_atr, 1) + "）";
-                if (r.breakout_vol_ratio > 0)
-                    m += std::string(r.squeeze_box_atr > 0 ? " / " : "") + "量比 " +
-                         fmt(in.vol_ratio, 1) + "x（需≥" + fmt(r.breakout_vol_ratio, 1) + "）";
-                m += box_fail ? "，本根不再开" : "，本根内放量仍会入场";
+                const bool lg = v.filtered_long;
+                std::string m = b.cfg.symbol + (lg ? " 向上" : " 向下");
+                if (trend::bare_vol_filter_on(r)) {
+                    // 裸K的信号只在收盘那一拍成立，被拦就是这次不做
+                    m += "突破不做：信号K量比 " + fmt(in.signal_vol_ratio, 1) + "x（需≥" +
+                         fmt(r.bare_vol_ratio, 1) + "）";
+                } else if (!trend::squeeze_box_pass(in, r, lg)) {
+                    m += "突破不做：";
+                    if (!(in.box_atr > 0)) {
+                        m += "箱体读数缺失";
+                    } else {
+                        m += "箱体 " + fmt(in.box_atr, 1) + "ATR 过宽（限≤" +
+                             fmt(r.squeeze_box_atr, 1) + "）";
+                        if (r.trend_er_min > 0)
+                            m += "，效率比 " +
+                                 (in.er_ok ? std::string(in.er >= 0 ? "+" : "") + fmt(in.er, 2)
+                                           : std::string("缺失")) +
+                                 " 不是趋势（需" + (lg ? "≥+" : "≤−") + fmt(r.trend_er_min, 2) + "）";
+                    }
+                } else {
+                    m += "突破待放量：量比 " + fmt(in.vol_ratio, 1) + "x（需≥" +
+                         fmt(r.breakout_vol_ratio, 1) + "），本根内量够即入场";
+                }
                 log(m);
             }
 

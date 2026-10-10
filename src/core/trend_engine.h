@@ -133,6 +133,8 @@ struct TrendBot {
     double  dc_dn   = 0;
     double  box_atr   = 0;     // ① 横盘突破过滤：通道宽度 ÷ ATR
     double  vol_ratio = 0;     // ① 横盘突破过滤：当前根量比
+    bool    er_ok = false;     // ① 横盘突破过滤：通道窗口效率比（带符号）
+    double  er    = 0;
     // 突破被过滤时日志每根K线只记一次（拦截每 3 秒都会命中）。不落盘
     int64_t squeeze_noted_bar_ms = 0;
     // ── K线快照（裸K 与 抛物线SAR 用；海龟只用上面的 ATR + 通道）──────────
@@ -143,6 +145,7 @@ struct TrendBot {
     double  prev_low    = 0;    // 上一根的最低价
     double  swing_low   = 0;    // bar 0 之前 N 根的最低价
     double  swing_high  = 0;
+    double  signal_vol_ratio = 0;   // 刚收盘那根的量比（裸K「等收盘突破」量比过滤）
     // 抛物线SAR 的夹逼要前两根的高低点
     double  psar_prev_high = 0, psar_prev_low = 0;
     double  psar_prev2_high = 0, psar_prev2_low = 0;
@@ -291,11 +294,12 @@ public:
     void set_max_open_positions(int n);
 
     // 应用层拉到K线后喂入信号快照（ATR + 唐奇安通道 + 当前K线开盘时间）。
-    // box_atr / vol_ratio 是横盘突破过滤的读数；不传就是 0，开了过滤的 bot 会因此
-    // 一单不开（宁拦勿放），没开过滤的不受影响
+    // box_atr / vol_ratio / er 是横盘突破过滤的读数；不传就是缺失，开了过滤的 bot
+    // 会因此一单不开（宁拦勿放），没开过滤的不受影响
     void update_signal(const std::string& bot_id, double atr, double atr_pct,
                        bool dc_ok, double dc_up, double dc_dn, int64_t bar_open_ms,
-                       double box_atr = 0, double vol_ratio = 0);
+                       double box_atr = 0, double vol_ratio = 0,
+                       bool er_ok = false, double er = 0);
     // K线快照（裸K 与 抛物线SAR 用）。与 update_signal 分开：海龟要的是
     // ATR+通道，这两个要的是原始高低点，合成一个大函数会让调用方被迫为
     // 用不到的参数填占位值。
@@ -309,6 +313,7 @@ public:
         double prev_high = 0, prev_low = 0;        // 上一根
         double prev2_high = 0, prev2_low = 0;      // 上上根（PSAR 夹逼用）
         double swing_low = 0, swing_high = 0;      // bar 0 之前 N 根的极值
+        double signal_vol_ratio = 0;               // bar 0 的量比（裸K量比过滤用）
         int64_t bar_open_ms = 0;
     };
     void update_bars(const std::string& bot_id, const BarSnap& s);

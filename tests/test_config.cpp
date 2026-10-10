@@ -170,6 +170,54 @@ int main() {
                          "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"breakout_vol_ratio\":-1}]}");
         HeadlessConfig hc2; std::string err2;
         check(!load_headless_config(path, hc2, err2), "量比阈值为负应被拒绝");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"squeeze_box_atr\":4,"
+                         "\"trend_er_min\":0.4}]}");
+        HeadlessConfig hc3; std::string err3;
+        check(load_headless_config(path, hc3, err3), "效率比阈值能加载");
+        if (hc3.trend_bots.size() == 1)
+            check(std::fabs(hc3.trend_bots[0].rule.trend_er_min - 0.4) < 1e-12, "  效率比阈值读入");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"trend_er_min\":1.5}]}");
+        HeadlessConfig hc4; std::string err4;
+        check(!load_headless_config(path, hc4, err4), "效率比阈值超过 1 应被拒绝");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"trend_er_min\":0.4}]}");
+        HeadlessConfig hc5; std::string err5;
+        load_headless_config(path, hc5, err5);
+        bool warned = false;
+        for (const auto& w : hc5.warnings)
+            if (w.find("trend_er_min 只在") != std::string::npos) warned = true;
+        check(warned, "  没开箱体却设了效率比：告警它不起作用");
+    }
+    {
+        // 裸K 信号K量比
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"bare_entry\":\"break_prev\",\"bare_vol_ratio\":1.8}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "裸K量比配置能加载");
+        if (hc.trend_bots.size() == 1)
+            check(std::fabs(hc.trend_bots[0].rule.bare_vol_ratio - 1.8) < 1e-12, "  裸K量比读入");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"bare_entry\":\"immediate\",\"bare_vol_ratio\":1.8}]}");
+        HeadlessConfig hc2; std::string err2;
+        load_headless_config(path, hc2, err2);
+        bool warned = false;
+        for (const auto& w : hc2.warnings)
+            if (w.find("bare_vol_ratio 只对") != std::string::npos) warned = true;
+        check(warned, "  立即顺势下设了量比：告警它不起作用");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"bare_vol_ratio\":-1}]}");
+        HeadlessConfig hc3; std::string err3;
+        check(!load_headless_config(path, hc3, err3), "裸K量比为负应被拒绝");
     }
     {
         // 方向：默认多空；long 读入；拼错拒绝启动
