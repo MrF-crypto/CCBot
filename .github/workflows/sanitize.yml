@@ -52,8 +52,9 @@ jobs:
             #   后台线程】，而它是 v5.7.0 起唯一的行情来源。它在 v5.9.2 之前
             #   两个 sanitizer 列表都不在 —— 门禁列表是硬编码的，加新套件时
             #   没人提醒，正是上面那段注释担心的"降级成摆设"
+            # ccg_smart_runner_tests：扫描用 parallel_for 开线程并发拉K线
             suites: ccg_trend_stress_tests ccg_pool_tests ccg_trend_engine_tests
-                    ccg_order_tests ccg_rest_feed_tests
+                    ccg_order_tests ccg_rest_feed_tests ccg_smart_runner_tests
 
     name: ${{ matrix.name }}
     steps:
@@ -141,7 +142,8 @@ jobs:
                     ccg_trend_tests ccg_trend_engine_tests ccg_trend_stress_tests
                     ccg_trend_state_tests ccg_config_tests
                     ccg_timesync_tests ccg_pool_tests
-                    ccg_rest_feed_tests ccg_app_logic_tests"
+                    ccg_rest_feed_tests ccg_app_logic_tests
+                    ccg_smart_tests ccg_smart_runner_tests"
           else
             SUITES="${{ matrix.suites }}"
           fi

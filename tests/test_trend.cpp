@@ -1183,8 +1183,75 @@ static void test_bare_regime() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ① 海龟出场优化：锁定 ATR / 盈利后加速收紧
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_exit_opt() {
+    auto open_long = [](const Config& c) {
+        State st;
+        on_filled(st, Pos::Long, 100, 94, c, false, 0, /*entry_atr*/ 2.0);
+        return st;
+    };
+    {
+        Config c;   // 都关：ATR 放大到 5，止损按 5 算
+        State st = open_long(c);
+        CHECK(near(st.entry_atr, 2.0), "on_filled 记下开仓时 ATR");
+        step(st, c, mk(110, 5.0));
+        CHECK(near(st.stop, 95.0), "普通 Chandelier：110 − 3×5 = 95（ATR 放大，止损变松）");
+    }
+    {
+        Config c; c.lock_atr = true;
+        State st = open_long(c);
+        step(st, c, mk(110, 5.0));
+        CHECK(near(st.stop, 104.0), "锁定 ATR：110 − 3×min(2,5) = 104");
+        step(st, c, mk(111, 1.0));
+        CHECK(near(st.stop, 108.0), "锁定 ATR：当前 ATR 更小时用当前的（111 − 3×1）");
+    }
+    {
+        Config c; c.accel_exit = true;
+        State st = open_long(c);
+        step(st, c, mk(110, 2.0));
+        CHECK(near(st.stop, 104.0), "浮盈 5ATR < 6：k 仍为 3（110 − 6）");
+        step(st, c, mk(112, 2.0));
+        CHECK(near(turtle_k(st, c), 2.0) && near(st.stop, 108.0), "浮盈 6ATR：k=2（112 − 4）");
+        step(st, c, mk(120, 2.0));
+        CHECK(near(turtle_k(st, c), 1.5) && near(st.stop, 117.0), "浮盈 10ATR：k=1.5（120 − 3）");
+        step(st, c, mk(118, 2.0));
+        CHECK(near(turtle_k(st, c), 1.5) && near(st.stop, 117.0),
+              "回落时 k 不回升（按极值算），止损棘轮不退");
+    }
+    {
+        Config c; c.accel_exit = true; c.atr_mult = 1.0;
+        State st = open_long(c);
+        step(st, c, mk(112, 2.0));
+        CHECK(near(turtle_k(st, c), 1.0), "用户 k 本来就比档位小：不放大");
+    }
+    {
+        Config c; c.lock_atr = true; c.accel_exit = true;
+        State st;
+        on_filled(st, Pos::Long, 100, 94, c, false);   // 没有开仓 ATR（旧存档恢复）
+        step(st, c, mk(112, 5.0));
+        CHECK(near(st.stop, 97.0), "开仓 ATR 缺失：两项都退回普通 Chandelier（112 − 15）");
+    }
+    {
+        // 空头对称
+        Config c; c.accel_exit = true; c.lock_atr = true;
+        State st;
+        on_filled(st, Pos::Short, 100, 106, c, false, 0, 2.0);
+        step(st, c, mk(88, 5.0, 110, 90));
+        CHECK(near(turtle_mfe_atr(st), 6.0) && near(st.stop, 92.0),
+              "空头：浮盈 6ATR，k=2，锁定 ATR=2 ⇒ 88 + 4 = 92");
+    }
+    {
+        Config c; State st = open_long(c);
+        on_closed(st);
+        CHECK(st.entry_atr == 0, "平仓清掉开仓 ATR");
+    }
+}
+
 int main() {
     test_turtle();
+    test_exit_opt();
     test_bare_regime();
     test_squeeze_filter();
     test_direction();

@@ -2,6 +2,7 @@
 #include "version.h"
 #include "core/key_store.h"
 #include "core/app_logic.h"
+#include "core/parallel.h"
 #include "net/alert.h"
 
 #include <QApplication>
@@ -30,6 +31,8 @@
 #include <QFormLayout>
 
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <future>
 #include <set>
 #include <map>
@@ -129,6 +132,8 @@ MainWindow::MainWindow(QWidget* parent)
     load_trades();
     load_trade_stats();   // 必须在 load_trades 之后：文件不存在时要用明细算初值
     load_settings();
+    load_smart_cfg();     // 未连接时也能打开弹窗改；连接成功后才真正运行
+    refreshSmartBadge();
     refreshStats();
 
     // 若本地已保存有效凭证，启动后自动连接，无需再手动点击
@@ -891,6 +896,12 @@ void MainWindow::buildUi() {
 
         row->addStretch();
 
+        // 智能模式：按钮本身就是状态徽标（关 / 监控几个、持仓几个 / 暂停 / 达到亏损限额）
+        smartBtn_ = new QPushButton("智能：关");
+        connect(smartBtn_, &QPushButton::clicked, this, &MainWindow::openSmartDialog);
+        row->addWidget(smartBtn_);
+        row->addSpacing(6);
+
         auto* btnSettings = new QPushButton("⚙ 设置");
         btnSettings->setFixedWidth(72);
         btnSettings->setStyleSheet(
@@ -1238,6 +1249,8 @@ void MainWindow::onConnect() {
 
             // 恢复上次保存的 Bot
             load_and_restore_trend();
+            // 智能模式：运行器持有引擎指针，随引擎一起重建
+            startSmartRunner();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
             // 手续费账本。第一次运行新版本时用成交明细补出各品种的时间段，
             // 之后由 reconcileFeeSpans 按当前 bot 列表开/关
@@ -1807,14 +1820,23 @@ void MainWindow::onTick() {
                 // 完全静默，于是"信号拉不到"和"拉到了但没突破"在界面上长得
                 // 一模一样，都是"等信号"。用户唯一能做的就是干等
                 QStringList failed;
-                int okn = 0;
-                for (const auto& b : need) {
-                    if (!client_ || !trend_engine_) break;
+                std::atomic<int> okn_a{0};
+                std::mutex fail_mtx;
+                auto mark_failed = [&](const std::string& s) {
+                    std::lock_guard<std::mutex> fl(fail_mtx);
+                    failed << QString::fromStdString(s);
+                };
+                // 并行拉：智能模式下可能有上百个 bot，串行一轮要一两分钟，超过刷新周期。
+                // HTTP 客户端自带连接池与限流闸门，引擎的写入口自己持锁
+                parallel_for((int)need.size(), kSignalFetchWorkers, [&](int idx) {
+                  try {
+                    const auto& b = need[idx];
+                    if (!client_ || !trend_engine_) return;
                     if (b.cfg.rule.strategy != trend::Strategy::Turtle) {
                         auto bp = client_->fetch_bar_pattern(
                             b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
-                        if (!bp.ok) { failed << QString::fromStdString(b.cfg.symbol); continue; }
-                        ++okn;
+                        if (!bp.ok) { mark_failed(b.cfg.symbol); return; }
+                        ++okn_a;
                         // 裸K 与 抛物线SAR 只要原始高低点，【不需要 ATR】——
                         // 少拉一次 REST。update_bars 自己设 sig_ok，所以不必
                         // 像 v5.1.0 之前那样成对调用两个接口（漏一次的表现是
@@ -1839,21 +1861,26 @@ void MainWindow::onTick() {
                         s.range_now_lo = bp.range_now_lo;
                         s.bar_open_ms = bp.bar_open_ms;
                         trend_engine_->update_bars(b.bot_id, s);
-                        continue;
+                        return;
                     }
                     auto snap = client_->fetch_trend_signal(
                         b.cfg.symbol, b.cfg.interval,
                         b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
                     if (!snap.ok) {
-                        failed << QString::fromStdString(b.cfg.symbol);
-                        continue;
+                        mark_failed(b.cfg.symbol);
+                        return;
                     }
-                    ++okn;
+                    ++okn_a;
                     trend_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                snap.bar_open_ms, snap.box_atr,
                                                snap.vol_ratio, snap.er_ok, snap.er);
-                }
+                  } catch (...) {
+                    // 跨线程的异常会直接 terminate；拉取失败当成这一个没拉到
+                    mark_failed(need[idx].cfg.symbol);
+                  }
+                });
+                const int okn = okn_a.load();
                 trendSigBusy_.store(false);
                 QMetaObject::invokeMethod(this, [this, failed, okn]() {
                     // 只在【集合变化】时报。拉取每分钟一轮，而一个拼错的品种会
@@ -1887,6 +1914,9 @@ void MainWindow::onTick() {
     // 布林带/RSI 指标批次随网格DCA 一并移除：那批数据只服务 DCA 的首单信号。
     // 趋势策略要的 ATR 与唐奇安通道走上面那条独立的信号拉取，节奏也不同
     // （按各 bot 自己的 K 线周期，而不是固定 5 分钟）
+
+    // 智能模式：到点扫描（后台），否则每分钟做一次轻量维护
+    smartTick();
 
     ++slowTickCount_;
 

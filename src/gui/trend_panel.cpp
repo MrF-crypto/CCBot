@@ -114,7 +114,26 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     botTable_->setItem(row, ColIdx, mk(QString::number(row + 1), kGrey));
 
     // ── 1 品种 ──
-    botTable_->setItem(row, ColSym, mk(QString::fromStdString(b.cfg.symbol)));
+    // 智能模式的自动 bot 带标签：哪份名单、第几名。不在名单里了（持仓中等走完）显示"待移出"
+    if (b.is_auto) {
+        // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时只标"自动"
+        const QString tag = b.smart_rank > 0
+            ? QString("自动·%1#%2").arg(b.smart_list == 'S' ? "空" : "多").arg(b.smart_rank)
+            : (b.smart_score > 0 ? QString("自动·待移出") : QString("自动"));
+        auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + "  " + tag,
+                          b.smart_rank > 0 ? kBlue : kGrey);
+        sym_it->setToolTip(QString("智能模式管理的 bot\n综合分 %1　%2\n"
+                                   "空仓时掉出名单（连续 2 轮、满 24 小时）会被自动移除；"
+                                   "持仓中绝不移除，等这笔走完")
+                               .arg(b.smart_score, 0, 'f', 0)
+                               .arg(b.smart_rank > 0
+                                        ? QString("%1名单第 %2 名").arg(b.smart_list == 'S' ? "做空" : "做多")
+                                                                   .arg(b.smart_rank)
+                                        : QString("已不在名单")));
+        botTable_->setItem(row, ColSym, sym_it);
+    } else {
+        botTable_->setItem(row, ColSym, mk(QString::fromStdString(b.cfg.symbol)));
+    }
 
     // ── 2 方向 ──
     // ⚠ 与 DCA 不同义。DCA 那列是【配置】（你选的多/空/双向），SAR 的配置里
@@ -163,6 +182,10 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                 tip += QString("放量过滤：量比 ≥ %1 倍（当前 %2）\n")
                            .arg(b.cfg.rule.breakout_vol_ratio, 0, 'f', 1)
                            .arg(b.vol_ratio, 0, 'f', 1);
+            if (b.cfg.rule.lock_atr || b.cfg.rule.accel_exit)
+                tip += QString("出场优化：%1%2\n")
+                           .arg(b.cfg.rule.lock_atr ? "锁定ATR " : "")
+                           .arg(b.cfg.rule.accel_exit ? "加速收紧" : "");
             break;
         case trend::Strategy::ParabolicSar:
             tip += QString("抛物线 SAR：SAR 值既是入场也是止损也是反转点\n"
@@ -531,6 +554,8 @@ struct TrendFormWidgets {
     QDoubleSpinBox* boxAtr    = nullptr;   // 横盘过滤：箱体 ≤ x ATR，0=关
     QDoubleSpinBox* volRatio  = nullptr;   // 放量过滤：量比 ≥ x，0=关
     QDoubleSpinBox* erMin     = nullptr;   // 箱体过宽时的例外：效率比 ≥ x，0=关
+    QCheckBox*      lockAtr   = nullptr;   // 出场优化：锁定 ATR
+    QCheckBox*      accelExit = nullptr;   // 出场优化：盈利后加速收紧
 
     // ── ② 抛物线 SAR ──
     QDoubleSpinBox* afStart = nullptr;
@@ -701,6 +726,22 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
                             "不按剩余时间外推：价格一直站在通道外、量攒够的那一刻入场。\n"
                             "两项过滤各自独立；只拦突破入场，不拦亏损止损后的立即反手。0 = 关。");
     p1->addRow("突破量比≥", w->volRatio);
+
+    w->lockAtr = new QCheckBox("锁定 ATR（暴涨时止损不跟着放宽）");
+    w->lockAtr->setChecked(c.rule.lock_atr);
+    w->lockAtr->setToolTip(
+        "止损距离 = k × min(开仓时的 ATR, 当前 ATR)。\n"
+        "山寨币暴涨时 ATR 急剧放大，普通 Chandelier 的止损会越涨越松，\n"
+        "见顶回落时回吐一大截。锁定之后止损距离不会大于开仓时的水平。");
+    p1->addRow(w->lockAtr);
+
+    w->accelExit = new QCheckBox("盈利后加速收紧（浮盈≥6ATR k→2，≥10ATR k→1.5）");
+    w->accelExit->setChecked(c.rule.accel_exit);
+    w->accelExit->setToolTip(
+        "浮盈按开仓时的 ATR 计。越涨止损越贴近，只降不升。\n"
+        "仍然是追踪止损，不是固定止盈——跑得远的单子照样能拿住，\n"
+        "只是急涨见顶、急跌回落时少吐一些。状态列会显示当前 k。");
+    p1->addRow(w->accelExit);
 
     // ── ② 抛物线 SAR ──
     w->afStart = new QDoubleSpinBox();
@@ -1077,6 +1118,8 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.squeeze_box_atr    = w->boxAtr->value();
             out.rule.breakout_vol_ratio = w->volRatio->value();
             out.rule.trend_er_min       = w->erMin->value();
+            out.rule.lock_atr           = w->lockAtr->isChecked();
+            out.rule.accel_exit         = w->accelExit->isChecked();
             break;
         case trend::Strategy::ParabolicSar:
             out.rule.af_start = w->afStart->value();
@@ -1175,6 +1218,13 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
         QMessageBox::warning(this, "添加失败", "该品种已存在一个未停止的趋势 bot。");
         return false;
     }
+    // 亲手改了自动 bot 的参数 = 接管它。不转的话下一轮扫描会按模板把参数改回去，
+    // 而且空仓掉出名单时还会被删掉——用户刚设好的东西悄悄没了
+    if (existing && existing->is_auto) {
+        trend_engine_->release_auto(id);
+        log(QString("%1 已转为手动 bot，智能模式不再管理它")
+                .arg(QString::fromStdString(c.symbol)), "OK");
+    }
     if (ticker_) ticker_->subscribe(c.symbol);
     trendSigForce_.store(true);   // 下一个 tick 立刻拉信号，不等满一整轮
 
@@ -1191,6 +1241,8 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
                                : QString());
             if (c.rule.breakout_vol_ratio > 0)
                 params += QString(" 量比≥%1x").arg(c.rule.breakout_vol_ratio, 0, 'f', 1);
+            if (c.rule.lock_atr)   params += " 锁定ATR";
+            if (c.rule.accel_exit) params += " 加速收紧";
             break;
         case trend::Strategy::ParabolicSar:
             params = QString("趋势SAR AF %1/%2/%3")
@@ -1250,6 +1302,8 @@ void MainWindow::save_trend_bots() {
         o["squeeze_box_atr"]    = b.cfg.rule.squeeze_box_atr;
         o["breakout_vol_ratio"] = b.cfg.rule.breakout_vol_ratio;
         o["trend_er_min"]       = b.cfg.rule.trend_er_min;
+        o["lock_atr"]           = b.cfg.rule.lock_atr;
+        o["accel_exit"]         = b.cfg.rule.accel_exit;
         o["af_start"]        = b.cfg.rule.af_start;
         o["af_step"]         = b.cfg.rule.af_step;
         o["af_max"]          = b.cfg.rule.af_max;
@@ -1272,6 +1326,7 @@ void MainWindow::save_trend_bots() {
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
         o["disaster_stop_price"] = b.disaster_stop_price;
         o["state"]           = (int)b.state;
+        o["auto"]            = b.is_auto;   // 智能模式管理的 bot
         // ── 运行时状态 ──
         // Qt 的 QJsonValue(double) 是全精度往返，不像 ostringstream 会截到 6 位。
         // 这点在 SAR 上尤其要紧：止损线【就是】出场价
@@ -1282,6 +1337,8 @@ void MainWindow::save_trend_bots() {
         // ② SAR 专用：AF 丢了的话重启后 SAR 会从 0.02 重新加速，止损线瞬间
         // 从"贴着价格"退回到远处——等于白白让出已经锁住的利润
         o["af"]              = b.st.af;
+        // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
+        o["entry_atr"]       = b.st.entry_atr;
         o["consec_reverses"] = b.st.consec_reverses;
         o["cooldown_left"]   = b.st.cooldown_left;
         // ③ 裸K 专用：once_per_bar 的判据（最后一次开仓所在K线的开盘时间）。
@@ -1342,6 +1399,8 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.squeeze_box_atr    = std::max(0.0, o["squeeze_box_atr"].toDouble(0));
         b.cfg.rule.breakout_vol_ratio = std::max(0.0, o["breakout_vol_ratio"].toDouble(0));
         b.cfg.rule.trend_er_min       = std::clamp(o["trend_er_min"].toDouble(0), 0.0, 1.0);
+        b.cfg.rule.lock_atr           = o["lock_atr"].toBool(false);
+        b.cfg.rule.accel_exit         = o["accel_exit"].toBool(false);
         b.cfg.rule.af_start        = o["af_start"].toDouble(0.02);
         b.cfg.rule.af_step         = o["af_step"].toDouble(0.02);
         b.cfg.rule.af_max          = o["af_max"].toDouble(0.20);
@@ -1416,6 +1475,7 @@ void MainWindow::load_and_restore_trend() {
         b.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
         b.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         b.state = (TrendBot::State)o["state"].toInt(0);
+        b.is_auto = o["auto"].toBool(false);
 
         const int pos = o["pos"].toInt((int)trend::Pos::Flat);
         b.st.pos = (pos == (int)trend::Pos::Long)  ? trend::Pos::Long
@@ -1427,6 +1487,7 @@ void MainWindow::load_and_restore_trend() {
         // 旧存档没有 af。默认取 af_start 而不是 0：0 会让 SAR 完全不动
         // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
         b.st.af              = o["af"].toDouble(b.cfg.rule.af_start);
+        b.st.entry_atr       = o["entry_atr"].toDouble(0);
         b.st.consec_reverses = o["consec_reverses"].toInt(0);
         b.st.cooldown_left   = o["cooldown_left"].toInt(0);
         b.st.last_entry_bar_ms = (int64_t)o["last_entry_bar_ms"].toInteger(0);

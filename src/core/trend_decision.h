@@ -88,6 +88,16 @@ struct Config {
     double breakout_vol_ratio = 0;
     double trend_er_min       = 0;
 
+    // 出场优化（默认关）。都只改 Chandelier 的两个输入，仍然是追踪止损、仍然棘轮，
+    // 没有固定止盈——不砍右尾这条不变。
+    //   lock_atr：止损距离用 min(开仓时 ATR, 当前 ATR)。山寨币暴涨时 ATR 急剧放大，
+    //     3×ATR 的止损【越涨越松】，见顶回落时回吐一大截；锁住之后不跟着放宽
+    //   accel_exit：浮盈（按开仓时 ATR 计）≥ 6 ATR 时 k 降到 2，≥ 10 ATR 时降到 1.5，
+    //     只降不升（浮盈按持仓期极值算，极值只朝有利方向走）。类似 SAR 的加速，
+    //     专门对付急涨急跌的顶部
+    bool   lock_atr   = false;
+    bool   accel_exit = false;
+
     // ── ② 抛物线 SAR ────────────────────────────────────────────────────────
     // SAR(下一根) = SAR(本根) + AF × (EP − SAR(本根))
     //   EP = 持仓期极值（多=最高、空=最低），复用 State::peak
@@ -166,6 +176,9 @@ struct State {
     int    cooldown_left   = 0;   // 剩余冷却K线数
     // ③ 专用：最后一次开仓所在K线的开盘时间。once_per_bar 靠它判"这根开过了"
     int64_t last_entry_bar_ms = 0;
+    // ① 专用：开仓时的 ATR。锁定 ATR 与加速收紧都以它为基准。要落盘——丢了的话
+    //    两项优化在重启后静默退回普通 Chandelier（为 0 时就是这样兜底的）
+    double entry_atr = 0;
 };
 
 struct Inputs {
@@ -410,6 +423,31 @@ inline double chandelier(Pos p, double peak, double atr, double k) {
     return p == Pos::Long ? peak - k * atr : peak + k * atr;
 }
 
+// ① 出场优化：锁定 ATR —— 取开仓时与当前的较小值
+inline double turtle_atr(const State& st, const Config& cfg, const Inputs& in) {
+    if (cfg.lock_atr && st.entry_atr > 0) return std::min(st.entry_atr, in.atr);
+    return in.atr;
+}
+// ① 出场优化：加速收紧的两档
+inline constexpr double kAccelAt1 = 6.0,  kAccelK1 = 2.0;
+inline constexpr double kAccelAt2 = 10.0, kAccelK2 = 1.5;
+// 持仓期最大浮盈，单位为开仓时 ATR。拿不到基准返回 0
+inline double turtle_mfe_atr(const State& st) {
+    if (!(st.entry_atr > 0) || !(st.entry_price > 0) || st.pos == Pos::Flat) return 0;
+    const double d = (st.pos == Pos::Long) ? st.peak - st.entry_price
+                                           : st.entry_price - st.peak;
+    return d / st.entry_atr;
+}
+// 当前生效的 k。用户的 k 本来就比档位小的话不放大
+inline double turtle_k(const State& st, const Config& cfg) {
+    const double k = cfg.atr_mult;
+    if (!cfg.accel_exit) return k;
+    const double mfe = turtle_mfe_atr(st);
+    if (mfe >= kAccelAt2) return std::min(k, kAccelK2);
+    if (mfe >= kAccelAt1) return std::min(k, kAccelK1);
+    return k;
+}
+
 // ② 抛物线 SAR 的递推：给出【下一根】的 SAR 值。
 //
 // ⚠ Wilder 原版的夹逼规则容易被漏掉，漏了会在震荡里提前被打：
@@ -446,7 +484,7 @@ inline double stop_candidate(Pos p, const State& st, const Config& cfg,
     case Strategy::Turtle:
     default:
         if (!(in.atr > 0)) return 0;
-        return chandelier(p, st.peak, in.atr, cfg.atr_mult);
+        return chandelier(p, st.peak, turtle_atr(st, cfg, in), turtle_k(st, cfg));
     }
 }
 
@@ -611,11 +649,13 @@ inline double initial_stop(Pos p, double fill_price, const Config& cfg,
 }
 
 inline void on_filled(State& st, Pos p, double fill_price, double stop_price,
-                      const Config& cfg, bool from_reverse, int64_t bar_open_ms = 0) {
+                      const Config& cfg, bool from_reverse, int64_t bar_open_ms = 0,
+                      double entry_atr = 0) {
     st.pos         = p;
     st.entry_price = fill_price;
     st.peak        = fill_price;
     st.stop        = stop_price;
+    st.entry_atr   = entry_atr;
     st.consec_reverses = from_reverse ? st.consec_reverses + 1 : 0;
     // 新一轮的 AF 从初始值重新加速。反手开出来的仓位同样——上一轮攒到的
     // 加速度属于上一段趋势，带过来会让新仓一开始就被贴得很紧
@@ -629,6 +669,7 @@ inline void on_closed(State& st) {
     st.entry_price = st.peak = st.stop = 0;
     st.af = 0;
     st.psar_ep_mark = 0;
+    st.entry_atr = 0;
     // ⚠ 不清 last_entry_bar_ms：once_per_bar 的语义正是"这一根【开过了】"，
     //   平仓后清掉的话同一根里会立刻再开一次，护栏等于没有
 }

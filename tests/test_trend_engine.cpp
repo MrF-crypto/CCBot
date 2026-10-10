@@ -228,6 +228,7 @@ int main() {
         check(std::fabs(b.st.stop - 104.0) < 1e-6, "止损线应为 110-3*2=104");
         check(b.qty > 0, "应记录成交数量");
         check(cli->leverage_calls == 1, "开仓前应设置一次杠杆");
+        check(std::fabs(b.st.entry_atr - 2.0) < 1e-12, "海龟开仓记下当时的 ATR（出场优化的基准）");
     }
 
     // ── 横盘突破过滤：没放量不开、每根只记一次日志、同一根里放量后入场 ────────
@@ -367,6 +368,183 @@ int main() {
         for (const auto& m : logs)
             if (m.find("向上箱体突破不做：信号K实体 0.5ATR（需≥0.6）") != std::string::npos) line = true;
         check(line, "  日志：箱体突破不做，带实体 ATR 倍数");
+    }
+
+    // ── 智能模式：自动 bot 刚加入不上膛，价格回到通道内才认突破 ───────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg, /*is_auto*/ true);
+        check(eng.get_bots()[0].is_auto && !eng.get_bots()[0].armed, "自动 bot 刚加入：未上膛");
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->calls.empty(), "  加入时价格已在通道外：不追");
+        check(eng.get_bots()[0].last_decision.find("新加入") != std::string::npos,
+              "  状态写明等回到通道内");
+        eng.tick("TESTUSDT", 100.0);
+        check(eng.get_bots()[0].armed, "  价格回到通道内：上膛");
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->calls.size() == 1, "  上膛后再突破：开仓");
+
+        eng.set_smart_meta(eng.get_bots()[0].bot_id, 80, 3, 'L');
+        eng.release_auto(eng.get_bots()[0].bot_id);
+        check(!eng.get_bots()[0].is_auto && eng.get_bots()[0].smart_rank == 0,
+              "  release_auto：转为手动 bot，名单信息清掉");
+
+        auto cli2 = std::make_shared<FakeClient>();
+        TrendEngine eng2(cli2, inline_host());
+        auto id2 = eng2.add_bot(cfg);
+        check(eng2.get_bots()[0].armed, "手动 bot 默认上膛（行为不变）");
+        feed(eng2, id2, 2.0, 110, 90);
+        cli2->fill_price = 111.0;
+        eng2.tick("TESTUSDT", 111.0);
+        check(cli2->calls.size() == 1, "  手动 bot 照常突破即开");
+    }
+
+    // ── 智能模式淘汰与换参数：有持仓、有在途订单都不能动 ─────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+        eng.set_pending_for_test(id, true);
+        check(!eng.remove_if_flat(id), "在途订单：remove_if_flat 拒绝（开仓单回来会找不到 bot）");
+        check(eng.replace_bot(id, cfg).empty(), "在途订单：replace_bot 拒绝");
+        eng.set_pending_for_test(id, false);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(!eng.remove_if_flat(id) && eng.get_bots().size() == 1, "有持仓：remove_if_flat 拒绝");
+        advance(10);
+        feed(eng, id, 2.0, 110, 90, 2);
+        cli->fill_price = 103.0;
+        eng.tick("TESTUSDT", 103.0);
+        check(eng.remove_if_flat(id) && eng.get_bots().empty(), "空仓：remove_if_flat 删掉");
+    }
+
+    // ── 当日亏损限额：全部 bot 已实现 − 估算手续费，UTC 跨日恢复 ─────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        auto wall = std::chrono::system_clock::time_point(std::chrono::hours(24 * 20000 + 10));
+        EngineHost h = inline_host();
+        h.now_wall = [&wall] { return wall; };
+        TrendEngine eng(cli, h);
+        eng.set_daily_loss_limit(20);
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+
+        feed(eng, id, 2.0, 110, 90, 1);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);                // 开多 @110，止损 104
+        const double q = eng.get_bots()[0].qty;
+        advance(10);
+        feed(eng, id, 2.0, 110, 90, 2);
+        cli->fill_price = 103.0;
+        eng.tick("TESTUSDT", 103.0);                // 止损出场
+        const double want = -7.0 * q - (110.0 + 103.0) * q * TrendEngine::kEstFeeRate;
+        check(std::fabs(eng.day_pnl().realized - want) < 1e-9,
+              "当日已实现 = 价差盈亏 − 估算手续费（来回各 0.05%）");
+        check(eng.day_pnl().day == 20000, "  按 UTC 日计");
+
+        advance(10);
+        feed(eng, id, 2.0, 110, 90, 3);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->calls.size() == 2, "  超过限额：新突破不开仓");
+        check(eng.get_bots()[0].last_decision.find("亏损限额") != std::string::npos,
+              "  状态写明亏损限额");
+
+        wall += std::chrono::hours(14);            // 跨过 UTC 0 点
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->calls.size() == 3, "  UTC 跨日：自动恢复开仓");
+        check(eng.day_pnl().realized == 0, "  新的一天从 0 算");
+
+        // 启动时恢复：只认今天的
+        TrendEngine eng2(cli, h);
+        eng2.restore_day_pnl({TrendEngine::utc_day(wall) - 1, -50});
+        check(eng2.day_pnl().realized == 0, "恢复：昨天的记录作废");
+        eng2.restore_day_pnl({TrendEngine::utc_day(wall), -50});
+        check(eng2.day_pnl().realized == -50, "恢复：今天的记录生效");
+    }
+
+    // ── 持仓浮亏限额 / 手动暂停开新仓 ─────────────────────────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg("AAAUSDT");
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto a = eng.add_bot(cfg);
+        auto b = eng.add_bot(mk_cfg("BBBUSDT"));
+        feed(eng, a, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("AAAUSDT", 110.0);                // A 开多 @110，止损 104
+        eng.tick("AAAUSDT", 105.0);                // 浮亏 5×qty ≈ −45
+        eng.set_float_loss_limit(30);
+        feed(eng, b, 2.0, 110, 90);
+        eng.tick("BBBUSDT", 111.0);
+        check(cli->calls.size() == 1, "浮亏合计超限：别的品种不开新仓");
+        check(bot_of(eng, "BBBUSDT").last_decision.find("浮亏") != std::string::npos,
+              "  状态写明浮亏限额");
+        eng.set_float_loss_limit(0);
+        eng.set_pause_new(true);
+        eng.tick("BBBUSDT", 111.0);
+        check(cli->calls.size() == 1 && eng.pause_new(), "手动暂停开新仓：不开");
+        check(bot_of(eng, "BBBUSDT").last_decision.find("暂停开新仓") != std::string::npos,
+              "  状态写明手动暂停");
+        eng.tick("AAAUSDT", 103.0);
+        check(cli->calls.size() == 2, "  暂停开新仓不影响已有仓位止损出场");
+        eng.set_pause_new(false);
+        eng.tick("BBBUSDT", 111.0);
+        check(cli->calls.size() == 3, "  解除暂停后照常开");
+    }
+
+    // ── 名额紧张时只留给高分的自动 bot；手动 bot 不受影响 ─────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        eng.set_max_open_positions(3);
+        eng.set_priority_reserve(2, 70);
+        auto m = eng.add_bot(mk_cfg("MANUSDT"));
+        auto x = eng.add_bot(mk_cfg("AUTOUSDT"), true);
+        feed(eng, m, 2.0, 110, 90);
+        feed(eng, x, 2.0, 110, 90);
+        cli->fill_price = 111.0;
+        eng.tick("MANUSDT", 111.0);                // 手动 bot 开，持仓 1/3 ⇒ 进入紧张区
+        check(cli->calls.size() == 1, "手动 bot 不受名额优先规则影响");
+        eng.set_smart_meta(x, 55, 12, 'L');
+        eng.tick("AUTOUSDT", 100.0);               // 上膛
+        eng.tick("AUTOUSDT", 111.0);
+        check(cli->calls.size() == 1, "名额紧张：55 分的自动 bot 不开");
+        check(bot_of(eng, "AUTOUSDT").last_decision.find("名额紧张") != std::string::npos,
+              "  状态写明名额紧张");
+        eng.set_smart_meta(x, 82, 2, 'L');
+        eng.tick("AUTOUSDT", 111.0);
+        check(cli->calls.size() == 2, "  82 分 ⇒ 开");
+    }
+
+    // ── 自动 bot 的过滤与闸门只计数、汇总，不逐条打日志 ───────────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<std::string> logs;
+        eng.set_log_cb([&](const std::string& s) { logs.push_back(s); });
+        auto cfg = mk_cfg();
+        cfg.rule.breakout_vol_ratio = 1.5;
+        auto id = eng.add_bot(cfg, true);
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 3.0, 1.0);
+        eng.tick("TESTUSDT", 100.0);               // 上膛
+        eng.tick("TESTUSDT", 111.0);               // 突破但没量
+        bool printed = false;
+        for (const auto& s : logs) if (s.find("突破待放量") != std::string::npos) printed = true;
+        check(!printed, "自动 bot 被过滤：不逐条打日志");
+        const auto sum = eng.take_filter_summary();
+        check(sum.find("量比 1") != std::string::npos, "  汇总里有：量比 1 次");
+        check(eng.take_filter_summary().empty(), "  取走即清零");
     }
 
     // ── 改策略参数保留已实现；删除再添加从 0 开始 ───────────────────────────

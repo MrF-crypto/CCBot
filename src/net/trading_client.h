@@ -219,6 +219,20 @@ public:
     // 所以这条恰恰是唯一会把 WS 故障暴露出来的——也是唯一会被它拖死的
     std::unordered_map<std::string, double> fetch_all_24h_changes();
 
+    // ── 智能模式扫描用的全市场数据（三个请求各一次，与品种数无关）───────────
+    // 每个都带 ok：拿不到和"拿到了但是空的"必须分开。扫描把"拿不到"当成
+    // 整轮不可信、一个 bot 都不动；当成"空"的话会把池里的币全判成不合格
+    struct MarketSymbol {
+        std::string symbol, base, quote, contract_type, status;
+        int64_t onboard_ms = 0, delivery_ms = 0;
+        double  tick = 0;
+    };
+    std::vector<MarketSymbol> fetch_exchange_symbols(bool* ok);   // exchangeInfo 全量，权重 1
+    struct Ticker24h { double quote_vol = 0, chg_pct = 0, last = 0; };
+    std::unordered_map<std::string, Ticker24h> fetch_all_24h(bool* ok);   // 权重 40
+    // 全市场最新资金费率，单位 %（lastFundingRate × 100）。权重 10
+    std::unordered_map<std::string, double> fetch_all_funding_pct(bool* ok);
+
     // 历史资金费流水。income 带符号，负数=你付出去的。
     // 币安不带时间范围时只返回最近7天，所以补历史要按7天窗口分页（见 funding_ledger）
     struct FundingRecord {

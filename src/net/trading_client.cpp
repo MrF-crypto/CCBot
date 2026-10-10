@@ -1527,6 +1527,96 @@ std::unordered_map<std::string, double> TradingClient::fetch_all_24h_changes() {
     return out;
 }
 
+namespace {
+// 币安把数值放在字符串里（"123.45"），时间戳是整数
+double sv_num(simdjson::dom::element e, const char* k) {
+    std::string_view s;
+    if (e[k].get(s) == simdjson::SUCCESS && !s.empty()) {
+        try { return std::stod(std::string(s)); } catch (...) { return 0; }
+    }
+    double d;
+    if (e[k].get(d) == simdjson::SUCCESS) return d;
+    return 0;
+}
+} // namespace
+
+std::vector<TradingClient::MarketSymbol> TradingClient::fetch_exchange_symbols(bool* ok) {
+    if (ok) *ok = false;
+    std::vector<MarketSymbol> out;
+    auto resp = http_get_public("/fapi/v1/exchangeInfo");
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::element doc;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
+    simdjson::dom::array arr;
+    if (doc["symbols"].get_array().get(arr) != simdjson::SUCCESS) return out;
+    for (auto e : arr) {
+        MarketSymbol m;
+        std::string_view v;
+        if (e["symbol"].get(v) != simdjson::SUCCESS || v.empty()) continue;
+        m.symbol = std::string(v);
+        if (e["baseAsset"].get(v) == simdjson::SUCCESS)    m.base = std::string(v);
+        if (e["quoteAsset"].get(v) == simdjson::SUCCESS)   m.quote = std::string(v);
+        if (e["contractType"].get(v) == simdjson::SUCCESS) m.contract_type = std::string(v);
+        if (e["status"].get(v) == simdjson::SUCCESS)       m.status = std::string(v);
+        int64_t t = 0;
+        if (e["onboardDate"].get(t) == simdjson::SUCCESS)  m.onboard_ms = t;
+        if (e["deliveryDate"].get(t) == simdjson::SUCCESS) m.delivery_ms = t;
+        simdjson::dom::array filters;
+        if (e["filters"].get_array().get(filters) == simdjson::SUCCESS)
+            for (auto f : filters) {
+                std::string_view ft;
+                if (f["filterType"].get(ft) == simdjson::SUCCESS && ft == "PRICE_FILTER")
+                    m.tick = sv_num(f, "tickSize");
+            }
+        out.push_back(std::move(m));
+    }
+    if (ok) *ok = !out.empty();
+    return out;
+}
+
+std::unordered_map<std::string, TradingClient::Ticker24h> TradingClient::fetch_all_24h(bool* ok) {
+    if (ok) *ok = false;
+    std::unordered_map<std::string, Ticker24h> out;
+    auto resp = http_get_public("/fapi/v1/ticker/24hr");
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::array arr;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
+    for (auto e : arr) {
+        std::string_view sym;
+        if (e["symbol"].get(sym) != simdjson::SUCCESS || sym.empty()) continue;
+        Ticker24h t;
+        t.quote_vol = sv_num(e, "quoteVolume");
+        t.chg_pct   = sv_num(e, "priceChangePercent");
+        t.last      = sv_num(e, "lastPrice");
+        out.emplace(std::string(sym), t);
+    }
+    if (ok) *ok = !out.empty();
+    return out;
+}
+
+std::unordered_map<std::string, double> TradingClient::fetch_all_funding_pct(bool* ok) {
+    if (ok) *ok = false;
+    std::unordered_map<std::string, double> out;
+    auto resp = http_get_public("/fapi/v1/premiumIndex");
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::array arr;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
+    for (auto e : arr) {
+        std::string_view sym, fr;
+        if (e["symbol"].get(sym) != simdjson::SUCCESS || sym.empty()) continue;
+        if (e["lastFundingRate"].get(fr) != simdjson::SUCCESS || fr.empty()) continue;
+        try { out.emplace(std::string(sym), std::stod(std::string(fr)) * 100.0); } catch (...) {}
+    }
+    if (ok) *ok = !out.empty();
+    return out;
+}
+
 TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) {
     PremiumInfo info;
     auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + sym);

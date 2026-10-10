@@ -27,6 +27,8 @@ class QVBoxLayout;
 #include "core/funding_ledger.h"
 #include "core/fee_ledger.h"
 #include "core/thread_pool.h"
+#include "core/smart_mode.h"
+#include "app/smart_runner.h"
 #include "net/trading_client.h"
 #include "net/rest_price_feed.h"
 #include <map>
@@ -178,6 +180,20 @@ private:
     void save_settings();
     void load_settings();
 
+    // ── 智能模式（实现在 smart_panel.cpp）──────────────────────────────────────
+    void openSmartDialog();
+    // 落到运行器与引擎上（风控闸门立即生效），并落盘
+    void applySmartConfig(const smart::Config& c);
+    // 连接成功、引擎建好之后调用：建运行器、读池状态、套用配置
+    void startSmartRunner();
+    // 每拍调一次：到点就把扫描丢到后台，否则做轻量维护
+    void smartTick();
+    void refreshSmartBadge();
+    std::string smart_cfg_path()   const;
+    std::string smart_state_path() const;
+    void save_smart_cfg() const;
+    void load_smart_cfg();
+
     // 关键事件外部提醒（Telegram/企业微信/飞书 webhook 等），后台线程发送，不阻塞 GUI
     void sendAlert(const QString& text);
     // 对账不一致 → 带明细的告警正文（只报条数等于没报，见函数注释）
@@ -327,6 +343,14 @@ private:
     // 拉取每分钟一轮，而一个拼错的品种会永远失败——不去重就是每小时 60 条
     // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
     std::set<std::string> trendSigFailed_;
+
+    // ── 智能模式 ──
+    // 运行器随引擎一起在每次连接成功时重建（它持有引擎指针）。配置独立落盘，
+    // 启动时就读进来，未连接时也能打开弹窗改
+    std::shared_ptr<SmartRunner> smart_;
+    smart::Config                smartCfg_;
+    std::atomic<bool>            smartBusy_{false};
+    QPushButton*                 smartBtn_ = nullptr;
 
     // ── 日志 ──
     QPlainTextEdit* logBox_ = nullptr;   // 上限 kLogMaxLines 行，超出自动丢最早的

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/trend_engine.h"
+#include "core/smart_mode.h"
 #include <string>
 #include <vector>
 
@@ -29,6 +30,9 @@ struct HeadlessConfig {
     // ⚠ 落盘路径仍是 <state_path>.sar，【故意不改】：改了名，升级上来的部署
     //   会读不到重启前的仓位状态，而那是比配置失效更危险的静默失效
     std::vector<TrendConfig> trend_bots;
+    // 智能模式（"smart_mode" 段）。格式与 GUI 存的 ccg_smart.json 相同，
+    // 解析与校验共用 smart::config_from_json。不写这一段 = 关
+    smart::Config smart;
     std::vector<std::string> warnings;   // 非致命配置问题（未知键等），启动时打给用户看
 
 };

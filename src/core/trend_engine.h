@@ -229,6 +229,18 @@ struct TrendBot {
     // 但必须说 —— 见 submit_open 里那段注释
     bool no_ds_warned = false;
 
+    // ── 智能模式 ──────────────────────────────────────────────────────────────
+    // 由智能模式创建、管理（扫描淘汰、按名单补位）。手动 bot 恒为 false，
+    // 智能模式不碰它们。落盘
+    bool   is_auto = false;
+    // false = 刚加入，价格回到通道内之前不认突破。
+    // 扫描选中的币很可能【此刻就在通道外】（强势名单尤其如此），不上膛的话
+    // 第一拍就判成突破，等于追高进场。不落盘：恢复时空仓的自动 bot 一律重新上膛
+    bool   armed   = true;
+    double smart_score = 0;   // 最近一次扫描的综合分，名额紧张时按它取舍
+    int    smart_rank  = 0;   // 名单内排名，0 = 已不在名单
+    char   smart_list  = 0;   // 'L' 做多名单 / 'S' 做空名单 / 0
+
     double realized_pnl = 0;
     int    trade_count  = 0;
     int    win_count    = 0;
@@ -263,7 +275,8 @@ public:
     // 测试/回测构造：注入内联执行器与虚拟时钟
     TrendEngine(std::shared_ptr<ITradingClient> client, EngineHost host);
 
-    std::string add_bot(const TrendConfig& cfg);   // 同品种已存在则返回空串
+    // 同品种已存在（未停止的）则返回空串。is_auto = 智能模式创建，刚加入时不上膛
+    std::string add_bot(const TrendConfig& cfg, bool is_auto = false);
     // 改策略参数：换成新配置，但保留已实现、笔数、胜率与起始时间。
     // 旧 bot 有持仓时拒绝并返回空串（换参数会重建止损线基准）。old_id 不存在时等同 add_bot
     std::string replace_bot(const std::string& old_id, const TrendConfig& cfg);
@@ -275,6 +288,10 @@ public:
     void resume_bot(const std::string& bot_id);
     void close_bot (const std::string& bot_id);  // 手动市价平仓
     void remove_bot(const std::string& bot_id);
+    // 只在空仓且没有在途订单时移除，返回是否删了。智能模式淘汰用：扫描拿到的
+    // 快照与真正删除之间，那个 bot 可能刚好开了仓——直接 remove_bot 会把一笔
+    // 真实仓位变成没人管的孤儿仓
+    bool remove_if_flat(const std::string& bot_id);
     void stop_all();
     std::vector<TrendBot> get_bots() const;
 
@@ -296,6 +313,40 @@ public:
     // 所以这是保守估计：宁可早拦一点，不要漏拦
     void set_max_total_margin(double usdt);
     void set_max_open_positions(int n);
+
+    // ── 智能模式相关的账户级闸门（都只拦【开新仓】，已有仓位照常管理）────────
+    // 当日亏损限额（0 = 关）：全部 bot（手动 + 自动）当日已实现盈亏，减去每笔
+    // 按名义 × kEstFeeRate × 2 估算的手续费，≤ −限额就停开新仓。按 UTC 日计，
+    // 北京时间早 8 点自动恢复。
+    // ⚠ 已实现盈亏本身不含手续费（只是价差 × 数量），而高频进出时手续费可能占
+    //   亏损的一大块；交易所的手续费流水要同步、有延迟，当不了实时闸门，所以估算
+    static constexpr double kEstFeeRate = 0.0005;   // 吃单 0.05%
+    void set_daily_loss_limit(double usdt);
+    // 持仓浮亏限额（0 = 关）：全部持仓浮动盈亏合计 ≤ −限额就停开新仓，回落后自动恢复
+    void set_float_loss_limit(double usdt);
+    // 手动暂停开新仓（应急开关）。对全部 bot 生效，不删 bot、不动已有仓位
+    void set_pause_new(bool on);
+    bool pause_new() const;
+    // 名额紧张时优先高分：同时持仓数 ≥ 上限 − reserve 时，自动 bot 的综合分
+    // 低于 min_score 就不开。手动 bot 不受影响。reserve = 0 关
+    void set_priority_reserve(int reserve, double min_score);
+    // 智能模式每轮扫描后写入排名与分数（界面显示、名额取舍用）
+    void set_smart_meta(const std::string& bot_id, double score, int rank, char list);
+    // 把自动 bot 转成手动 bot：智能模式从此不再淘汰它、不再改它的参数。
+    // 用户在策略弹窗里亲手改了一个自动 bot 的参数，就是在接管它
+    void release_auto(const std::string& bot_id);
+
+    struct DayPnl {
+        int64_t day      = 0;   // UTC 日序号（自 1970-01-01 起的天数）
+        double  realized = 0;   // 当日已实现 − 估算手续费
+    };
+    DayPnl day_pnl() const;              // 当前 UTC 日的值（跨日后为 0）
+    void   restore_day_pnl(DayPnl d);    // 启动时恢复；不是今天的直接作废
+    static int64_t utc_day(std::chrono::system_clock::time_point t);
+
+    // 自动 bot 的过滤与闸门汇总（取走即清零）。100 个 bot 时逐条打印会刷屏，
+    // 由智能模式每轮扫描打一行。空串 = 这段时间没有
+    std::string take_filter_summary();
 
     // 应用层拉到K线后喂入信号快照（ATR + 唐奇安通道 + 当前K线开盘时间）。
     // box_atr / vol_ratio / er 是横盘突破过滤的读数；不传就是缺失，开了过滤的 bot
@@ -506,6 +557,22 @@ private:
     // 就是每 3 秒一条同样的日志——本项目踩过这个（150 行日志里 120 行是噪音）。
     // 拦截原因始终写进 last_decision，界面上一直看得到，不依赖日志
     std::set<std::string>           cap_logged_;
+
+    // ── 智能模式相关 ──
+    double                          daily_loss_limit_ = 0;
+    double                          float_loss_limit_ = 0;
+    bool                            pause_new_        = false;
+    int                             prio_reserve_     = 0;
+    double                          prio_min_score_   = 0;
+    int64_t                         day_key_          = 0;   // day_realized_ 属于哪个 UTC 日
+    double                          day_realized_     = 0;
+    // 自动 bot 的过滤计数（按类别）与被闸门拦过的 bot。见 take_filter_summary
+    std::map<std::string, int>      filter_counts_;
+    std::set<std::string>           gate_blocked_auto_;
+    // 一笔平仓计入当日已实现（扣估算手续费）。⚠ 调用方须已持 mtx_
+    void book_day(double pnl, double entry, double exit, double qty);
+    // 当日已实现：day_key_ 不是今天就是 0。⚠ 调用方须已持 mtx_
+    double today_realized() const;
 };
 
 } // namespace ccbot

@@ -169,6 +169,46 @@ int main() {
               "策略参数必须取自最新配置，而不是落盘快照");
     }
 
+    // ── 开仓时 ATR 跨重启存活（海龟锁定 ATR / 加速收紧的基准）───────────────
+    {
+        auto b = mk_bot("BTCUSDT", trend::Pos::Long, 100, 100, 94, 1);
+        b.st.entry_atr = 2.345678901234;
+        save_trend_state(path, {b});
+        auto got = load_trend_state(path, {mk_cfg("BTCUSDT")});
+        check(got.size() == 1 && got[0].st.entry_atr == b.st.entry_atr,
+              "开仓时 ATR 全精度往返");
+    }
+
+    // ── 智能模式的自动 bot：不在配置里，靠标记 + 模板恢复 ────────────────────
+    {
+        auto held = mk_bot("AUTOAUSDT", trend::Pos::Long, 100, 100, 94, 1);
+        held.is_auto = true;
+        auto flat = mk_bot("AUTOBUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        flat.is_auto = true;
+        save_trend_state(path, {held, flat, mk_bot("BTCUSDT", trend::Pos::Flat, 0, 0, 0, 0)});
+
+        TrendConfig tmpl = mk_cfg("");
+        tmpl.rule.atr_mult = 2.5;
+        auto got = load_trend_state(path, {mk_cfg("BTCUSDT")}, &tmpl);
+        int autos = 0;
+        for (const auto& g : got)
+            if (g.is_auto) {
+                ++autos;
+                check(std::fabs(g.cfg.rule.atr_mult - 2.5) < 1e-12 && !g.cfg.symbol.empty(),
+                      "  自动 bot 用模板参数、保留自己的品种名");
+            }
+        check(got.size() == 3 && autos == 2, "有模板：两个自动 bot 都恢复，手动 bot 照常");
+
+        auto got2 = load_trend_state(path, {mk_cfg("BTCUSDT")});
+        bool held_back = false, flat_back = false;
+        for (const auto& g : got2) {
+            if (g.cfg.symbol == "AUTOAUSDT") held_back = (g.st.pos == trend::Pos::Long);
+            if (g.cfg.symbol == "AUTOBUSDT") flat_back = true;
+        }
+        check(held_back, "没有模板（智能模式已关）：持仓中的自动 bot 仍恢复，仓位不能被忘掉");
+        check(!flat_back, "没有模板：空仓的自动 bot 丢弃");
+    }
+
     // ── 半截状态防御：有方向却没有止损线 ─────────────────────────────────────
     {
         // stop=0 时多头的 `price <= stop` 永远不成立，仓位会一直裸着没人管——

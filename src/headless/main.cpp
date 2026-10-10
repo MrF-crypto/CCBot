@@ -5,12 +5,17 @@
 #include "core/app_logic.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
+#include "core/parallel.h"
+#include "core/smart_mode.h"
+#include "app/smart_runner.h"
 #include "net/trading_client.h"
 #include "net/rest_price_feed.h"
 #include "net/alert.h"
 #include "headless/headless_config.h"
 #include "headless/trend_state.h"
 
+#include <simdjson.h>
+#include <algorithm>
 #include <csignal>
 #include <atomic>
 #include <thread>
@@ -104,7 +109,72 @@ bool acquire_instance_lock(const std::string& lock_path) {
 
 } // namespace
 
+// ccbot_headless --scan [config.json]
+// 智能模式的只读预览：只调公开行情接口（不需要 API Key、不下单、不碰状态文件），
+// 按配置里的 smart_mode 段（没有就用默认值）扫一遍全市场，打印两份名单后退出。
+// 启用智能模式之前先看看它会选出哪些币
+static int run_scan_only(const std::string& config_path) {
+    smart::Config sc;
+    if (!config_path.empty()) {
+        std::ifstream f(config_path, std::ios::binary);
+        if (f) {
+            std::ostringstream buf;
+            buf << f.rdbuf();
+            simdjson::dom::parser p;
+            simdjson::dom::element root, sm;
+            auto ps = simdjson::padded_string(buf.str());
+            if (p.parse(ps).get(root) == simdjson::SUCCESS &&
+                root["smart_mode"].get(sm) == simdjson::SUCCESS) {
+                std::string err;
+                if (!smart::config_from_json(simdjson::to_string(sm), sc, &err)) {
+                    std::cerr << err << std::endl;
+                    return 1;
+                }
+            }
+        }
+    }
+    // 公开接口不签名，Key 留空。⚠ 必须显式指定主网：Config 默认是测试网，
+    // 而测试网的成交额、上线品种都是假的——第一次实测就是这样扫出了一份
+    // "过门槛 344 个"的错误名单（主网实际约 190 个）
+    TradingClient::Config tc;
+    tc.testnet = false;
+    TradingClient client(tc);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto scan = scan_market(client, sc, {}, RestPriceFeed::now_ms());
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+    if (!scan.outcome.ok) {
+        std::cout << "扫描失败：" << scan.error << std::endl;
+        return 1;
+    }
+    const auto& rk = scan.outcome.ranking;
+    std::cout << "USDT 永续 " << scan.universe << " 个，过门槛 " << scan.passed_gate
+              << "，特征合格 " << scan.eligible << "，做多名单 " << rk.longs.size()
+              << "，做空名单 " << rk.shorts.size() << "（≥" << sc.min_score << " 分），用时 "
+              << secs << " 秒\n";
+    auto dump = [&](const char* title, const std::vector<std::string>& list, bool lng, int n) {
+        std::cout << "\n── " << title << "（前 " << std::min<int>(n, (int)list.size()) << "）──\n"
+                  << "  #  品种              分数  ATR%  箱体/ATR  压缩  横盘48  量能   位置  强弱   效率比\n";
+        for (int i = 0; i < (int)list.size() && i < n; ++i) {
+            const auto& r = rk.rows.at(list[i]);
+            const auto& f = r.f;
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "%3d  %-16s %5.1f %5.2f %8.1f %5.2f %7.1f %5.2fx %5.2f %+5.2f %+6.2f\n",
+                          i + 1, list[i].c_str(), lng ? r.long_score : r.short_score, f.atr_pct,
+                          f.box12_atr, f.atr_ratio, f.box48_atr, f.vol_lift, f.pos12, f.rs, f.er24);
+            std::cout << line;
+        }
+    };
+    if (sc.dir_long)  dump("做多名单", rk.longs,  true,  sc.long_n);
+    if (sc.dir_short) dump("做空名单", rk.shorts, false, sc.short_n);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--scan")
+        return run_scan_only(argc > 2 ? argv[2] : "");
+
     std::string config_path = (argc > 1) ? argv[1] : "config.json";
 
     std::signal(SIGINT,  handle_signal);
@@ -191,7 +261,9 @@ int main(int argc, char** argv) {
     // 状态文件仍带 .sar 后缀：老部署升级上来时这个文件已经存在，改名等于
     // 把在跑的仓位状态丢掉
     const std::string trend_state_path = cfg.state_path + ".sar";
-    if (!cfg.trend_bots.empty()) {
+    // 引擎一律创建：配置里一个手动 bot 都没有时，智能模式也可能在用它；
+    // 智能模式关着时，状态文件里也可能有一笔还在持仓的自动 bot 要接着管
+    {
         trend_engine = std::make_shared<TrendEngine>(client, pool);
         // 账户级闸门。v4.7.1 之前这两个配置项挂在 DCA 引擎上，DCA 移除后若不接到
         // 这里，它们就会【静默失效】——配置文件照样写着上限，进程照样启动，
@@ -217,7 +289,9 @@ int main(int argc, char** argv) {
         // 先恢复落盘状态，再把配置里新增、落盘没有的品种全新起步。
         // 顺序不能反：反了的话 add_bot 会先占住品种名，restore_bot 被拒，
         // 引擎以为自己空仓而交易所上的仓位还在
-        auto trend_saved = load_trend_state(trend_state_path, cfg.trend_bots);
+        // 自动 bot 不在配置里，用智能模式模板恢复参数（关着时空仓的自动 bot 会被丢弃）
+        auto trend_saved = load_trend_state(trend_state_path, cfg.trend_bots,
+                                            cfg.smart.enabled ? &cfg.smart.tmpl : nullptr);
         std::set<std::string> trend_restored;
         for (auto& b : trend_saved) {
             auto id = trend_engine->restore_bot(b);
@@ -286,8 +360,44 @@ int main(int argc, char** argv) {
     ticker.on_server_msg([](const std::string& m) { log_line(m, "WARN"); });
     ticker.start();
     std::set<std::string> symbols;
-    for (const auto& c : cfg.trend_bots) symbols.insert(c.symbol);
+    // 按引擎里实际的 bot 订阅（含从落盘恢复的自动 bot），不只看配置文件
+    for (const auto& b : trend_engine->get_bots()) symbols.insert(b.cfg.symbol);
     for (const auto& s : symbols) ticker.subscribe(s);
+
+    // ── 智能模式 ─────────────────────────────────────────────────────────────
+    // 扫描在数据线程池里跑（几十秒的网络请求），它增删品种时只把请求放进队列，
+    // 由主循环在下一拍统一订阅/退订——symbols 只在主循环线程里改，不加锁遍历也安全
+    std::mutex sym_q_mtx;
+    std::set<std::string> sym_add_q, sym_del_q;
+    std::atomic<bool> smart_busy{false};
+    auto smart = std::make_shared<SmartRunner>(
+        client, trend_engine, cfg.state_path + ".smart",
+        [webhook](const std::string& m, bool warn) {
+            log_line(m, warn ? "WARN" : "INFO");
+            // VPS 上没有界面：扫描失败、持仓中的币即将下架这类告警要推出去
+            if (warn && !webhook.empty())
+                std::thread([w = webhook, m]() { send_webhook(w, "[ccbot] " + m); }).detach();
+        });
+    smart->on_symbol_added = [&](const std::string& s) {
+        std::lock_guard<std::mutex> lk(sym_q_mtx);
+        sym_add_q.insert(s);
+        sym_del_q.erase(s);
+    };
+    smart->on_symbol_removed = [&](const std::string& s) {
+        std::lock_guard<std::mutex> lk(sym_q_mtx);
+        sym_del_q.insert(s);
+        sym_add_q.erase(s);
+    };
+    smart->load();
+    smart->set_config(cfg.smart);
+    if (cfg.smart.enabled) {
+        const auto& sc = cfg.smart;
+        log_line(std::string("智能模式已启用：") + (sc.dir_long ? "做多" : "") +
+                 (sc.dir_long && sc.dir_short ? "+" : "") + (sc.dir_short ? "做空" : "") +
+                 "，名单 " + std::to_string(sc.long_n) + "/" + std::to_string(sc.short_n) +
+                 "，同时持仓上限 " + std::to_string(sc.max_positions) +
+                 (sc.daily_loss_limit > 0 ? "，当日亏损限额 " + std::to_string((int)sc.daily_loss_limit) + "U" : ""));
+    }
 
     log_line("主循环启动，Ctrl+C 退出");
 
@@ -335,6 +445,31 @@ int main(int argc, char** argv) {
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(3));
         ++tick_n;
+
+        // ── 0) 智能模式增删的品种：在主循环线程里统一订阅/退订 ────────────────
+        {
+            std::set<std::string> add, del;
+            {
+                std::lock_guard<std::mutex> lk(sym_q_mtx);
+                add.swap(sym_add_q);
+                del.swap(sym_del_q);
+            }
+            for (const auto& s : add)
+                if (symbols.insert(s).second) ticker.subscribe(s);
+            if (!del.empty()) {
+                // 还有别的 bot（比如同品种的手动 bot）在用就不能退订——退错了那个
+                // bot 从此收不到价格，止损线永远不会被触发
+                std::set<std::string> in_use;
+                for (const auto& b : trend_engine->get_bots()) in_use.insert(b.cfg.symbol);
+                for (const auto& s : del) {
+                    if (in_use.count(s)) continue;
+                    symbols.erase(s);
+                    ticker.unsubscribe(s);
+                    stall_ticks.erase(s);
+                    stall_alerted.erase(s);
+                }
+            }
+        }
 
         auto bots = trend_engine ? trend_engine->get_bots() : std::vector<TrendBot>{};
 
@@ -459,14 +594,17 @@ int main(int argc, char** argv) {
             if (!need.empty()) {
                 trend_sig_busy.store(true);
                 fetch_pool->submit([client, trend_engine, need, &trend_sig_busy]() {
-                    for (const auto& b : need) {
+                    // 并行拉：智能模式下可能有上百个 bot，串行一轮会超过刷新周期
+                    parallel_for((int)need.size(), kSignalFetchWorkers, [&](int idx) {
+                      try {
+                        const auto& b = need[idx];
                         // 裸K 与 抛物线SAR 只要原始高低点，【不需要 ATR】——
                         // 少拉一次 REST。update_bars 自己设 sig_ok，所以不必
                         // 像 v5.1.0 之前那样成对调用两个接口
                         if (b.cfg.rule.strategy != trend::Strategy::Turtle) {
                             auto bp = client->fetch_bar_pattern(
                                 b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
-                            if (!bp.ok) continue;
+                            if (!bp.ok) return;
                             TrendEngine::BarSnap s;
                             s.open        = bp.cur_open;
                             s.prev_close  = bp.prev_close;
@@ -487,17 +625,18 @@ int main(int argc, char** argv) {
                             s.range_now_lo = bp.range_now_lo;
                             s.bar_open_ms = bp.bar_open_ms;
                             trend_engine->update_bars(b.bot_id, s);
-                            continue;
+                            return;
                         }
                         auto snap = client->fetch_trend_signal(
                             b.cfg.symbol, b.cfg.interval,
                             b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
-                        if (!snap.ok) continue;
+                        if (!snap.ok) return;
                         trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                   snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                   snap.bar_open_ms, snap.box_atr,
                                                   snap.vol_ratio, snap.er_ok, snap.er);
-                    }
+                      } catch (...) {}   // 跨线程的异常会直接 terminate
+                    });
                     trend_sig_busy.store(false);
                 });
             }
@@ -512,6 +651,22 @@ int main(int argc, char** argv) {
         //     而它正是重启后最不能丢的那个值——丢了止损线就是一笔无人看管的裸仓位
         if (trend_engine && tick_n % 20 == 0)
             save_trend_state(trend_state_path, trend_engine->get_bots());
+
+        // ── 5b) 智能模式：每分钟看一次到点没有（整点后 1 分钟扫描），
+        //     扫描丢进数据线程池；不扫描时做轻量维护（关闭后清空仓自动 bot、当日盈亏落盘）
+        if (tick_n % 20 == 0) {
+            const int64_t now_ms = RestPriceFeed::now_ms();
+            if (smart->due(now_ms) && !smart_busy.exchange(true)) {
+                fetch_pool->submit([smart, now_ms, &smart_busy]() {
+                    try { smart->run_once(now_ms); }
+                    catch (const std::exception& e) { log_line(std::string("⚠ 智能模式扫描异常: ") + e.what(), "WARN"); }
+                    catch (...) { log_line("⚠ 智能模式扫描未知异常", "WARN"); }
+                    smart_busy.store(false);
+                });
+            } else if (!smart_busy.load()) {
+                smart->housekeep(now_ms);
+            }
+        }
 
         // ── 6) 心跳（异步，约1分钟一次）─────────────────────────────────────
         if (tick_n % 20 == 0 && !hb_busy.load()) {
@@ -738,6 +893,7 @@ int main(int argc, char** argv) {
 
     if (trend_engine) save_trend_state(trend_state_path, trend_engine->get_bots());
     funding.save(funding_path);
+    smart->housekeep(RestPriceFeed::now_ms());   // 候选池与当日盈亏落盘
 
     // 没排空就直接结束进程，不跑析构。在途任务捏着引擎的裸指针，而引擎里 pool_
     // 的声明位置在 mtx_/bots_ 之前 —— 正常析构会先销毁那两个成员，任务一访问

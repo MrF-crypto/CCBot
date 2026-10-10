@@ -24,8 +24,14 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
 
 // 按 symbol 匹配配置里的 bot，把落盘的运行时状态拼回一个新的 TrendBot
 // （cfg 用传入的最新配置，其余用落盘值），交给 TrendEngine::restore_bot() 用。
-// 配置里已删除的品种，其落盘状态会被丢弃
+// 配置里已删除的品种，其落盘状态会被丢弃。
+//
+// 智能模式的自动 bot 不在配置文件里：传入 auto_tmpl 时，标记为 auto 的条目用
+// 模板（换上自己的品种名）重建参数。⚠ 不传模板时，【持仓中】的自动 bot 仍然
+// 恢复（用默认参数的海龟）——不能因为智能模式被关掉就把一笔真实仓位忘掉；
+// 空仓的自动 bot 直接丢弃
 std::vector<TrendBot> load_trend_state(const std::string& path,
-                                   const std::vector<TrendConfig>& cfgs);
+                                   const std::vector<TrendConfig>& cfgs,
+                                   const TrendConfig* auto_tmpl = nullptr);
 
 } // namespace ccbot

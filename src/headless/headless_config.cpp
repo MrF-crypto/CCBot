@@ -88,6 +88,20 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         return false;
     }
 
+    // ── 智能模式（"smart_mode" 段，可选）────────────────────────────────────
+    // 解析与校验交给 smart::config_from_json，GUI 读的是同一套。非法值拒绝启动：
+    // 自动在没看过的币上开仓，配置错了不能"带病运行"
+    {
+        simdjson::dom::element sm;
+        if (root["smart_mode"].get(sm) == simdjson::SUCCESS) {
+            std::string serr;
+            if (!smart::config_from_json(simdjson::to_string(sm), out.smart, &serr)) {
+                err = serr.empty() ? "smart_mode 段格式错误" : serr;
+                return false;
+            }
+        }
+    }
+
     // ── 旧的 "bots" 数组（网格DCA）：本版起不再支持 ──────────────────────────
     // 必须【显式报出来】而不是静默忽略。静默忽略的后果是：升级后用户的配置文件
     // 原样放着，进程正常启动、日志一切正常，而那些 DCA 品种其实一个都没在跑——
@@ -112,6 +126,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         // ① 海龟
         "donchian_period", "atr_period", "atr_mult",
         "squeeze_box_atr", "breakout_vol_ratio", "trend_er_min",
+        "lock_atr", "accel_exit",
         // ② 抛物线SAR
         "af_start", "af_step", "af_max",
         // ③ 纯裸K
@@ -290,6 +305,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                     err = c.symbol + " 海龟: trend_er_min 要在 0~1 之间（0 = 关）";
                     return false;
                 }
+                c.rule.lock_atr   = get_bool(so, "lock_atr", c.rule.lock_atr);
+                c.rule.accel_exit = get_bool(so, "accel_exit", c.rule.accel_exit);
                 if (c.rule.trend_er_min > 0 && !(c.rule.squeeze_box_atr > 0))
                     out.warnings.push_back(c.symbol + " 海龟：trend_er_min 只在 squeeze_box_atr > 0 时生效，现在不起作用");
             } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {
@@ -356,8 +373,10 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
     // v4.7.1 之前这里还要拦"同一品种被 bots 与 sar_bots 同时接管"（两个引擎各下
     // 各的单、互相平掉对方的仓）。网格DCA 移除后只剩一套策略，这类冲突不存在了。
 
-    if (out.trend_bots.empty()) {
-        err = "配置文件里 trend_bots 为空（或每一项都缺少 symbol），至少要配一个";
+    // 只开智能模式、不配手动 bot 是合法的用法（品种全由扫描选）
+    if (out.trend_bots.empty() && !out.smart.enabled) {
+        err = "配置文件里 trend_bots 为空（或每一项都缺少 symbol），且没有启用 smart_mode——"
+              "至少要配一个品种，或者启用智能模式";
         return false;
     }
 

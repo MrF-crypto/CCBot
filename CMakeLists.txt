@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 5.9.11 LANGUAGES CXX)
+project(TradingBot VERSION 5.10.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -99,6 +99,8 @@ set(CORE_SOURCES
     src/core/trend_engine.cpp
     src/core/funding_ledger.cpp
     src/core/fee_ledger.cpp
+    src/core/smart_mode.cpp
+    src/app/smart_runner.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
     # 行情源：REST 轮询。v5.7.0 起替代 book_ticker_stream（WebSocket）。
@@ -140,6 +142,7 @@ if(WIN32 OR APPLE)
         src/core/key_store.cpp
         src/gui/main_window.cpp
         src/gui/trend_panel.cpp
+        src/gui/smart_panel.cpp
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )
@@ -340,7 +343,8 @@ endif()
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
-                                src/core/trend_engine.cpp)
+                                src/core/trend_engine.cpp
+                                src/core/smart_mode.cpp)
 target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)
@@ -355,6 +359,29 @@ add_executable(ccg_app_logic_tests tests/test_app_logic.cpp)
 target_include_directories(ccg_app_logic_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(MSVC)
     target_compile_options(ccg_app_logic_tests PRIVATE /utf-8)
+endif()
+
+# ── 智能模式纯逻辑测试：门槛、特征、打分排名、候选池增删、配置往返 ─────────────
+add_executable(ccg_smart_tests tests/test_smart.cpp src/core/smart_mode.cpp)
+target_include_directories(ccg_smart_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_smart_tests PRIVATE simdjson::simdjson)
+if(MSVC)
+    target_compile_options(ccg_smart_tests PRIVATE /utf-8)
+endif()
+
+# ── 智能模式执行层测试：假交易所 → 扫描 → 候选池决策落到引擎 ─────────────────
+add_executable(ccg_smart_runner_tests tests/test_smart_runner.cpp
+                                      src/app/smart_runner.cpp src/core/smart_mode.cpp
+                                      src/core/trend_engine.cpp
+                                      src/net/trading_client.cpp src/net/rate_gate.cpp)
+target_include_directories(ccg_smart_runner_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_smart_runner_tests PRIVATE ${CORE_LIBS})
+if(WIN32)
+    target_link_libraries(ccg_smart_runner_tests PRIVATE crypt32 ws2_32 wsock32)
+    target_compile_definitions(ccg_smart_runner_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_options(ccg_smart_runner_tests PRIVATE /utf-8)
 endif()
 
 # ccg_persist_tests 随网格DCA 一并移除（本版）：它测的是 headless_state 的
@@ -385,7 +412,8 @@ set(CCBOT_OWN_TARGETS
     ccg_indicator_tests ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests
     ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
     ccg_rate_tests ccg_timesync_tests ccg_config_tests
-    ccg_key_store_tests ccg_rest_feed_tests ccg_app_logic_tests
+    ccg_key_store_tests ccg_rest_feed_tests ccg_app_logic_tests ccg_smart_tests
+    ccg_smart_runner_tests
 )
 if(WIN32 OR APPLE)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)

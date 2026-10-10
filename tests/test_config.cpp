@@ -194,6 +194,38 @@ int main() {
         check(warned, "  没开箱体却设了效率比：告警它不起作用");
     }
     {
+        // 智能模式段：读进来、非法值拒绝启动、不写就是关
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"smart_mode\":{\"enabled\":true,\"dir_short\":false,\"long_n\":30,"
+                         "\"min_quote_vol\":8000000,\"daily_loss_limit\":150,\"blacklist\":[\"XUSDT\"],"
+                         "\"template\":{\"budget_usdt\":50,\"atr_mult\":2.5}}}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err), "smart_mode 段能加载（不配 trend_bots 也行）");
+        check(hc.smart.enabled && !hc.smart.dir_short && hc.smart.long_n == 30 &&
+              std::fabs(hc.smart.min_quote_vol - 8e6) < 1e-6 &&
+              std::fabs(hc.smart.daily_loss_limit - 150) < 1e-9 && hc.smart.blacklist.count("XUSDT"),
+              "  各项读入");
+        check(std::fabs(hc.smart.tmpl.budget_usdt - 50) < 1e-9 &&
+              std::fabs(hc.smart.tmpl.rule.atr_mult - 2.5) < 1e-9 &&
+              hc.smart.tmpl.rule.donchian_period == 12,
+              "  模板：写了的覆盖，没写的保持默认（通道 12）");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"smart_mode\":{\"enabled\":true,\"atr_pct_min\":9,\"atr_pct_max\":3}}");
+        HeadlessConfig hc2; std::string err2;
+        check(!load_headless_config(path, hc2, err2) && err2.find("ATR%") != std::string::npos,
+              "smart_mode 非法值：拒绝启动并说明原因");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\"}]}");
+        HeadlessConfig hc3; std::string err3;
+        check(load_headless_config(path, hc3, err3) && !hc3.smart.enabled, "不写 smart_mode：关");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"smart_mode\":{\"enabled\":false}}");
+        HeadlessConfig hc4; std::string err4;
+        check(!load_headless_config(path, hc4, err4), "没有手动 bot 且智能模式关着：拒绝启动（什么都不会跑）");
+    }
+    {
         // 裸K 信号K量比
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","

@@ -72,6 +72,9 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
         ss << "{"
            << "\"symbol\":\""    << json_escape(b.cfg.symbol) << "\","
            << "\"state\":"       << (int)b.state << ","
+           // 智能模式管理的 bot 不在配置文件里，恢复时要靠这个标记 + 智能模式模板
+           // 重建参数（见 load_trend_state）
+           << "\"auto\":"        << (b.is_auto ? "true" : "false") << ","
            << "\"pos\":"         << (int)b.st.pos << ","
            << "\"entry_price\":" << b.st.entry_price << ","
            << "\"peak\":"        << b.st.peak << ","
@@ -79,6 +82,8 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            // ② 抛物线SAR 专用：AF 丢了的话重启后 SAR 会从 af_start 重新加速，
            //    止损线瞬间从"贴着价格"退回远处——等于白白让出已经锁住的利润
            << "\"af\":"          << b.st.af << ","
+           // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
+           << "\"entry_atr\":"   << b.st.entry_atr << ","
            // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
            //    忘掉，盘中即时模式下同一根里会再开一次
            << "\"last_entry_bar_ms\":" << b.st.last_entry_bar_ms << ","
@@ -118,7 +123,8 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
 }
 
 std::vector<TrendBot> load_trend_state(const std::string& path,
-                                   const std::vector<TrendConfig>& cfgs) {
+                                   const std::vector<TrendConfig>& cfgs,
+                                   const TrendConfig* auto_tmpl) {
     std::vector<TrendBot> out;
 
     std::ifstream f(path, std::ios::binary);
@@ -140,13 +146,34 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         const std::string sym = get_str(o, "symbol", "");
         if (sym.empty()) continue;
 
-        // 配置里已经删掉的品种，落盘状态直接丢弃
+        bool is_auto = false;
+        {
+            bool v = false;
+            if (o["auto"].get(v) == simdjson::SUCCESS) is_auto = v;
+        }
+        const int saved_pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
+
+        // 配置里已经删掉的品种，落盘状态直接丢弃。
+        // 自动 bot 例外：它本来就不在配置里，参数取智能模式模板
         const TrendConfig* cfg = nullptr;
-        for (const auto& c : cfgs) if (c.symbol == sym) { cfg = &c; break; }
+        TrendConfig auto_cfg;
+        if (is_auto) {
+            if (auto_tmpl) {
+                auto_cfg = *auto_tmpl;
+            } else if (saved_pos == (int)trend::Pos::Flat) {
+                continue;   // 智能模式已关，空仓的自动 bot 不再需要
+            }
+            // 没有模板但有持仓：默认参数的海龟接着管，至少止损线还在
+            auto_cfg.symbol = sym;
+            cfg = &auto_cfg;
+        } else {
+            for (const auto& c : cfgs) if (c.symbol == sym) { cfg = &c; break; }
+        }
         if (!cfg) continue;
 
         TrendBot b;
         b.cfg   = *cfg;                       // 参数用最新配置，不用落盘的
+        b.is_auto = is_auto;
         b.state = (TrendBot::State)(int)get_num(o, "state", 0);
 
         const int pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
@@ -159,6 +186,7 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         // 旧存档没有 af。兜底取 af_start 而不是 0：0 会让 SAR 完全不动
         // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
         b.st.af              = get_num(o, "af", b.cfg.rule.af_start);
+        b.st.entry_atr       = get_num(o, "entry_atr", 0);
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
