@@ -232,6 +232,28 @@ int main() {
               "数量为0的持仓状态应被丢弃为空仓");
     }
 
+    // ── 成交 CSV 读回（补算当日已实现用）────────────────────────────────────
+    {
+        const std::string csv = path + ".csv";
+        write_file(csv,
+            "time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers\r\n"
+            "2026-10-10 09:30:00,AAAUSDT,sar_long,追踪止盈出场，等待新信号,100,110,2,20,0\r\n"
+            "2026-10-10 10:00:00,BBBUSDT,sar_short,原因里有,英文逗号,50,55,1,-5,0\r\n"
+            "坏行\r\n"
+            "2026-10-10 11:00:00,CCCUSDT,sar_long,x,abc,1,1,1,0\r\n");
+        const auto t = load_trades_csv(csv);
+        check(t.size() == 2, "CSV：两行有效，坏行与非数字行跳过（实际 " + std::to_string(t.size()) + "）");
+        if (t.size() == 2) {
+            check(t[0].symbol == "AAAUSDT" && t[0].pnl == 20 && t[0].qty == 2 &&
+                  t[0].side == trend::Pos::Long, "  第一行各列读对");
+            check(t[1].symbol == "BBBUSDT" && t[1].pnl == -5 && t[1].entry_price == 50 &&
+                  t[1].side == trend::Pos::Short, "  原因里带英文逗号：数值列从行尾取，照样读对");
+            check(t[0].close_time.time_since_epoch().count() != 0, "  时间读成了时间点");
+        }
+        check(load_trades_csv(csv + ".nope").empty(), "  文件不存在：空");
+        std::remove(csv.c_str());
+    }
+
     // ── 损坏/缺失文件不崩溃 ──────────────────────────────────────────────────
     {
         write_file(path, "{ 这不是 json");

@@ -34,4 +34,9 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
                                    const TrendConfig* auto_tmpl = nullptr);
 
+// 读 headless 的成交 CSV（ccbot_trades.csv）。只用来补算当日已实现（启动时
+// 状态文件里没有今天的数）。时间列是本地时间 "YYYY-MM-DD HH:MM:SS"，按本地时区
+// 换回时间点；原因列可能含逗号，所以数值列从行尾往前取。坏行跳过
+std::vector<TrendTrade> load_trades_csv(const std::string& path);
+
 } // namespace ccbot

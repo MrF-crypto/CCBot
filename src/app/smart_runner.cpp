@@ -3,6 +3,7 @@
 #include "net/trading_client.h"
 
 #include <simdjson.h>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -40,7 +41,64 @@ std::string join(const std::vector<std::string>& v, const char* sep) {
     return s;
 }
 
+// 名单 / 分段代码 → 日志里的简称
+std::string list_name(char c) {
+    switch (c) {
+    case smart::kListLong:   return "多";
+    case smart::kListShort:  return "空";
+    case smart::kSegStrong:  return "强";
+    case smart::kSegWeak:    return "弱";
+    case smart::kSegMid:     return "中";
+    case smart::kSegHot:     return "过热";
+    default:                 return "?";
+    }
+}
+
 } // namespace
+
+std::vector<SmartRunner::Group> SmartRunner::build_groups(const smart::Ranking& rk,
+                                                          const smart::Segmented& sg,
+                                                          const smart::Config& cfg,
+                                                          const std::set<std::string>& with_bot) {
+    std::vector<Group> out;
+    auto make = [&](const std::string& title, char code, const std::vector<std::string>& list,
+                    int quota, auto score_of) {
+        Group g;
+        g.title = title;
+        g.code  = code;
+        g.quota = quota;
+        for (int i = 0; i < (int)list.size() && i < quota; ++i) {
+            const auto& s = rk.rows.at(list[i]);
+            g.rows.push_back({list[i], code, i + 1, score_of(s), s.f.atr_pct, s.f.box12_atr,
+                              s.f.vol_lift, s.f.rs, s.f.max_up24, with_bot.count(list[i]) > 0});
+        }
+        out.push_back(std::move(g));
+    };
+    if (cfg.dir_mode == smart::DirMode::Mixed) {
+        using smart::Scored;
+        const auto mid_dir = cfg.dir_long && cfg.dir_short ? "多空" : (cfg.dir_long ? "仅多" : "仅空");
+        if (smart::seg_quota(smart::kSegStrong, cfg) > 0)
+            make("强势（仅多）", smart::kSegStrong, sg.strong, cfg.strong_n,
+                 [](const Scored& s) { return s.long_score; });
+        if (smart::seg_quota(smart::kSegWeak, cfg) > 0)
+            make("弱势（仅空）", smart::kSegWeak, sg.weak, cfg.weak_n,
+                 [](const Scored& s) { return s.short_score; });
+        if (smart::seg_quota(smart::kSegMid, cfg) > 0)
+            make(std::string("中间（") + mid_dir + "）", smart::kSegMid, sg.mid, cfg.mid_n,
+                 [](const Scored& s) { return s.squeeze_score; });
+        if (smart::seg_quota(smart::kSegHot, cfg) > 0)
+            make("过热（仅空）", smart::kSegHot, sg.hot, cfg.hot_n,
+                 [](const Scored& s) { return s.short_score; });
+    } else {
+        if (cfg.dir_long)
+            make("做多", smart::kListLong, rk.longs, cfg.long_n,
+                 [](const smart::Scored& s) { return s.long_score; });
+        if (cfg.dir_short)
+            make("做空", smart::kListShort, rk.shorts, cfg.short_n,
+                 [](const smart::Scored& s) { return s.short_score; });
+    }
+    return out;
+}
 
 // ── 全市场扫描 ──────────────────────────────────────────────────────────────
 
@@ -145,7 +203,32 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
     return r;
 }
 
+double sum_day_realized(const std::vector<TrendTrade>& trades, int64_t utc_day) {
+    double r = 0;
+    for (const auto& t : trades) {
+        if (t.close_time.time_since_epoch().count() == 0) continue;
+        if (TrendEngine::utc_day(t.close_time) != utc_day) continue;
+        const double fee = (std::fabs(t.entry_price) + std::fabs(t.exit_price)) *
+                           std::fabs(t.qty) * TrendEngine::kEstFeeRate;
+        if (std::isfinite(t.pnl) && std::isfinite(fee)) r += t.pnl - fee;
+    }
+    return r;
+}
+
 // ── SmartRunner ────────────────────────────────────────────────────────────
+
+void SmartRunner::seed_day_from_history(const std::vector<TrendTrade>& trades) {
+    if (!engine_) return;
+    const auto d = engine_->day_pnl();
+    if (d.realized != 0) return;   // 状态文件里有今天的数，以它为准
+    const double r = sum_day_realized(trades, d.day);
+    if (r != 0) {
+        engine_->restore_day_pnl({d.day, r});
+        if (log_) log_("智能模式：按成交历史补算今天（UTC）已实现 " + fmt(r, 2) + "U（含估算手续费）", false);
+    }
+}
+
+void SmartRunner::cancel() { cancelled_.store(true); }
 
 SmartRunner::SmartRunner(std::shared_ptr<TradingClient> client, std::shared_ptr<TrendEngine> engine,
                          std::string state_path, LogFn log)
@@ -221,6 +304,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     const smart::Config cfg = config();
     Report rep;
     rep.at_ms = now_ms;
+    if (cancelled_.load()) return rep;
     if (!cfg.enabled || !engine_ || !client_) { housekeep(now_ms); return rep; }
 
     const auto bots = engine_->get_bots();
@@ -235,6 +319,8 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     }
 
     const auto scan = scan_market(*client_, cfg, pool_syms, now_ms);
+    // 扫描要几十秒，期间这个运行器可能已经被作废（断线重连换了新的）：不落地
+    if (cancelled_.load()) return rep;
     {
         // 下一次：下一个整点后 1 分钟（等 1h K线收盘）
         std::lock_guard<std::mutex> lk(mtx_);
@@ -244,11 +330,28 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     rep.passed_gate = scan.passed_gate;
     rep.eligible    = scan.eligible;
     if (!scan.outcome.ok) {
-        rep.summary = "智能模式：本轮扫描失败（" + scan.error + "），候选池不动，下个整点再试";
-        if (log_) log_(rep.summary, true);
+        int streak = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            streak = ++fail_streak_;
+        }
+        rep.summary = "智能模式：本轮扫描失败（" + scan.error + "），候选池不动，下个整点再试" +
+                      (streak > 1 ? "（已连续 " + std::to_string(streak) + " 轮）" : std::string());
+        // 只有第一轮失败走告警（会推 webhook），之后只记日志
+        if (log_) log_(rep.summary, streak == 1);
         std::lock_guard<std::mutex> lk(mtx_);
         last_ = rep;
         return rep;
+    }
+    {
+        int was = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            was = fail_streak_;
+            fail_streak_ = 0;
+        }
+        if (was > 0 && log_)
+            log_("智能模式：扫描已恢复（此前连续失败 " + std::to_string(was) + " 轮）", false);
     }
 
     smart::Plan plan;
@@ -277,13 +380,22 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     for (const auto& m : plan.meta)
         if (!gone_ids.count(m.bot_id)) engine_->set_smart_meta(m.bot_id, m.score, m.rank, m.list);
 
-    // ── 参数同步：方向或模板改了，空仓的自动 bot 换上新参数 ──
-    int resynced = 0;
+    // ── 参数同步：方向（混合模式下随分段变）或模板改了，空仓的自动 bot 换上新参数 ──
+    // 方向取本轮决策给的；这一轮没拿到数据（没有 meta）的不动
+    // 段也要带上：过热段的参数和模板不同（不要求量比）
+    std::map<std::string, std::pair<trend::Direction, char>> want_dir;
+    for (const auto& m : plan.meta)
+        if (m.has_dir) want_dir[m.bot_id] = {m.dir, m.list};
+    int resynced = 0, redirected = 0;
     for (const auto& b : bots) {
         if (!b.is_auto || gone_ids.count(b.bot_id)) continue;
         if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending) continue;
         if (b.state == TrendBot::State::Stopped) continue;
-        const auto want = smart::make_bot_config(cfg, b.cfg.symbol);
+        const auto wd = want_dir.find(b.bot_id);
+        if (wd == want_dir.end()) continue;
+        const auto want = smart::make_bot_config(cfg, b.cfg.symbol, wd->second.first,
+                                                 wd->second.second);
+        if (b.cfg.rule.direction != want.rule.direction) ++redirected;
         if (same_params(b.cfg, want)) continue;
         // ⚠ replace_bot 在 id 不存在时会【新建】——上面已排除本轮删掉的；
         //   它自己会拒绝有持仓/在途订单的
@@ -293,15 +405,15 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     // ── 补位 ──
     std::vector<std::string> add_desc;
     for (const auto& a : plan.add) {
-        const auto id = engine_->add_bot(smart::make_bot_config(cfg, a.symbol), true);
+        const auto id = engine_->add_bot(smart::make_bot_config(cfg, a.symbol, a.dir, a.list), true);
         if (id.empty()) continue;   // 同品种已有 bot（扫描期间被手动加了）
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            pool_.on_added(a.symbol, now_ms);
+            pool_.on_added(a.symbol, now_ms, a.list);
         }
         engine_->set_smart_meta(id, a.score, a.rank, a.list);
         ++rep.added;
-        add_desc.push_back(a.symbol + "（" + (a.list == 'L' ? "多" : "空") + " #" +
+        add_desc.push_back(a.symbol + "（" + list_name(a.list) + " #" +
                            std::to_string(a.rank) + " " + fmt(a.score, 0) + "分）");
         if (on_symbol_added) on_symbol_added(a.symbol);
     }
@@ -317,29 +429,25 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         ++rep.monitored;
         if (b.qty > 0) ++rep.holding;
     }
-    auto rows = [&](const std::vector<std::string>& list, char tag, int n) {
-        std::vector<Row> v;
-        for (int i = 0; i < (int)list.size() && i < n; ++i) {
-            const auto& sc = scan.outcome.ranking.rows.at(list[i]);
-            v.push_back({list[i], tag, i + 1, tag == 'L' ? sc.long_score : sc.short_score,
-                         sc.f.atr_pct, sc.f.box12_atr, sc.f.vol_lift, sc.f.rs,
-                         with_bot.count(list[i]) > 0});
-        }
-        return v;
-    };
-    if (cfg.dir_long)  rep.longs  = rows(scan.outcome.ranking.longs,  'L', cfg.long_n);
-    if (cfg.dir_short) rep.shorts = rows(scan.outcome.ranking.shorts, 'S', cfg.short_n);
+    rep.groups = build_groups(scan.outcome.ranking, plan.seg, cfg, with_bot);
     rep.ok = true;
+    std::string lists;
+    for (const auto& g : rep.groups) {
+        std::string name = g.title.substr(0, g.title.find("（"));
+        lists += "，" + name + " " + std::to_string(g.rows.size());
+    }
     rep.summary = "智能模式：合格 " + std::to_string(rep.eligible) + "/" + std::to_string(rep.universe) +
-                  (cfg.dir_long ? "，做多 " + std::to_string(rep.longs.size()) : std::string()) +
-                  (cfg.dir_short ? "，做空 " + std::to_string(rep.shorts.size()) : std::string()) +
+                  lists +
                   "；+" + std::to_string(rep.added) + " −" + std::to_string(rep.removed) +
                   "，监控 " + std::to_string(rep.monitored) + "（持仓 " + std::to_string(rep.holding) + "）";
     if (log_) {
         log_(rep.summary, false);
         if (!add_desc.empty()) log_("  新增：" + join(add_desc, "、"), false);
         if (!rm_desc.empty())  log_("  移出：" + join(rm_desc, "、"), false);
-        if (resynced > 0)      log_("  " + std::to_string(resynced) + " 个空仓自动 bot 已换上新参数", false);
+        if (resynced > 0)
+            log_("  " + std::to_string(resynced) + " 个空仓自动 bot 已换上新参数" +
+                 (redirected > 0 ? "（其中 " + std::to_string(redirected) + " 个随分段换了方向）"
+                                 : std::string()), false);
         const auto fs = engine_->take_filter_summary();
         if (!fs.empty())       log_("  上一轮以来自动 bot：" + fs, false);
     }
@@ -351,7 +459,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
 }
 
 void SmartRunner::housekeep(int64_t /*now_ms*/) {
-    if (!engine_) return;
+    if (!engine_ || cancelled_.load()) return;
     bool enabled = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -375,7 +483,7 @@ void SmartRunner::housekeep(int64_t /*now_ms*/) {
 }
 
 void SmartRunner::save_locked() const {
-    if (state_path_.empty()) return;
+    if (state_path_.empty() || cancelled_.load()) return;   // 作废的不和新运行器抢文件
     std::ostringstream o;
     o << std::setprecision(std::numeric_limits<double>::max_digits10);
     const auto d = engine_ ? engine_->day_pnl() : TrendEngine::DayPnl{};

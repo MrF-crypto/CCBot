@@ -10,6 +10,7 @@
 // ⚠ 不起线程、不碰网络，所以只进 ASan 列表，不进 TSan 列表。
 #include "core/app_logic.h"
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -127,6 +128,19 @@ int main() {
               "  说明里要告诉人怎么改回去（设为「立即反手」）");
         check(m.note.find("同向信号") != std::string::npos,
               "  并且讲清具体变了什么，而不是只说「有变化」");
+    }
+
+    std::printf("\n── 恢复暂停：价格是否已越过止损线 ──\n");
+    {
+        using trend::Pos;
+        check(std::fabs(app::resume_overshoot_pct(Pos::Long, 95, 100) - 5.0) < 1e-9,
+              "多单：现价 95 < 止损 100 ⇒ 越过 5%");
+        check(app::resume_overshoot_pct(Pos::Long, 105, 100) == 0, "多单：还在线上方 ⇒ 0（不拦）");
+        check(std::fabs(app::resume_overshoot_pct(Pos::Short, 104, 100) - 4.0) < 1e-9,
+              "空单：现价 104 > 止损 100 ⇒ 越过 4%");
+        check(app::resume_overshoot_pct(Pos::Short, 96, 100) == 0, "空单：还在线下方 ⇒ 0");
+        check(app::resume_overshoot_pct(Pos::Long, 0, 100) == 0, "现价拿不到 ⇒ 0（不拦，也不瞎报）");
+        check(app::resume_overshoot_pct(Pos::Flat, 50, 100) == 0, "空仓 ⇒ 0");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\nOK: 应用层判定测试全部通过\n", g_fail);

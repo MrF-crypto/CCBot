@@ -116,9 +116,32 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     // ── 1 品种 ──
     // 智能模式的自动 bot 带标签：哪份名单、第几名。不在名单里了（持仓中等走完）显示"待移出"
     if (b.is_auto) {
+        // 名单 / 分段代码见 core/smart_mode.h（L/S 突破模式，U/D/M/H 混合模式）
+        auto list_short = [](char c) -> QString {
+            switch (c) {
+            case 'L': return "多";
+            case 'S': return "空";
+            case 'U': return "强";
+            case 'D': return "弱";
+            case 'M': return "中";
+            case 'H': return "过热";
+            default:  return "";
+            }
+        };
+        auto list_long = [](char c) -> QString {
+            switch (c) {
+            case 'L': return "做多名单";
+            case 'S': return "做空名单";
+            case 'U': return "强势段（仅多）";
+            case 'D': return "弱势段（仅空）";
+            case 'M': return "中间段（多空）";
+            case 'H': return "过热段（仅空）";
+            default:  return "名单";
+            }
+        };
         // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时只标"自动"
         const QString tag = b.smart_rank > 0
-            ? QString("自动·%1#%2").arg(b.smart_list == 'S' ? "空" : "多").arg(b.smart_rank)
+            ? QString("自动·%1#%2").arg(list_short(b.smart_list)).arg(b.smart_rank)
             : (b.smart_score > 0 ? QString("自动·待移出") : QString("自动"));
         auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + "  " + tag,
                           b.smart_rank > 0 ? kBlue : kGrey);
@@ -127,8 +150,8 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                                    "持仓中绝不移除，等这笔走完")
                                .arg(b.smart_score, 0, 'f', 0)
                                .arg(b.smart_rank > 0
-                                        ? QString("%1名单第 %2 名").arg(b.smart_list == 'S' ? "做空" : "做多")
-                                                                   .arg(b.smart_rank)
+                                        ? QString("%1第 %2 名").arg(list_long(b.smart_list))
+                                                              .arg(b.smart_rank)
                                         : QString("已不在名单")));
         botTable_->setItem(row, ColSym, sym_it);
     } else {
@@ -473,8 +496,23 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
         br->setFixedHeight(20);
         br->setStyleSheet("QPushButton{background:#1a3d1a;color:#3fb950;"
                           "font-size:11px;padding:0 6px;}");
-        connect(br, &QPushButton::clicked, this, [this, id]() {
+        connect(br, &QPushButton::clicked, this, [this, id, sym]() {
             if (!trend_engine_) return;
+            // 暂停期间价格可能已经越过止损线：恢复后第一拍就会市价平仓，先说清楚。
+            // 暂停的 bot 不吃 tick，它的 current_price 是暂停那一刻的，要用行情源的现价
+            for (const auto& bb : trend_engine_->get_bots()) {
+                if (bb.bot_id != id || bb.st.pos == trend::Pos::Flat || bb.qty <= 0) continue;
+                const double px = ticker_ ? ticker_->mark_price(bb.cfg.symbol) : 0.0;
+                const double over = app::resume_overshoot_pct(bb.st.pos, px, bb.st.stop);
+                if (over > 0 &&
+                    !confirmDanger("确认恢复",
+                        QString("%1 暂停期间价格已越过止损线 %2%（现价 %3，止损线 %4）。\n\n"
+                                "恢复后第一拍就会按市价平仓，成交价可能比止损线差很多。")
+                            .arg(sym).arg(over, 0, 'f', 2)
+                            .arg(px, 0, 'g', 8).arg(bb.st.stop, 0, 'g', 8),
+                        "恢复并平仓"))
+                    return;
+            }
             trend_engine_->resume_bot(id);
             // 「全部停止」会关掉 tick 定时器——单个 bot 恢复时必须把它拉起来，
             // 否则 bot 显示"运行中"但引擎永远不被驱动，止损线永远不会触发

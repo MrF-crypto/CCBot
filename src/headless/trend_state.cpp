@@ -2,6 +2,7 @@
 
 #include <simdjson.h>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -120,6 +121,44 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
         if (f) f << ss.str();
         std::filesystem::remove(tmp, ec);
     }
+}
+
+std::vector<TrendTrade> load_trades_csv(const std::string& path) {
+    std::vector<TrendTrade> out;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return out;
+    std::string line;
+    bool header = true;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (header) { header = false; continue; }
+        // 列：time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers
+        std::vector<std::string> cols;
+        size_t start = 0;
+        for (size_t i = 0; i <= line.size(); ++i)
+            if (i == line.size() || line[i] == ',') { cols.push_back(line.substr(start, i - start)); start = i + 1; }
+        if (cols.size() < 9) continue;
+        const size_t n = cols.size();
+        TrendTrade t;
+        try {
+            t.entry_price = std::stod(cols[n - 5]);
+            t.exit_price  = std::stod(cols[n - 4]);
+            t.qty         = std::stod(cols[n - 3]);
+            t.pnl         = std::stod(cols[n - 2]);
+        } catch (...) { continue; }
+        std::tm tmv{};
+        std::istringstream ts(cols[0]);
+        ts >> std::get_time(&tmv, "%Y-%m-%d %H:%M:%S");
+        if (ts.fail()) continue;
+        tmv.tm_isdst = -1;   // 让 mktime 自己判断夏令时
+        const std::time_t tt = std::mktime(&tmv);
+        if (tt == (std::time_t)-1) continue;
+        t.close_time = std::chrono::system_clock::from_time_t(tt);
+        t.symbol = cols[1];
+        t.side   = (cols[2].find("short") != std::string::npos) ? trend::Pos::Short : trend::Pos::Long;
+        out.push_back(std::move(t));
+    }
+    return out;
 }
 
 std::vector<TrendBot> load_trend_state(const std::string& path,

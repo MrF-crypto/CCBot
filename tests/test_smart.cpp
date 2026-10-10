@@ -195,6 +195,7 @@ static bool added(const Plan& p, const std::string& sym) {
 
 static void test_pool() {
     Config c;
+    c.dir_mode = DirMode::Breakout;   // 这一组测的是突破模式的两份名单；混合模式见 test_mixed
     c.long_n = 2; c.short_n = 1;
 
     {
@@ -345,6 +346,108 @@ static void test_pool() {
     }
 }
 
+// ── 混合模式：分段、覆盖规则、缓冲区、名额、方向 ─────────────────────────
+static Scored sc(double rs_pct, double rs, double er = 0, double up = 0, double dn = 0) {
+    Scored s;
+    s.rs_pct = rs_pct;
+    s.long_score = s.short_score = s.squeeze_score = 80;
+    s.f.ok = true;
+    s.f.rs = rs; s.f.er24 = er; s.f.max_up24 = up; s.f.max_dn24 = dn;
+    return s;
+}
+
+static void test_mixed() {
+    Config c;   // 默认就是混合模式
+    check(c.dir_mode == DirMode::Mixed && c.strong_n == 20 && c.weak_n == 20 &&
+          c.mid_n == 50 && c.hot_n == 10, "默认：混合模式，名额 20/20/50/10");
+
+    // ── 分段 ──
+    SegState st;
+    check(classify(sc(85, 1.2), c, st) == kSegStrong, "排名前 30% 且跑赢 BTC ⇒ 强势");
+    st = {};
+    check(classify(sc(85, -0.1), c, st) == kSegMid, "排名靠前但跑输 BTC（全市场都弱）⇒ 不算强势");
+    st = {};
+    check(classify(sc(10, -1.0), c, st) == kSegWeak, "排名后 30% 且跑输 BTC ⇒ 弱势");
+    st = {};
+    check(classify(sc(50, 0.1), c, st) == kSegMid, "中间 ⇒ 中间段");
+    st = {};
+    check(classify(sc(95, 3.0, 0.5, 90), c, st) == kSegHot, "7 天内单日涨 90% ⇒ 过热（不管排名多高）");
+    st = {};
+    check(classify(sc(5, -3.0, -0.5, 0, 60), c, st) == kSegMid, "7 天内单日跌 60% ⇒ 中间段，不进弱势");
+    st = {};
+    check(classify(sc(85, 1.2, -0.5), c, st) == kSegMid, "强势但 24 根效率比 −0.5（掉头）⇒ 降为中间段");
+    check(st.base == kSegStrong, "  掉头只改这一轮的方向，底段仍是强势（缓冲区照常）");
+    st = {};
+    check(classify(sc(10, -1.0, 0.5), c, st) == kSegMid, "弱势但在反弹 ⇒ 降为中间段");
+
+    // ── 缓冲区：进 30%、出 40%、连续 2 轮 ──
+    st = {};
+    classify(sc(80, 1.0), c, st);
+    check(classify(sc(65, 0.8), c, st) == kSegStrong, "已在强势、掉到 65%（仍在前 40%）⇒ 留在强势");
+    check(classify(sc(55, 0.5), c, st) == kSegStrong, "掉出前 40% 第 1 轮 ⇒ 还留着");
+    check(classify(sc(55, 0.5), c, st) == kSegMid, "连续第 2 轮 ⇒ 离开强势");
+    st = {};
+    check(classify(sc(65, 0.8), c, st) == kSegMid, "新币在 65%：没进前 30%，不进强势（进出门槛不对称）");
+    st = {};
+    classify(sc(80, 1.0), c, st);
+    classify(sc(55, 0.5), c, st);                     // 出段第 1 轮
+    classify(sc(70, 0.9), c, st);                     // 回来了，计数清零
+    check(classify(sc(55, 0.5), c, st) == kSegStrong, "出段要【连续】2 轮，中间回来过就重新数");
+    st = {};
+    classify(sc(80, 1.0), c, st);
+    check(classify(sc(80, -0.2), c, st) == kSegStrong, "强势币跑输 BTC 第 1 轮 ⇒ 还留着");
+    check(classify(sc(80, -0.2), c, st) == kSegMid, "  第 2 轮 ⇒ 离开");
+
+    // ── 方向与勾选 ──
+    bool ok = false;
+    check(seg_direction(kSegStrong, c, &ok) == trend::Direction::LongOnly && ok, "强势 ⇒ 仅多");
+    check(seg_direction(kSegWeak, c, &ok) == trend::Direction::ShortOnly && ok, "弱势 ⇒ 仅空");
+    check(seg_direction(kSegHot, c, &ok) == trend::Direction::ShortOnly && ok, "过热 ⇒ 仅空");
+    check(seg_direction(kSegMid, c, &ok) == trend::Direction::Both && ok, "中间 ⇒ 多空，谁突破做谁");
+    Config cl = c; cl.dir_short = false;
+    seg_direction(kSegWeak, cl, &ok);
+    check(!ok && seg_quota(kSegWeak, cl) == 0 && seg_quota(kSegHot, cl) == 0,
+          "只勾做多：弱势段、过热段不能做，名额为 0");
+    check(seg_direction(kSegMid, cl, &ok) == trend::Direction::LongOnly && ok, "只勾做多：中间段只做多");
+
+    // ── 名单：每段按名额补、方向跟段 ──
+    Ranking r;
+    auto put = [&](const std::string& s, Scored x) { x.symbol = s; r.rows[s] = x; };
+    put("STRONGUSDT", sc(90, 1.5));
+    put("WEAKUSDT",   sc(5, -1.5));
+    put("MIDUSDT",    sc(50, 0.0));
+    put("HOTUSDT",    sc(99, 4.0, 0, 120));
+    Config c1 = c; c1.strong_n = c1.weak_n = c1.mid_n = c1.hot_n = 1;
+    Pool pool;
+    ScanOutcome s; s.ok = true; s.ranking = r;
+    auto p = pool.plan(s, {}, c1, kNow);
+    auto dir_of = [&](const std::string& sym) {
+        for (const auto& a : p.add) if (a.symbol == sym) return std::make_pair(a.list, a.dir);
+        return std::make_pair(char(0), trend::Direction::Both);
+    };
+    check(p.add.size() == 4, "四段各补 1 个");
+    check(dir_of("STRONGUSDT") == std::make_pair(kSegStrong, trend::Direction::LongOnly), "  强势币：仅多");
+    check(dir_of("WEAKUSDT") == std::make_pair(kSegWeak, trend::Direction::ShortOnly), "  弱势币：仅空");
+    check(dir_of("MIDUSDT") == std::make_pair(kSegMid, trend::Direction::Both), "  中间币：多空");
+    check(dir_of("HOTUSDT") == std::make_pair(kSegHot, trend::Direction::ShortOnly), "  过热币：仅空");
+
+    // 池里的币换了段：给出新方向（空仓时由执行层切换）
+    for (const auto& a : p.add) pool.on_added(a.symbol, kNow - 10 * kDay, a.list);
+    Ranking r2 = r;
+    r2.rows["STRONGUSDT"].f.er24 = -0.6;   // 强势币开始掉头
+    ScanOutcome s2; s2.ok = true; s2.ranking = r2;
+    auto p2 = pool.plan(s2, {bot("a1", "STRONGUSDT", true)}, c1, kNow);
+    bool switched = false;
+    for (const auto& m : p2.meta)
+        if (m.bot_id == "a1") switched = m.has_dir && m.dir == trend::Direction::Both && m.list == kSegMid;
+    check(switched, "强势币掉头：本轮分到中间段，方向改为多空");
+
+    // 分段状态跨重启
+    Pool p3;
+    check(p3.from_json(pool.to_json()) && p3.entries().at("STRONGUSDT").seg.base == kSegStrong,
+          "分段状态（底段）随候选池落盘");
+}
+
 static void test_config_json() {
     Config c;
     c.enabled = true;
@@ -356,6 +459,10 @@ static void test_config_json() {
     c.tmpl.rule.atr_mult = 2.5;
     c.tmpl.size_mode = TrendConfig::SizeMode::RiskBased;
     c.tmpl.risk_usdt = 7;
+    c.dir_mode = DirMode::Breakout;
+    c.mid_n = 33;
+    c.hot_pct = 70;
+    c.weak_vol_ratio = 0.8;
     Config d;
     std::string err;
     check(config_from_json(config_to_json(c), d, &err), "配置 JSON 往返：能读回");
@@ -363,6 +470,12 @@ static void test_config_json() {
           d.long_n == 40 && near(d.daily_loss_limit, 123.5), "  各项一致");
     check(near(d.tmpl.rule.atr_mult, 2.5) && d.tmpl.size_mode == TrendConfig::SizeMode::RiskBased &&
           near(d.tmpl.risk_usdt, 7), "  模板一致");
+    check(d.dir_mode == DirMode::Breakout && d.mid_n == 33 && near(d.hot_pct, 70) &&
+          near(d.weak_vol_ratio, 0.8), "  混合模式相关设置一致");
+    Config g;
+    check(!config_from_json("{\"dir_mode\":\"sideways\"}", g, &err), "方向模式拼错：拒绝");
+    check(!config_from_json("{\"seg_enter_pct\":45,\"seg_exit_pct\":40}", g, &err),
+          "进段门槛大于出段门槛：拒绝（缓冲区反了）");
 
     Config e;
     check(config_from_json("{\"long_n\":10}", e, &err) && e.long_n == 10 && e.short_n == 50,
@@ -389,6 +502,7 @@ int main() {
     test_features();
     test_rank();
     test_pool();
+    test_mixed();
     test_config_json();
     if (g_fail == 0) {
         std::printf("OK: 智能模式测试全部通过\n");

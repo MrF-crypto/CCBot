@@ -2,6 +2,7 @@
 #include "core/smart_mode.h"
 #include "core/trend_engine.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,6 +33,11 @@ struct MarketScan {
 MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
                        const std::set<std::string>& pool_syms, int64_t now_ms, int parallel = 3);
 
+// 用成交历史算某个 UTC 日的已实现盈亏，扣估算手续费——口径与引擎的当日亏损一致
+// （TrendEngine::book_day）。启动时状态文件里没有今天的数（升级后第一次运行、
+// 文件丢了）就用它补，否则当日亏损限额会从 0 重新算
+double sum_day_realized(const std::vector<TrendTrade>& trades, int64_t utc_day);
+
 class SmartRunner {
 public:
     using LogFn = std::function<void(const std::string& msg, bool warn)>;
@@ -50,11 +56,18 @@ public:
 
     struct Row {               // 名单展示用
         std::string symbol;
-        char   list  = 0;
+        char   list  = 0;      // 名单 / 分段代码（smart::kList* / kSeg*）
         int    rank  = 0;
         double score = 0;
-        double atr_pct = 0, box12_atr = 0, vol_lift = 0, rs = 0;
+        double atr_pct = 0, box12_atr = 0, vol_lift = 0, rs = 0, max_up24 = 0;
         bool   has_bot = false;
+    };
+    // 一份名单：突破模式是"做多 / 做空"两份，混合模式是"强势 / 弱势 / 中间 / 过热"四份
+    struct Group {
+        std::string title;     // 例如 "强势（仅多）"
+        char        code = 0;
+        int         quota = 0;
+        std::vector<Row> rows;
     };
     struct Report {
         bool        ok = false;
@@ -62,8 +75,12 @@ public:
         int         universe = 0, passed_gate = 0, eligible = 0;
         int         added = 0, removed = 0, monitored = 0, holding = 0;
         std::string summary;          // 一行
-        std::vector<Row> longs, shorts;
+        std::vector<Group> groups;
     };
+    // 把一次扫描整理成名单（--scan 预览与 run_once 共用）
+    static std::vector<Group> build_groups(const smart::Ranking& rk, const smart::Segmented& sg,
+                                           const smart::Config& cfg,
+                                           const std::set<std::string>& with_bot);
     // 扫描 + 落地。阻塞。未启用时只做清理（见 housekeep）
     Report run_once(int64_t now_ms);
     Report last_report() const;
@@ -79,6 +96,14 @@ public:
 
     // 启动时调用：读池状态与当日盈亏
     void load();
+    // load 之后调用：引擎里今天的已实现还是 0（状态文件里没有今天的数）时，
+    // 用成交历史补上
+    void seed_day_from_history(const std::vector<TrendTrade>& trades);
+
+    // 作废这个运行器：正在跑的那一轮扫描完成后【不落地】、不写状态文件。
+    // GUI 断线重连会连引擎一起重建运行器，旧的那轮扫描若照常落地，会把结果写进
+    // 已经不用的旧引擎，还和新运行器抢同一个状态文件
+    void cancel();
 
 private:
     void apply_engine_gates_locked();
@@ -96,6 +121,10 @@ private:
     Report             last_;
     int64_t            next_due_ms_ = 0;   // 0 = 立刻
     std::mutex         run_mtx_;           // run_once 不重入
+    std::atomic<bool>  cancelled_{false};
+    // 连续扫描失败的轮数。只有第一轮失败走告警（webhook），之后只记日志，
+    // 恢复时说一声——长时间断网不至于每小时推一条同样的话
+    int                fail_streak_ = 0;
 };
 
 } // namespace ccbot

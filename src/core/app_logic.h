@@ -147,4 +147,14 @@ inline ReverseMigration migrate_reverse_mode(bool allow_reverse, bool needs_sign
     return m;
 }
 
+// ── 恢复暂停的 bot：价格是不是已经越过了止损线 ─────────────────────────────
+// 暂停期间本地止损线不动、价格在动。恢复后第一拍发现已经在线外，就会立刻市价平仓，
+// 成交价可能比止损线差很多——这件事要在点"继续"之前说出来，而不是事后在日志里看到。
+// 返回越过的幅度（% of 止损线，>0 = 已越过）；数据不全返回 0（不拦）
+inline double resume_overshoot_pct(trend::Pos pos, double price, double stop) {
+    if (pos == trend::Pos::Flat || !(price > 0) || !(stop > 0)) return 0;
+    const double d = (pos == trend::Pos::Long) ? (stop - price) : (price - stop);
+    return d > 0 ? d / stop * 100.0 : 0;
+}
+
 } // namespace ccbot::app

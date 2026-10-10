@@ -63,6 +63,8 @@ void MainWindow::load_smart_cfg() {
 
 void MainWindow::startSmartRunner() {
     if (!trend_engine_ || !client_) return;
+    // 断线重连：旧运行器持有旧引擎，它若有一轮扫描在跑，作废掉——不落地、不写文件
+    if (smart_) smart_->cancel();
     smart_ = std::make_shared<SmartRunner>(
         client_, trend_engine_, smart_state_path(),
         [this](const std::string& m, bool warn) {
@@ -83,6 +85,8 @@ void MainWindow::startSmartRunner() {
                                   Qt::QueuedConnection);
     };
     smart_->load();
+    // 状态文件里没有今天的数（升级后第一次运行）：用成交明细补，亏损限额不从 0 算
+    smart_->seed_day_from_history(trades_);
     applySmartConfig(smartCfg_);
     if (smartCfg_.enabled) log("智能模式已启用，稍后开始扫描全市场", "OK");
 }
@@ -256,17 +260,90 @@ void MainWindow::openSmartDialog() {
                        "BTC、ETH、稳定币已内置排除。");
     fGate->addRow("拉黑", eBlack);
 
-    auto* fList = group("名单");
+    auto* fList = group("名单与方向");
+    auto* cbMode = new QComboBox();
+    cbMode->addItem("混合：强势仅多 / 弱势仅空 / 中间多空 / 过热仅空", (int)smart::DirMode::Mixed);
+    cbMode->addItem("突破定方向：全部多空，谁突破做谁", (int)smart::DirMode::Breakout);
+    cbMode->setCurrentIndex(c0.dir_mode == smart::DirMode::Mixed ? 0 : 1);
+    cbMode->setToolTip(
+        "混合：按 7 天相对强弱分段，每段固定方向——跟着趋势走，强势币不逆势做空、弱势币不逆势做多；\n"
+        "  中间段（名额最多）是横盘蓄势、方向未出的币，多空都做，谁突破做谁；\n"
+        "  7 天内单日暴涨 ≥ 过热阈值的币单独一段，只做空（等它派发回落）。\n"
+        "突破定方向：不分段，所有自动 bot 都是多空。");
+    fList->addRow("方向模式", cbMode);
+
+    // 混合模式的名额与门槛
+    auto* sSn_ = ispin(0, 200, c0.strong_n, " 个");
+    auto* sWn  = ispin(0, 200, c0.weak_n, " 个");
+    auto* sMn  = ispin(0, 200, c0.mid_n, " 个");
+    auto* sHn  = ispin(0, 200, c0.hot_n, " 个");
+    auto* quotaRow = new QHBoxLayout();
+    quotaRow->addWidget(new QLabel("强"));  quotaRow->addWidget(sSn_);
+    quotaRow->addWidget(new QLabel("弱"));  quotaRow->addWidget(sWn);
+    quotaRow->addWidget(new QLabel("中"));  quotaRow->addWidget(sMn);
+    quotaRow->addWidget(new QLabel("过热")); quotaRow->addWidget(sHn);
+    quotaRow->addStretch();
+    fList->addRow("各段名额", quotaRow);
+    auto* sEnter = dspin(1, 49, 5, 0, c0.seg_enter_pct, " %");
+    auto* sExit  = dspin(1, 49, 5, 0, c0.seg_exit_pct, " %");
+    sEnter->setToolTip("强势：相对强弱排名前这么多、且跑赢 BTC 才进；弱势对称（后这么多、跑输 BTC）。");
+    sExit->setToolTip("掉出这个范围、或强弱翻了符号，连续 2 轮才离开——排名在边界附近浮动时方向不来回变。");
+    auto* segRow = new QHBoxLayout();
+    segRow->addWidget(new QLabel("进"));  segRow->addWidget(sEnter);
+    segRow->addWidget(new QLabel("出"));  segRow->addWidget(sExit);
+    segRow->addStretch();
+    fList->addRow("强弱段门槛", segRow);
+    auto* sTurn  = dspin(0, 1, 0.05, 2, c0.turn_er);
+    sTurn->setToolTip("强势段里 24 根效率比低于 −这个值（在掉头）⇒ 这一轮降为多空；弱势段对称。");
+    fList->addRow("掉头 效率比", sTurn);
+    auto* sHot   = dspin(1, 1000, 5, 0, c0.hot_pct, " %");
+    auto* sCrash = dspin(1, 100, 5, 0, c0.crash_pct, " %");
+    sHot->setToolTip("7 天内任意连续 24 小时涨幅 ≥ 这个 ⇒ 过热段，只做空。\n"
+                     "相对强弱是这一下堆出来的，后面多半是派发、阴跌回原位。");
+    sCrash->setToolTip("7 天内任意连续 24 小时跌幅 ≥ 这个 ⇒ 放到中间段（不进弱势段，做空易被轧）。");
+    auto* hotRow = new QHBoxLayout();
+    hotRow->addWidget(new QLabel("过热 ≥")); hotRow->addWidget(sHot);
+    hotRow->addWidget(new QLabel("暴跌 ≥")); hotRow->addWidget(sCrash);
+    hotRow->addStretch();
+    fList->addRow("单日涨跌", hotRow);
+    auto* sWeakVol = dspin(0, 20, 0.1, 1, c0.weak_vol_ratio, " 倍", "不要求");
+    sWeakVol->setToolTip(
+        "弱势段（仅空）跌破时要求的量比，覆盖模板里的「突破量比」。\n"
+        "下跌不需要有人砸，阴跌缩量是常态——1.5 倍会挡掉一部分真实下跌。\n"
+        "1.0 = 不低于均量：挡明显缩量的假跌破、放行正常阴跌。0 = 不要求。\n"
+        "过热段固定不要求；中间段沿用模板（横盘币缩量跌破多半是洗盘）。\n"
+        "建议先用 1.5，日志里弱势段常见「突破待放量」再往下调。");
+    fList->addRow("弱势段量比≥", sWeakVol);
+
+    // 突破模式的名额
     auto* sLn = ispin(0, 200, c0.long_n, " 个");
     auto* sSn = ispin(0, 200, c0.short_n, " 个");
-    fList->addRow("做多名单取前", sLn);
-    fList->addRow("做空名单取前", sSn);
+    auto* lsRow = new QHBoxLayout();
+    lsRow->addWidget(new QLabel("做多")); lsRow->addWidget(sLn);
+    lsRow->addWidget(new QLabel("做空")); lsRow->addWidget(sSn);
+    lsRow->addStretch();
+    fList->addRow("名单名额", lsRow);
+    // 只启用当前模式用得上的那些
+    {
+        auto sync = [=]() {
+            const bool mixed = (smart::DirMode)cbMode->currentData().toInt() == smart::DirMode::Mixed;
+            for (QWidget* w : std::initializer_list<QWidget*>{sSn_, sWn, sMn, sHn, sEnter, sExit,
+                                                               sTurn, sHot, sCrash, sWeakVol})
+                w->setEnabled(mixed);
+            sLn->setEnabled(!mixed);
+            sSn->setEnabled(!mixed);
+        };
+        sync();
+        connect(cbMode, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg,
+                [sync](int) { sync(); });
+    }
     auto* sMin = dspin(0, 100, 5, 0, c0.min_score, " 分");
     sMin->setToolTip("排名是相对的，行情清淡时前几名也可能很平庸——低于这个分不进名单。");
     fList->addRow("最低综合分", sMin);
     auto* note = new QLabel("淘汰：空仓时掉出前 1.5N 且连续 2 轮、加入满 24 小时才移除；"
                             "硬门槛不合格立即移除；持仓中绝不移除，等这笔走完。"
-                            "一笔走完后 bot 保留，继续等下一次突破。");
+                            "一笔走完后 bot 保留，继续等下一次突破。"
+                            "混合模式下币换了段，空仓时 bot 跟着换方向，持仓中的等走完。");
     note->setWordWrap(true);
     note->setStyleSheet("color:#8b949e;font-size:11px;");
     fList->addRow(note);
@@ -347,8 +424,9 @@ void MainWindow::openSmartDialog() {
     // ── 名单页 ────────────────────────────────────────────────────────────
     const auto rep = smart_ ? smart_->last_report() : SmartRunner::Report{};
     auto mkTable = [](const std::vector<SmartRunner::Row>& rows) {
-        auto* t = new QTableWidget((int)rows.size(), 7);
-        t->setHorizontalHeaderLabels({"#", "品种", "综合分", "ATR%", "箱体/ATR", "量能抬升", "已开 bot"});
+        auto* t = new QTableWidget((int)rows.size(), 9);
+        t->setHorizontalHeaderLabels({"#", "品种", "分数", "强弱", "7天最大单日涨",
+                                      "ATR%", "箱体/ATR", "量能抬升", "已开 bot"});
         t->verticalHeader()->setVisible(false);
         t->setEditTriggers(QAbstractItemView::NoEditTriggers);
         t->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -363,15 +441,20 @@ void MainWindow::openSmartDialog() {
             set(0, QString::number(r.rank));
             set(1, QString::fromStdString(r.symbol));
             set(2, QString::number(r.score, 'f', 0));
-            set(3, QString::number(r.atr_pct, 'f', 2));
-            set(4, QString::number(r.box12_atr, 'f', 1));
-            set(5, QString::number(r.vol_lift, 'f', 2) + "x");
-            set(6, r.has_bot ? "✓" : "");
+            set(3, QString("%1%2").arg(r.rs >= 0 ? "+" : "").arg(r.rs, 0, 'f', 2));
+            set(4, QString::number(r.max_up24, 'f', 0) + "%");
+            set(5, QString::number(r.atr_pct, 'f', 2));
+            set(6, QString::number(r.box12_atr, 'f', 1));
+            set(7, QString::number(r.vol_lift, 'f', 2) + "x");
+            set(8, r.has_bot ? "✓" : "");
         }
         return t;
     };
-    tabs->addTab(mkTable(rep.longs),  QString("做多名单（%1）").arg(rep.longs.size()));
-    tabs->addTab(mkTable(rep.shorts), QString("做空名单（%1）").arg(rep.shorts.size()));
+    // 突破模式两页（做多 / 做空），混合模式四页（强势 / 弱势 / 中间 / 过热）
+    for (const auto& g : rep.groups)
+        tabs->addTab(mkTable(g.rows), QString("%1 %2/%3")
+                                          .arg(QString::fromStdString(g.title))
+                                          .arg(g.rows.size()).arg(g.quota));
 
     // ── 状态行 ────────────────────────────────────────────────────────────
     {
@@ -410,6 +493,17 @@ void MainWindow::openSmartDialog() {
             s = s.trimmed().toUpper();
             if (!s.isEmpty()) c.blacklist.insert(s.toStdString());
         }
+        c.dir_mode  = (smart::DirMode)cbMode->currentData().toInt();
+        c.strong_n  = sSn_->value();
+        c.weak_n    = sWn->value();
+        c.mid_n     = sMn->value();
+        c.hot_n     = sHn->value();
+        c.seg_enter_pct = sEnter->value();
+        c.seg_exit_pct  = sExit->value();
+        c.turn_er   = sTurn->value();
+        c.hot_pct   = sHot->value();
+        c.crash_pct = sCrash->value();
+        c.weak_vol_ratio = sWeakVol->value();
         c.long_n    = sLn->value();
         c.short_n   = sSn->value();
         c.min_score = sMin->value();

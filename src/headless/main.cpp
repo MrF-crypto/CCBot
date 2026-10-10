@@ -148,26 +148,27 @@ static int run_scan_only(const std::string& config_path) {
         return 1;
     }
     const auto& rk = scan.outcome.ranking;
+    // 混合模式先分段。预览没有历史，全部按新币的进段门槛判
+    std::map<std::string, smart::SegState> no_history;
+    const auto seg = smart::segment(rk, sc, no_history);
+    const auto groups = SmartRunner::build_groups(rk, seg, sc, {});
     std::cout << "USDT 永续 " << scan.universe << " 个，过门槛 " << scan.passed_gate
-              << "，特征合格 " << scan.eligible << "，做多名单 " << rk.longs.size()
-              << "，做空名单 " << rk.shorts.size() << "（≥" << sc.min_score << " 分），用时 "
-              << secs << " 秒\n";
-    auto dump = [&](const char* title, const std::vector<std::string>& list, bool lng, int n) {
-        std::cout << "\n── " << title << "（前 " << std::min<int>(n, (int)list.size()) << "）──\n"
-                  << "  #  品种              分数  ATR%  箱体/ATR  压缩  横盘48  量能   位置  强弱   效率比\n";
-        for (int i = 0; i < (int)list.size() && i < n; ++i) {
-            const auto& r = rk.rows.at(list[i]);
-            const auto& f = r.f;
+              << "，特征合格 " << scan.eligible << "，方向模式："
+              << (sc.dir_mode == smart::DirMode::Mixed ? "混合" : "突破定方向")
+              << "，最低 " << sc.min_score << " 分，用时 " << secs << " 秒\n";
+    for (const auto& g : groups) {
+        std::cout << "\n── " << g.title << "  " << g.rows.size() << "/" << g.quota << " ──\n"
+                  << "  #  品种              分数  强弱  7天最大单日涨 效率比  ATR%  箱体/ATR  量能\n";
+        for (const auto& r : g.rows) {
+            const auto& f = rk.rows.at(r.symbol).f;
             char line[256];
             std::snprintf(line, sizeof(line),
-                          "%3d  %-16s %5.1f %5.2f %8.1f %5.2f %7.1f %5.2fx %5.2f %+5.2f %+6.2f\n",
-                          i + 1, list[i].c_str(), lng ? r.long_score : r.short_score, f.atr_pct,
-                          f.box12_atr, f.atr_ratio, f.box48_atr, f.vol_lift, f.pos12, f.rs, f.er24);
+                          "%3d  %-16s %5.1f %+5.2f %10.0f%% %+6.2f %5.2f %8.1f %5.2fx\n",
+                          r.rank, r.symbol.c_str(), r.score, f.rs, f.max_up24, f.er24,
+                          f.atr_pct, f.box12_atr, f.vol_lift);
             std::cout << line;
         }
-    };
-    if (sc.dir_long)  dump("做多名单", rk.longs,  true,  sc.long_n);
-    if (sc.dir_short) dump("做空名单", rk.shorts, false, sc.short_n);
+    }
     return 0;
 }
 
@@ -389,6 +390,8 @@ int main(int argc, char** argv) {
         sym_add_q.erase(s);
     };
     smart->load();
+    // 状态文件里没有今天的数（升级后第一次运行）：用成交 CSV 补，亏损限额不从 0 算
+    smart->seed_day_from_history(load_trades_csv(trades_csv));
     smart->set_config(cfg.smart);
     if (cfg.smart.enabled) {
         const auto& sc = cfg.smart;

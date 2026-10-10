@@ -32,6 +32,9 @@ struct FakeMarket {
         int64_t onboard_ms = kNow - 100 * kDay;
         std::string status = "TRADING";
         int64_t delivery_ms = 4133404800000LL;
+        // 第 140 根起价格整体乘 (1+pump)：一根K线里暴涨。
+        // ⚠ 放在最后：上面几个字段有用例按位置花括号初始化
+        double  pump = 0;
     };
     std::map<std::string, Sym> syms;
     bool fail_info = false, fail_t24 = false;
@@ -74,10 +77,12 @@ struct FakeMarket {
     std::string klines(const std::string& sym) const {
         const auto it = syms.find(sym);
         const double slope = (it == syms.end()) ? 0 : it->second.slope;
+        const double pump  = (it == syms.end()) ? 0 : it->second.pump;
         std::string b = "[";
         double prev = 100;
         for (int i = 0; i < 201; ++i) {
-            const double c = 100 + slope * (i - 200) + ((i % 2) ? 0.6 : -0.6);
+            double c = 100 + slope * (i - 200) + ((i % 2) ? 0.6 : -0.6);
+            if (i >= 140) c *= (1.0 + pump);
             const double h = std::max(prev, c) + 1, l = std::min(prev, c) - 1;
             b += std::string(i ? "," : "") + "[" + std::to_string(kNow - (201 - i) * 3600000LL) + ",\"" +
                  std::to_string(prev) + "\",\"" + std::to_string(h) + "\",\"" + std::to_string(l) + "\",\"" +
@@ -119,14 +124,19 @@ struct Rig {
         h.submit = [](std::function<void()> fn) { fn(); };
         eng = std::make_shared<TrendEngine>(tc, h);
         std::filesystem::remove(path);
+        // 告警（会推 webhook）带 "W:" 前缀，方便断言去重
         run = std::make_unique<SmartRunner>(tc, eng, path,
-                                            [this](const std::string& m, bool) { logs.push_back(m); });
+                                            [this](const std::string& m, bool warn) {
+                                                logs.push_back((warn ? "W:" : "I:") + m);
+                                            });
         run->on_symbol_added   = [this](const std::string& s) { subs.insert(s); };
         run->on_symbol_removed = [this](const std::string& s) { subs.erase(s); };
     }
+    // 默认按突破模式（两份名单）——下面大部分用例测的是那一套；混合模式单独一段
     smart::Config cfg(int ln = 2, int sn = 2) {
         smart::Config c;
         c.enabled = true;
+        c.dir_mode = smart::DirMode::Breakout;
         c.long_n = ln; c.short_n = sn;
         c.min_score = 0;
         return c;
@@ -279,6 +289,110 @@ int main() {
         int autos = 0;
         for (const auto& b : r.eng->get_bots()) if (b.is_auto) ++autos;
         check(autos == 0 && r.has_bot("FLATUSDT"), "关闭：空仓自动 bot 全部移除，手动 bot 保留");
+    }
+
+    // ── 混合模式：强势仅多 / 弱势仅空 / 中间多空 / 过热仅空 ─────────────────────
+    {
+        Rig r(dir + "/m.json");
+        auto& m = r.mk.syms;
+        m["UPAUSDT"].slope  = 0.05;    // 最强（除了暴涨币）⇒ 强势
+        m["UPBUSDT"].slope  = 0.02;    // 偏强但没进前 30% ⇒ 中间
+        m["DNAUSDT"].slope  = -0.05;   // 弱 ⇒ 弱势
+        m["DNBUSDT"].slope  = -0.03;
+        m["FLATUSDT"].slope = 0;       // 横着 ⇒ 中间
+        m["FLAT2USDT"].slope = 0;
+        m["PUMPUSDT"].pump  = 0.9;     // 一根K线涨 90% ⇒ 过热
+        m["BTCUSDT"].slope  = 0;
+        auto c = r.cfg();
+        c.dir_mode = smart::DirMode::Mixed;
+        c.weak_vol_ratio = 1.0;
+        r.run->set_config(c);
+        const auto rep = r.run->run_once(kNow);
+        check(rep.ok && rep.groups.size() == 4, "混合模式：名单分四组（强 / 弱 / 中 / 过热）");
+        auto dir_of = [&](const std::string& s) { return r.bot(s).cfg.rule.direction; };
+        auto seg_of = [&](const std::string& s) { return r.bot(s).smart_list; };
+        check(seg_of("UPAUSDT") == smart::kSegStrong && dir_of("UPAUSDT") == trend::Direction::LongOnly,
+              "  强势币：强势段、仅多");
+        check(seg_of("DNAUSDT") == smart::kSegWeak && dir_of("DNAUSDT") == trend::Direction::ShortOnly,
+              "  弱势币：弱势段、仅空");
+        check(seg_of("FLATUSDT") == smart::kSegMid && dir_of("FLATUSDT") == trend::Direction::Both,
+              "  横盘币：中间段、多空（谁突破做谁）");
+        check(seg_of("PUMPUSDT") == smart::kSegHot && dir_of("PUMPUSDT") == trend::Direction::ShortOnly,
+              "  单日暴涨 90% 的币：过热段、仅空（不因强弱分高就去做多）");
+        check(r.bot("PUMPUSDT").cfg.rule.breakout_vol_ratio == 0,
+              "  过热段不要求量比（暴涨后的回落多是缩量阴跌）");
+        check(r.bot("DNAUSDT").cfg.rule.breakout_vol_ratio == 1.0,
+              "  弱势段用自己的量比设置（这里设成 1.0）");
+        check(r.bot("FLATUSDT").cfg.rule.breakout_vol_ratio == c.tmpl.rule.breakout_vol_ratio &&
+              c.tmpl.rule.breakout_vol_ratio > 0,
+              "  中间段照常要量比（横盘币缩量跌破多半是洗盘）");
+        check(has(rep.summary, "强势") && has(rep.summary, "过热"), "  汇总里按段列出");
+
+        // 只勾做多：弱势、过热不加；中间段只做多
+        Rig r2(dir + "/m2.json");
+        r2.mk.syms = m;
+        auto c2 = c; c2.dir_short = false;
+        r2.run->set_config(c2);
+        r2.run->run_once(kNow);
+        check(!r2.has_bot("DNAUSDT") && !r2.has_bot("PUMPUSDT"), "只勾做多：弱势段、过热段不加");
+        check(r2.bot("FLATUSDT").cfg.rule.direction == trend::Direction::LongOnly,
+              "  中间段只做多（与勾选取交集）");
+    }
+
+    // ── 扫描连续失败：只有第一轮告警（推 webhook），之后只记日志，恢复时说一声 ──
+    {
+        Rig r(dir + "/g.json");
+        basic_market(r.mk);
+        r.run->set_config(r.cfg());
+        r.mk.fail_info = true;
+        for (int i = 0; i < 3; ++i) { r.run->force(); r.run->run_once(kNow + i * 3600000LL); }
+        int warns = 0, infos = 0;
+        for (const auto& l : r.logs) {
+            if (l.rfind("W:", 0) == 0 && has(l, "扫描失败")) ++warns;
+            if (l.rfind("I:", 0) == 0 && has(l, "扫描失败")) ++infos;
+        }
+        check(warns == 1 && infos == 2, "连续失败 3 轮：告警 1 次，其余只记日志（实际 告警 " +
+                                        std::to_string(warns) + " / 日志 " + std::to_string(infos) + "）");
+        check(has(r.all_logs(), "已连续 3 轮"), "  日志里写明连续几轮");
+        r.mk.fail_info = false;
+        r.run->force();
+        r.run->run_once(kNow + 5 * 3600000LL);
+        check(has(r.all_logs(), "扫描已恢复（此前连续失败 3 轮）"), "  恢复时说一声");
+    }
+
+    // ── 作废的运行器：正在跑的那轮不落地、不写文件 ────────────────────────────
+    {
+        Rig r(dir + "/h.json");
+        basic_market(r.mk);
+        r.run->set_config(r.cfg());
+        r.run->cancel();
+        r.run->run_once(kNow);
+        int autos = 0;
+        for (const auto& b : r.eng->get_bots()) if (b.is_auto) ++autos;
+        check(autos == 0, "作废后：扫描结果不落地（断线重连时旧运行器不往旧引擎里加 bot）");
+        r.run->housekeep(kNow);
+        check(!std::filesystem::exists(r.path), "  也不写状态文件（不和新运行器抢）");
+    }
+
+    // ── 当日已实现：状态文件里没有就用成交历史补 ───────────────────────────────
+    {
+        const auto now = std::chrono::system_clock::now();
+        const int64_t today = TrendEngine::utc_day(now);
+        std::vector<TrendTrade> tr(3);
+        tr[0].close_time = now;                         tr[0].pnl = -10; tr[0].entry_price = 100; tr[0].exit_price = 95; tr[0].qty = 2;
+        tr[1].close_time = now;                         tr[1].pnl = 4;   tr[1].entry_price = 50;  tr[1].exit_price = 52; tr[1].qty = 1;
+        tr[2].close_time = now - std::chrono::hours(48); tr[2].pnl = -99; tr[2].entry_price = 1;  tr[2].exit_price = 1;  tr[2].qty = 1;
+        const double want = (-10 - (100 + 95) * 2 * TrendEngine::kEstFeeRate) +
+                            (4 - (50 + 52) * 1 * TrendEngine::kEstFeeRate);
+        check(std::fabs(sum_day_realized(tr, today) - want) < 1e-9,
+              "按成交历史算今天的已实现：只算今天的，扣估算手续费（与引擎同口径）");
+
+        Rig r(dir + "/i.json");
+        r.run->seed_day_from_history(tr);
+        check(std::fabs(r.eng->day_pnl().realized - want) < 1e-9, "状态里没有今天的数：用历史补上");
+        r.eng->restore_day_pnl({today, -1});
+        r.run->seed_day_from_history(tr);
+        check(r.eng->day_pnl().realized == -1, "状态里已有今天的数：以状态为准，不覆盖");
     }
 
     // ── 池状态与当日盈亏落盘 ─────────────────────────────────────────────────
