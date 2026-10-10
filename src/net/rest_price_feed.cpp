@@ -145,11 +145,10 @@ void RestPriceFeed::loop() {
             const int n = fail_streak_.fetch_add(1) + 1;
             // ⚠ 只在【第一次】失败时报。1 秒一轮，每轮都报就是刷屏——
             //   而"还在失败"这个事实由界面的健康指示器持续呈现，不需要日志复述
+            // 一行：发生了什么、后果、要不要人管。为什么不撤保护写在 RestPriceFeed 的头注释里
             if (!fail_reported_.exchange(true))
-                say("⚠ 行情拉取失败（REST 轮询第 " + std::to_string(n) +
-                    " 轮）。已有价格在 " + std::to_string(kStaleMs / 1000) +
-                    " 秒后转为陈旧，届时引擎会停止开新仓；已持仓的移动止损"
-                    "沿用最后一条有效线，不会因为拿不到数据而撤掉保护");
+                say("⚠ 行情拉取失败（第 " + std::to_string(n) + " 轮），" +
+                    std::to_string(kStaleMs / 1000) + " 秒内恢复不了就暂停开新仓；持仓止损照常");
         }
 
         // ② 24h 涨跌：只用于显示，30 秒一轮足够（权重 40，拉太密不值）

@@ -19,6 +19,8 @@ constexpr int64_t kHourMs = 3600LL * 1000;
 // 交割日期在这么久以内就算"即将下架"。永续的交割日期是 2100 年，币安公告下架后
 // 会把它改到下架那天——提前一个月起就不再新加，持仓中的醒目告警
 constexpr int64_t kDelistHorizonMs = 30 * kDayMs;
+// 批量淘汰保护的下限：池子很小时（比如只剩 3 个）一轮淘汰 2 个是正常的
+constexpr int kMassRemoveMin = 4;
 
 std::string fmt(double v, int prec) {
     std::ostringstream o;
@@ -296,6 +298,10 @@ Plan Pool::plan(const ScanOutcome& scan, const std::vector<BotView>& bots,
     int auto_count = 0;
     for (const auto& b : bots) present.insert(b.symbol);
 
+    // 本轮准备移除的（先攒着，最后过一道"批量淘汰"保护再落定）
+    std::vector<std::pair<Plan::Remove, Plan::Meta>> rm;
+    int judged = 0;   // 本轮真正被评判过的空仓自动 bot（拿到了数据、没停止）
+
     for (const auto& b : bots) {
         if (!b.is_auto) continue;
         ++auto_count;
@@ -334,24 +340,40 @@ Plan Pool::plan(const ScanOutcome& scan, const std::vector<BotView>& bots,
         // 已停止的：是你或对账停的，可能有要看的原因，不替你删
         if (b.stopped) { p.meta.push_back(m); continue; }
 
+        ++judged;
         if (hard != scan.hard_fail.end()) {
-            p.remove.push_back({b.bot_id, b.symbol, hard->second});
-            --auto_count;
+            rm.push_back({{b.bot_id, b.symbol, hard->second}, m});
             continue;
         }
         if (!in_list) {
             ++e.miss_scans;
             const bool old_enough = now_ms - e.added_ms >= cfg.min_residence_h * kHourMs;
             if (e.miss_scans >= cfg.drop_after_scans && old_enough) {
-                p.remove.push_back({b.bot_id, b.symbol,
-                                    "连续 " + std::to_string(e.miss_scans) + " 轮掉出名单"});
-                --auto_count;
+                rm.push_back({{b.bot_id, b.symbol,
+                               "连续 " + std::to_string(e.miss_scans) + " 轮掉出名单"}, m});
                 continue;
             }
         } else {
             e.miss_scans = 0;
         }
         p.meta.push_back(m);
+    }
+
+    // ── 批量淘汰保护 ──
+    // 一轮里过半的自动 bot 同时被判出局，正常行情里几乎不会发生；更可能是数据
+    // 本身出了问题（交易所改了字段名、某个字段解析成 0）——那就是"拿到的不是
+    // 我以为的那个"，照单执行会一轮删光整个池子。这一轮一个都不删，告警，
+    // 下一轮再看。持续成立的话每轮都会再拦、再告警
+    if ((int)rm.size() >= kMassRemoveMin && (int)rm.size() * 2 > judged) {
+        p.alerts.push_back("智能模式：本轮 " + std::to_string(rm.size()) + "/" +
+                           std::to_string(judged) + " 个自动 bot 同时被判出局，疑似数据异常，"
+                           "这一轮不移除，下一轮再看");
+        for (const auto& x : rm) p.meta.push_back(x.second);
+    } else {
+        for (const auto& x : rm) {
+            p.remove.push_back(x.first);
+            --auto_count;
+        }
     }
 
     // 补位：两份名单各取前 N，按分数统一排队，直到填满容量

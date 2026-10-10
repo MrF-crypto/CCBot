@@ -268,10 +268,6 @@ std::string MainWindow::funding_path() const {
     return (portable_data_dir() + "/ccg_funding.json").toStdString();
 }
 
-std::string MainWindow::fee_path() const {
-    return (portable_data_dir() + "/ccg_fees.json").toStdString();
-}
-
 std::string MainWindow::stats_path() const {
     return (portable_data_dir() + "/ccg_trade_stats.json").toStdString();
 }
@@ -885,14 +881,11 @@ void MainWindow::buildUi() {
         fundLabel_->setVisible(false);
         row->addWidget(fundLabel_);
 
-        // 累计手续费：交易所实际扣掉的（资金流水 COMMISSION），只统计各品种
-        // 有 bot 的那些时间段。v5.9.10 之前这个位置是"盈亏"徽标
-        feeBadge_ = new QLabel("手续费 $0.00");
-        feeBadge_->setStyleSheet(
-            "QLabel{color:#8b949e;font-size:11px;background:#21262d;"
-            "border-radius:8px;padding:2px 8px;}");
-        row->addSpacing(10);
-        row->addWidget(feeBadge_);
+        // v5.9.10 起这里有一个"累计手续费"徽标，v5.10.0 随手续费账本移除：
+        // 它要逐品种向交易所拉资金流水（/fapi/v1/income 每次权重 30），智能模式
+        // 一百个品种时一次同步约 3000 权重，超过每分钟 2400 的上限——限流闸门会把
+        // 价格轮询也一起挡住，本地追踪止损每小时冻结约一分钟。为一个展示用的数字
+        // 冒这个险不值。代码在 v5.9.10 的 tag 里（core/fee_ledger.*）
 
         row->addStretch();
 
@@ -1193,9 +1186,6 @@ void MainWindow::onConnect() {
                     save_trade_stats();
                     refreshStats();
                     save_trend_bots();
-                    // 平仓后约 1 分钟同步一次手续费，别让顶部数字等将近一小时才变
-                    const qint64 soon = QDateTime::currentMSecsSinceEpoch() + 60 * 1000;
-                    if (nextFeeSyncMs_ == 0 || soon < nextFeeSyncMs_) nextFeeSyncMs_ = soon;
                     // 交易所侧灾难止损触发时本地【收不到】这个回调——它在周期
                     // 对账里表现为一条"交易所已无此仓位"，告警走那条路
                 }, Qt::QueuedConnection);
@@ -1252,16 +1242,6 @@ void MainWindow::onConnect() {
             // 智能模式：运行器持有引擎指针，随引擎一起重建
             startSmartRunner();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
-            // 手续费账本。第一次运行新版本时用成交明细补出各品种的时间段，
-            // 之后由 reconcileFeeSpans 按当前 bot 列表开/关
-            if (!feesReady_) {
-                fees_.load(fee_path());
-                if (!fees_.backfilled()) backfillFeeSpans();
-                reconcileFeeSpans();
-                feesReady_     = true;
-                nextFeeSyncMs_ = QDateTime::currentMSecsSinceEpoch();   // 尽快同步一次
-                refreshFeeBadge();
-            }
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
             // 本地状态是错的，带着错误均价继续跑会把止盈止损全算错
@@ -1376,114 +1356,6 @@ void MainWindow::refreshFunding() {
             fundFetchBusy_.store(false);
         }, Qt::QueuedConnection);
     });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 手续费账本
-//
-// 口径见 core/fee_ledger.h：只统计各品种"有 bot 的那些时间段"里交易所实际扣掉的
-// 手续费。时间段不在删除按钮、清除按钮、改参数这几个入口里逐一维护 —— 入口多，
-// 漏一个就是一段永远不关的时间段。改成每拍拿当前 bot 列表对一遍：
-//   · 新出现的品种开一段，从列表里消失的品种关掉
-//   · 改策略参数是"删了再建"，在同一个函数里连续完成，对的时候品种一直在列表里，
-//     时间段不会被切断
-// ─────────────────────────────────────────────────────────────────────────────
-void MainWindow::reconcileFeeSpans() {
-    if (!trend_engine_) return;
-    std::set<std::string> active;
-    for (const auto& b : trend_engine_->get_bots()) active.insert(b.cfg.symbol);
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (fees_.reconcile_active(active, now)) {
-        fees_.save(fee_path());
-        // 有品种刚被删掉：它的最后那笔平仓手续费要在删除后 kGraceMs 内补拉，
-        // 别等到下一个整点
-        const qint64 after_grace = now + FeeLedger::kGraceMs + 30 * 1000;
-        if (nextFeeSyncMs_ == 0 || after_grace < nextFeeSyncMs_) nextFeeSyncMs_ = after_grace;
-    }
-}
-
-// 第一次运行新版本：用成交明细补出各品种的时间段。
-//
-// ⚠ 不能用 bot 的启动时间：start_time 不落盘，每次启动恢复出来的 bot 启动时间都是
-//   "现在"。改用成交明细：每个品种以最早一笔平仓往前推 7 天作为起点（把第一笔的
-//   开仓手续费也包进去），已删除的 bot 以最后一笔平仓之后 1 分钟作为终点。
-//   代价是这 7 天里如果手动交易过同一品种，也会被算进来
-void MainWindow::backfillFeeSpans() {
-    constexpr qint64 kLead = 7LL * 24 * 3600 * 1000;
-    std::map<std::string, std::pair<qint64, qint64>> range;   // 品种 → (最早, 最晚) 平仓时刻
-    for (const auto& t : trades_) {
-        const qint64 ms = tp_to_ms(t.close_time);
-        if (ms <= 0 || t.symbol.empty()) continue;
-        auto it = range.find(t.symbol);
-        if (it == range.end()) range[t.symbol] = {ms, ms};
-        else { it->second.first = std::min(it->second.first, ms);
-               it->second.second = std::max(it->second.second, ms); }
-    }
-    std::set<std::string> active;
-    if (trend_engine_)
-        for (const auto& b : trend_engine_->get_bots()) active.insert(b.cfg.symbol);
-    for (const auto& [sym, r] : range) {
-        if (active.count(sym)) fees_.open_span(sym, r.first - kLead);
-        else                   fees_.add_closed_span(sym, r.first - kLead, r.second + 60 * 1000);
-    }
-    fees_.set_backfilled(true);
-    fees_.save(fee_path());
-    if (!range.empty())
-        log(QString("手续费账本：按成交明细补算 %1 个品种的历史手续费（最多往回约 90 天）")
-                .arg(range.size()));
-}
-
-void MainWindow::syncFees() {
-    if (!client_) return;
-    if (feeFetchBusy_.exchange(true)) return;   // 上一批没跑完就跳过
-    // 先排上下一次的常规同步；同步途中又有平仓的话，回调会把它提前
-    nextFeeSyncMs_ = QDateTime::currentMSecsSinceEpoch() + 3600LL * 1000;
-    run_async([this]() {
-        bool ok = true;
-        const int added = sync_fee_ledger(*client_, fees_, QDateTime::currentMSecsSinceEpoch(), &ok);
-        QMetaObject::invokeMethod(this, [this, added, ok]() {
-            fees_.save(fee_path());
-            refreshFeeBadge();
-            // 没拉全的品种不会被标成已同步（见 fee_ledger），这里只需要早点重试
-            if (!ok) {
-                const qint64 retry = QDateTime::currentMSecsSinceEpoch() + 5 * 60 * 1000;
-                if (retry < nextFeeSyncMs_) nextFeeSyncMs_ = retry;
-            }
-            (void)added;
-            feeFetchBusy_.store(false);
-        }, Qt::QueuedConnection);
-    });
-}
-
-void MainWindow::refreshFeeBadge() {
-    if (!feeBadge_) return;
-    const double total = fees_.total();
-    feeBadge_->setText("手续费 " + signed_money(total));
-    const QString bg = (total < -0.005) ? "#3d1a1a" : "#21262d";
-    feeBadge_->setStyleSheet(QString(
-        "QLabel{color:%1;font-size:11px;background:%2;border-radius:8px;padding:2px 8px;}")
-        .arg(money_color(total), bg));
-
-    // 悬停：各品种明细，按付出的多少排序
-    std::vector<std::pair<double, std::string>> rows;
-    int skipped = 0;
-    for (const auto& s : fees_.symbols()) {
-        const auto e = fees_.get(s);
-        skipped += e.skipped_asset;
-        if (e.count > 0) rows.push_back({e.total, s});
-    }
-    std::sort(rows.begin(), rows.end());
-    QString tip = "交易所实际扣掉的手续费（资金流水），按 USDT 计。\n"
-                  "只统计每个品种有 bot 的那些时间段，删掉的 bot 也算在内；\n"
-                  "这些时间段里你在 App 上手动交易同一品种，手续费也会算进来。\n";
-    if (!rows.empty()) {
-        tip += "\n";
-        for (const auto& [v, s] : rows)
-            tip += QString("  %1  %2\n").arg(QString::fromStdString(s), -14).arg(signed_money(v));
-    }
-    if (skipped > 0)
-        tip += QString("\n另有 %1 条不是 USDT 计价的流水（如 BNB 抵扣），没有计入。").arg(skipped);
-    feeBadge_->setToolTip(tip.trimmed());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1915,6 +1787,9 @@ void MainWindow::onTick() {
     // 趋势策略要的 ATR 与唐奇安通道走上面那条独立的信号拉取，节奏也不同
     // （按各 bot 自己的 K 线周期，而不是固定 5 分钟）
 
+    // 暂停中的 bot 的硬止损补挂：tick 不驱动暂停的 bot，丢了的硬止损要在这里补
+    if (trend_engine_) trend_engine_->maintain_paused_hard_stops();
+
     // 智能模式：到点扫描（后台），否则每分钟做一次轻量维护
     smartTick();
 
@@ -1923,13 +1798,6 @@ void MainWindow::onTick() {
     // 资金费：费率每 100 tick（约5分钟）刷一次，历史流水每 1200 tick（约1小时）同步一次。
     // 结算本身 8 小时才一次，再密没有意义，纯属浪费限流额度
     if (fundTickCount_++ % 100 == 0) refreshFunding();
-
-    // 手续费：每拍都对一遍 bot 列表（纯内存），到点才向交易所同步
-    if (feesReady_) {
-        reconcileFeeSpans();
-        if (nextFeeSyncMs_ > 0 && QDateTime::currentMSecsSinceEpoch() >= nextFeeSyncMs_)
-            syncFees();
-    }
 
     // 成交明细的延迟落盘：save_trades 做了去抖，被压下的写在这里补上
     if (tradesDirty_) save_trades(true);

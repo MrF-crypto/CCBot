@@ -404,6 +404,70 @@ int main() {
         check(cli2->calls.size() == 1, "  手动 bot 照常突破即开");
     }
 
+    // ── 暂停中：硬止损丢了要补挂；它触发后对账确认时按挂单价记账 ──────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<TrendTrade> trades;
+        eng.set_trade_cb([&](const TrendTrade& t) { trades.push_back(t); });
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        cfg.use_disaster_stop = true;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 110.0;
+        eng.tick("TESTUSDT", 110.0);
+        check(cli->ds_count("place") == 1, "开仓后挂上硬止损");
+        const double dsp = cli->ds_last_price();
+        const double q   = eng.get_bots()[0].qty;
+
+        eng.stop_bot(id);
+        auto iss = eng.reconcile_stop_orders({});          // 交易所挂单列表里没有它了
+        check(!iss.empty() && eng.get_bots()[0].disaster_stop_id.empty(), "暂停中硬止损不见了：清掉单号");
+        eng.tick("TESTUSDT", 109.0);
+        check(cli->ds_count("place") == 1, "  暂停的 bot 不吃 tick，tick 不会补挂");
+        eng.maintain_paused_hard_stops();
+        check(cli->ds_count("place") == 2, "  maintain_paused_hard_stops 补挂上了");
+        eng.maintain_paused_hard_stops();
+        check(cli->ds_count("place") == 2, "  已挂上就不重复挂");
+
+        // 交易所侧仓位没了（硬止损触发）：对账两轮确认
+        advance(10);
+        reconcile(eng, {});
+        check(trades.empty(), "  第 1 轮存疑：先不记账");
+        advance(70);
+        reconcile(eng, {});
+        const auto b = eng.get_bots()[0];
+        const double want = (dsp - 110.0) * q;
+        check(trades.size() == 1 && trades[0].reason.find("硬止损") != std::string::npos,
+              "第 2 轮确认：按硬止损记一笔成交（不再是'外部已平'、一笔都不记）");
+        check(std::fabs(b.realized_pnl - want) < 1e-9 && b.trade_count == 1,
+              "  按挂单价估算盈亏，进 bot 统计");
+        check(eng.day_pnl().realized < want + 1e-9, "  进当日亏损（含估算手续费）");
+        check(b.st.pos == trend::Pos::Flat && b.qty == 0, "  本地状态清空");
+    }
+
+    // ── 交易所有仓位、程序里没有任何 bot：连续 2 轮后报一次 ───────────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        eng.add_bot(mk_cfg("AAAUSDT"));
+        const std::vector<TrendEngine::ExchangePos> ex = {{"ORPHUSDT", 1, 2.5, 10.0}};
+        auto r1 = reconcile(eng, ex);
+        check(r1.empty(), "没有 bot 的持仓：第 1 轮不报（可能是旧快照）");
+        auto r2 = reconcile(eng, ex);
+        bool said = false;
+        for (const auto& s : r2) if (s.find("ORPHUSDT") != std::string::npos &&
+                                     s.find("没有对应的 bot") != std::string::npos) said = true;
+        check(said, "  第 2 轮报：交易所有持仓、程序里没有 bot");
+        auto r3 = reconcile(eng, ex);
+        check(r3.empty(), "  只报一次，不刷屏");
+        reconcile(eng, {});
+        reconcile(eng, ex);
+        auto r5 = reconcile(eng, ex);
+        check(!r5.empty(), "  消失后再出现：重新计数、再报一次");
+    }
+
     // ── 智能模式淘汰与换参数：有持仓、有在途订单都不能动 ─────────────────────
     {
         auto cli = std::make_shared<FakeClient>();

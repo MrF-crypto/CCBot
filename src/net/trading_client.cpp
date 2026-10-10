@@ -1760,57 +1760,6 @@ TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
     return out;
 }
 
-std::vector<TradingClient::IncomeRecord>
-TradingClient::fetch_income(const std::string& income_type, int64_t start_ms, int64_t end_ms,
-                            const std::string& sym, int limit, bool* ok) {
-    if (ok) *ok = false;
-    std::vector<IncomeRecord> out;
-    std::string params = "incomeType=" + income_type +
-                         "&limit=" + std::to_string(std::clamp(limit, 1, 1000));
-    if (!sym.empty())   params += "&symbol=" + sym;
-    if (start_ms > 0)   params += "&startTime=" + std::to_string(start_ms);
-    if (end_ms   > 0)   params += "&endTime="   + std::to_string(end_ms);
-    params += "&recvWindow=5000";
-
-    auto resp = http_get(ep(Ep::Income), params);
-    if (resp.empty()) return out;
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return out;
-    simdjson::dom::array arr;
-    if (doc.get(arr) != simdjson::SUCCESS) return out;   // 错误对象而非数组 ⇒ 没拉成
-
-    // 数字字段币安有时给数字有时给字符串，两种都收
-    auto get_i64 = [](simdjson::dom::element e, int64_t& v) {
-        if (e.get(v) == simdjson::SUCCESS) return true;
-        std::string_view sv;
-        if (e.get(sv) == simdjson::SUCCESS) {
-            try { v = std::stoll(std::string(sv)); return true; } catch (...) {}
-        }
-        return false;
-    };
-    for (auto e : arr) {
-        IncomeRecord r;
-        std::string_view sv;
-        if (e["symbol"].get(sv) == simdjson::SUCCESS) r.symbol = std::string(sv);
-        if (e["asset"].get(sv)  == simdjson::SUCCESS) r.asset  = std::string(sv);
-        if (e["income"].get(sv) == simdjson::SUCCESS) {
-            try { r.income = std::stod(std::string(sv)); } catch (...) { continue; }
-        } else {
-            double d = 0;
-            if (e["income"].get(d) != simdjson::SUCCESS) continue;
-            r.income = d;
-        }
-        get_i64(e["time"], r.time);
-        get_i64(e["tranId"], r.tran_id);
-        if (!r.symbol.empty() && r.time > 0) out.push_back(r);
-    }
-    if (ok) *ok = true;
-    return out;
-}
-
-
 TradingClient::RateStatus TradingClient::rate_status() const {
     auto sn = gate_->snapshot();
     return { sn.used_weight, sn.limit, sn.throttled, sn.rejected, sn.banned, sn.ban_left_ms };

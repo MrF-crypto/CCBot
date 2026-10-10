@@ -519,6 +519,9 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ── 1b) 暂停中的 bot 的硬止损补挂：tick 不驱动暂停的 bot ──────────────
+        trend_engine->maintain_paused_hard_stops();
+
         // ── 1c) 心跳文件（dead-man's switch）：每 tick 写入当前时间戳。
         //     外部看门狗（systemd WatchdogSec / cron）检查这个文件的年龄就能发现
         //     "进程还在但循环卡住"——这是日志和进程存活检查都发现不了的故障

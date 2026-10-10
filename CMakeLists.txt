@@ -98,7 +98,6 @@ find_package(Threads REQUIRED)
 set(CORE_SOURCES
     src/core/trend_engine.cpp
     src/core/funding_ledger.cpp
-    src/core/fee_ledger.cpp
     src/core/smart_mode.cpp
     src/app/smart_runner.cpp
     src/net/trading_client.cpp
@@ -280,7 +279,6 @@ endif()
 
 # ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
 add_executable(ccg_funding_tests tests/test_funding.cpp src/core/funding_ledger.cpp
-                                 src/core/fee_ledger.cpp
                                  src/net/trading_client.cpp
                                  src/net/rate_gate.cpp)
 target_include_directories(ccg_funding_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

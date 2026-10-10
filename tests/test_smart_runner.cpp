@@ -203,6 +203,15 @@ int main() {
         r.run->force();
         rep = r.run->run_once(kNow + 3600000 * 31LL);
         check(!rep.ok && r.eng->get_bots().size() == n0, "24h 行情拉不到（返回 HTML）：同样不动");
+
+        // 字段解析出问题（比如成交额全成了很小的数）：全市场 0 个合格，当数据异常
+        r.mk.fail_t24 = false;
+        for (auto& kv : r.mk.syms) kv.second.quote_vol = 1;
+        r.run->force();
+        rep = r.run->run_once(kNow + 3600000 * 32LL);
+        check(!rep.ok && has(rep.summary, "数据异常") && r.eng->get_bots().size() == n0,
+              "全市场合格为 0：疑似数据异常，整轮作废、bot 一个不动");
+        for (auto& kv : r.mk.syms) kv.second.quote_vol = 20e6;
     }
 
     // ── 单个币的K线拉不到：它是"未知"，不淘汰；成交额掉了：淘汰 ──────────────

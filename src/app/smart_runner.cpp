@@ -133,6 +133,13 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
         return r;
     }
     r.eligible = (int)eligible.size();
+    // 全市场一个合格的都没有：正常行情不会这样，多半是某个字段解析成了 0
+    // （交易所改了格式）。当成数据异常，而不是"今天没有好币"去淘汰整个池子
+    if (r.universe > 0 && r.eligible == 0) {
+        r.error = "全市场合格品种为 0（门槛通过 " + std::to_string(r.passed_gate) +
+                  "），疑似数据异常";
+        return r;
+    }
     out.ranking = smart::rank(eligible, cfg);
     out.ok = true;
     return r;

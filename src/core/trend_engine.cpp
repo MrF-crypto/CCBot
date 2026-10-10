@@ -141,8 +141,10 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
 std::vector<std::string> TrendEngine::reconcile_positions(
         const std::vector<ExchangePos>& exchange,
         std::chrono::milliseconds snapshot_age) {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    std::unique_lock<std::recursive_mutex> lk(mtx_);
     std::vector<std::string> issues;
+    // 硬止损在暂停/离线期间触发、由对账确认的那些平仓。成交回调在锁外发
+    std::vector<TrendTrade> fired;
 
     const auto now = host_.now_steady();
 
@@ -268,9 +270,35 @@ std::vector<std::string> TrendEngine::reconcile_positions(
                           "先不处理，下一轮再确认");
                 continue;
             }
-            note_once(TrendBot::Recon::ExtGone,
-                      b.cfg.symbol + " 本地有仓位但交易所没有（连续 2 轮确认：外部已平/被强平），"
-                      "已清空本地状态并停止该bot");
+            // 硬止损单先前已从挂单列表里消失 ⇒ 最可能是它触发了（暂停中、或程序
+            // 离线时）。按它的触发价记一笔：否则这笔亏损不进 bot 统计、不进成交
+            // 明细，也不进当日亏损限额——风控少算一笔
+            if (b.ds_vanished_price > 0 && b.st.entry_price > 0 && b.qty > 0) {
+                const double sign = (b.st.pos == trend::Pos::Long) ? 1.0 : -1.0;
+                const double px   = b.ds_vanished_price;
+                const double pnl  = (px - b.st.entry_price) * b.qty * sign;
+                b.realized_pnl += pnl;
+                ++b.trade_count;
+                if (pnl > 0) ++b.win_count;
+                book_day(pnl, b.st.entry_price, px, b.qty);
+                TrendTrade tr;
+                tr.symbol      = b.cfg.symbol;
+                tr.side        = b.st.pos;
+                tr.entry_price = b.st.entry_price;
+                tr.exit_price  = px;
+                tr.qty         = b.qty;
+                tr.pnl         = pnl;
+                tr.reason      = "交易所硬止损触发（对账确认，按挂单价估算）";
+                tr.close_time  = host_.now_wall();
+                fired.push_back(tr);
+                note_once(TrendBot::Recon::ExtGone,
+                          b.cfg.symbol + " 交易所硬止损已触发（对账确认）：按 $" + fmt(px) +
+                          " 估算记账 " + fmt(pnl, 2) + "U，已停止该bot");
+            } else {
+                note_once(TrendBot::Recon::ExtGone,
+                          b.cfg.symbol + " 本地有仓位但交易所没有（连续 2 轮确认：外部已平/被强平），"
+                          "已清空本地状态并停止该bot");
+            }
             trend::on_closed(b.st);
             clear_ds_runtime(b);
             // 这条路径【没有】撤单动作（对账在锁内，不能做 HTTP），所以要自己
@@ -327,6 +355,30 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             b.recon_noted = TrendBot::Recon::None;   // 完全一致：允许将来重新报
         }
     }
+
+    // ── 交易所有仓位、程序里没有任何 bot 对应 ─────────────────────────────────
+    // 上面是按 bot 逐个比的，一个品种只要没有 bot，它在交易所上的仓位就完全看不见。
+    // 连续 2 轮才报：刚平仓又刚好被删掉的 bot，在旧快照里还会出现一次
+    {
+        std::set<std::string> tracked;
+        for (const auto& kv : bots_) tracked.insert(kv.second.cfg.symbol);
+        std::set<std::string> seen_now;
+        for (const auto& e : exchange) {
+            if (!(e.qty > 0) || tracked.count(e.symbol)) continue;
+            const std::string key = e.symbol + (e.direction > 0 ? "_L" : "_S");
+            seen_now.insert(key);
+            if (++untracked_seen_[key] == 2)
+                issues.push_back(e.symbol + " 交易所有持仓（" + (e.direction > 0 ? "多 " : "空 ") +
+                                 fmt(e.qty, 8) + "），程序里没有对应的 bot：没有止损保护，请手动处理");
+        }
+        for (auto it = untracked_seen_.begin(); it != untracked_seen_.end();)
+            it = seen_now.count(it->first) ? std::next(it) : untracked_seen_.erase(it);
+    }
+
+    // 成交回调在锁外发：回调方（界面/CSV）不该在引擎锁里跑
+    lk.unlock();
+    if (trade_cb_)
+        for (const auto& tr : fired) trade_cb_(tr);
     return issues;
 }
 
@@ -354,6 +406,9 @@ std::vector<std::string> TrendEngine::reconcile_stop_orders(
         //   应该拿到完整的重试阶梯
         // 可能被手动撤掉、被交易所撤掉，或落盘里是个过期单号
         issues.push_back(b.cfg.symbol + " 交易所上的硬止损单不见了，下一拍重新挂");
+        // 记下它的触发价：消失多半是触发了，仓位对账确认"交易所已无仓位"时
+        // 要按这个价记账（那时下面的清零与重挂早已发生）
+        if (b.disaster_stop_price > 0) b.ds_vanished_price = b.disaster_stop_price;
         b.disaster_stop_id.clear();
         b.disaster_stop_price = 0;
         b.ds_attempts    = 0;
@@ -397,6 +452,31 @@ void TrendEngine::close_bot(const std::string& id) {
 void TrendEngine::remove_bot(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     bots_.erase(id);
+}
+
+void TrendEngine::maintain_paused_hard_stops() {
+    std::string id;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        for (const auto& kv : bots_) {
+            const auto& b = kv.second;
+            // 运行中的由 tick 驱动，这里只管暂停的——两处都派发会并发挂两张
+            if (b.state != TrendBot::State::Stopped) continue;
+            if (!b.cfg.use_disaster_stop || b.pending) continue;
+            if (b.st.pos == trend::Pos::Flat || b.qty <= 0) continue;
+            if (!b.disaster_stop_id.empty() || b.ds_syncing) continue;
+            if (b.ds_next_try.time_since_epoch().count() != 0 &&
+                host_.now_steady() < b.ds_next_try) continue;
+            id = b.bot_id;
+            break;   // 一拍一个，和 tick 里的节奏一致
+        }
+    }
+    if (id.empty()) return;
+    host_.submit([this, id]() {
+        try { try_place_hard_stop(id); }
+        catch (const std::exception& e) { log("⚠ 硬止损挂单异常: " + std::string(e.what())); }
+        catch (...) { log("⚠ 硬止损挂单未知异常"); }
+    });
 }
 
 bool TrendEngine::remove_if_flat(const std::string& id) {
@@ -1193,6 +1273,7 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
 // 代价：趋势走远之后这张单仍停在开仓时的位置，此刻断电的损失比移动止损大。
 // 这是取舍，不是遗漏——它的定位是【最大风险兜底】，不是第二条移动止损。
 void TrendEngine::clear_ds_runtime(TrendBot& b) {
+    b.ds_vanished_price = 0;   // 属于刚关掉的那笔仓位
     b.ds_attempts    = 0;
     b.ds_unprotected = false;
     b.ds_next_try    = {};

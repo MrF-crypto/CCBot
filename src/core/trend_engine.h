@@ -173,6 +173,13 @@ struct TrendBot {
     // 单号误清掉
     bool        ds_syncing = false;
 
+    // 硬止损单从交易所挂单列表里【消失】时它的触发价（见 reconcile_stop_orders）。
+    // 消失最常见的原因是它触发了——而那时对账还要两轮才确认仓位没了，
+    // disaster_stop_price 早已被清零重挂，确认时就不知道该按什么价记账。
+    // 留着它，"外部已平"那条路径才能把这笔按硬止损价记进统计和当日亏损。
+    // 随仓位关闭清零，不落盘
+    double ds_vanished_price = 0;
+
     // 本仓位已尝试挂单的次数。阶梯见 TrendEngine::kDs* 常量
     int  ds_attempts = 0;
     // 已经告过"此仓位无交易所侧保护"的警，界面据此标红。挂上之后清掉
@@ -288,6 +295,11 @@ public:
     void resume_bot(const std::string& bot_id);
     void close_bot (const std::string& bot_id);  // 手动市价平仓
     void remove_bot(const std::string& bot_id);
+    // 已停止（暂停）的 bot 的硬止损补挂。挂单重试平时由 tick 驱动，而 tick 跳过
+    // 暂停的 bot——于是暂停期间硬止损丢了就永远不补，仓位既没有本地止损也没有
+    // 交易所止损。硬止损是进程外的保护，不是策略决策，暂停也照样要补。
+    // 应用层每拍调用一次（与是否有价格无关）
+    void maintain_paused_hard_stops();
     // 只在空仓且没有在途订单时移除，返回是否删了。智能模式淘汰用：扫描拿到的
     // 快照与真正删除之间，那个 bot 可能刚好开了仓——直接 remove_bot 会把一笔
     // 真实仓位变成没人管的孤儿仓
@@ -557,6 +569,11 @@ private:
     // 就是每 3 秒一条同样的日志——本项目踩过这个（150 行日志里 120 行是噪音）。
     // 拦截原因始终写进 last_decision，界面上一直看得到，不依赖日志
     std::set<std::string>           cap_logged_;
+    // 交易所上有仓位、但程序里【没有任何 bot】对应的品种（键 = 品种_L/_S → 连续
+    // 看到的轮数）。对账原本只按 bot 逐个比，没有 bot 的品种完全看不见；
+    // 智能模式频繁增删 bot 之后这个窗口变大了。连续 2 轮才报（吸收快照陈旧），
+    // 报一次，消失后复位
+    std::map<std::string, int>      untracked_seen_;
 
     // ── 智能模式相关 ──
     double                          daily_loss_limit_ = 0;

@@ -283,6 +283,38 @@ static void test_pool() {
         check(tagged, "  名单信息：做多第 3");
     }
     {
+        // 批量淘汰保护：过半同时出局 ⇒ 疑似数据异常，这一轮一个都不删
+        Pool pool;
+        std::vector<BotView> bots;
+        auto s = scan_with({"L1USDT"}, {});
+        for (int i = 0; i < 6; ++i) {
+            const std::string sym = "M" + std::to_string(i) + "USDT";
+            pool.on_added(sym, kNow - 10 * kDay);
+            bots.push_back(bot("a" + std::to_string(i), sym, true));
+            if (i < 5) s.hard_fail[sym] = "状态 ";   // 6 个里 5 个被判不合格
+        }
+        auto p = pool.plan(s, bots, c, kNow);
+        check(p.remove.empty(), "6 个里 5 个同时被判出局：疑似数据异常，一个都不删");
+        bool warned = false;
+        for (const auto& a : p.alerts) if (has(a, "疑似数据异常")) warned = true;
+        check(warned, "  告警说明原因");
+
+        Pool pool2;
+        std::vector<BotView> bots2;
+        auto s2 = scan_with({"L1USDT"}, {});
+        for (int i = 0; i < 6; ++i) {
+            const std::string sym = "N" + std::to_string(i) + "USDT";
+            pool2.on_added(sym, kNow - 10 * kDay);
+            bots2.push_back(bot("b" + std::to_string(i), sym, true));
+        }
+        s2.hard_fail["N0USDT"] = "24h 成交额不足";
+        s2.ranking.longs = {"N1USDT", "N2USDT", "N3USDT", "N4USDT", "N5USDT"};
+        for (const auto& x : s2.ranking.longs) s2.ranking.rows[x].long_score = 80;
+        Config c6 = c; c6.long_n = 6;
+        auto p2 = pool2.plan(s2, bots2, c6, kNow);
+        check(p2.remove.size() == 1 && removed(p2, "N0USDT"), "只有个别出局：照常移除");
+    }
+    {
         // 已停止的自动 bot：不替用户删
         Pool pool;
         pool.on_added("STOPUSDT", kNow - 10 * kDay);
