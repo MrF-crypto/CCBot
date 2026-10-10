@@ -333,6 +333,42 @@ int main() {
               "  下一根放量 2.4x 突破 ⇒ 开多");
     }
 
+    // ── 裸K 震荡态 + 信号K力度：状态显示震荡、箱体突破实体太弱的日志 ────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<std::string> logs;
+        eng.set_log_cb([&](const std::string& m) { logs.push_back(m); });
+        auto cfg = mk_bare_cfg();
+        cfg.rule.chop_er_max = 0.3;
+        cfg.rule.signal_body_atr = 0.6;
+        auto id = eng.add_bot(cfg);
+
+        // 平常信号（收盘 112 > 前高 110），但在震荡里、没冲出箱体 [95,115]
+        auto s = bars_break_up(95, 115, 1);
+        s.prev_open = 110; s.bar_atr = 2.0; s.er_ok = true; s.er = 0.1;
+        s.range_hi = 115; s.range_lo = 95; s.range_now_hi = 115; s.range_now_lo = 95;
+        eng.update_bars(id, s);
+        cli->fill_price = 112.0;
+        eng.tick("TESTUSDT", 112.0);
+        check(cli->calls.empty(), "裸K 震荡态：突破前一根不开仓");
+        const auto d = eng.get_bots()[0].last_decision;
+        check(d.find("震荡") != std::string::npos && d.find("等箱体突破") != std::string::npos,
+              "  状态显示震荡、等箱体突破");
+
+        // 下一根收盘站上箱体，但实体只有 0.5ATR
+        advance(10);
+        auto s2 = s;
+        s2.bar_open_ms = 2; s2.range_hi = 111; s2.prev_open = 111;
+        eng.update_bars(id, s2);
+        eng.tick("TESTUSDT", 112.0);
+        check(cli->calls.empty(), "  箱体突破但实体 0.5ATR < 0.6：不开仓");
+        bool line = false;
+        for (const auto& m : logs)
+            if (m.find("向上箱体突破不做：信号K实体 0.5ATR（需≥0.6）") != std::string::npos) line = true;
+        check(line, "  日志：箱体突破不做，带实体 ATR 倍数");
+    }
+
     // ── 改策略参数保留已实现；删除再添加从 0 开始 ───────────────────────────
     // v5.9.10 之前改参数在界面上走 remove_bot + add_bot，每改一次参数这个 bot 的
     // 已实现、笔数、胜率就清零，汇总栏的"已实现"也跟着少掉一块

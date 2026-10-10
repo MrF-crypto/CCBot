@@ -146,8 +146,16 @@ public:
         double  swing_low  = 0;     // bar 1..N 的最低价
         double  swing_high = 0;     // bar 1..N 的最高价
         double  signal_vol_ratio = 0;   // 刚收盘那根的量 ÷ 它之前 kSignalVolWindow 根均量，0=拿不到
+        // 裸K 震荡态与信号K力度（窗口 kSignalVolWindow 根，ATR 周期 kBareAtrPeriod）
+        double  prev_open = 0;      // 刚收盘那根的开盘价
+        double  bar_atr   = 0;      // 已收盘K线的 ATR，0=算不出
+        bool    er_ok = false;      // 最近 20 根已收盘的效率比（带符号）
+        double  er    = 0;
+        double  range_hi = 0, range_lo = 0;          // 刚收盘那根【之前】20 根的高低
+        double  range_now_hi = 0, range_now_lo = 0;  // 含刚收盘那根的最近 20 根
         int64_t bar_open_ms = 0;    // 当前未收盘根的开盘时间
     };
+    static constexpr int kBareAtrPeriod = 14;
     // 裸K信号根量比的均量窗口。固定 20 根：5m 下约 100 分钟，能跟上时段性的
     // 放量缩量；摆动根数只有 3 左右，拿它当窗口太短，一根大量就把均量带偏
     static constexpr int kSignalVolWindow = 20;

@@ -1036,8 +1036,156 @@ static void test_direction() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ③ 裸K：震荡态（效率比 + 箱体突破）与信号K力度
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_bare_regime() {
+    // 等收盘突破的基准输入：bar0 收盘 112 > 前一根高 110（平常的多头信号），
+    // 箱体 [95, 115]，ATR 2
+    auto base = [](double er, bool er_ok = true) {
+        Inputs in = bare_in(112, 94, 114);
+        in.prev_close = 112; in.prev_high = 110; in.prev_low = 100;
+        in.prev_open = 110;
+        in.new_bar = true;
+        in.bar_atr = 2.0;
+        in.er_ok = er_ok; in.er = er;
+        in.range_hi = 115; in.range_lo = 95;
+        in.range_now_hi = 115; in.range_now_lo = 95;
+        return in;
+    };
+    Config c;
+    c.strategy = Strategy::BareK;
+    c.bare_entry = BareEntry::BreakPrevBar;
+    c.chop_er_max = 0.3;
+
+    {
+        State st;
+        const auto v = step(st, c, base(0.1));
+        CHECK(v.action == Action::Hold, "震荡态：突破前一根不算");
+        CHECK(std::string(v.reason).find("等箱体突破") != std::string::npos, "  原因写明等箱体突破");
+        CHECK(!v.filtered, "  不算被过滤（是没信号）");
+    }
+    {
+        State st;
+        Inputs in = base(0.1);
+        in.range_hi = 111;   // 收盘 112 站上箱体
+        CHECK(step(st, c, in).action == Action::OpenLong, "震荡态：收盘站上箱体 ⇒ 开多");
+    }
+    {
+        State st;
+        Inputs in = base(-0.1);
+        in.prev_close = 94; in.prev_low = 100;   // 收盘跌破箱体下沿 95
+        in.prev_open = 97;
+        CHECK(step(st, c, in).action == Action::OpenShort, "震荡态：收盘跌破箱体 ⇒ 开空（|ER| 判震荡）");
+    }
+    {
+        State st;
+        CHECK(step(st, c, base(0.5)).action == Action::OpenLong, "趋势态（ER 0.5）：平常信号照常");
+        State st2;
+        CHECK(step(st2, c, base(-0.5)).action == Action::OpenLong,
+              "ER −0.5 也是趋势态（按绝对值），平常信号照常");
+    }
+    {
+        State st;
+        CHECK(step(st, c, base(0, false)).action == Action::Hold, "效率比缺失 ⇒ 按震荡处理");
+    }
+    {
+        Config cz = c; cz.chop_er_max = 0;
+        State st;
+        CHECK(step(st, cz, base(0.05)).action == Action::OpenLong, "震荡过滤关 ⇒ 原行为");
+    }
+    {
+        // 震荡中止损：只平不反手；趋势中照常反手
+        Config cr = c; cr.reverse = ReverseMode::Immediate;
+        State st;
+        on_filled(st, Pos::Long, 110, 100, cr, false);
+        Inputs hit = base(0.1);
+        hit.price = 99; hit.swing_low = 100; hit.new_bar = false;
+        const auto v = step(st, cr, hit);
+        CHECK(v.action == Action::Close, "震荡中亏损止损 ⇒ 只平不反手");
+        CHECK(std::string(v.reason).find("震荡") != std::string::npos, "  原因写明震荡中");
+        State st2;
+        on_filled(st2, Pos::Long, 110, 100, cr, false);
+        Inputs hit2 = base(0.6);
+        hit2.price = 99; hit2.swing_low = 100; hit2.new_bar = false;
+        CHECK(step(st2, cr, hit2).action == Action::CloseReverseShort, "趋势中亏损止损 ⇒ 照常反手");
+    }
+    {
+        // 立即顺势：震荡态看实时价对最近 20 根
+        Config ci = c; ci.bare_entry = BareEntry::Immediate;
+        Inputs in = base(0.1);
+        in.new_bar = false; in.bar_open = 100; in.price = 105;
+        State st;
+        CHECK(step(st, ci, in).action == Action::Hold, "立即顺势·震荡：在箱体内不开");
+        in.price = 116;
+        State st2;
+        CHECK(step(st2, ci, in).action == Action::OpenLong, "立即顺势·震荡：实时价冲出箱体 ⇒ 开多");
+    }
+    {
+        // 震荡态的箱体突破照样要过量比
+        Config cv = c; cv.bare_vol_ratio = 1.8;
+        Inputs in = base(0.1);
+        in.range_hi = 111;
+        in.signal_vol_ratio = 1.0;
+        State st;
+        const auto v = step(st, cv, in);
+        CHECK(v.action == Action::Hold && v.filtered, "震荡态箱体突破没放量 ⇒ 拦");
+    }
+
+    // ── 信号K力度 ──
+    Config cb;
+    cb.strategy = Strategy::BareK;
+    cb.bare_entry = BareEntry::BreakPrevBar;
+    cb.signal_body_atr = 0.6;
+    {
+        State st;
+        Inputs in = base(0.5);
+        in.prev_open = 111;   // 实体 1 = 0.5 ATR
+        const auto v = step(st, cb, in);
+        CHECK(v.action == Action::Hold && v.filtered, "实体 0.5ATR < 0.6 ⇒ 拦");
+        CHECK(std::string(v.reason).find("太弱") != std::string::npos, "  原因写明信号K太弱");
+    }
+    {
+        State st;
+        Inputs in = base(0.5);
+        in.prev_open = 110;   // 实体 2 = 1.0 ATR
+        CHECK(step(st, cb, in).action == Action::OpenLong, "实体 1.0ATR ⇒ 放行");
+    }
+    {
+        State st;
+        Inputs in = base(0.5);
+        in.prev_open = 114;   // 阴线收在前高之上：方向相反
+        CHECK(step(st, cb, in).action == Action::Hold, "阴线向上突破 ⇒ 方向不一致，拦");
+    }
+    {
+        State st;
+        Inputs in = base(0.5);
+        in.bar_atr = 0;
+        CHECK(step(st, cb, in).action == Action::Hold, "ATR 缺失 ⇒ 拦");
+    }
+    {
+        // 立即顺势：死区，不算被过滤
+        Config ci = cb; ci.bare_entry = BareEntry::Immediate; ci.signal_body_atr = 0.5;
+        Inputs in = base(0.5);
+        in.new_bar = false; in.bar_open = 100; in.price = 100.8;   // 死区 = 0.5×2 = 1
+        State st;
+        const auto v = step(st, ci, in);
+        CHECK(v.action == Action::Hold && !v.filtered, "立即顺势：离开盘价 0.8 < 死区 1 ⇒ 没信号（不记日志）");
+        in.price = 101.2;
+        State st2;
+        CHECK(step(st2, ci, in).action == Action::OpenLong, "立即顺势：离开盘价 1.2 > 死区 ⇒ 开多");
+        in.price = 98.8;
+        State st3;
+        CHECK(step(st3, ci, in).action == Action::OpenShort, "立即顺势：向下离开死区 ⇒ 开空");
+        in.price = 105; in.bar_atr = 0;
+        State st4;
+        CHECK(step(st4, ci, in).action == Action::Hold, "立即顺势：开了死区但 ATR 缺失 ⇒ 不开");
+    }
+}
+
 int main() {
     test_turtle();
+    test_bare_regime();
     test_squeeze_filter();
     test_direction();
     test_psar();

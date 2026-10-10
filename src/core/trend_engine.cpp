@@ -69,7 +69,11 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg) {
                  " / 摆动N=" + std::to_string(cfg.rule.swing_bars) +
                  (cfg.rule.once_per_bar ? " / 每根限一次" : "") +
                  (trend::bare_vol_filter_on(cfg.rule)
-                      ? " / 量比≥" + fmt(cfg.rule.bare_vol_ratio, 1) + "x" : std::string());
+                      ? " / 量比≥" + fmt(cfg.rule.bare_vol_ratio, 1) + "x" : std::string()) +
+                 (cfg.rule.signal_body_atr > 0
+                      ? " / 力度≥" + fmt(cfg.rule.signal_body_atr, 1) + "ATR" : std::string()) +
+                 (cfg.rule.chop_er_max > 0
+                      ? " / 震荡效率比<" + fmt(cfg.rule.chop_er_max, 2) : std::string());
         break;
     case trend::Strategy::Turtle:
     default:
@@ -488,6 +492,14 @@ void TrendEngine::update_bars(const std::string& id, const BarSnap& s) {
     b.swing_low       = s.swing_low;
     b.swing_high      = s.swing_high;
     b.signal_vol_ratio = s.signal_vol_ratio;
+    b.prev_open    = s.prev_open;
+    b.bar_atr      = s.bar_atr;
+    b.er_ok        = s.er_ok;
+    b.er           = s.er;
+    b.range_hi     = s.range_hi;
+    b.range_lo     = s.range_lo;
+    b.range_now_hi = s.range_now_hi;
+    b.range_now_lo = s.range_now_lo;
     // "K线数据就绪"必须按【这个策略真正用到的字段】判定，不能一刀切成
     // "前一根高低点都在"。③ 盘中即时入场只用本根开盘价，前一根的高低点对它
     // 毫无意义——一刀切的话，数据层哪天少给一个它用不到的字段，这个 bot 就会
@@ -664,6 +676,12 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             in.swing_low   = b.swing_low;
             in.swing_high  = b.swing_high;
             in.signal_vol_ratio = b.signal_vol_ratio;
+            in.prev_open    = b.prev_open;
+            in.bar_atr      = fresh ? b.bar_atr : 0;
+            in.range_hi     = b.range_hi;
+            in.range_lo     = b.range_lo;
+            in.range_now_hi = b.range_now_hi;
+            in.range_now_lo = b.range_now_lo;
             in.psar_prev_high  = b.psar_prev_high;
             in.psar_prev_low   = b.psar_prev_low;
             in.psar_prev2_high = b.psar_prev2_high;
@@ -683,6 +701,14 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                     d << " 摆动[" << fmt(in.swing_low) << "," << fmt(in.swing_high) << "]";
                     if (trend::bare_vol_filter_on(b.cfg.rule))
                         d << " 上根量比" << fmt(in.signal_vol_ratio, 1) << "x";
+                    if (trend::bare_chop_on(b.cfg.rule)) {
+                        d << " 效率比";
+                        if (in.er_ok) d << fmt(std::fabs(in.er), 2);
+                        else          d << "缺失";
+                        if (trend::bare_in_chop(in, b.cfg.rule))
+                            d << " 震荡 箱体[" << fmt(in.range_now_lo) << ","
+                              << fmt(in.range_now_hi) << "]";
+                    }
                 }
                 else if (b.cfg.rule.strategy == trend::Strategy::ParabolicSar && in.bar_ok)
                     d << " 前根[" << fmt(in.psar_prev_low) << "," << fmt(in.psar_prev_high) << "]";
@@ -708,10 +734,21 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                 const auto& r = b.cfg.rule;
                 const bool lg = v.filtered_long;
                 std::string m = b.cfg.symbol + (lg ? " 向上" : " 向下");
-                if (trend::bare_vol_filter_on(r)) {
-                    // 裸K的信号只在收盘那一拍成立，被拦就是这次不做
-                    m += "突破不做：信号K量比 " + fmt(in.signal_vol_ratio, 1) + "x（需≥" +
-                         fmt(r.bare_vol_ratio, 1) + "）";
+                if (r.strategy == trend::Strategy::BareK) {
+                    // 裸K的信号只在收盘那一拍成立，被拦就是这次不做。没过的几项都列出来
+                    m += trend::bare_in_chop(in, r) ? "箱体突破不做：" : "突破不做：";
+                    std::string parts;
+                    if (trend::bare_vol_block(in, r))
+                        parts += "信号K量比 " + fmt(in.signal_vol_ratio, 1) + "x（需≥" +
+                                 fmt(r.bare_vol_ratio, 1) + "）";
+                    if (trend::bare_body_block(in, r, lg)) {
+                        // 实体按方向取正：负数 = 阴阳和突破方向相反
+                        parts += std::string(parts.empty() ? "" : "，") + "信号K实体 " +
+                                 (trend::bare_body_ready(in) ? fmt(trend::bare_body_in_atr(in, lg), 1) + "ATR"
+                                       : std::string("缺失")) +
+                                 "（需≥" + fmt(r.signal_body_atr, 1) + "）";
+                    }
+                    m += parts;
                 } else if (!trend::squeeze_box_pass(in, r, lg)) {
                     m += "突破不做：";
                     if (!(in.box_atr > 0)) {

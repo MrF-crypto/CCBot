@@ -183,6 +183,12 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                 tip += QString("突破量比：信号K ≥ %1 倍（上根 %2）\n")
                            .arg(b.cfg.rule.bare_vol_ratio, 0, 'f', 1)
                            .arg(b.signal_vol_ratio, 0, 'f', 1);
+            if (b.cfg.rule.signal_body_atr > 0)
+                tip += QString("信号K力度：≥ %1 ATR\n").arg(b.cfg.rule.signal_body_atr, 0, 'f', 1);
+            if (b.cfg.rule.chop_er_max > 0)
+                tip += QString("震荡态：效率比 < %1（当前 %2）时不反手、只做箱体突破\n")
+                           .arg(b.cfg.rule.chop_er_max, 0, 'f', 2)
+                           .arg(b.er_ok ? QString::number(std::fabs(b.er), 'f', 2) : QString("缺失"));
             break;
         }
         tip += (b.cfg.size_mode == TrendConfig::SizeMode::RiskBased)
@@ -536,6 +542,8 @@ struct TrendFormWidgets {
     QCheckBox*      oncePerBar = nullptr;
     QSpinBox*       swing      = nullptr;
     QDoubleSpinBox* bareVol    = nullptr;   // 信号K量比 ≥ x，0=关；只对「等收盘突破」
+    QDoubleSpinBox* bodyAtr    = nullptr;   // 信号K力度 ≥ x ATR，0=关
+    QDoubleSpinBox* chopEr     = nullptr;   // 震荡态：效率比 < x，0=关
     QSpinBox*       maxRev     = nullptr;
     QSpinBox*       cooldown   = nullptr;
 
@@ -780,6 +788,39 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
         "⚠ 不拦止损后的反手（反手在盘中触发，没有收好的K线可判）。\n"
         "   横盘里反手磨损大的话，配合「止损后只平掉，等信号」或「连续反手上限」。");
     p3->addRow("突破量比≥", w->bareVol);
+
+    w->bodyAtr = new QDoubleSpinBox();
+    w->bodyAtr->setRange(0.0, 5.0);
+    w->bodyAtr->setSingleStep(0.1);
+    w->bodyAtr->setDecimals(1);
+    w->bodyAtr->setSpecialValueText("关");
+    w->bodyAtr->setSuffix(" ATR");
+    w->bodyAtr->setValue(c.rule.signal_body_atr);
+    w->bodyAtr->setToolTip(
+        "信号K要够强才算数（ATR 用同周期 ATR14，只算已收盘K线）。0 = 关。\n\n"
+        "等收盘突破：信号K实体 |收盘 − 开盘| ≥ x×ATR，且阴阳和方向一致。\n"
+        "  挡掉收盘刚好蹭过前高的小K线。建议从 0.6 起步。\n\n"
+        "立即顺势：实时价离本根开盘价 ≥ x×ATR 才算信号。\n"
+        "  等于在开盘价附近设一个死区——新K线开盘时价格在开盘价上下抖，\n"
+        "  正是这个模式来回翻转的根源。建议从 0.3~0.5 起步。");
+    p3->addRow("信号K力度≥", w->bodyAtr);
+
+    w->chopEr = new QDoubleSpinBox();
+    w->chopEr->setRange(0.0, 1.0);
+    w->chopEr->setSingleStep(0.05);
+    w->chopEr->setDecimals(2);
+    w->chopEr->setSpecialValueText("关");
+    w->chopEr->setValue(c.rule.chop_er_max);
+    w->chopEr->setToolTip(
+        "最近 20 根K线的效率比（净涨跌 ÷ 来回总路程）低于这个值 ⇒ 震荡态。0 = 关。\n"
+        "随机走 20 根平均约 0.18，建议从 0.3 起步。\n\n"
+        "震荡态下：\n"
+        "  · 平常的入场信号不算\n"
+        "  · 止损后只平不反手（不管上面反手怎么设）——横盘里反手是磨损大户\n"
+        "  · 只认箱体突破：收盘站上 / 跌破最近 20 根的高低点（立即顺势看实时价），\n"
+        "    量比和力度照样要过。横盘时等着，冲出箱体那一根就进\n"
+        "表格「状态」列会显示当前效率比和箱体。");
+    p3->addRow("震荡 效率比<", w->chopEr);
     // 「立即顺势」不用量比（开盘几秒成交量≈0），选它时置灰，免得以为调了有用
     {
         auto syncBareVol = [w]() {
@@ -1047,6 +1088,8 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.once_per_bar = w->oncePerBar->isChecked();
             out.rule.swing_bars   = w->swing->value();
             out.rule.bare_vol_ratio = w->bareVol->value();
+            out.rule.signal_body_atr = w->bodyAtr->value();
+            out.rule.chop_er_max     = w->chopEr->value();
             out.rule.max_consecutive_reverses = w->maxRev->value();
             out.rule.cooldown_bars            = w->cooldown->value();
             break;
@@ -1163,6 +1206,10 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
                          .arg(c.rule.once_per_bar ? " 每根限一次" : "");
             if (trend::bare_vol_filter_on(c.rule))
                 params += QString(" 量比≥%1x").arg(c.rule.bare_vol_ratio, 0, 'f', 1);
+            if (c.rule.signal_body_atr > 0)
+                params += QString(" 力度≥%1ATR").arg(c.rule.signal_body_atr, 0, 'f', 1);
+            if (c.rule.chop_er_max > 0)
+                params += QString(" 震荡效率比<%1").arg(c.rule.chop_er_max, 0, 'f', 2);
             break;
     }
     if (c.rule.direction != trend::Direction::Both)
@@ -1215,6 +1262,8 @@ void MainWindow::save_trend_bots() {
         o["risk_usdt"]       = b.cfg.risk_usdt;
         o["swing_bars"]      = b.cfg.rule.swing_bars;
         o["bare_vol_ratio"]  = b.cfg.rule.bare_vol_ratio;
+        o["signal_body_atr"] = b.cfg.rule.signal_body_atr;
+        o["chop_er_max"]     = b.cfg.rule.chop_er_max;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
         o["use_disaster_stop"]  = b.cfg.use_disaster_stop;
         o["disaster_stop_buffer_pct"] = b.cfg.disaster_stop_buffer_pct;
@@ -1298,6 +1347,8 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.af_max          = o["af_max"].toDouble(0.20);
         b.cfg.rule.swing_bars      = o["swing_bars"].toInt(3);
         b.cfg.rule.bare_vol_ratio  = std::max(0.0, o["bare_vol_ratio"].toDouble(0));
+        b.cfg.rule.signal_body_atr = std::max(0.0, o["signal_body_atr"].toDouble(0));
+        b.cfg.rule.chop_er_max     = std::clamp(o["chop_er_max"].toDouble(0), 0.0, 1.0);
         b.cfg.rule.once_per_bar    = o["once_per_bar"].toBool(false);
         b.cfg.rule.max_consecutive_reverses = o["max_consecutive_reverses"].toInt(0);
         b.cfg.rule.cooldown_bars   = o["cooldown_bars"].toInt(0);

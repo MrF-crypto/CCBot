@@ -146,6 +146,10 @@ struct TrendBot {
     double  swing_low   = 0;    // bar 0 之前 N 根的最低价
     double  swing_high  = 0;
     double  signal_vol_ratio = 0;   // 刚收盘那根的量比（裸K「等收盘突破」量比过滤）
+    // 裸K 震荡态与信号K力度（效率比复用上面的 er / er_ok）
+    double  prev_open = 0;
+    double  bar_atr   = 0;
+    double  range_hi = 0, range_lo = 0, range_now_hi = 0, range_now_lo = 0;
     // 抛物线SAR 的夹逼要前两根的高低点
     double  psar_prev_high = 0, psar_prev_low = 0;
     double  psar_prev2_high = 0, psar_prev2_low = 0;
@@ -314,6 +318,11 @@ public:
         double prev2_high = 0, prev2_low = 0;      // 上上根（PSAR 夹逼用）
         double swing_low = 0, swing_high = 0;      // bar 0 之前 N 根的极值
         double signal_vol_ratio = 0;               // bar 0 的量比（裸K量比过滤用）
+        // 裸K 震荡态与信号K力度
+        double prev_open = 0, bar_atr = 0;
+        bool   er_ok = false;
+        double er = 0;
+        double range_hi = 0, range_lo = 0, range_now_hi = 0, range_now_lo = 0;
         int64_t bar_open_ms = 0;
     };
     void update_bars(const std::string& bot_id, const BarSnap& s);

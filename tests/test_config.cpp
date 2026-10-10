@@ -218,6 +218,27 @@ int main() {
                          "\"bare_vol_ratio\":-1}]}");
         HeadlessConfig hc3; std::string err3;
         check(!load_headless_config(path, hc3, err3), "裸K量比为负应被拒绝");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"signal_body_atr\":0.6,\"chop_er_max\":0.3}]}");
+        HeadlessConfig hc4; std::string err4;
+        check(load_headless_config(path, hc4, err4), "裸K力度与震荡配置能加载");
+        if (hc4.trend_bots.size() == 1) {
+            check(std::fabs(hc4.trend_bots[0].rule.signal_body_atr - 0.6) < 1e-12, "  力度读入");
+            check(std::fabs(hc4.trend_bots[0].rule.chop_er_max - 0.3) < 1e-12, "  震荡阈值读入");
+        }
+        bool typo = false;
+        for (const auto& w : hc4.warnings)
+            if (w.find("signal_body_atr") != std::string::npos ||
+                w.find("chop_er_max") != std::string::npos) typo = true;
+        check(!typo, "  新键不该被当成拼写错误");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
+                         "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
+                         "\"chop_er_max\":2}]}");
+        HeadlessConfig hc5; std::string err5;
+        check(!load_headless_config(path, hc5, err5), "震荡阈值超过 1 应被拒绝");
     }
     {
         // 方向：默认多空；long 读入；拼错拒绝启动

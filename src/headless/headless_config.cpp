@@ -116,6 +116,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "af_start", "af_step", "af_max",
         // ③ 纯裸K
         "bare_entry", "once_per_bar", "swing_bars", "bare_vol_ratio",
+        "signal_body_atr", "chop_er_max",
         // 共享
         "reverse", "max_consecutive_reverses", "cooldown_bars",
         "signal_max_age_sec", "use_disaster_stop", "disaster_stop_buffer_pct",
@@ -327,6 +328,16 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 }
                 if (c.rule.bare_vol_ratio > 0 && c.rule.bare_entry == trend::BareEntry::Immediate)
                     out.warnings.push_back(c.symbol + " 纯裸K：bare_vol_ratio 只对 break_prev 生效，immediate 下不起作用");
+                c.rule.signal_body_atr = get_num(so, "signal_body_atr", c.rule.signal_body_atr);
+                if (!(c.rule.signal_body_atr >= 0)) {
+                    err = c.symbol + " 纯裸K: signal_body_atr 不能为负（0 = 关）";
+                    return false;
+                }
+                c.rule.chop_er_max = get_num(so, "chop_er_max", c.rule.chop_er_max);
+                if (!(c.rule.chop_er_max >= 0 && c.rule.chop_er_max <= 1)) {
+                    err = c.symbol + " 纯裸K: chop_er_max 要在 0~1 之间（0 = 关）";
+                    return false;
+                }
                 // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
                 if (c.rule.bare_entry == trend::BareEntry::Immediate &&
                     c.rule.reverse == trend::ReverseMode::Immediate && !c.rule.once_per_bar)

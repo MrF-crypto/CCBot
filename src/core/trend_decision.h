@@ -121,6 +121,19 @@ struct Config {
     // ⚠ 「立即顺势」不用：新K线开盘几秒成交量≈0，累计量比每根开头都过不了，
     //   外推又会把一点量放大几十倍。也不拦止损后的反手（盘中触发，没有收好的K线）
     double bare_vol_ratio = 0;
+    // 震荡态（0 = 关）。最近 20 根已收盘K线的效率比 |ER| < 这个值 ⇒ 震荡：
+    //   · "突破前一根 / 实时价对比开盘价"的信号不算（横盘里几乎全是噪音）
+    //   · 止损后只平不反手，不管反手设置是什么——横盘里反手是手续费磨损的大头，
+    //     量比只能挡入场、挡不住它
+    //   · 只认箱体突破：收盘（立即顺势是实时价）站上 / 跌破最近 20 根的高低点
+    // ⚠ 箱体突破这条通道不能省：ER 往回看 20 根，真突破之后要好几根才升上来，
+    //   震荡态一律不做的话爆拉要等走出半山腰才进场。读数缺失按震荡处理（更保守）
+    double chop_er_max = 0;
+    // 信号K力度（0 = 关），单位 ATR（同周期 ATR14，只用已收盘K线）：
+    //   等收盘突破：信号K实体 |收盘 − 开盘| ≥ x×ATR，且阴阳与方向一致
+    //   立即顺势：实时价偏离本根开盘价 ≥ x×ATR 才算信号——开盘价附近的死区，
+    //            新K线开盘时价格在开盘价上下抖正是这个模式来回翻转的根源
+    double signal_body_atr = 0;
 
     // ── 反手（共享）─────────────────────────────────────────────────────────
     ReverseMode reverse = ReverseMode::None;
@@ -182,6 +195,13 @@ struct Inputs {
     double swing_low   = 0;      // bar 0 之前 N 根的最低价
     double swing_high  = 0;      // bar 0 之前 N 根的最高价
     double signal_vol_ratio = 0; // 刚收盘那根（bar 0）的量比，0 = 拿不到
+    // ③ 震荡态与信号K力度（er / er_ok 与海龟共用字段，裸K下是最近 20 根已收盘的效率比）
+    double prev_open    = 0;     // bar 0 的开盘价（算信号K实体）
+    double bar_atr      = 0;     // 同周期 ATR14，只用已收盘K线，0 = 拿不到
+    double range_hi     = 0;     // bar 0 之前 20 根的最高 / 最低（等收盘突破的箱体）
+    double range_lo     = 0;
+    double range_now_hi = 0;     // 含 bar 0 的最近 20 根已收盘（立即顺势的箱体）
+    double range_now_lo = 0;
     // ② PSAR 需要【前两根】的高低点做夹逼（Wilder 原版规则）
     double psar_prev_high  = 0, psar_prev_low  = 0;
     double psar_prev2_high = 0, psar_prev2_low = 0;
@@ -242,13 +262,44 @@ inline bool allows(const Config& cfg, Pos p) {
     return false;
 }
 
+// ③ 立即顺势的死区：实时价要离开盘价多远才算信号。返回 <0 = 开了力度过滤却拿不到 ATR
+inline double bare_dead_band(const Inputs& in, const Config& cfg) {
+    if (!(cfg.signal_body_atr > 0)) return 0;
+    return in.bar_atr > 0 ? cfg.signal_body_atr * in.bar_atr : -1;
+}
+
+// ③ 震荡态
+inline bool bare_chop_on(const Config& cfg) {
+    return cfg.strategy == Strategy::BareK && cfg.chop_er_max > 0;
+}
+inline bool bare_in_chop(const Inputs& in, const Config& cfg) {
+    if (!bare_chop_on(cfg)) return false;
+    return !in.er_ok || std::fabs(in.er) < cfg.chop_er_max;
+}
+// 震荡态下唯一的入场：箱体突破。等收盘突破看 bar 0 收盘 vs 它之前 20 根；
+// 立即顺势看实时价 vs 最近 20 根已收盘
+inline bool chop_break_long(const Inputs& in, const Config& cfg) {
+    if (!in.bar_ok) return false;
+    if (cfg.bare_entry == BareEntry::Immediate)
+        return in.range_now_hi > 0 && in.price > in.range_now_hi;
+    return in.new_bar && in.prev_close > 0 && in.range_hi > 0 && in.prev_close > in.range_hi;
+}
+inline bool chop_break_short(const Inputs& in, const Config& cfg) {
+    if (!in.bar_ok) return false;
+    if (cfg.bare_entry == BareEntry::Immediate)
+        return in.range_now_lo > 0 && in.price < in.range_now_lo;
+    return in.new_bar && in.prev_close > 0 && in.range_lo > 0 && in.prev_close < in.range_lo;
+}
+
 // 入场信号（策略无关的统一入口）。
 inline bool entry_long(const Inputs& in, const Config& cfg) {
     switch (cfg.strategy) {
     case Strategy::BareK:
         if (!in.bar_ok) return false;
-        if (cfg.bare_entry == BareEntry::Immediate)
-            return in.bar_open > 0 && in.price > in.bar_open;
+        if (cfg.bare_entry == BareEntry::Immediate) {
+            const double band = bare_dead_band(in, cfg);
+            return band >= 0 && in.bar_open > 0 && in.price > in.bar_open + band;
+        }
         // BreakPrevBar：只在【跨新K线】那一拍成立——规格是"本根收盘时判定"，
         // 不加这道门的话同一根K线的每个 tick 都会重复触发
         return in.new_bar && in.prev_close > 0 && in.prev_high > 0 &&
@@ -266,8 +317,10 @@ inline bool entry_short(const Inputs& in, const Config& cfg) {
     switch (cfg.strategy) {
     case Strategy::BareK:
         if (!in.bar_ok) return false;
-        if (cfg.bare_entry == BareEntry::Immediate)
-            return in.bar_open > 0 && in.price < in.bar_open;
+        if (cfg.bare_entry == BareEntry::Immediate) {
+            const double band = bare_dead_band(in, cfg);
+            return band >= 0 && in.bar_open > 0 && in.price < in.bar_open - band;
+        }
         return in.new_bar && in.prev_close > 0 && in.prev_low > 0 &&
                in.prev_close < in.prev_low;
     case Strategy::ParabolicSar:
@@ -323,10 +376,33 @@ inline const char* bare_vol_block(const Inputs& in, const Config& cfg) {
     return "突破，但信号K未放量";
 }
 
+// ③ 等收盘突破的信号K力度：实体 ≥ x×ATR 且阴阳与方向一致。
+// 立即顺势的力度过滤是死区，做在 entry_long/short 里——那里没过就是"没信号"，
+// 不算"被拦"，否则每根K线开盘价附近都会记一条日志
+inline bool bare_body_filter_on(const Config& cfg) {
+    return cfg.strategy == Strategy::BareK && cfg.bare_entry == BareEntry::BreakPrevBar &&
+           cfg.signal_body_atr > 0;
+}
+// 信号K实体折成 ATR，按方向取正（负数 = 阴阳与方向相反）。调用方先确认读数齐全
+inline bool bare_body_ready(const Inputs& in) {
+    return in.bar_atr > 0 && in.prev_open > 0 && in.prev_close > 0;
+}
+inline double bare_body_in_atr(const Inputs& in, bool is_long) {
+    if (!bare_body_ready(in)) return 0;
+    const double body = in.prev_close - in.prev_open;
+    return (is_long ? body : -body) / in.bar_atr;
+}
+inline const char* bare_body_block(const Inputs& in, const Config& cfg, bool is_long) {
+    if (!bare_body_filter_on(cfg)) return nullptr;
+    if (bare_body_ready(in) && bare_body_in_atr(in, is_long) >= cfg.signal_body_atr) return nullptr;
+    return "突破，但信号K太弱";
+}
+
 // 开仓前的过滤，按策略分派。返回 nullptr = 放行
 inline const char* entry_block(const Inputs& in, const Config& cfg, bool is_long) {
     if (const char* w = squeeze_block(in, cfg, is_long)) return w;
-    return bare_vol_block(in, cfg);
+    if (const char* w = bare_vol_block(in, cfg)) return w;
+    return bare_body_block(in, cfg, is_long);
 }
 
 // Chandelier 止损线。多头挂在极值下方，空头挂在极值上方
@@ -452,6 +528,12 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             v.reason = v.profitable_exit ? "触线出场（不反手）" : "止损出场（不反手）";
             return v;
         }
+        // ③ 震荡态：只平不反手。横盘里反手开出来的那笔同样大概率被打掉
+        if (bare_in_chop(in, cfg)) {
+            v.action = Action::Close;
+            v.reason = "止损出场（震荡中，不反手）";
+            return v;
+        }
         // 反手的目标方向不允许 ⇒ 只平。不动连续反手计数：这一次本来就没有反手
         if (!allows(cfg, is_long ? Pos::Short : Pos::Long)) {
             v.action = Action::Close;
@@ -485,8 +567,12 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
     // 每根K线最多开一次：被止损出场后不在同一根里重新入场
     if (bar_already_used(st, cfg, in)) { v.reason = "本根已开过（每根一次）"; return v; }
 
-    const bool up = allows(cfg, Pos::Long) && entry_long(in, cfg);
-    const bool dn = !up && allows(cfg, Pos::Short) && entry_short(in, cfg);
+    // ③ 震荡态下只认箱体突破，平常的入场信号不算
+    const bool chop = bare_in_chop(in, cfg);
+    const bool up = allows(cfg, Pos::Long) &&
+                    (chop ? chop_break_long(in, cfg) : entry_long(in, cfg));
+    const bool dn = !up && allows(cfg, Pos::Short) &&
+                    (chop ? chop_break_short(in, cfg) : entry_short(in, cfg));
     if (up || dn) {
         if (const char* why = entry_block(in, cfg, up)) {
             v.reason = why;
@@ -499,7 +585,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         return v;
     }
 
-    v.reason = "无信号";
+    v.reason = chop ? "震荡中，等箱体突破" : "无信号";
     return v;
 }
 

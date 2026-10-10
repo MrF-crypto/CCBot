@@ -1829,6 +1829,14 @@ void MainWindow::onTick() {
                         s.swing_low   = bp.swing_low;
                         s.swing_high  = bp.swing_high;
                         s.signal_vol_ratio = bp.signal_vol_ratio;
+                        s.prev_open    = bp.prev_open;
+                        s.bar_atr      = bp.bar_atr;
+                        s.er_ok        = bp.er_ok;
+                        s.er           = bp.er;
+                        s.range_hi     = bp.range_hi;
+                        s.range_lo     = bp.range_lo;
+                        s.range_now_hi = bp.range_now_hi;
+                        s.range_now_lo = bp.range_now_lo;
                         s.bar_open_ms = bp.bar_open_ms;
                         trend_engine_->update_bars(b.bot_id, s);
                         continue;

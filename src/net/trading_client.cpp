@@ -1440,8 +1440,9 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
     if (swing_bars < 1) return out;
 
     // 需要：未收盘根(1) + 信号根(1) + 摆动窗口(N)，再多拿几根兜底。
-    // 信号根量比的均量窗口要 kSignalVolWindow 根，两者取大
-    const int need = std::max(swing_bars, kSignalVolWindow) + 2 + 3;
+    // 信号根量比、震荡态的箱体与效率比要 kSignalVolWindow 根，ATR 的 Wilder 平滑
+    // 要预热（同海龟：4 倍周期），几者取大。61 根以内请求权重仍是 1
+    const int need = std::max({swing_bars, kSignalVolWindow, kBareAtrPeriod * 4}) + 2 + 3;
     auto bars = fetch_klines(sym, interval, need);
     if ((int)bars.size() < swing_bars + 2) return out;
 
@@ -1471,6 +1472,27 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
         vols.reserve(bars.size());
         for (const auto& b : bars) vols.push_back(b.volume);
         out.signal_vol_ratio = indicators::volume_ratio(vols, n - 2, kSignalVolWindow);
+    }
+
+    // 震荡态与信号K力度。全部只用已收盘K线；拿不到的留 0 / false，
+    // 开了对应过滤的 bot 按"缺失就拦 / 按震荡处理"走
+    {
+        out.prev_open = bars[n - 2].open;
+        std::vector<indicators::Ohlc> oh;
+        oh.reserve(bars.size());
+        for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
+        const std::vector<indicators::Ohlc> closed(oh.begin(), oh.end() - 1);
+        out.bar_atr = indicators::atr(closed, kBareAtrPeriod);
+
+        const auto e = indicators::efficiency_ratio(oh, kSignalVolWindow, 1);
+        out.er_ok = e.ok;
+        out.er    = e.er;
+        if (const auto r = indicators::donchian(oh, kSignalVolWindow, 2); r.ok) {
+            out.range_hi = r.up; out.range_lo = r.dn;
+        }
+        if (const auto r = indicators::donchian(oh, kSignalVolWindow, 1); r.ok) {
+            out.range_now_hi = r.up; out.range_now_lo = r.dn;
+        }
     }
 
     out.ok = (out.price > 0 && out.cur_open > 0 && out.prev_close > 0 &&
