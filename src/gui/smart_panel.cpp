@@ -84,6 +84,7 @@ void MainWindow::startSmartRunner() {
         QMetaObject::invokeMethod(this, [this, s]() { unsubscribeIfUnused(s); },
                                   Qt::QueuedConnection);
     };
+    smart_->set_journal(journal_);
     smart_->load();
     // 状态文件里没有今天的数（升级后第一次运行）：用成交明细补，亏损限额不从 0 算
     smart_->seed_day_from_history(trades_);

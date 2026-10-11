@@ -169,6 +169,7 @@ Features compute_features(const std::vector<Bar>& bars, const std::vector<Bar>& 
     box(12, hi12, lo12);
     box(48, hi48, lo48);
 
+    f.close     = close;
     f.atr_pct   = atr14 / close * 100.0;
     f.box12_atr = (hi12 - lo12) / atr14;
     f.box48_atr = (hi48 - lo48) / atr14;

@@ -1,4 +1,5 @@
 #pragma once
+#include "core/journal.h"
 #include "core/smart_mode.h"
 #include "core/trend_engine.h"
 
@@ -96,6 +97,8 @@ public:
 
     // 启动时调用：读池状态与当日盈亏
     void load();
+    // 数据记录层：每轮扫描的名单快照、候选池的加入/移出/换方向写进 journal（可不设）
+    void set_journal(std::shared_ptr<Journal> j) { journal_ = std::move(j); }
     // load 之后调用：引擎里今天的已实现还是 0（状态文件里没有今天的数）时，
     // 用成交历史补上
     void seed_day_from_history(const std::vector<TrendTrade>& trades);
@@ -112,6 +115,7 @@ private:
 
     std::shared_ptr<TradingClient> client_;
     std::shared_ptr<TrendEngine>   engine_;
+    std::shared_ptr<Journal>       journal_;
     std::string                    state_path_;
     LogFn                          log_;
 

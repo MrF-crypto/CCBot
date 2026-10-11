@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <cmath>
 #include <limits>
 #include <sstream>
 
@@ -85,6 +86,18 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            << "\"af\":"          << b.st.af << ","
            // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
            << "\"entry_atr\":"   << b.st.entry_atr << ","
+           // 数据记录层：开仓那一刻的名单信息与入场位置。⚠ NaN 写进 JSON 是非法的，
+           // 没有值就不写这个键
+           << "\"open_ms\":"     << b.open_ms << ","
+           << "\"open_seg\":"    << (int)b.open_seg << ","
+           << "\"open_rank\":"   << b.open_rank << ","
+           << "\"open_score\":"  << b.open_score << ","
+           << (std::isfinite(b.open_dist_atr)
+                   ? "\"open_dist_atr\":" + std::to_string(b.open_dist_atr) + ","
+                   : std::string())
+           // 浮盈亏最低（持仓期最差价）与 R 的分母（初始止损线）
+           << "\"trough\":"      << b.trough << ","
+           << "\"open_stop\":"   << b.open_stop << ","
            // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
            //    忘掉，盘中即时模式下同一根里会再开一次
            << "\"last_entry_bar_ms\":" << b.st.last_entry_bar_ms << ","
@@ -226,6 +239,13 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
         b.st.af              = get_num(o, "af", b.cfg.rule.af_start);
         b.st.entry_atr       = get_num(o, "entry_atr", 0);
+        b.open_ms            = get_i64(o, "open_ms", 0);
+        b.open_seg           = (char)(int)get_num(o, "open_seg", 0);
+        b.open_rank          = (int)get_num(o, "open_rank", 0);
+        b.open_score         = get_num(o, "open_score", 0);
+        b.open_dist_atr      = get_num(o, "open_dist_atr", std::numeric_limits<double>::quiet_NaN());
+        b.trough             = get_num(o, "trough", 0);
+        b.open_stop          = get_num(o, "open_stop", 0);
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");

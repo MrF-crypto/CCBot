@@ -169,6 +169,29 @@ int main() {
               "策略参数必须取自最新配置，而不是落盘快照");
     }
 
+    // ── 数据记录层的开仓信息跨重启；NaN 不能写坏 JSON ─────────────────────────
+    {
+        auto a = mk_bot("AAAUSDT", trend::Pos::Long, 100, 100, 94, 1);
+        a.open_ms = 1791619200000LL; a.open_seg = 'U'; a.open_rank = 3; a.open_score = 72.5;
+        a.open_dist_atr = 0.75;
+        a.trough = 96.125; a.open_stop = 94.5;
+        auto b = mk_bot("BBBUSDT", trend::Pos::Long, 100, 100, 94, 1);   // open_dist_atr 默认 NaN
+        save_trend_state(path, {a, b});
+        auto got = load_trend_state(path, {mk_cfg("AAAUSDT"), mk_cfg("BBBUSDT")});
+        check(got.size() == 2, "开仓信息：两个 bot 都能读回（NaN 没把 JSON 写坏）");
+        for (const auto& g : got) {
+            if (g.cfg.symbol == "AAAUSDT")
+                check(g.open_ms == a.open_ms && g.open_seg == 'U' && g.open_rank == 3 &&
+                      std::fabs(g.open_score - 72.5) < 1e-9 && std::fabs(g.open_dist_atr - 0.75) < 1e-6,
+                      "  开仓时的段、名次、分数、入场离边沿 ATR 都接得上");
+            if (g.cfg.symbol == "AAAUSDT")
+                check(g.trough == 96.125 && g.open_stop == 94.5,
+                      "  持仓期最差价与初始止损线（浮盈亏最低 / R 的依据）接得上");
+            if (g.cfg.symbol == "BBBUSDT")
+                check(std::isnan(g.open_dist_atr), "  没有的仍是 NaN");
+        }
+    }
+
     // ── 开仓时 ATR 跨重启存活（海龟锁定 ATR / 加速收紧的基准）───────────────
     {
         auto b = mk_bot("BTCUSDT", trend::Pos::Long, 100, 100, 94, 1);

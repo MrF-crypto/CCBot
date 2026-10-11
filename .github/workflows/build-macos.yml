@@ -99,7 +99,7 @@ jobs:
                    ccg_trend_stress_tests \
                    ccg_config_tests ccg_timesync_tests ccg_pool_tests \
                    ccg_rest_feed_tests ccg_app_logic_tests \
-                   ccg_smart_tests ccg_smart_runner_tests; do
+                   ccg_smart_tests ccg_smart_runner_tests ccg_journal_tests; do
             echo "── $t ──"
             ./build/$t
           done

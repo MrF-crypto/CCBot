@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace ccg {
 
@@ -139,11 +140,12 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
             default:  return "名单";
             }
         };
-        // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时只标"自动"
+        // "智能"已经显示在周期·模式列，这里只标段和名次。
+        // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时不标
         const QString tag = b.smart_rank > 0
-            ? QString("自动·%1#%2").arg(list_short(b.smart_list)).arg(b.smart_rank)
-            : (b.smart_score > 0 ? QString("自动·待移出") : QString("自动"));
-        auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + "  " + tag,
+            ? QString("%1#%2").arg(list_short(b.smart_list)).arg(b.smart_rank)
+            : (b.smart_score > 0 ? QString("待移出") : QString());
+        auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + (tag.isEmpty() ? "" : "  " + tag),
                           b.smart_rank > 0 ? kBlue : kGrey);
         sym_it->setToolTip(QString("智能模式管理的 bot\n综合分 %1　%2\n"
                                    "空仓时掉出名单（连续 2 轮、满 24 小时）会被自动移除；"
@@ -174,12 +176,17 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     // 模式名单独占一格信息量太小，合成 "3m·裸K" / "4h·通道" 更划算
     const auto strat   = b.cfg.rule.strategy;
     const bool bar_mode = (strat == trend::Strategy::BareK);
-    const char* short_name = (strat == trend::Strategy::Turtle)       ? "·海龟"
+    // 智能模式管理的 bot 显示"智能"（它只建海龟，策略和参数在悬停提示里）；
+    // 手动 bot 显示自己的策略名
+    const char* short_name = b.is_auto                                ? "·智能"
+                           : (strat == trend::Strategy::Turtle)       ? "·海龟"
                            : (strat == trend::Strategy::ParabolicSar) ? "·SAR"
                                                                       : "·裸K";
-    auto* strat_it = mk(QString::fromStdString(b.cfg.interval) + short_name, kBlue);
+    auto* strat_it = mk(QString::fromStdString(b.cfg.interval) + short_name,
+                        b.is_auto ? kAmber : kBlue);
     {
-        QString tip = QString("%1　信号周期 %2\n")
+        QString tip = QString("%1%2　信号周期 %3\n")
+                          .arg(b.is_auto ? "智能模式管理 · " : "")
                           .arg(trend::strategy_name(strat))
                           .arg(QString::fromStdString(b.cfg.interval));
         if (b.cfg.rule.direction != trend::Direction::Both)
@@ -322,8 +329,27 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     botTable_->setItem(row, ColEntry, entry_it);
 
     // ── 9 浮动P&L ──
-    botTable_->setItem(row, ColUnreal,
-        mk(has_pos ? fmt_signed(upnl) : "—", pnl_color(upnl)));
+    // 悬停：最高到过多少（同交易明细的「浮盈亏最高」口径）、按当前止损线平仓是多少
+    auto* unreal_it = mk(has_pos ? fmt_signed(upnl) : "—", pnl_color(upnl));
+    if (has_pos && b.st.entry_price > 0) {
+        const double sign = is_long ? 1.0 : -1.0;
+        auto usd = [](double v) {
+            return QString("%1$%2").arg(v >= 0 ? "+" : "-").arg(std::abs(v), 0, 'f', 2);
+        };
+        // 开仓那一刻是 0，当前浮盈也算进去：peak 是采样极值，可能还没跟上这一拍
+        double best = std::max(0.0, upnl);
+        if (b.st.peak > 0)
+            best = std::max(best, (b.st.peak - b.st.entry_price) * b.qty * sign);
+        QString tip = QString("浮动盈亏  %1\n最高到过  %2").arg(usd(upnl), usd(best));
+        const double risk = std::abs(b.st.entry_price - b.open_stop);
+        if (b.open_stop > 0 && risk > 0)
+            tip += QString("（%1R）").arg(QString("%1%2").arg(best >= 0 ? "+" : "-")
+                                           .arg(std::abs(best / b.qty) / risk, 0, 'f', 1));
+        if (b.st.stop > 0)
+            tip += QString("\n止损锁定  %1").arg(usd((b.st.stop - b.st.entry_price) * b.qty * sign));
+        unreal_it->setToolTip(tip);
+    }
+    botTable_->setItem(row, ColUnreal, unreal_it);
 
     // ── 10 保证金 / 11 收益率 ──
     double margin = 0, roe = 0;
@@ -1377,6 +1403,15 @@ void MainWindow::save_trend_bots() {
         o["af"]              = b.st.af;
         // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
         o["entry_atr"]       = b.st.entry_atr;
+        // 数据记录层：开仓那一刻的名单信息与入场位置，跨重启的仓位平掉时要用
+        o["open_ms"]         = (qint64)b.open_ms;
+        o["open_seg"]        = (int)b.open_seg;
+        o["open_rank"]       = b.open_rank;
+        o["open_score"]      = b.open_score;
+        if (std::isfinite(b.open_dist_atr)) o["open_dist_atr"] = b.open_dist_atr;
+        // 浮盈亏最低（持仓期最差价）与 R 的分母。丢了的话重启前那段浮亏就没了
+        o["trough"]          = b.trough;
+        o["open_stop"]       = b.open_stop;
         o["consec_reverses"] = b.st.consec_reverses;
         o["cooldown_left"]   = b.st.cooldown_left;
         // ③ 裸K 专用：once_per_bar 的判据（最后一次开仓所在K线的开盘时间）。
@@ -1526,6 +1561,15 @@ void MainWindow::load_and_restore_trend() {
         // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
         b.st.af              = o["af"].toDouble(b.cfg.rule.af_start);
         b.st.entry_atr       = o["entry_atr"].toDouble(0);
+        b.open_ms            = (int64_t)o["open_ms"].toInteger(0);
+        b.open_seg           = (char)o["open_seg"].toInt(0);
+        b.open_rank          = o["open_rank"].toInt(0);
+        b.open_score         = o["open_score"].toDouble(0);
+        b.open_dist_atr      = o.contains("open_dist_atr")
+                                   ? o["open_dist_atr"].toDouble(0)
+                                   : std::numeric_limits<double>::quiet_NaN();
+        b.trough             = o["trough"].toDouble(0);
+        b.open_stop          = o["open_stop"].toDouble(0);
         b.st.consec_reverses = o["consec_reverses"].toInt(0);
         b.st.cooldown_left   = o["cooldown_left"].toInt(0);
         b.st.last_entry_bar_ms = (int64_t)o["last_entry_bar_ms"].toInteger(0);

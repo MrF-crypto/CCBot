@@ -40,6 +40,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <limits>
 #include <cstdlib>          // std::_Exit
 
 namespace ccg {
@@ -384,6 +385,12 @@ void MainWindow::save_trades(bool force) {
         o["reversed"]    = t.reversed;
         o["reason"]      = QString::fromStdString(t.reason);
         o["close_time_ms"] = tp_to_ms(t.close_time);
+        // 浮盈亏最高 / 最低。NaN 不写（JSON 里没有 NaN），读回来缺键即 NaN
+        auto put = [&o](const char* k, double v) { if (std::isfinite(v)) o[k] = v; };
+        put("mfe_usd", t.mfe_usd); put("mae_usd", t.mae_usd);
+        put("mfe_pct", t.mfe_pct); put("mae_pct", t.mae_pct);
+        put("mfe_atr", t.mfe_atr); put("mae_atr", t.mae_atr);
+        put("mfe_r",   t.mfe_r);   put("mae_r",   t.mae_r);
         arr.append(o);
     }
     QSaveFile f(QString::fromStdString(trade_path()));   // 原子保存，崩溃不损坏交易明细
@@ -415,6 +422,14 @@ void MainWindow::load_trades() {
         t.reversed    = o["reversed"].toBool(false);
         t.reason      = o["reason"].toString().toStdString();
         t.close_time  = ms_to_tp((qint64)o["close_time_ms"].toDouble());
+        // 老记录没有这几个键：保持 NaN，界面显示 "--"
+        auto get = [&o](const char* k) {
+            return o.contains(k) ? o[k].toDouble() : std::numeric_limits<double>::quiet_NaN();
+        };
+        t.mfe_usd = get("mfe_usd"); t.mae_usd = get("mae_usd");
+        t.mfe_pct = get("mfe_pct"); t.mae_pct = get("mae_pct");
+        t.mfe_atr = get("mfe_atr"); t.mae_atr = get("mae_atr");
+        t.mfe_r   = get("mfe_r");   t.mae_r   = get("mae_r");
         trades_.push_back(t);
     }
 }
@@ -499,7 +514,7 @@ void MainWindow::refreshStats() {
 void MainWindow::openTradeHistoryDialog() {
     QDialog dlg(this);
     dlg.setWindowTitle("交易明细与周期统计");
-    dlg.resize(860, 620);
+    dlg.resize(1040, 620);
     auto* dv = new QVBoxLayout(&dlg);
 
     auto mkc = [](const QString& s, const QColor& c) {
@@ -589,9 +604,15 @@ void MainWindow::openTradeHistoryDialog() {
     histTitle->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding-top:6px;");
     dv->addWidget(histTitle);
 
-    auto* table = new QTableWidget(0, 9);
+    auto* table = new QTableWidget(0, 11);
     table->setHorizontalHeaderLabels(
-        {"时间","品种","方向","开仓价","平仓价","数量","盈亏","反手","原因"});
+        {"时间","品种","方向","开仓价","平仓价","数量","盈亏","浮盈亏最高","浮盈亏最低","反手","原因"});
+    table->horizontalHeaderItem(7)->setToolTip(
+        "持仓期间浮盈亏最好的那一刻。开仓那一刻是 0，所以不会是负数。\n"
+        "和「盈亏」对比：最高 +$30、平仓 +$5 = 回吐了大部分利润。悬停看 R / ATR 倍数");
+    table->horizontalHeaderItem(8)->setToolTip(
+        "持仓期间浮盈亏最差的那一刻。开仓那一刻是 0，所以不会是正数。\n"
+        "赚钱的单子最低也到过 -1R 附近 = 止损放得刚好；远没到 = 止损可以收紧。悬停看 R / ATR 倍数");
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     table->verticalHeader()->setVisible(false);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -617,9 +638,27 @@ void MainWindow::openTradeHistoryDialog() {
         table->setItem(i, 5, mkc(QString::number(t.qty, 'f', 4), QColor("#8b949e")));
         table->setItem(i, 6, mkc(QString("%1$%2").arg(t.pnl >= 0 ? "+" : "").arg(std::abs(t.pnl), 0, 'f', 2),
                                   t.pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
-        table->setItem(i, 7, mkc(t.reversed ? "是" : "--",
+        // 浮盈亏最高 / 最低：负数红，0 和正数绿（与「盈亏」列同一套颜色）。
+        // 老记录没有这两项（NaN）显示 "--"
+        auto excursion = [&](double usd, double pct, double atr, double r, const char* name) {
+            if (!std::isfinite(usd)) return mkc("--", QColor("#8b949e"));
+            auto* it = mkc(QString("%1$%2").arg(usd >= 0 ? "+" : "-").arg(std::abs(usd), 0, 'f', 2),
+                           usd >= 0 ? QColor("#3fb950") : QColor("#f85149"));
+            auto sg = [](double v, int prec) {
+                return QString("%1%2").arg(v >= 0 ? "+" : "-").arg(std::abs(v), 0, 'f', prec);
+            };
+            QStringList parts;
+            parts << (std::isfinite(r)   ? sg(r, 2) + "R"     : QString("R 算不了（没有初始止损记录）"));
+            parts << (std::isfinite(atr) ? sg(atr, 2) + "ATR" : QString("ATR 算不了（非海龟或老仓位）"));
+            if (std::isfinite(pct)) parts << sg(pct, 2) + "%";
+            it->setToolTip(QString("%1 %2").arg(name, parts.join(" / ")));
+            return it;
+        };
+        table->setItem(i, 7, excursion(t.mfe_usd, t.mfe_pct, t.mfe_atr, t.mfe_r, "最高"));
+        table->setItem(i, 8, excursion(t.mae_usd, t.mae_pct, t.mae_atr, t.mae_r, "最低"));
+        table->setItem(i, 9, mkc(t.reversed ? "是" : "--",
                                   t.reversed ? QColor("#d29922") : QColor("#8b949e")));
-        table->setItem(i, 8, mkc(QString::fromStdString(t.reason), QColor("#8b949e")));
+        table->setItem(i, 10, mkc(QString::fromStdString(t.reason), QColor("#8b949e")));
     }
 
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Close);
@@ -1173,7 +1212,12 @@ void MainWindow::onConnect() {
                     save_trend_bots();
                 }, Qt::QueuedConnection);
             });
-            trend_engine_->set_trade_cb([this](const TrendTrade& tr) {
+            if (!journal_)
+                journal_ = std::make_shared<Journal>((portable_data_dir() + "/journal").toStdString());
+            // 数据记录层：被过滤掉的突破。Journal 自带锁，可以在引擎线程里直接写
+            trend_engine_->set_filter_cb([j = journal_](const FilterEvent& e) { j->filter(e); });
+            trend_engine_->set_trade_cb([this, j = journal_](const TrendTrade& tr) {
+                j->trade(tr);   // 数据记录层：带开仓时的段、分数、入场离边沿多少 ATR
                 QMetaObject::invokeMethod(this, [this, tr]() {
                     // 直接存 TrendTrade，不再转成中间结构：v4.7.1 之前这里要把它
                     // 翻译成 DCA 的 TradeRecord（层数填 0、原因加 "SAR " 前缀），

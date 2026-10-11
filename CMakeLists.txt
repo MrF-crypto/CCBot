@@ -99,6 +99,7 @@ set(CORE_SOURCES
     src/core/trend_engine.cpp
     src/core/funding_ledger.cpp
     src/core/smart_mode.cpp
+    src/core/journal.cpp
     src/app/smart_runner.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
@@ -370,6 +371,7 @@ endif()
 # ── 智能模式执行层测试：假交易所 → 扫描 → 候选池决策落到引擎 ─────────────────
 add_executable(ccg_smart_runner_tests tests/test_smart_runner.cpp
                                       src/app/smart_runner.cpp src/core/smart_mode.cpp
+                                      src/core/journal.cpp
                                       src/core/trend_engine.cpp
                                       src/net/trading_client.cpp src/net/rate_gate.cpp)
 target_include_directories(ccg_smart_runner_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -380,6 +382,14 @@ if(WIN32)
 endif()
 if(MSVC)
     target_compile_options(ccg_smart_runner_tests PRIVATE /utf-8)
+endif()
+
+# ── 数据记录层测试：CSV 格式、按日文件、过期清理、字段转义 ─────────────────────
+add_executable(ccg_journal_tests tests/test_journal.cpp src/core/journal.cpp)
+target_include_directories(ccg_journal_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_journal_tests PRIVATE simdjson::simdjson Threads::Threads)
+if(MSVC)
+    target_compile_options(ccg_journal_tests PRIVATE /utf-8)
 endif()
 
 # ccg_persist_tests 随网格DCA 一并移除（本版）：它测的是 headless_state 的
@@ -411,7 +421,7 @@ set(CCBOT_OWN_TARGETS
     ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
     ccg_rate_tests ccg_timesync_tests ccg_config_tests
     ccg_key_store_tests ccg_rest_feed_tests ccg_app_logic_tests ccg_smart_tests
-    ccg_smart_runner_tests
+    ccg_smart_runner_tests ccg_journal_tests
 )
 if(WIN32 OR APPLE)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)

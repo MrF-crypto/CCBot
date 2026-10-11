@@ -257,6 +257,9 @@ int main(int argc, char** argv) {
     }
 
     // ── 趋势引擎（海龟 / 抛物线SAR / 纯裸K，本版起是唯一的引擎）──────────────
+    // 数据记录层：状态文件同目录下的 journal/（见 core/journal.h）
+    const auto journal = std::make_shared<Journal>(
+        (std::filesystem::path(cfg.state_path).parent_path() / "journal").string());
     std::shared_ptr<TrendEngine> trend_engine;
     std::vector<std::string> trend_ids;
     // 状态文件仍带 .sar 后缀：老部署升级上来时这个文件已经存在，改名等于
@@ -272,7 +275,9 @@ int main(int argc, char** argv) {
         trend_engine->set_max_total_margin(cfg.max_total_margin);
         trend_engine->set_max_open_positions(cfg.max_open_positions);
         trend_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
+        trend_engine->set_filter_cb([j = journal](const FilterEvent& e) { j->filter(e); });
         trend_engine->set_trade_cb([&](const TrendTrade& tr) {
+            journal->trade(tr);   // 数据记录层：带开仓时的段、分数、入场离边沿多少 ATR
             std::ostringstream ss;
             ss << "[趋势] " << tr.symbol << " " << tr.reason
                << " 开=$" << tr.entry_price << " 平=$" << tr.exit_price
@@ -389,6 +394,7 @@ int main(int argc, char** argv) {
         sym_del_q.insert(s);
         sym_add_q.erase(s);
     };
+    smart->set_journal(journal);
     smart->load();
     // 状态文件里没有今天的数（升级后第一次运行）：用成交 CSV 补，亏损限额不从 0 算
     smart->seed_day_from_history(load_trades_csv(trades_csv));

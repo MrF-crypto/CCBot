@@ -332,6 +332,8 @@ private:
     // 运行器随引擎一起在每次连接成功时重建（它持有引擎指针）。配置独立落盘，
     // 启动时就读进来，未连接时也能打开弹窗改
     std::shared_ptr<SmartRunner> smart_;
+    // 数据记录层：<数据目录>/journal 下的 CSV，供实盘复盘、校准智能模式（见 core/journal.h）
+    std::shared_ptr<Journal>     journal_;
     smart::Config                smartCfg_;
     std::atomic<bool>            smartBusy_{false};
     QPushButton*                 smartBtn_ = nullptr;

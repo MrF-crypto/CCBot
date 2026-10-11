@@ -1,5 +1,6 @@
 #include "core/trend_engine.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
@@ -11,6 +12,47 @@ std::string fmt(double v, int prec = 4) {
     std::ostringstream o;
     o << std::fixed << std::setprecision(prec) << v;
     return o.str();
+}
+// 数据记录层：把开仓那一刻的情况抄到成交记录上
+void fill_trade_meta(TrendTrade& tr, const TrendBot& b) {
+    if (b.open_ms > 0)
+        tr.open_time = std::chrono::system_clock::time_point(std::chrono::milliseconds(b.open_ms));
+    tr.is_auto  = b.is_auto;
+    tr.seg      = b.open_seg;
+    tr.rank     = b.open_rank;
+    tr.score    = b.open_score;
+    tr.entry_dist_atr = b.open_dist_atr;
+    tr.strategy = b.cfg.rule.strategy;
+    tr.interval = b.cfg.interval;
+
+    // 浮盈亏最高 / 最低。⚠ 必须在 on_closed 之前调用（它清 peak / entry_atr）。
+    // 开仓价与平仓价也算进极值：采样是每拍一次，平仓那一下（尤其硬止损按
+    // 触发价记账）可能比任何一次采样都差
+    const double e = tr.entry_price;
+    if (!(e > 0) || !(tr.qty > 0) || tr.side == trend::Pos::Flat) return;
+    const bool   lg   = (tr.side == trend::Pos::Long);
+    const double sign = lg ? 1.0 : -1.0;
+    double best = e, worst = e;
+    for (double px : {b.st.peak, b.trough, tr.exit_price}) {
+        if (!(px > 0)) continue;
+        best  = lg ? std::max(best, px)  : std::min(best, px);
+        worst = lg ? std::min(worst, px) : std::max(worst, px);
+    }
+    const double up = (best - e) * sign;     // ≥ 0，价格单位
+    const double dn = (worst - e) * sign;    // ≤ 0
+    tr.mfe_usd = up * tr.qty;
+    tr.mae_usd = dn * tr.qty;
+    tr.mfe_pct = up / e * 100.0;
+    tr.mae_pct = dn / e * 100.0;
+    if (b.st.entry_atr > 0) {
+        tr.mfe_atr = up / b.st.entry_atr;
+        tr.mae_atr = dn / b.st.entry_atr;
+    }
+    const double risk = std::fabs(e - b.open_stop);
+    if (b.open_stop > 0 && risk > 0) {
+        tr.mfe_r = up / risk;
+        tr.mae_r = dn / risk;
+    }
 }
 const char* side_of(trend::Pos p, bool closing) {
     // 开仓：多=BUY 空=SELL；平仓方向相反
@@ -290,6 +332,7 @@ std::vector<std::string> TrendEngine::reconcile_positions(
                 tr.pnl         = pnl;
                 tr.reason      = "交易所硬止损触发（对账确认，按挂单价估算）";
                 tr.close_time  = host_.now_wall();
+                fill_trade_meta(tr, b);
                 fired.push_back(tr);
                 note_once(TrendBot::Recon::ExtGone,
                           b.cfg.symbol + " 交易所硬止损已触发（对账确认）：按 $" + fmt(px) +
@@ -858,6 +901,7 @@ void TrendEngine::tick(const std::string& symbol, double price) {
     //   再次判定时走的是另一条分支——动作就错了。到那时这里必须改成向量派发
     std::string to_close, close_reason, to_open, to_ds_sync;
     trend::Pos reverse_to = trend::Pos::Flat, open_dir = trend::Pos::Flat;
+    std::vector<FilterEvent> filtered_events;   // 锁外再交给数据记录层
 
     {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
@@ -916,6 +960,12 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                 b.armed = true;
 
             const auto v = trend::step(b.st, b.cfg.rule, in);
+
+            // 持仓期最差价（浮亏最低）。有利极值 st.peak 由 step 更新，这里补另一头
+            if (b.st.pos != trend::Pos::Flat)
+                b.trough = !(b.trough > 0) ? price
+                         : (b.st.pos == trend::Pos::Long) ? std::min(b.trough, price)
+                                                          : std::max(b.trough, price);
 
             {
                 std::ostringstream d;
@@ -1006,6 +1056,17 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                 // 每轮汇总成一行；原因照常在状态列里
                 if (b.is_auto) ++filter_counts_[cat];
                 else           log(m);
+                if (filter_cb_) {
+                    FilterEvent fe;
+                    fe.time     = host_.now_wall();
+                    fe.symbol   = b.cfg.symbol;
+                    fe.is_long  = lg;
+                    fe.is_auto  = b.is_auto;
+                    fe.category = cat;
+                    fe.price    = price;
+                    fe.detail   = m;
+                    filtered_events.push_back(std::move(fe));
+                }
             }
 
             // 硬止损的【重试驱动】。固定语义下，挂上了就再也不碰——所以这里
@@ -1079,6 +1140,8 @@ void TrendEngine::tick(const std::string& symbol, double price) {
     // 派发在锁外：submit 可能同步执行（测试/回放的内联执行器），
     // 持锁派发会在同一线程上重入取锁——recursive_mutex 救得了死锁，
     // 救不了"别人看到的是半更新状态"
+    if (filter_cb_)
+        for (const auto& fe : filtered_events) filter_cb_(fe);
     if (!to_close.empty()) submit_close(to_close, close_reason, reverse_to);
     if (!to_open.empty())  submit_open (to_open,  open_dir, false);
 
@@ -1113,6 +1176,8 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
             // 开仓时的 ATR：海龟的锁定 ATR / 加速收紧以它为基准。和初始止损线
             // 同一时刻取，两者口径一致
             double entry_atr = 0;
+            // 数据记录层：开仓时的通道边沿（算"入场离边沿多远"）
+            double edge_up = 0, edge_dn = 0;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
@@ -1120,7 +1185,10 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 const auto& b = it->second;
                 cfg   = b.cfg;
                 price = b.current_price;
-                if (cfg.rule.strategy == trend::Strategy::Turtle) entry_atr = b.atr;
+                if (cfg.rule.strategy == trend::Strategy::Turtle) {
+                    entry_atr = b.atr;
+                    if (b.dc_ok) { edge_up = b.dc_up; edge_dn = b.dc_dn; }
+                }
                 // 初始止损线在【持锁时】按当前快照算好带出去：下单是异步的，
                 // 等回来再算的话快照可能已经换了一根K线，止损线会和成交价错配
                 trend::Inputs si;
@@ -1198,6 +1266,21 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 // 判定"这一根已经开过了"
                 trend::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse,
                                  b.bar_open_ms, entry_atr);
+                // 数据记录层：开仓那一刻的名单信息与入场位置
+                b.open_ms    = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   host_.now_wall().time_since_epoch()).count();
+                b.open_seg   = b.smart_list;
+                b.open_rank  = b.smart_rank;
+                b.open_score = b.smart_score;
+                b.trough     = fill;
+                b.open_stop  = b.st.stop;
+                b.open_dist_atr = std::numeric_limits<double>::quiet_NaN();
+                if (entry_atr > 0) {
+                    if (dir == trend::Pos::Long && edge_up > 0)
+                        b.open_dist_atr = (fill - edge_up) / entry_atr;
+                    else if (dir == trend::Pos::Short && edge_dn > 0)
+                        b.open_dist_atr = (edge_dn - fill) / entry_atr;
+                }
                 b.qty = r.executed_qty;
                 // 对账要知道这笔变化发生在什么时候，才能判断交易所快照来不来得及
                 // 包含它。漏打时间戳 = 对账拿旧快照把刚开的仓判成"外部已平"
@@ -1678,6 +1761,7 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                     tr.reason      = "交易所硬止损触发（成交价为近似值）";
                     tr.reversed    = false;
                     tr.close_time  = host_.now_wall();
+                    fill_trade_meta(tr, b);
                     emit_trade = true;
 
                     b.realized_pnl += pnl;
@@ -1740,6 +1824,7 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 tr.reason      = reason;
                 tr.reversed    = (reverse_to != trend::Pos::Flat);
                 tr.close_time  = host_.now_wall();
+                fill_trade_meta(tr, b);
                 emit_trade = true;
 
                 b.realized_pnl += pnl;

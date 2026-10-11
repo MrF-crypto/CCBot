@@ -154,6 +154,7 @@ struct Features {
     double er24      = 0;       // 24 根效率比，带方向
     double max_up24  = 0;       // 最近 7 天里任意连续 24 根的最大涨幅（%）——过热判定
     double max_dn24  = 0;       // 同窗口最大跌幅（%，正数）——暴跌判定
+    double close     = 0;       // 最后一根已收盘K线的收盘价（数据记录层：事后算后续涨跌）
 };
 // bars / btc：已收盘的 1h K线，时间正序，不含未收盘那根。至少 kMinBars 根
 inline constexpr int kMinBars = 170;

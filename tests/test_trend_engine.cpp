@@ -404,6 +404,99 @@ int main() {
         check(cli2->calls.size() == 1, "  手动 bot 照常突破即开");
     }
 
+    // ── 数据记录层：成交带上开仓时的段/分数/入场离边沿；过滤事件每根K线一次 ──────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<TrendTrade> trades;
+        std::vector<FilterEvent> filters;
+        eng.set_trade_cb([&](const TrendTrade& t) { trades.push_back(t); });
+        eng.set_filter_cb([&](const FilterEvent& e) { filters.push_back(e); });
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        cfg.rule.breakout_vol_ratio = 1.5;
+        auto id = eng.add_bot(cfg, /*is_auto*/ true);
+        eng.set_smart_meta(id, 77, 4, 'U');
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 3.0, 1.0);
+        eng.tick("TESTUSDT", 100.0);            // 上膛
+        eng.tick("TESTUSDT", 111.0);            // 突破，量比 1.0 不够
+        eng.tick("TESTUSDT", 111.5);
+        check(filters.size() == 1 && filters[0].category == "量比" && filters[0].is_long &&
+              filters[0].is_auto, "被过滤的突破：发出一条事件（同一根K线只一次）");
+
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 3.0, 2.0);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);            // 放量，开多 @111
+        const auto b = eng.get_bots()[0];
+        check(b.open_seg == 'U' && b.open_rank == 4 && b.open_score == 77,
+              "开仓时记下所在段、名次、分数");
+        check(std::fabs(b.open_dist_atr - 0.5) < 1e-9, "  入场离通道上沿 (111−110)÷2 = 0.5 ATR");
+        advance(10);
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 2, 3.0, 2.0);
+        cli->fill_price = 104.0;
+        eng.tick("TESTUSDT", 104.0);            // 止损出场
+        check(trades.size() == 1 && trades[0].seg == 'U' && trades[0].rank == 4 &&
+              std::fabs(trades[0].entry_dist_atr - 0.5) < 1e-9 && trades[0].is_auto &&
+              trades[0].open_time.time_since_epoch().count() != 0 && trades[0].interval == cfg.interval,
+              "  平仓的成交记录带上这些信息");
+    }
+
+    // ── 浮盈亏最高 / 最低（MFE / MAE）：美元、%、ATR、R 四种单位 ──────────────
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        std::vector<TrendTrade> trades;
+        eng.set_trade_cb([&](const TrendTrade& t) { trades.push_back(t); });
+        auto cfg = mk_cfg();
+        cfg.rule.reverse = trend::ReverseMode::None;
+        auto id = eng.add_bot(cfg);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);            // 开多 @111
+        auto b = eng.get_bots()[0];
+        const double q = b.qty, ostop = b.open_stop;
+        check(b.st.pos == trend::Pos::Long && b.trough == 111.0 && ostop > 0 && ostop < 111.0,
+              "开仓：最差价从成交价起算，记下初始止损线");
+        eng.tick("TESTUSDT", 109.0);            // 浮亏 −2
+        eng.tick("TESTUSDT", 115.0);            // 浮盈 +4，止损线上移到 115−6 = 109
+        eng.tick("TESTUSDT", 110.0);
+        check(eng.get_bots()[0].trough == 109.0, "  持仓中跟踪最差价（多单取最低）");
+        cli->fill_price = 108.0;
+        eng.tick("TESTUSDT", 108.0);            // 跌破 109 止损出场，成交 108
+        check(trades.size() == 1, "  止损出场一笔");
+        if (trades.size() == 1) {
+            const auto& t = trades[0];
+            const double risk = 111.0 - ostop;
+            // 平仓价 108 比采样到的最低 109 还差：最低要算到平仓价
+            check(std::fabs(t.mfe_usd - 4.0 * q) < 1e-9 && std::fabs(t.mae_usd + 3.0 * q) < 1e-9,
+                  "  浮盈亏最高 +4×数量，最低 −3×数量（平仓价也算进极值）");
+            check(std::fabs(t.mfe_pct - 4.0 / 111.0 * 100) < 1e-9 &&
+                  std::fabs(t.mae_pct + 3.0 / 111.0 * 100) < 1e-9, "  占开仓价 %");
+            check(std::fabs(t.mfe_atr - 2.0) < 1e-9 && std::fabs(t.mae_atr + 1.5) < 1e-9,
+                  "  ATR 倍数：+4÷2 = 2，−3÷2 = −1.5");
+            check(std::fabs(t.mfe_r - 4.0 / risk) < 1e-9 && std::fabs(t.mae_r + 3.0 / risk) < 1e-9,
+                  "  R 倍数：按开仓价到初始止损线的距离");
+        }
+
+        // 空单：方向反过来，最差价取最高
+        auto cli2 = std::make_shared<FakeClient>();
+        TrendEngine eng2(cli2, inline_host());
+        std::vector<TrendTrade> tr2;
+        eng2.set_trade_cb([&](const TrendTrade& t) { tr2.push_back(t); });
+        auto id2 = eng2.add_bot(cfg);
+        feed(eng2, id2, 2.0, 110, 90);
+        cli2->fill_price = 89.0;
+        eng2.tick("TESTUSDT", 89.0);            // 开空 @89
+        const double q2 = eng2.get_bots()[0].qty;
+        eng2.tick("TESTUSDT", 90.5);            // 浮亏 −1.5
+        eng2.tick("TESTUSDT", 87.0);            // 浮盈 +2，止损线 87+6 = 93
+        cli2->fill_price = 93.5;
+        eng2.tick("TESTUSDT", 93.5);            // 止损出场
+        check(tr2.size() == 1 && tr2[0].side == trend::Pos::Short &&
+              std::fabs(tr2[0].mfe_usd - 2.0 * q2) < 1e-9 && std::fabs(tr2[0].mae_usd + 4.5 * q2) < 1e-9,
+              "空单：最高 +2×数量，最低 −4.5×数量");
+    }
+
     // ── 暂停中：硬止损丢了要补挂；它触发后对账确认时按挂单价记账 ──────────────
     {
         auto cli = std::make_shared<FakeClient>();

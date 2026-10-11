@@ -328,6 +328,20 @@ int main() {
               "  中间段照常要量比（横盘币缩量跌破多半是洗盘）");
         check(has(rep.summary, "强势") && has(rep.summary, "过热"), "  汇总里按段列出");
 
+        // 数据记录层：扫描快照与候选池事件
+        const auto jdir = std::filesystem::path(dir) / "journal_m";
+        std::filesystem::remove_all(jdir);
+        Rig rj(dir + "/mj.json");
+        rj.mk.syms = m;
+        rj.run->set_journal(std::make_shared<Journal>(jdir.string()));
+        rj.run->set_config(c);
+        rj.run->run_once(kNow);
+        bool scan_file = false;
+        for (const auto& e : std::filesystem::directory_iterator(jdir))
+            if (e.path().filename().string().rfind("scan-", 0) == 0) scan_file = true;
+        check(scan_file && std::filesystem::exists(jdir / "pool.csv"),
+              "数据记录层：每轮写扫描快照，加入的币记进 pool.csv");
+
         // 只勾做多：弱势、过热不加；中间段只做多
         Rig r2(dir + "/m2.json");
         r2.mk.syms = m;

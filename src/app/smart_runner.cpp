@@ -373,6 +373,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         }
         ++rep.removed;
         rm_desc.push_back(r.symbol + "（" + r.why + "）");
+        if (journal_) journal_->pool(now_ms, r.symbol, "移出", 0, 0, 0, r.why);
         if (on_symbol_removed) on_symbol_removed(r.symbol);
     }
 
@@ -395,11 +396,18 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         if (wd == want_dir.end()) continue;
         const auto want = smart::make_bot_config(cfg, b.cfg.symbol, wd->second.first,
                                                  wd->second.second);
-        if (b.cfg.rule.direction != want.rule.direction) ++redirected;
         if (same_params(b.cfg, want)) continue;
         // ⚠ replace_bot 在 id 不存在时会【新建】——上面已排除本轮删掉的；
         //   它自己会拒绝有持仓/在途订单的
-        if (!engine_->replace_bot(b.bot_id, want).empty()) ++resynced;
+        if (engine_->replace_bot(b.bot_id, want).empty()) continue;
+        ++resynced;
+        if (b.cfg.rule.direction != want.rule.direction) {
+            ++redirected;
+            if (journal_)
+                journal_->pool(now_ms, b.cfg.symbol, "换方向", wd->second.second, 0, 0,
+                               std::string(trend::direction_name(b.cfg.rule.direction)) + " → " +
+                               trend::direction_name(want.rule.direction));
+        }
     }
 
     // ── 补位 ──
@@ -415,6 +423,9 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         ++rep.added;
         add_desc.push_back(a.symbol + "（" + list_name(a.list) + " #" +
                            std::to_string(a.rank) + " " + fmt(a.score, 0) + "分）");
+        if (journal_)
+            journal_->pool(now_ms, a.symbol, "加入", a.list, a.rank, a.score,
+                           trend::direction_name(a.dir));
         if (on_symbol_added) on_symbol_added(a.symbol);
     }
 
@@ -430,6 +441,8 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         if (b.qty > 0) ++rep.holding;
     }
     rep.groups = build_groups(scan.outcome.ranking, plan.seg, cfg, with_bot);
+    // 数据记录层：完整名单快照（全部合格币，不只是进名单的）
+    if (journal_) journal_->scan(now_ms, scan.outcome.ranking, plan.seg, with_bot);
     rep.ok = true;
     std::string lists;
     for (const auto& g : rep.groups) {

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -246,7 +247,21 @@ struct TrendBot {
     bool   armed   = true;
     double smart_score = 0;   // 最近一次扫描的综合分，名额紧张时按它取舍
     int    smart_rank  = 0;   // 名单内排名，0 = 已不在名单
-    char   smart_list  = 0;   // 'L' 做多名单 / 'S' 做空名单 / 0
+    char   smart_list  = 0;   // 名单 / 分段代码（smart::kList* / kSeg*），0 = 无
+
+    // 开仓那一刻的情况，平仓时写进成交记录（数据记录层）。随仓位落盘：
+    // 跨重启的仓位平掉时也要知道它是从哪一段、几分、离通道多远进来的
+    int64_t open_ms        = 0;
+    char    open_seg       = 0;
+    int     open_rank      = 0;
+    double  open_score     = 0;
+    double  open_dist_atr  = std::numeric_limits<double>::quiet_NaN();
+    // 浮盈亏最高 / 最低用。有利极值就是 st.peak，这里补上另一头：
+    // trough = 持仓期最差价（多=最低、空=最高），0 = 还没采到；
+    // open_stop = 开仓时的初始止损线（R 的分母），0 = 不知道（老仓位）。
+    // 都是采样价（每拍一次），不额外请求；程序离线期间的波动采不到
+    double  trough         = 0;
+    double  open_stop      = 0;
 
     double realized_pnl = 0;
     int    trade_count  = 0;
@@ -270,12 +285,49 @@ struct TrendTrade {
     std::string reason;
     bool        reversed    = false;     // 本次平仓后是否反手了
     std::chrono::system_clock::time_point close_time{};
+
+    // ── 数据记录层用（开仓那一刻的情况），给实盘复盘：哪一段赚钱、入场晚了多少 ──
+    std::chrono::system_clock::time_point open_time{};   // 0 = 不知道（老仓位）
+    bool        is_auto = false;
+    char        seg     = 0;      // 开仓时所在的名单 / 分段（smart::kList* / kSeg*）
+    int         rank    = 0;
+    double      score   = 0;
+    // 开仓价离通道边沿多远（ATR 为单位，向突破方向为正）。只有海龟有；NaN = 没有
+    double      entry_dist_atr = std::numeric_limits<double>::quiet_NaN();
+    trend::Strategy strategy = trend::Strategy::Turtle;
+    std::string interval;
+
+    // 持仓期浮盈亏的最高 / 最低（MFE / MAE），带符号：最高是最好的那一刻，
+    // 最低是最差的那一刻。开仓那一刻浮盈亏为 0，所以最高 ≥ 0、最低 ≤ 0。
+    // 四种单位：美元、占开仓价 %、开仓 ATR 倍数、R（初始止损距离）倍数。
+    // NaN = 算不了（ATR：非海龟或老仓位；R：老仓位没记初始止损）
+    double mfe_usd = std::numeric_limits<double>::quiet_NaN();
+    double mae_usd = std::numeric_limits<double>::quiet_NaN();
+    double mfe_pct = std::numeric_limits<double>::quiet_NaN();
+    double mae_pct = std::numeric_limits<double>::quiet_NaN();
+    double mfe_atr = std::numeric_limits<double>::quiet_NaN();
+    double mae_atr = std::numeric_limits<double>::quiet_NaN();
+    double mfe_r   = std::numeric_limits<double>::quiet_NaN();
+    double mae_r   = std::numeric_limits<double>::quiet_NaN();
+};
+
+// 一次被过滤掉的突破（每个 bot 每根K线最多一次）。数据记录层用：事后看这些被拦下的
+// 突破后来怎么走，判断过滤挡的是坏单还是好单
+struct FilterEvent {
+    std::chrono::system_clock::time_point time{};
+    std::string symbol;
+    bool        is_long = true;
+    bool        is_auto = false;
+    std::string category;   // 箱体 / 量比 / 信号K
+    double      price = 0;
+    std::string detail;     // 和日志里那一句一样
 };
 
 class TrendEngine {
 public:
-    using LogCb   = std::function<void(const std::string&)>;
-    using TradeCb = std::function<void(const TrendTrade&)>;
+    using LogCb    = std::function<void(const std::string&)>;
+    using TradeCb  = std::function<void(const TrendTrade&)>;
+    using FilterCb = std::function<void(const FilterEvent&)>;
 
     TrendEngine(std::shared_ptr<ITradingClient> client,
               std::shared_ptr<ThreadPool>     pool);
@@ -309,6 +361,8 @@ public:
 
     void set_log_cb(LogCb cb)     { log_cb_   = std::move(cb); }
     void set_trade_cb(TradeCb cb) { trade_cb_ = std::move(cb); }
+    // 被过滤掉的突破（数据记录层）。在锁外回调
+    void set_filter_cb(FilterCb cb) { filter_cb_ = std::move(cb); }
 
     // ── 账户级闸门（0 = 不限）──────────────────────────────────────────────────
     // 与每个 bot 的 budget_usdt 是【两道不同的闸】：后者管"单个品种投多少"，
@@ -555,6 +609,7 @@ private:
     std::map<std::string, TrendBot>   bots_;
     LogCb                           log_cb_;
     TradeCb                         trade_cb_;
+    FilterCb                        filter_cb_;
     int                             seq_ = 0;
     double                          max_total_margin_   = 0;   // 0=不限
     int                             max_open_positions_ = 0;   // 0=不限
