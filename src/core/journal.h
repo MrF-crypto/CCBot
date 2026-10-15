@@ -16,7 +16,8 @@
 //   scan-YYYYMMDD.csv     每轮扫描的完整名单快照（全部合格币的指标、分数、所在段、收盘价）
 //                         ——事后拿后续快照里的价格对照，看高分币是不是真的走得更好
 //   filter-YYYYMMDD.csv   被过滤掉的突破（每 bot 每根K线最多一条）——事后看它后来怎么走
-// 按日的两类保留 keep_days 天（默认 60），每天第一次写时清理更早的。时间一律 UTC
+//   ambush-YYYYMMDD.csv   智能裸K 的埋伏池快照（建池 / 每小时刷新）——进池的币后来有多少真点火了
+// 按日的几类保留 keep_days 天（默认 60），每天第一次写时清理更早的。时间一律 UTC
 namespace ccbot {
 
 class Journal {
@@ -28,6 +29,9 @@ public:
     void pool  (int64_t ms, const std::string& symbol, const std::string& event,
                 char seg, int rank, double score, const std::string& reason);
     void scan  (int64_t ms, const smart::Ranking& rk, const smart::Segmented& sg,
+                const std::set<std::string>& with_bot);
+    // 智能裸K：埋伏池快照（每天建池一次、每小时刷新一次）。event = 建池 / 刷新
+    void ambush(int64_t ms, const std::string& event, const std::vector<smart::Ambush>& pool,
                 const std::set<std::string>& with_bot);
 
     const std::string& dir() const { return dir_; }

@@ -36,6 +36,11 @@ RestPriceFeed::RestPriceFeed(FetchMap fetch_marks, FetchMap fetch_changes,
 
 RestPriceFeed::~RestPriceFeed() { stop(); }
 
+void RestPriceFeed::on_fetch_error(ErrFn fn) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    err_fn_ = std::move(fn);
+}
+
 void RestPriceFeed::on_server_msg(LogCb cb) {
     std::lock_guard<std::mutex> lk(mtx_);
     log_cb_ = std::move(cb);
@@ -87,8 +92,14 @@ void RestPriceFeed::loop() {
         // ① 标记价：一次全取，与品种数无关
         bool ok = false;
         bool used_fallback = false;
+        std::string why;   // 主源这一轮失败的原因
         if (fetch_marks_) {
             auto all = fetch_marks_();
+            if (all.empty()) {
+                ErrFn ef;
+                { std::lock_guard<std::mutex> lk(mtx_); ef = err_fn_; }
+                if (ef) why = ef();
+            }
 
             // ② 主源连续失败到"健康灯该转红"的程度，就启用备用源。
             //
@@ -138,16 +149,23 @@ void RestPriceFeed::loop() {
         if (ok) {
             last_ok_ms_.store(now_ms());
             fail_streak_.store(0);
-            // 恢复只报一次
+            // 报过的才报恢复，带上中断了多久
             if (fail_reported_.exchange(false))
-                say("✅ 行情已恢复（REST 轮询）");
+                say("✅ 行情已恢复（中断约 " +
+                    std::to_string(std::max<int64_t>(1, (now_ms() - fail_since_ms_ + 500) / 1000)) +
+                    " 秒）");
         } else {
             const int n = fail_streak_.fetch_add(1) + 1;
-            // ⚠ 只在【第一次】失败时报。1 秒一轮，每轮都报就是刷屏——
-            //   而"还在失败"这个事实由界面的健康指示器持续呈现，不需要日志复述
+            if (n == 1) {
+                fail_since_ms_ = t0;
+                fail_why_      = why;
+            }
+            // ⚠ 连续 kUnhealthyFails 轮才报，而且只报一次。一两轮就好的瞬时失败不报——
+            //   经代理时很常见，界面的健康指示器本来就在实时显示。
             // 一行：发生了什么、后果、要不要人管。为什么不撤保护写在 RestPriceFeed 的头注释里
-            if (!fail_reported_.exchange(true))
-                say("⚠ 行情拉取失败（第 " + std::to_string(n) + " 轮），" +
+            if (n >= kUnhealthyFails && !fail_reported_.exchange(true))
+                say("⚠ 行情连续 " + std::to_string(n) + " 轮拉不到" +
+                    (fail_why_.empty() ? std::string() : "（" + fail_why_ + "）") + "，" +
                     std::to_string(kStaleMs / 1000) + " 秒内恢复不了就暂停开新仓；持仓止损照常");
         }
 

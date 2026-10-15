@@ -196,10 +196,15 @@ int main() {
     {
         auto b = mk_bot("BTCUSDT", trend::Pos::Long, 100, 100, 94, 1);
         b.st.entry_atr = 2.345678901234;
+        b.st.entry_edge = 99.87654321;
+        b.st.fail_bar_ms = 1791622800000LL;
         save_trend_state(path, {b});
         auto got = load_trend_state(path, {mk_cfg("BTCUSDT")});
         check(got.size() == 1 && got[0].st.entry_atr == b.st.entry_atr,
               "开仓时 ATR 全精度往返");
+        check(got.size() == 1 && got[0].st.entry_edge == b.st.entry_edge &&
+                  got[0].st.fail_bar_ms == b.st.fail_bar_ms,
+              "开仓时被突破的通道边沿、假突破从哪一根开始判，都往返（跨重启接得上）");
     }
 
     // ── 智能模式的自动 bot：不在配置里，靠标记 + 模板恢复 ────────────────────
@@ -230,6 +235,45 @@ int main() {
         }
         check(held_back, "没有模板（智能模式已关）：持仓中的自动 bot 仍恢复，仓位不能被忘掉");
         check(!flat_back, "没有模板：空仓的自动 bot 丢弃");
+    }
+
+    // ── 智能裸K 的 bot：名单代码 K 随仓位落盘，恢复时用裸K 模板而不是海龟模板 ──
+    {
+        auto k = mk_bot("BAREAUSDT", trend::Pos::Long, 100, 103, 97, 1);
+        k.is_auto = true;
+        k.smart_list = 'K';
+        k.open_trigger = 'I';
+        k.open_vol_ratio = 3.25;
+        auto t = mk_bot("TURTAUSDT", trend::Pos::Long, 100, 100, 94, 1);
+        t.is_auto = true;
+        t.smart_list = 'M';
+        save_trend_state(path, {k, t});
+
+        TrendConfig tmpl = mk_cfg("");
+        tmpl.interval = "1h";
+        TrendConfig bare = mk_cfg("");
+        bare.interval = "1h";
+        bare.rule.atr_mult  = 2.5;                              // 裸K 自己的 k，和海龟模板区分开
+        bare.rule.direction = trend::Direction::LongOnly;
+        auto got = load_trend_state(path, {}, &tmpl, &bare);
+        bool k_ok = false, t_ok = false;
+        for (const auto& g : got) {
+            if (g.cfg.symbol == "BAREAUSDT")
+                k_ok = g.cfg.rule.atr_mult == 2.5 && g.cfg.rule.direction == trend::Direction::LongOnly &&
+                       g.smart_list == 'K' && g.open_trigger == 'I' &&
+                       std::fabs(g.open_vol_ratio - 3.25) < 1e-6 && std::isnan(g.open_box_atr);
+            if (g.cfg.symbol == "TURTAUSDT")
+                t_ok = g.cfg.rule.atr_mult != 2.5 && g.smart_list == 'M';
+        }
+        check(k_ok, "裸K 的 bot 用裸K 模板恢复，名单代码、触发方式、开仓量比接得上（箱体没有仍是 NaN）");
+        check(t_ok, "  海龟的自动 bot 照旧用海龟模板");
+
+        auto got2 = load_trend_state(path, {}, nullptr, &bare);
+        bool k_back = false;
+        for (const auto& g : got2)
+            if (g.cfg.symbol == "BAREAUSDT")
+                k_back = (g.cfg.rule.atr_mult == 2.5 && g.st.pos == trend::Pos::Long);
+        check(k_back, "  智能模式已关：持仓中的裸K bot 仍按裸K 参数恢复（不套默认海龟）");
     }
 
     // ── 半截状态防御：有方向却没有止损线 ─────────────────────────────────────

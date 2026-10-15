@@ -98,8 +98,10 @@ int main() {
         fail.store(true);
         check(wait_until([&] { return feed.health().fail_streak >= 3; }),
               "连续失败被计数");
-        // ⚠ 1 秒一轮，每轮都报就是刷屏。这正是 WS 版里那套退避+节流在解决的问题，
-        //   而轮询只要一个"报过了"的标记就够
+        // ⚠ 1 秒一轮，每轮都报就是刷屏。连续 3 轮才报，而且只报一次。
+        //   计数先加、日志后发：等日志真的发出来再数
+        wait_until([&] { return logs.load() >= 1; });
+        check(wait_until([&] { return feed.health().fail_streak >= 5; }), "  继续失败");
         const int after = logs.load();
         check(after == 1, "连续失败只报一次（实际报了 " + std::to_string(after) + " 条）");
 
@@ -110,7 +112,48 @@ int main() {
 
         fail.store(false);
         check(wait_until([&] { return feed.health().fail_streak == 0; }), "恢复后计数归零");
-        check(logs.load() == 2, "  恢复也只报一次（共 2 条：失败 1 + 恢复 1）");
+        check(wait_until([&] { return logs.load() == 2; }) && logs.load() == 2,
+              "  恢复也只报一次（共 2 条：失败 1 + 恢复 1）");
+        feed.stop();
+    }
+
+    std::printf("\n── 用例2b：只失败一轮（经代理时常见的瞬时故障）→ 不写日志；失败原因拼进日志 ──\n");
+    {
+        std::atomic<int> calls{0}, fail_from{-1}, fail_n{0};
+        std::vector<std::string> logs;
+        std::mutex lm;
+        RestPriceFeed feed(
+            [&]() -> std::unordered_map<std::string, double> {
+                const int c = calls.fetch_add(1);
+                const int f = fail_from.load();
+                if (f >= 0 && c >= f && c < f + fail_n.load()) return {};
+                return {{"BTCUSDT", 60000.0}};
+            },
+            []() -> std::unordered_map<std::string, double> { return {}; });
+        feed.on_server_msg([&](const std::string& m) { std::lock_guard<std::mutex> lk(lm); logs.push_back(m); });
+        feed.on_fetch_error([] { return std::string("连接中断"); });
+        feed.subscribe("BTCUSDT");
+        feed.start();
+        check(wait_until([&] { return feed.mark_price("BTCUSDT") > 0; }), "先正常拿到价");
+        fail_n.store(1);
+        fail_from.store(calls.load() + 1);              // 下一轮失败一次
+        const int target = fail_from.load() + 3;
+        check(wait_until([&] { return calls.load() >= target; }), "  失败一轮后又跑了两轮");
+        {
+            std::lock_guard<std::mutex> lk(lm);
+            check(logs.empty(), "只失败一轮：不写日志（实际 " + std::to_string(logs.size()) + " 条）");
+        }
+        fail_n.store(4);
+        fail_from.store(calls.load() + 1);              // 再来一段连续 4 轮的失败
+        check(wait_until([&] { std::lock_guard<std::mutex> lk(lm); return logs.size() >= 2; }),
+              "连续失败 4 轮：报一条、恢复一条");
+        {
+            std::lock_guard<std::mutex> lk(lm);
+            check(logs.size() == 2 && logs[0].find("连接中断") != std::string::npos &&
+                      logs[0].find("连续 3 轮") != std::string::npos &&
+                      logs[1].find("中断约") != std::string::npos,
+                  "  失败那条带原因、第 3 轮才报；恢复那条带中断时长");
+        }
         feed.stop();
     }
 

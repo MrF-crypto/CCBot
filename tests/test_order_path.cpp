@@ -786,6 +786,42 @@ int main() {
     //   留着它是纯防御：开仓不幂等，万一将来有别的路径同时置上这两者，
     //   重发会变成双倍仓位。不为一个构造不出的场景写假用例。
 
+    std::printf("── 网络层：失败原因说得出来；杠杆设过一次不再重复设 ──\n");
+    {
+        TradingClient tc(test_cfg());
+        int lev_posts = 0;
+        std::string mode = "html";
+        tc.set_test_hook([&](const std::string& m, const std::string& path,
+                             const std::string&, TradingClient::FakeReply& out) {
+            if (path.find("/leverage") != std::string::npos && m == "POST") {
+                ++lev_posts;
+                if (mode == "reject") { out.code = 400; out.body = "{\"code\":-4028,\"msg\":\"Leverage 99 is not valid\"}"; }
+                else                  { out.body = "{\"leverage\":2,\"symbol\":\"FLOCKUSDT\"}"; }
+                return true;
+            }
+            if (path.find("/account") != std::string::npos) {
+                out.code = 200;
+                out.body = "<html><body>proxy error</body></html>";
+                return true;
+            }
+            return false;
+        });
+        const auto acc = tc.fetch_account();
+        check(!acc.ok && acc.error.find("返回的不是 JSON") != std::string::npos &&
+                  acc.error.find("<html>") != std::string::npos,
+              "账户接口拿到网页：错误里写明「返回的不是 JSON」并附开头（实际：" + acc.error + "）");
+
+        check(tc.set_leverage("FLOCKUSDT", 2) && lev_posts == 1, "设杠杆成功");
+        check(tc.set_leverage("FLOCKUSDT", 2) && lev_posts == 1, "  同一品种同样的杠杆：不再发请求");
+        check(tc.set_leverage("FLOCKUSDT", 3) && lev_posts == 2, "  换了杠杆：照常发");
+        mode = "reject";
+        const bool rej = !tc.set_leverage("ABCUSDT", 99);
+        const std::string why = tc.last_error();
+        check(rej && why.find("-4028") != std::string::npos,
+              "  交易所拒绝：last_error 带错误码（实际：" + why + "）");
+        check(!tc.set_leverage("ABCUSDT", 99) && lev_posts == 4, "  失败的不缓存，下次照样再试");
+    }
+
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

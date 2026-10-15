@@ -77,9 +77,9 @@ struct Config {
     //     山寨币"横盘吸筹 → 瞬间爆拉"的形态里，爆拉前的箱体很窄；箱体本来就宽的
     //     突破多半是震荡里来回扫，正是手续费磨损的来源
     //   breakout_vol_ratio：当前这根的成交量 ≥ 箱体内各根均量的这么多倍才算放量。
-    //     ⚠ 用的是当前根【已成交】的量，不按剩余时间外推。外推在刚开盘几分钟时
-    //       会把一点量放大十几倍，反而最容易放进假突破。不外推的代价是晚一点：
-    //       价格一直站在通道外，量攒够那一刻才入场
+    //     ⚠ 默认用当前根【已成交】的量，不按已走时间折算。不折算的代价是晚——
+    //       价格一直站在通道外，量攒够那一刻才入场，那时往往已经离边沿很远。
+    //       vol_paced 打开后按已走时间折算（带下限，见下面 vol_paced 的说明）
     //   trend_er_min：箱体过宽时的例外。箱体只量宽度，分不清"宽"是来回扫出来的
     //     还是一路涨出来的——后者是趋势延续，正是海龟最赚钱的那类入场。
     //     通道窗口的效率比（净变化 ÷ 来回总路程）≥ 这个值、且净走向与突破同向，
@@ -97,6 +97,30 @@ struct Config {
     //     专门对付急涨急跌的顶部
     bool   lock_atr   = false;
     bool   accel_exit = false;
+    // vol_paced：突破量比按这根K线【已走过的时间】折算（应用层喂进来的 vol_ratio 就是折算后的，
+    //   见 indicators::paced_ratio）。不折算的话，一根 1h 开盘 5 分钟就突破，累计量只有
+    //   整根的 1/12，要成交速度是平时的 18 倍才过 1.5 倍——多数突破被拦到后半小时才开，
+    //   那时价格早已远离通道边沿（实盘：离边沿 0.5~1 ATR 才追进去的胜率 11%）。
+    //   折算设了下限（已走时间按至少 1/4 根算），开盘头几分钟的一点量不会被放大十几倍
+    // fail_exit：假突破提前走。开仓后【有一根K线收盘】跌回开仓时的通道边沿以内（做多 = 收盘
+    //   低于当时的上沿），不等 k×ATR 止损，直接平。假突破最常见的样子就是很快跌回箱体，
+    //   等止损要亏满 1R
+    //   多空分开开关：fail_exit 管多单，fail_exit_short 管空单。实盘（空头行情一晚）多单被判
+    //   假突破平掉后 3 小时继续跌的占 78%，规则在帮着少亏；空单反弹回通道后 86% 又接着跌，
+    //   规则把本来能赚的空单砍掉了。所以智能模板默认只开多单那一项
+    bool   vol_paced  = false;
+    bool   fail_exit  = false;
+    bool   fail_exit_short = false;
+
+    // ── 收益率追踪止盈（三个策略共用，默认关）────────────────────────────────
+    // 收益率 = 浮动盈亏 ÷ 保证金，和主表「收益率」那一列同一个算法（带杠杆，保证金按现价算）：
+    //   做多 (现价 − 开仓价) ÷ 现价 × 杠杆 × 100，做空反过来。
+    // 持仓期最高收益率（按持仓极值价算）到过 roi_trail_start，之后从最高点回撤
+    // roi_trail_back 个【收益率点数】就平（例：最高 +15%、回撤 5 ⇒ 回到 +10% 就走）。
+    // 和 k×ATR 追踪止损同时生效，谁先触发听谁的
+    bool   roi_trail       = false;
+    double roi_trail_start = 10;   // 激活：最高收益率 ≥ 这个（%）
+    double roi_trail_back  = 5;    // 回撤这么多个百分点就平
 
     // ── ② 抛物线 SAR ────────────────────────────────────────────────────────
     // SAR(下一根) = SAR(本根) + AF × (EP − SAR(本根))
@@ -179,6 +203,14 @@ struct State {
     // ① 专用：开仓时的 ATR。锁定 ATR 与加速收紧都以它为基准。要落盘——丢了的话
     //    两项优化在重启后静默退回普通 Chandelier（为 0 时就是这样兜底的）
     double entry_atr = 0;
+    // ① 专用：开仓时被突破的通道边沿（做多 = 上沿，做空 = 下沿），0 = 不知道。
+    //    fail_exit 判"收盘跌回通道内"用它——不能用当前的通道，开仓后通道跟着突破那几根抬高，
+    //    价格只是没再创新高就会被误判成跌回。要落盘
+    double entry_edge = 0;
+    // ① 专用：假突破从【哪一根K线的收盘】开始判（那根的开盘时间），0 = 没设（老仓位）则按开仓那根。
+    //    开仓那根已经走到最后 1/4 才开仓的，留到下一根：开仓后离收盘只剩几分钟，
+    //    价格稍一回落就收回边沿以内，等于没给它走出去的机会（实盘 19 笔这样被平）。要落盘
+    int64_t fail_bar_ms = 0;
 };
 
 struct Inputs {
@@ -198,6 +230,7 @@ struct Inputs {
     double er    = 0;
     bool   new_bar = false;  // 本 tick 是否跨入新K线（冷却按K线计数）
     int64_t bar_open_ms = 0; // 当前这根K线的开盘时间
+    double  leverage    = 0; // 这个 bot 的杠杆（收益率追踪止盈换算收益率用），0 = 不知道
 
     // ── 裸K / PSAR 的K线输入 ───────────────────────────────────────────────
     bool   bar_ok      = false;  // K线数据是否就绪
@@ -411,6 +444,34 @@ inline const char* bare_body_block(const Inputs& in, const Config& cfg, bool is_
     return "突破，但信号K太弱";
 }
 
+// 收益率（%），和主表「收益率」列同一个算法：浮动盈亏 ÷（现价 × 数量 ÷ 杠杆）
+inline double roi_pct(Pos p, double entry, double price, double leverage) {
+    if (p == Pos::Flat || !(entry > 0) || !(price > 0) || !(leverage > 0)) return 0;
+    const double d = (p == Pos::Long) ? price - entry : entry - price;
+    return d / price * leverage * 100.0;
+}
+// 收益率追踪止盈：持仓期最高收益率到过激活线，且现在比最高点回撤了 roi_trail_back 个点。
+// 最高收益率按持仓极值价（st.peak）算——做多是最高价、做空是最低价，收益率随价格单调，
+// 所以极值价对应的就是最高收益率，不用另存
+inline bool roi_trail_hit(const State& st, const Config& cfg, const Inputs& in) {
+    if (!cfg.roi_trail || st.pos == Pos::Flat || !(st.peak > 0)) return false;
+    const double peak = roi_pct(st.pos, st.entry_price, st.peak, in.leverage);
+    if (!(peak >= cfg.roi_trail_start)) return false;
+    const double now = roi_pct(st.pos, st.entry_price, in.price, in.leverage);
+    return now <= peak - cfg.roi_trail_back;
+}
+
+// 假突破判定（fail_exit）：开始判的那根K线（fail_bar_ms，没设就是开仓那根）已经收完，
+// 且最近收盘的那根收回到开仓时的通道边沿以内。整个持仓期都在判，不只看开仓那一根
+inline bool fail_breakout(const State& st, const Config& cfg, const Inputs& in) {
+    if (cfg.strategy != Strategy::Turtle) return false;
+    if (!(st.pos == Pos::Long ? cfg.fail_exit : cfg.fail_exit_short)) return false;
+    if (st.pos == Pos::Flat ||!(st.entry_edge > 0) || !(in.prev_close > 0)) return false;
+    const int64_t from = st.fail_bar_ms > 0 ? st.fail_bar_ms : st.last_entry_bar_ms;
+    if (from <= 0 || in.bar_open_ms <= from) return false;
+    return st.pos == Pos::Long ? in.prev_close < st.entry_edge : in.prev_close > st.entry_edge;
+}
+
 // 开仓前的过滤，按策略分派。返回 nullptr = 放行
 inline const char* entry_block(const Inputs& in, const Config& cfg, bool is_long) {
     if (const char* w = squeeze_block(in, cfg, is_long)) return w;
@@ -540,6 +601,26 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         }
         v.stop = st.stop;
 
+        // 假突破：开仓那根之后有K线收盘跌回开仓时的通道边沿以内，不等止损线，直接走。
+        // prev_close 与 bar_open_ms 来自同一份快照：bar_open_ms > 开仓那根 = 开仓那根已经收完，
+        // prev_close 就是它（或之后某根）的收盘价
+        if (fail_breakout(st, cfg, in)) {
+            v.action = Action::Close;
+            v.reason = "假突破：收盘跌回通道内";
+            v.profitable_exit = is_long ? (in.price >= st.entry_price) : (in.price <= st.entry_price);
+            st.consec_reverses = 0;
+            return v;
+        }
+
+        // 收益率追踪止盈：和止损线同时生效，谁先到听谁的。盈利出场，不反手
+        if (roi_trail_hit(st, cfg, in)) {
+            v.action = Action::Close;
+            v.reason = "追踪止盈：收益率从高点回撤";
+            v.profitable_exit = is_long ? (in.price >= st.entry_price) : (in.price <= st.entry_price);
+            st.consec_reverses = 0;
+            return v;
+        }
+
         const bool hit = is_long ? (in.price <= st.stop) : (in.price >= st.stop);
         if (!hit) {
             v.reason = "持仓中";
@@ -650,12 +731,13 @@ inline double initial_stop(Pos p, double fill_price, const Config& cfg,
 
 inline void on_filled(State& st, Pos p, double fill_price, double stop_price,
                       const Config& cfg, bool from_reverse, int64_t bar_open_ms = 0,
-                      double entry_atr = 0) {
+                      double entry_atr = 0, double entry_edge = 0) {
     st.pos         = p;
     st.entry_price = fill_price;
     st.peak        = fill_price;
     st.stop        = stop_price;
     st.entry_atr   = entry_atr;
+    st.entry_edge  = entry_edge;
     st.consec_reverses = from_reverse ? st.consec_reverses + 1 : 0;
     // 新一轮的 AF 从初始值重新加速。反手开出来的仓位同样——上一轮攒到的
     // 加速度属于上一段趋势，带过来会让新仓一开始就被贴得很紧
@@ -670,6 +752,8 @@ inline void on_closed(State& st) {
     st.af = 0;
     st.psar_ep_mark = 0;
     st.entry_atr = 0;
+    st.entry_edge = 0;
+    st.fail_bar_ms = 0;
     // ⚠ 不清 last_entry_bar_ms：once_per_bar 的语义正是"这一根【开过了】"，
     //   平仓后清掉的话同一根里会立刻再开一次，护栏等于没有
 }

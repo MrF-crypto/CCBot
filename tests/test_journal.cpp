@@ -56,10 +56,13 @@ int main() {
     t.entry_dist_atr = 0.8; t.interval = "1h";
     t.mfe_usd = 30; t.mae_usd = -8; t.mfe_pct = 15; t.mae_pct = -4;
     t.mfe_atr = 7.5; t.mae_atr = -2; t.mfe_r = 2.5; t.mae_r = -0.6667;
+    t.trigger = 'I'; t.entry_vol_ratio = 3.1; t.entry_box_atr = 1.5;
     j.trade(t);
     TrendTrade t2 = t;
     t2.symbol = "BBBUSDT"; t2.entry_dist_atr = std::numeric_limits<double>::quiet_NaN();
     t2.mfe_atr = t2.mae_atr = t2.mfe_r = t2.mae_r = std::numeric_limits<double>::quiet_NaN();
+    t2.trigger = 0;
+    t2.entry_vol_ratio = t2.entry_box_atr = std::numeric_limits<double>::quiet_NaN();
     t2.reason = "原因里有,英文逗号";
     j.trade(t2);
     auto tl = lines_of(dir / "trades.csv");
@@ -75,14 +78,17 @@ int main() {
         check(has(tl[2], "\"原因里有,英文逗号\""), "  原因含逗号：加引号，不串列");
         check(has(tl[2], "19.79,,30,"), "  入场离边沿拿不到（NaN）：留空，不写 nan");
         check(has(tl[0], "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,"
-                         "浮盈亏最低ATR,浮盈亏最高R,浮盈亏最低R,原因"), "  浮盈亏最高/最低四种单位的表头");
-        check(has(tl[1], ",0.8,30,-8,15,-4,7.5,-2,2.5,-0.6667,"), "  浮盈亏最高/最低：美元、%、ATR、R");
-        check(has(tl[2], ",30,-8,15,-4,,,,,\""), "  ATR / R 算不了（NaN）：留空");
+                         "浮盈亏最低ATR,浮盈亏最高R,浮盈亏最低R,触发方式,入场量比,入场箱体ATR,原因"),
+              "  浮盈亏最高/最低四种单位、触发方式、入场量比与箱体的表头");
+        check(has(tl[1], ",0.8,30,-8,15,-4,7.5,-2,2.5,-0.6667,点火,3.1,1.5,"),
+              "  浮盈亏最高/最低：美元、%、ATR、R；触发方式「点火」、量比、箱体");
+        check(has(tl[2], ",30,-8,15,-4,,,,,,,,\""), "  ATR / R / 触发 / 量比 / 箱体没有：留空");
     }
 
     // ── 过滤 / 过期清理 ──
     std::ofstream(dir / "scan-20200101.csv") << "old";
     std::ofstream(dir / "filter-20200101.csv") << "old";
+    std::ofstream(dir / "ambush-20200101.csv") << "old";   // 清理一天只做一次：要在第一次写之前放好
     std::ofstream(dir / "scan-20261001.csv") << "recent";
     FilterEvent fe;
     fe.time = at(t0); fe.symbol = "CCCUSDT"; fe.is_long = false; fe.category = "量比";
@@ -94,6 +100,22 @@ int main() {
     check(!fs::exists(dir / "scan-20200101.csv") && !fs::exists(dir / "filter-20200101.csv"),
           "超过保留天数的按日文件被清理");
     check(fs::exists(dir / "scan-20261001.csv"), "  保留期内的不动");
+
+    // ── 智能裸K 的埋伏池快照（与 scan / filter 一样按日分文件、过期清理）──
+    {
+        smart::Ambush a;
+        a.symbol = "GGGUSDT"; a.score = 82.5;
+        a.f.ok = true; a.f.kappa = 1.05; a.f.pos = 0.7; a.f.atr_pct = 0.9; a.f.atr_ratio = 0.8;
+        a.f.higher_low = true; a.f.up_vol_share = 0.6; a.f.box_hi = 1.02; a.f.box_lo = 0.98; a.f.close = 1.01;
+        smart::Ambush a2 = a; a2.symbol = "HHHUSDT"; a2.f.atr_ratio = 0; a2.f.higher_low = false;
+        j.ambush(t0, "建池", {a, a2}, {"GGGUSDT"});
+    }
+    auto ambl = lines_of(dir / "ambush-20261010.csv");
+    check(ambl.size() == 3 && has(ambl[0], "事件,品种,分数,κ,箱体内位置,1hATR%") &&
+              has(ambl[1], "建池,GGGUSDT,82.5,1.05,0.7,0.9,0.8,是,0.6,1.02,0.98,1.01,是") &&
+              has(ambl[2], "HHHUSDT,82.5,1.05,0.7,0.9,,,0.6"),
+          "ambush-日期.csv：埋伏池快照（κ、位置、ATR%；ATR 压缩比算不出留空）");
+    check(!fs::exists(dir / "ambush-20200101.csv"), "  过期的 ambush 文件照样清理");
 
     // ── 候选池 ──
     j.pool(t0, "DDDUSDT", "加入", smart::kSegHot, 1, 40, "仅空");

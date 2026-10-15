@@ -126,7 +126,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         // ① 海龟
         "donchian_period", "atr_period", "atr_mult",
         "squeeze_box_atr", "breakout_vol_ratio", "trend_er_min",
-        "lock_atr", "accel_exit",
+        "lock_atr", "accel_exit", "vol_paced", "fail_exit", "fail_exit_short",
         // ② 抛物线SAR
         "af_start", "af_step", "af_max",
         // ③ 纯裸K
@@ -136,6 +136,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "reverse", "max_consecutive_reverses", "cooldown_bars",
         "signal_max_age_sec", "use_disaster_stop", "disaster_stop_buffer_pct",
         "size_mode", "risk_usdt",
+        "roi_trail", "roi_trail_start", "roi_trail_back",
         // 兼容旧键：仍然识别，但会迁移并显式告警（见下）
         "mode", "allow_reverse", "reverse_needs_signal",
     };
@@ -191,6 +192,14 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
             c.interval    = get_str(so, "interval", c.interval);
             c.signal_max_age_sec = (int)get_num(so, "signal_max_age_sec",
                                                 c.signal_max_age_sec);
+            // 收益率追踪止盈（三个策略共用）：最高收益率到过 start 后回撤 back 个点就平
+            c.rule.roi_trail       = get_bool(so, "roi_trail", c.rule.roi_trail);
+            c.rule.roi_trail_start = get_num(so, "roi_trail_start", c.rule.roi_trail_start);
+            c.rule.roi_trail_back  = get_num(so, "roi_trail_back", c.rule.roi_trail_back);
+            if (c.rule.roi_trail && !(c.rule.roi_trail_start > 0 && c.rule.roi_trail_back > 0)) {
+                err = c.symbol + ": roi_trail_start / roi_trail_back 必须大于 0";
+                return false;
+            }
             // 交易所侧灾难止损：SAR 唯一的进程外保护，强烈建议开
             c.use_disaster_stop = get_bool(so, "use_disaster_stop", c.use_disaster_stop);
             c.disaster_stop_buffer_pct = get_num(so, "disaster_stop_buffer_pct",
@@ -307,6 +316,9 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 }
                 c.rule.lock_atr   = get_bool(so, "lock_atr", c.rule.lock_atr);
                 c.rule.accel_exit = get_bool(so, "accel_exit", c.rule.accel_exit);
+                c.rule.vol_paced  = get_bool(so, "vol_paced", c.rule.vol_paced);
+                c.rule.fail_exit  = get_bool(so, "fail_exit", c.rule.fail_exit);
+                c.rule.fail_exit_short = get_bool(so, "fail_exit_short", c.rule.fail_exit_short);
                 if (c.rule.trend_er_min > 0 && !(c.rule.squeeze_box_atr > 0))
                     out.warnings.push_back(c.symbol + " 海龟：trend_er_min 只在 squeeze_box_atr > 0 时生效，现在不起作用");
             } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {

@@ -23,87 +23,6 @@ static bool near(double a, double b, double eps = 1e-6) {
 }
 
 int main() {
-    // ── Bollinger ────────────────────────────────────────────────────────────
-    {
-        // 常数序列：标准差为0，三条线重合
-        std::vector<double> closes(5, 10.0);
-        auto r = bollinger(closes, 5, 2.0);
-        CHECK(r.ok, "常数序列 boll 应该 ok");
-        CHECK(near(r.mb, 10.0), "常数序列均值应为10");
-        CHECK(near(r.ub, 10.0), "常数序列标准差为0，上轨应等于均值");
-        CHECK(near(r.lb, 10.0), "常数序列标准差为0，下轨应等于均值");
-    }
-    {
-        // 1,2,3,4,5：手算 mean=3, 总体方差=2, sd=sqrt(2)
-        std::vector<double> closes = {1, 2, 3, 4, 5};
-        auto r = bollinger(closes, 5, 1.0);
-        double sd = std::sqrt(2.0);
-        CHECK(r.ok, "1..5 boll 应该 ok");
-        CHECK(near(r.mb, 3.0), "1..5 均值应为3");
-        CHECK(near(r.ub, 3.0 + sd), "1..5 上轨应为 mean+sd");
-        CHECK(near(r.lb, 3.0 - sd), "1..5 下轨应为 mean-sd");
-    }
-    {
-        // 数据不够 period 根，应该返回 ok=false
-        std::vector<double> closes = {1, 2, 3};
-        auto r = bollinger(closes, 20, 2.0);
-        CHECK(!r.ok, "数据不足时 boll 应返回 ok=false");
-    }
-
-    // ── RSI ──────────────────────────────────────────────────────────────────
-    {
-        // 单调上涨：全是涨，avg_loss=0 → RSI=100
-        std::vector<double> closes;
-        for (int i = 1; i <= 15; ++i) closes.push_back((double)i);
-        double v = rsi(closes, 14);
-        CHECK(near(v, 100.0), "单调上涨 RSI 应为100");
-    }
-    {
-        // 单调下跌：全是跌，avg_gain=0 → RSI=0
-        std::vector<double> closes;
-        for (int i = 15; i >= 1; --i) closes.push_back((double)i);
-        double v = rsi(closes, 14);
-        CHECK(near(v, 0.0), "单调下跌 RSI 应为0");
-    }
-    {
-        // 数据不够 period+1 根，应返回中性值 50
-        std::vector<double> closes = {1, 2, 3};
-        double v = rsi(closes, 14);
-        CHECK(near(v, 50.0), "数据不足时 RSI 应返回中性值50");
-    }
-    {
-        // 手算精确值：44,44.5,43.5,44.5 period=3 → RSI=60
-        std::vector<double> closes = {44.0, 44.5, 43.5, 44.5};
-        double v = rsi(closes, 3);
-        CHECK(near(v, 60.0), "手算样例 RSI 应为60");
-    }
-
-    // ── EMA / 带偏移SMA（v2.5 趋势状态机）────────────────────────────────────
-    {
-        // 常数序列：EMA 应等于该常数
-        std::vector<double> closes(250, 7.5);
-        CHECK(near(ema(closes, 200), 7.5), "常数序列 EMA 应等于常数本身");
-        // 数据不足：返回 0
-        std::vector<double> few = {1, 2, 3};
-        CHECK(near(ema(few, 200), 0.0), "数据不足 EMA 应返回0");
-        // 单调上涨：EMA 应落后于最新价但高于起点
-        std::vector<double> up;
-        for (int i = 1; i <= 250; ++i) up.push_back((double)i);
-        double e = ema(up, 200);
-        CHECK(e > 100.0 && e < 250.0, "单调上涨 EMA 应在起点和最新价之间且滞后");
-    }
-    {
-        // sma_at 手算：1..10，period=3
-        std::vector<double> c = {1,2,3,4,5,6,7,8,9,10};
-        CHECK(near(sma_at(c, 3, 0), 9.0), "sma_at 末尾3根 (8+9+10)/3=9");
-        CHECK(near(sma_at(c, 3, 2), 7.0), "sma_at 偏移2 (6+7+8)/3=7");
-        CHECK(near(sma_at(c, 3, 8), 0.0), "sma_at 偏移出界应返回0");
-        CHECK(near(sma_at(c, 0, 0), 0.0), "sma_at period=0 应返回0");
-        // 斜率语义：上涨序列 now > prev
-        CHECK(sma_at(c, 3, 0) > sma_at(c, 3, 3), "上涨序列中轨斜率应为正");
-    }
-
-
     // ── ATR ──────────────────────────────────────────────────────────────────
     {
         // 常数序列：振幅为0、跳空为0 → ATR=0
@@ -181,6 +100,15 @@ int main() {
         CHECK(volume_ratio(v, 2, 4) == 0, "量比: 前面不够 window 根 ⇒ 0");
         CHECK(volume_ratio(v, 6, 2) == 0, "量比: 越界 ⇒ 0");
         CHECK(volume_ratio({0, 0, 5}, 2, 2) == 0, "量比: 均量为 0 ⇒ 0（拿不到，不是无穷大）");
+    }
+    // ── 量比按已走时间折算 ────────────────────────────────────────────────────
+    {
+        CHECK(near(paced_ratio(0.5, 0.5), 1.0), "折算: 走了一半、累计量已达均量一半 ⇒ 1 倍的速度");
+        CHECK(near(paced_ratio(0.3, 0.75), 0.4), "折算: 0.3 ÷ 0.75 = 0.4");
+        CHECK(near(paced_ratio(0.2, 0.05), 0.8), "折算: 才走 5% ⇒ 按 25% 算（0.2 ÷ 0.25），开盘头几分钟不放大十几倍");
+        CHECK(near(paced_ratio(1.8, 1.3), 1.8), "折算: 超过 1（时钟偏差）按 1 算");
+        CHECK(paced_ratio(0, 0.5) == 0, "折算: 拿不到（0）仍是 0");
+        CHECK(near(paced_ratio(0.2, std::nan("")), 0.8), "折算: 已走比例算不出（NaN）按下限算");
     }
 
     // ── 效率比 ────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -73,12 +74,13 @@ static void test_gates() {
     check(pre_gate(meta("AAAUSDT"), nullptr, nullptr, c, kNow, false).empty(),
           "门槛：行情/费率没拿到时不据此判不合格（由调用方归为未知）");
 
-    Features fe; fe.ok = true; fe.atr_pct = 0.5;
-    check(has(atr_gate(fe, c, false), "太低"), "ATR% 0.5 < 0.8 太低");
-    fe.atr_pct = 0.7;
-    check(atr_gate(fe, c, true).empty(), "  已在池里放宽 20%（0.64）");
-    fe.atr_pct = 7;
-    check(has(atr_gate(fe, c, false), "太高"), "ATR% 7 > 6 太高");
+    Features fe; fe.ok = true; fe.atr_pct = 0.4;
+    check(has(atr_gate(fe, c, false), "太低"), "ATR% 0.4 < 0.5 太低");
+    fe.atr_pct = 0.45;
+    check(atr_gate(fe, c, true).empty(), "  已在池里放宽 20%（0.4）");
+    fe.atr_pct = 2.2;
+    check(has(atr_gate(fe, c, false), "太高"), "ATR% 2.2 > 2 太高（回测 > 2% 期望≈0）");
+    check(atr_gate(fe, c, true).empty(), "  已在池里放宽 20%（2.4）");
 }
 
 // 一串收盘价生成K线：高低各 ±0.5，量固定
@@ -130,6 +132,7 @@ static Features feat(double rs, double er, double b12, double ar, double b48, do
     f.ok = true; f.atr_pct = 2;
     f.rs = rs; f.er24 = er; f.box12_atr = b12; f.atr_ratio = ar; f.box48_atr = b48;
     f.vol_lift = vl; f.pos12 = pos;
+    f.kappa12 = b12 / std::sqrt(12.0);   // κ ≈ 箱体/ATR ÷ √12（价格与下沿的差别忽略）
     return f;
 }
 
@@ -145,12 +148,23 @@ static void test_rank() {
     check(r.shorts.front() == "WEAKUSDT", "排名：做空名单第一是弱势币");
     check(r.rank_long("MEHUSDT") == 3 && r.rank_short("MEHUSDT") == 3, "排名：平庸币两边都垫底");
     check(r.rank_long("NOPEUSDT") == 0, "排名：不在名单返回 0");
-    // STRONG 与 WEAK 在箱体/压缩/横盘/量能四项并列第一，并列取平均名次 ⇒ 75 分；
-    // 强弱、效率比、位置三项独占第一 ⇒ 100。合计 (30+15+10)×100 + (10+10+10+15)×75 = 8875
-    check(near(r.rows["STRONGUSDT"].long_score, 88.75), "  手算核对：强势币做多 88.75 分");
-    // MEH：强弱/效率比/位置居中 50，其余四项垫底 0 ⇒ (30+15+10)×50 = 2750
+    // 12 根箱体按 κ 区间打分：STRONG / WEAK 箱体 3 ATR ⇒ κ≈0.87（0.8~1.2）满分 100；
+    // MEH 箱体 6 ATR ⇒ κ≈1.73（已扩张）0 分。
+    // 压缩/横盘/量能三项 STRONG 与 WEAK 并列第一，并列取平均名次 ⇒ 75；
+    // 强弱、效率比、位置三项独占第一 ⇒ 100。
+    // 合计 (30+15+10)×100 + 10×100 + (10+10+15)×75 = 9125
+    check(near(r.rows["STRONGUSDT"].long_score, 91.25), "  手算核对：强势币做多 91.25 分");
+    // MEH：强弱/效率比/位置居中 50，κ 0 分，其余三项垫底 0 ⇒ (30+15+10)×50 = 2750
     check(near(r.rows["MEHUSDT"].long_score, 27.5), "  手算核对：平庸币 27.5 分");
-    check(near(r.rows["WEAKUSDT"].short_score, 88.75), "  做空对称：弱势币做空 88.75 分");
+    check(near(r.rows["WEAKUSDT"].short_score, 91.25), "  做空对称：弱势币做空 91.25 分");
+
+    // 箱体极窄（κ < 0.5，假突破重灾区）不再因为"越窄越好"排到前面
+    std::map<std::string, Features> k;
+    k["TIGHTUSDT"] = feat(0, 0, 1.2, 1, 10, 1, 0.5);   // κ≈0.35
+    k["GOODUSDT"]  = feat(0, 0, 3.5, 1, 10, 1, 0.5);   // κ≈1.01
+    const auto rk = rank(k, c);
+    check(rk.rows.at("GOODUSDT").long_score - rk.rows.at("TIGHTUSDT").long_score > 9.9,
+          "  κ 按区间打分：κ≈1.0 比 κ≈0.35（箱体极窄）高 10 分");
 
     Config c2; c2.min_score = 50;
     auto r2 = rank(e, c2);
@@ -222,9 +236,9 @@ static void test_pool() {
         s.delisting.insert("HOLDUSDT");
         auto p = pool.plan(s, {bot("a1", "HOLDUSDT", true, /*pos*/ true)}, c, kNow);
         check(!removed(p, "HOLDUSDT"), "持仓中：不合格也不移除，等这笔走完");
-        bool leaving = false;
-        for (const auto& m : p.meta) if (m.bot_id == "a1") leaving = m.leaving;
-        check(leaving, "  标成待移出");
+        bool meta_rank0 = false;
+        for (const auto& m : p.meta) if (m.bot_id == "a1") meta_rank0 = (m.rank == 0);
+        check(meta_rank0, "  名次清零（界面标「待移出」）");
         check(p.alerts.size() == 1 && has(p.alerts[0], "下架"), "  持仓中即将下架：醒目告警");
     }
     {
@@ -483,7 +497,7 @@ static void test_config_json() {
     Config f;
     check(!config_from_json("{\"atr_pct_min\":5,\"atr_pct_max\":2}", f, &err) && has(err, "ATR%"),
           "非法值整份拒绝");
-    check(f.atr_pct_min == 0.8, "  拒绝时原配置不动");
+    check(f.atr_pct_min == 0.5, "  拒绝时原配置不动");
     check(!config_from_json("{\"template\":{\"interval\":\"5m\"}}", f, &err), "模板周期只认 1h/2h/4h");
 
     const auto t = make_bot_config(c, "ABCUSDT");
@@ -495,9 +509,192 @@ static void test_config_json() {
     check(dt.interval == "1h" && dt.rule.donchian_period == 12 && dt.rule.lock_atr && dt.rule.accel_exit &&
           near(dt.rule.squeeze_box_atr, 4) && near(dt.rule.trend_er_min, 0.4) &&
           near(dt.rule.breakout_vol_ratio, 1.5), "默认模板：1h、通道 12、过滤与出场优化都开");
+    check(dt.rule.vol_paced && dt.rule.fail_exit && !dt.rule.fail_exit_short,
+          "  量比按时间折算开；假突破提前出场默认只判多单");
+    Config def;
+    check(near(def.atr_pct_min, 0.5) && near(def.atr_pct_max, 2.0), "  1h ATR% 区间默认 0.5~2");
+    check(!dt.rule.roi_trail, "  收益率追踪止盈默认关");
+    Config roi;
+    roi.tmpl.rule.roi_trail = true; roi.tmpl.rule.roi_trail_start = 12; roi.tmpl.rule.roi_trail_back = 4;
+    roi.bare.roi_trail = true; roi.bare.roi_start = 20; roi.bare.roi_back = 8;
+    Config roi2;
+    std::string e3;
+    check(config_from_json(config_to_json(roi), roi2, &e3) && roi2.tmpl.rule.roi_trail &&
+              near(roi2.tmpl.rule.roi_trail_start, 12) && near(roi2.tmpl.rule.roi_trail_back, 4) &&
+              roi2.bare.roi_trail && near(roi2.bare.roi_start, 20) && near(roi2.bare.roi_back, 8),
+          "  追踪止盈随海龟模板、裸K 配置往返（两套各自一份）");
+    const auto bb = make_bare_bot_config(roi2, "XYZUSDT");
+    check(bb.rule.roi_trail && near(bb.rule.roi_trail_start, 20) && near(bb.rule.roi_trail_back, 8),
+          "  裸K 的 bot 用裸K 自己的追踪止盈设置，不跟海龟模板");
+    check(!config_from_json("{\"template\":{\"roi_trail_back\":0}}", roi2, &e3), "  回撤 0 个点拒绝");
+
+    Config rt;
+    rt.tmpl.rule.vol_paced = false;
+    rt.tmpl.rule.fail_exit = false;
+    rt.tmpl.rule.fail_exit_short = true;
+    Config rt2;
+    std::string e2;
+    check(config_from_json(config_to_json(rt), rt2, &e2) && !rt2.tmpl.rule.vol_paced &&
+              !rt2.tmpl.rule.fail_exit && rt2.tmpl.rule.fail_exit_short,
+          "  这三项随模板往返");
+    Config old;
+    check(config_from_json("{\"template\":{\"lock_atr\":true}}", old, &e2) && old.tmpl.rule.vol_paced &&
+              old.tmpl.rule.fail_exit && !old.tmpl.rule.fail_exit_short,
+          "  老配置没有这些键：按默认（空单不判）");
+}
+
+// ── 智能裸K（埋伏点火）：结构特征、κ、打分、移出、点火判定、bot 配置、配置往返 ──────────
+static Bar bar(int64_t t, double o, double h, double l, double c, double qv = 1000) {
+    Bar b;
+    b.open_ms = t; b.open = o; b.high = h; b.low = l; b.close = c; b.volume = 10; b.quote_vol = qv;
+    return b;
+}
+
+// 1h：200 根在 100 附近窄幅横盘（箱体 99.5~100.5，ATR 约 1），最后一根收 last_close
+static std::vector<Bar> amb_bars(double last_close = 100.2, double wick = 0.3) {
+    std::vector<Bar> v;
+    for (int i = 0; i < 200; ++i) {
+        double o = (i % 2) ? 99.8 : 100.2, c = (i % 2) ? 100.2 : 99.8;
+        if (i == 199) c = last_close;
+        v.push_back(bar(i * 3600000LL, o, std::max(o, c) + wick, std::min(o, c) - wick, c,
+                        c > o ? 2000 : 1000));
+    }
+    return v;
+}
+
+// 5m：60 根已收盘，前 59 根在 99.9/100.1 之间（ATR 约 0.6、成交额 1000），最后一根是要判的
+static std::vector<Bar> ign_bars(double o, double h, double l, double c, double qv, bool red5 = false) {
+    std::vector<Bar> v;
+    for (int i = 0; i < 59; ++i) {
+        double bo = (i % 2) ? 99.9 : 100.1, bc = (i % 2) ? 100.1 : 99.9, bh = 100.3, bl = 99.7;
+        if (red5 && i >= 54) { bo = 100.3; bc = 99.9; bh = 100.4; bl = 99.8; }
+        v.push_back(bar(i * 300000LL, bo, bh, bl, bc));
+    }
+    v.push_back(bar(59 * 300000LL, o, h, l, c, qv));
+    return v;
+}
+
+static void test_bare() {
+    BareConfig bc;
+
+    // ── 结构特征 ──
+    auto f = compute_ambush(amb_bars());
+    check(f.ok && near(f.box_hi, 100.5) && near(f.box_lo, 99.5) && near(f.close, 100.2),
+          "埋伏结构：12 根 1h 箱体上下沿");
+    const double want_kappa = (1.0 / 99.5 * 100.0) / f.atr_pct / std::sqrt(12.0);
+    check(near(f.kappa, want_kappa, 1e-9) && f.atr_pct > 0.8 && f.atr_pct < 1.2,
+          "  κ = (箱体高度% ÷ ATR%) ÷ √12，箱体高度按下沿算");
+    check(near(f.pos, 0.7, 1e-9) && f.atr_ratio > 0, "  箱体内位置 0.7，ATR 压缩比算得出");
+    check(near(f.up_vol_share, 2000.0 * 6 / (2000.0 * 6 + 1000.0 * 6), 1e-9), "  上涨量占比按成交额算");
+    {
+        auto few = amb_bars();
+        few.resize(30);
+        check(!compute_ambush(few).ok, "  K线不够：不合格（不硬算）");
+    }
+
+    // ── κ 打分 ──
+    check(kappa_score(1.0) == 1 && kappa_score(0.8) == 1 && kappa_score(1.2) == 1, "κ 0.8~1.2 满分");
+    check(near(kappa_score(0.65), 0.5) && near(kappa_score(1.35), 0.5), "  两边线性递减");
+    check(kappa_score(0.4) == 0 && kappa_score(1.6) == 0, "  < 0.5（假突破重灾区）与 > 1.5（已扩张）0 分");
+
+    // ── 硬条件与打分 ──
+    check(ambush_gate(f, bc).empty(), "ATR% 1%、位置 0.7：合格");
+    const auto hot = compute_ambush(amb_bars(100.2, 1.4));
+    check(hot.ok && hot.atr_pct > 2 && !ambush_gate(hot, bc).empty(), "  1h ATR% > 2：不进");
+    const auto low = compute_ambush(amb_bars(99.6));
+    check(low.ok && low.pos < 0.55 && !ambush_gate(low, bc).empty(), "  收在箱体下部：不进");
+    AmbushFeat best = f;
+    best.kappa = 1.0; best.pos = 1.0; best.atr_pct = 0.8; best.higher_low = true;
+    best.up_vol_share = 0.6; best.atr_ratio = 0.8;
+    check(near(ambush_score(best, bc), 100), "满分结构 100 分");
+    AmbushFeat worse = best;
+    worse.kappa = 0.4;
+    check(near(ambush_score(worse, bc), 60), "  κ 掉到 0.4：少 40 分（κ 权重最大）");
+
+    std::map<std::string, AmbushFeat> m;
+    m["AAAUSDT"] = best;
+    m["BBBUSDT"] = worse;
+    m["CCCUSDT"] = f;
+    m["HOTUSDT"] = hot;
+    bc.pool_n = 2;
+    const auto pool = select_ambush(m, bc);
+    check(pool.size() == 2 && pool[0].symbol == "AAAUSDT" && pool[0].score > pool[1].score,
+          "选池：不合格的剔除，按分数取前 pool_n 个");
+    bc.pool_n = 40;
+
+    // ── 待命刷新：移出 ──
+    check(ambush_drop(f, 99.5, 100.2, bc).empty(), "还在箱体里：留");
+    auto down = f; down.close = 99.0;
+    check(has(ambush_drop(down, 99.5, 100.2, bc), "跌破箱体下沿"), "  跌破上次的箱体下沿：移出");
+    auto up = f; up.close = 130;
+    check(has(ambush_drop(up, 99.5, 100.0, bc), "已涨"), "  进池后涨超 25%：移出");
+    check(has(ambush_drop(hot, 99.5, 100.2, bc), "ATR%"), "  ATR% 超限：移出");
+    AmbushFeat bad;
+    check(ambush_drop(bad, 99.5, 100.2, bc).empty(), "  这轮没算出来（数据不全）：不动它");
+
+    // ── 点火判定（已收盘的 5m）──
+    const double hi = 100.5, lo = 99.5;
+    auto g = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000), hi, lo, bc);
+    check(g.ok && near(g.vol_ratio, 5) && near(g.low, 100.1) && g.close_pos > 0.9 && g.upper_wick < 0.1,
+          "点火：量比 5x、实体 1.2%、收在高位、上影短、贴着箱体上沿");
+    check(near(g.atr, 0.6, 0.05), "  ATR 用点火【之前】的（不含点火那根）");
+    g = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 2000), hi, lo, bc);
+    check(!g.ok && !g.vetoed && has(g.why, "量比"), "量比 2x：不点火");
+    // 收盘位置刚好 0.6（过线），上影 0.4（> 0.35）
+    g = check_ignition(ign_bars(100.2, 102.6, 100.1, 101.6, 5000), hi, lo, bc);
+    check(!g.ok && has(g.why, "上影"), "上影太长（冲上去被砸回）：不点火");
+    g = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000, true), hi, lo, bc);
+    check(!g.ok && g.vetoed && has(g.why, "连阴"), "否决：点火前 5 根连阴（下跌中继反抽）");
+    g = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000), 110, 99.9, bc);
+    check(!g.ok && g.vetoed && has(g.why, "箱体下部"), "否决：点火前在箱体下部");
+    g = check_ignition(ign_bars(100.2, 100.8, 100.1, 100.7, 5000), hi, lo, bc);
+    check(!g.ok && g.vetoed && has(g.why, "涨幅/ATR"), "否决：涨幅 ÷ ATR < 1.5（相对自身波动太弱）");
+    // 箱体 95~104：点火前位置 0.54（不否决），收盘 101.4 离上沿 104 还有 2.5%
+    g = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000), 104, 95, bc);
+    check(!g.ok && has(g.why, "箱体上沿"), "离箱体上沿太远（收盘没贴到上沿）：不点火");
+    check(!check_ignition(std::vector<Bar>(5), hi, lo, bc).ok, "K线不够：不判");
+
+    // ── bot 配置 ──
+    Config c;
+    c.tmpl.budget_usdt = 250;
+    c.tmpl.leverage    = 5;
+    c.tmpl.rule.squeeze_box_atr = 4;
+    const auto t = make_bare_bot_config(c, "XYZUSDT");
+    check(t.symbol == "XYZUSDT" && t.interval == "1h" && t.rule.strategy == trend::Strategy::Turtle &&
+          t.rule.donchian_period == 12 && t.rule.atr_period == 14 && near(t.rule.atr_mult, 3.0) &&
+          t.rule.direction == trend::Direction::LongOnly,
+          "裸K bot：1h、仅多、3 × ATR14 追踪");
+    check(t.rule.squeeze_box_atr == 0 && t.rule.trend_er_min == 0 && t.rule.breakout_vol_ratio == 0 &&
+          t.rule.reverse == trend::ReverseMode::None && t.use_disaster_stop &&
+          near(t.budget_usdt, 250) && t.leverage == 5,
+          "  入场过滤全关（入场不归它管）、不反手、硬止损、仓位杠杆沿用模板");
+    check(ambush_excluded_base("PAXG") && ambush_excluded_base("XAUT") && !ambush_excluded_base("SOL"),
+          "黄金代币不埋伏");
+
+    // ── 配置往返与校验 ──
+    Config b;
+    b.strategy = Strategy::BareK;
+    b.bare.pool_n = 30; b.bare.vol_ratio = 4; b.bare.atr_pct_max = 1.5; b.bare.veto_red_bars = 4;
+    b.bare.min_quote_vol = 5e6; b.bare.edge_tol_pct = 0.2; b.bare.accel_exit = false;
+    Config r;
+    std::string err;
+    check(config_from_json(config_to_json(b), r, &err) && r.strategy == Strategy::BareK &&
+              r.bare.pool_n == 30 && near(r.bare.vol_ratio, 4) && near(r.bare.atr_pct_max, 1.5) &&
+              r.bare.veto_red_bars == 4 && near(r.bare.min_quote_vol, 5e6) &&
+              near(r.bare.edge_tol_pct, 0.2) && !r.bare.accel_exit && r.bare.lock_atr,
+          "裸K 配置往返");
+    Config d;
+    check(config_from_json("{\"strategy\":\"bare\",\"bare\":{}}", d, &err) &&
+              d.bare.pool_n == 40 && near(d.bare.vol_ratio, 3.0) && d.bare.max_positions == 10 &&
+              near(d.bare.atr_pct_max, 2.0) && near(d.bare.pos_min, 0.55),
+          "  没写的键取默认（池 40 / 量比 3x / ATR% ≤ 2 / 位置 ≥ 0.55）");
+    check(!config_from_json("{\"strategy\":\"grid\"}", d, &err) && has(err, "strategy"), "  未知策略整份拒绝");
+    check(!config_from_json("{\"bare\":{\"close_pos_min\":1.5}}", d, &err), "  收盘位置超出 0~1 拒绝");
+    check(!config_from_json("{\"bare\":{\"atr_mult\":0}}", d, &err), "  追踪止损 0 ATR 拒绝");
 }
 
 int main() {
+    test_bare();
     test_gates();
     test_features();
     test_rank();

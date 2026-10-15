@@ -100,6 +100,7 @@ public:
 private slots:
     void onConnect();
     void onStopAll();
+    void onCloseAll();
     void onClearStopped();
     void onTick();
     void refreshBotTable();
@@ -202,7 +203,9 @@ private:
     // rest_price_feed.h 的头注释：WS 有一个"连上了却没有数据"的失败模式，
     // 识别它需要六种机制（静默看门狗、强制重连、退避、升级重建、订阅确认
     // 取证、对照探针），而轮询没有"连接"这个中间状态，压根不存在那个问题
-    std::unique_ptr<RestPriceFeed>     ticker_;
+    // shared_ptr：后台任务（智能裸K 点火判定）要拿一份副本用——重连会换掉 ticker_，
+    // 后台线程直接读成员的话，旧的那个析构后就是悬空指针
+    std::shared_ptr<RestPriceFeed>     ticker_;
 
     QTimer* tick_timer_  = nullptr;
     QTimer* ob_timer_    = nullptr;
@@ -295,10 +298,8 @@ private:
     //
     // indFetchBusy_ / trendFetchBusy_ 随网格DCA 的指标与趋势批次一并删除。
     // ⚠ 这两个成员删掉之前是【无引用】的——而无引用的私有成员编译器不会警告，
-    //   删代码时靠编译器兜不住，只能靠逐个 grep
-    // REST 价格兜底的防重入。串行遍历全部缺价品种，品种一多远超 3 秒的 tick 周期，
-    // 没有这道闸会在 fetchPool_ 里无限堆积并饿死高周期指标拉取
-    std::atomic<bool> restFetchBusy_{false};
+    //   删代码时靠编译器兜不住，只能靠逐个 grep。
+    //   restFetchBusy_（逐品种 REST 补价的防重入）同理：补价那条路早已由行情轮询取代，v5.10 删掉
     // 24h 涨幅的 REST 兜底：全市场一次取回，缓存到下一轮
     // 软/硬两条线是 stale-while-revalidate：超过 soft 就后台刷新但【继续用旧值】，
     // 只有超过 hard 才判为无数据。单一阈值会在每次过期时制造一个"没有数据"的
@@ -327,6 +328,9 @@ private:
     // 拉取每分钟一轮，而一个拼错的品种会永远失败——不去重就是每小时 60 条
     // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
     std::set<std::string> trendSigFailed_;
+    // 上一轮信号拉取失败的品种。连续两轮都失败才报（单个品种失败一轮、下一分钟就好，
+    // 经代理时很常见，每次两行就是噪音）
+    std::set<std::string> trendSigPrevFail_;
 
     // ── 智能模式 ──
     // 运行器随引擎一起在每次连接成功时重建（它持有引擎指针）。配置独立落盘，
@@ -336,6 +340,7 @@ private:
     std::shared_ptr<Journal>     journal_;
     smart::Config                smartCfg_;
     std::atomic<bool>            smartBusy_{false};
+    std::atomic<bool>            bareBusy_{false};    // 智能裸K 的点火判定（每拍一次，5m 收盘后要拉K线）
     QPushButton*                 smartBtn_ = nullptr;
 
     // ── 日志 ──

@@ -1249,9 +1249,131 @@ static void test_exit_opt() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ① 海龟假突破提前出场：开仓那根收完后，有K线收盘跌回开仓时的通道边沿以内就走
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_fail_exit() {
+    const int64_t H = 3600000, t0 = 100 * H;   // 开仓那根K线的开盘时间
+    auto in_at = [&](double price, int64_t bar_open, double prev_close) {
+        Inputs in = mk(price, 2.0, 112, 90);    // 开仓后通道上沿已被突破的那几根抬到 112
+        in.bar_open_ms = bar_open;
+        in.prev_close  = prev_close;
+        return in;
+    };
+    auto open_long = [&](const Config& c) {
+        State st;
+        on_filled(st, Pos::Long, 111, 105, c, false, t0, 2.0, /*entry_edge*/ 110);
+        return st;
+    };
+    {
+        Config c; c.fail_exit = true;
+        State st = open_long(c);
+        CHECK(near(st.entry_edge, 110), "on_filled 记下被突破的上沿 110");
+        auto v = step(st, c, in_at(109.5, t0, 109.0));
+        CHECK(v.action == Action::Hold, "开仓那根还没收完：不判（prev_close 是开仓前那根的）");
+        v = step(st, c, in_at(110.6, t0 + H, 110.5));
+        CHECK(v.action == Action::Hold, "开仓那根收在 110.5（> 110）：没跌回，继续拿");
+        v = step(st, c, in_at(109.8, t0 + 2 * H, 109.7));
+        CHECK(v.action == Action::Close && std::string(v.reason).find("假突破") != std::string::npos,
+              "下一根收在 109.7（< 开仓时的上沿 110）：直接走，不等 105 的止损线");
+        CHECK(near(st.entry_edge, 110), "  判定用的是开仓时的上沿，不是当前抬高到 112 的通道");
+        on_closed(st);
+        CHECK(st.entry_edge == 0, "平仓清掉入场边沿");
+    }
+    {
+        Config c;   // 没开 fail_exit：跌回通道照样拿着，等止损线
+        State st = open_long(c);
+        auto v = step(st, c, in_at(109.8, t0 + 2 * H, 109.7));
+        CHECK(v.action == Action::Hold, "没开假突破出场：跌回通道内照样拿着");
+    }
+    {
+        Config c; c.fail_exit_short = true;
+        State st;
+        on_filled(st, Pos::Short, 89, 95, c, false, t0, 2.0, /*entry_edge*/ 90);
+        auto v = step(st, c, in_at(90.4, t0 + H, 90.3));
+        CHECK(v.action == Action::Close, "做空对称（勾了空单）：收盘 90.3 回到下沿 90 之上 ⇒ 走");
+    }
+    {
+        Config c; c.fail_exit = true;   // 只勾多单
+        State st;
+        on_filled(st, Pos::Short, 89, 95, c, false, t0, 2.0, /*entry_edge*/ 90);
+        auto v = step(st, c, in_at(90.4, t0 + H, 90.3));
+        CHECK(v.action == Action::Hold, "只勾多单：空单反弹回通道照样拿着，交给止损线");
+    }
+    {
+        Config c; c.fail_exit_short = true;   // 只勾空单
+        State st = open_long(c);
+        auto v = step(st, c, in_at(109.8, t0 + 2 * H, 109.7));
+        CHECK(v.action == Action::Hold, "只勾空单：多单跌回通道照样拿着");
+    }
+    {
+        Config c; c.fail_exit = true;
+        State st;
+        on_filled(st, Pos::Long, 111, 105, c, false, t0, 2.0, /*entry_edge*/ 0);
+        auto v = step(st, c, in_at(109.8, t0 + 2 * H, 109.7));
+        CHECK(v.action == Action::Hold, "不知道开仓时的边沿（老仓位）：不判，交给止损线");
+    }
+    {
+        Config c; c.fail_exit = true;
+        State st = open_long(c);
+        st.fail_bar_ms = t0 + H;                 // 开仓那根的最后 1/4 才开仓：从下一根开始判
+        auto v = step(st, c, in_at(109.8, t0 + H, 109.7));
+        CHECK(v.action == Action::Hold, "fail_bar_ms 是下一根：开仓那根收盘跌回也不判");
+        v = step(st, c, in_at(109.6, t0 + 2 * H, 109.5));
+        CHECK(v.action == Action::Close, "  下一根收完还在通道内：平");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 收益率追踪止盈：最高收益率到过激活线，从最高点回撤 n 个点就平（收益率带杠杆，同主表）
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_roi_trail() {
+    // 3 倍杠杆、开多 @100：收益率 = (价 − 100) ÷ 价 × 300
+    //   价 105.27 ⇒ ≈ +15.03%；价 103.45 ⇒ ≈ +10.0%
+    CHECK(near(roi_pct(Pos::Long, 100, 105, 3), 5.0 / 105 * 300), "收益率：按现价算保证金（同主表）");
+    CHECK(near(roi_pct(Pos::Short, 100, 95, 3), 5.0 / 95 * 300), "  做空对称");
+    CHECK(roi_pct(Pos::Long, 100, 105, 0) == 0, "  杠杆不知道（0）⇒ 0，不触发");
+
+    Config c;
+    c.roi_trail = true;  c.roi_trail_start = 10;  c.roi_trail_back = 5;
+    auto in_lev = [](double price) { Inputs in = mk(price, 2.0, 110, 90); in.leverage = 3; return in; };
+    {
+        State st;
+        on_filled(st, Pos::Long, 100, 90, c, false);
+        CHECK(step(st, c, in_lev(104.0)).action == Action::Hold, "+11.5%：激活但没回撤，拿着");
+        CHECK(step(st, c, in_lev(105.27)).action == Action::Hold, "+15%：新高，拿着");
+        CHECK(step(st, c, in_lev(103.6)).action == Action::Hold, "回到 +10.3%：回撤 4.7 个点 < 5，拿着");
+        const auto v = step(st, c, in_lev(103.4));
+        CHECK(v.action == Action::Close && std::string(v.reason).find("追踪止盈") != std::string::npos &&
+                  v.profitable_exit,
+              "回到 +9.9%：从最高 +15% 回撤超过 5 个点 ⇒ 平（盈利出场）");
+    }
+    {
+        State st;
+        on_filled(st, Pos::Long, 100, 90, c, false);
+        step(st, c, in_lev(103.0));   // 最高 +8.7%，没到激活线
+        CHECK(step(st, c, in_lev(100.5)).action == Action::Hold, "最高只到 +8.7%（没激活）：回落也不平，交给止损线");
+    }
+    {
+        State st;
+        on_filled(st, Pos::Short, 100, 110, c, false);
+        step(st, c, in_lev(95.0));    // 做空 +15.8%
+        CHECK(step(st, c, in_lev(96.9)).action == Action::Close, "做空：最高 +15.8% 回到 +9.6% ⇒ 平");
+    }
+    {
+        Config off;   // 没勾：同样的走势照样拿着
+        State st;
+        on_filled(st, Pos::Long, 100, 90, off, false);
+        step(st, off, in_lev(105.27));
+        CHECK(step(st, off, in_lev(103.4)).action == Action::Hold, "没勾追踪止盈：不平");
+    }
+}
+
 int main() {
     test_turtle();
     test_exit_opt();
+    test_fail_exit();
+    test_roi_trail();
     test_bare_regime();
     test_squeeze_filter();
     test_direction();

@@ -1,4 +1,5 @@
 #include "headless/trend_state.h"
+#include "core/smart_mode.h"
 
 #include <simdjson.h>
 #include <chrono>
@@ -86,6 +87,9 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            << "\"af\":"          << b.st.af << ","
            // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
            << "\"entry_atr\":"   << b.st.entry_atr << ","
+           // 开仓时被突破的通道边沿。丢了的话"收盘跌回通道内就走"在重启后失效
+           << "\"entry_edge\":"  << b.st.entry_edge << ","
+           << "\"fail_bar_ms\":" << b.st.fail_bar_ms << ","   // 假突破从哪一根的收盘开始判
            // 数据记录层：开仓那一刻的名单信息与入场位置。⚠ NaN 写进 JSON 是非法的，
            // 没有值就不写这个键
            << "\"open_ms\":"     << b.open_ms << ","
@@ -98,6 +102,16 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            // 浮盈亏最低（持仓期最差价）与 R 的分母（初始止损线）
            << "\"trough\":"      << b.trough << ","
            << "\"open_stop\":"   << b.open_stop << ","
+           // 开仓时的量比 / 箱体 / 触发方式（记录层）；名单代码——智能裸K 的 bot
+           // 重启后靠它认出来，换用 5m 的参数恢复（不能套 1h 海龟模板）
+           << (std::isfinite(b.open_vol_ratio)
+                   ? "\"open_vol_ratio\":" + std::to_string(b.open_vol_ratio) + ","
+                   : std::string())
+           << (std::isfinite(b.open_box_atr)
+                   ? "\"open_box_atr\":" + std::to_string(b.open_box_atr) + ","
+                   : std::string())
+           << "\"open_trigger\":" << (int)b.open_trigger << ","
+           << "\"smart_list\":"  << (int)b.smart_list << ","
            // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
            //    忘掉，盘中即时模式下同一根里会再开一次
            << "\"last_entry_bar_ms\":" << b.st.last_entry_bar_ms << ","
@@ -176,7 +190,8 @@ std::vector<TrendTrade> load_trades_csv(const std::string& path) {
 
 std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
-                                   const TrendConfig* auto_tmpl) {
+                                   const TrendConfig* auto_tmpl,
+                                   const TrendConfig* bare_tmpl) {
     std::vector<TrendBot> out;
 
     std::ifstream f(path, std::ios::binary);
@@ -204,14 +219,20 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
             if (o["auto"].get(v) == simdjson::SUCCESS) is_auto = v;
         }
         const int saved_pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
+        const char smart_list = (char)(int)get_num(o, "smart_list", 0);
 
         // 配置里已经删掉的品种，落盘状态直接丢弃。
-        // 自动 bot 例外：它本来就不在配置里，参数取智能模式模板
+        // 自动 bot 例外：它本来就不在配置里，参数取智能模式模板（裸K 的用裸K 模板）
         const TrendConfig* cfg = nullptr;
         TrendConfig auto_cfg;
         if (is_auto) {
-            if (auto_tmpl) {
+            if (auto_tmpl && smart_list == smart::kSegBare && bare_tmpl) {
+                auto_cfg = *bare_tmpl;
+            } else if (auto_tmpl) {
                 auto_cfg = *auto_tmpl;
+            } else if (saved_pos != (int)trend::Pos::Flat && smart_list == smart::kSegBare &&
+                       bare_tmpl) {
+                auto_cfg = *bare_tmpl;   // 智能模式已关，但裸K 仓位还在：按裸K 参数管到走完
             } else if (saved_pos == (int)trend::Pos::Flat) {
                 continue;   // 智能模式已关，空仓的自动 bot 不再需要
             }
@@ -239,6 +260,8 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
         b.st.af              = get_num(o, "af", b.cfg.rule.af_start);
         b.st.entry_atr       = get_num(o, "entry_atr", 0);
+        b.st.entry_edge      = get_num(o, "entry_edge", 0);
+        b.st.fail_bar_ms     = get_i64(o, "fail_bar_ms", 0);
         b.open_ms            = get_i64(o, "open_ms", 0);
         b.open_seg           = (char)(int)get_num(o, "open_seg", 0);
         b.open_rank          = (int)get_num(o, "open_rank", 0);
@@ -246,6 +269,10 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.open_dist_atr      = get_num(o, "open_dist_atr", std::numeric_limits<double>::quiet_NaN());
         b.trough             = get_num(o, "trough", 0);
         b.open_stop          = get_num(o, "open_stop", 0);
+        b.open_vol_ratio     = get_num(o, "open_vol_ratio", std::numeric_limits<double>::quiet_NaN());
+        b.open_box_atr       = get_num(o, "open_box_atr", std::numeric_limits<double>::quiet_NaN());
+        b.open_trigger       = (char)(int)get_num(o, "open_trigger", 0);
+        b.smart_list         = smart_list;
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");

@@ -245,6 +245,9 @@ struct TrendBot {
     // 扫描选中的币很可能【此刻就在通道外】（强势名单尤其如此），不上膛的话
     // 第一拍就判成突破，等于追高进场。不落盘：恢复时空仓的自动 bot 一律重新上膛
     bool   armed   = true;
+    // 待移出：智能模式已关、或已切到另一套策略，这个自动 bot 只把手上这笔管完，
+    // 平仓后【不再开新仓】，等智能模式删掉它。不落盘：每次维护都会重新标
+    bool   retiring = false;
     double smart_score = 0;   // 最近一次扫描的综合分，名额紧张时按它取舍
     int    smart_rank  = 0;   // 名单内排名，0 = 已不在名单
     char   smart_list  = 0;   // 名单 / 分段代码（smart::kList* / kSeg*），0 = 无
@@ -262,6 +265,18 @@ struct TrendBot {
     // 都是采样价（每拍一次），不额外请求；程序离线期间的波动采不到
     double  trough         = 0;
     double  open_stop      = 0;
+    // 开仓那一刻的量比与箱体（海龟才有；NaN = 没有），以及触发方式。
+    // smart_trigger 是 force_open 打的标记（智能裸K 点火 = 'I'），成交时抄进 open_trigger。
+    // open_* 随仓位落盘，smart_trigger 不落盘（它只活到这一笔成交）
+    char    smart_trigger  = 0;
+    char    open_trigger   = 0;
+    // force_open 带进来的初始止损与开仓读数（点火K线最低点、点火量比、箱体/ATR）。
+    // 只活到这一笔下单：submit_open 读走即清，不落盘
+    double  forced_stop    = 0;
+    double  forced_vol     = std::numeric_limits<double>::quiet_NaN();
+    double  forced_box     = std::numeric_limits<double>::quiet_NaN();
+    double  open_vol_ratio = std::numeric_limits<double>::quiet_NaN();
+    double  open_box_atr   = std::numeric_limits<double>::quiet_NaN();
 
     double realized_pnl = 0;
     int    trade_count  = 0;
@@ -309,6 +324,11 @@ struct TrendTrade {
     double mae_atr = std::numeric_limits<double>::quiet_NaN();
     double mfe_r   = std::numeric_limits<double>::quiet_NaN();
     double mae_r   = std::numeric_limits<double>::quiet_NaN();
+
+    // 开仓那一刻的量比 / 箱体（海龟才有，NaN = 没有）与触发方式（智能裸K 点火 = 'I'，0 = 自己的信号）
+    char   trigger         = 0;
+    double entry_vol_ratio = std::numeric_limits<double>::quiet_NaN();
+    double entry_box_atr   = std::numeric_limits<double>::quiet_NaN();
 };
 
 // 一次被过滤掉的突破（每个 bot 每根K线最多一次）。数据记录层用：事后看这些被拦下的
@@ -346,6 +366,10 @@ public:
     void stop_bot  (const std::string& bot_id);
     void resume_bot(const std::string& bot_id);
     void close_bot (const std::string& bot_id);  // 手动市价平仓
+    // 一键平仓：全部 bot（含已停止的）的持仓市价平掉，原因记为「一键平仓」。
+    // 在途单（正在开 / 正在平）的跳过——它的结果回来之前再发平仓单不安全。
+    // 返回发出平仓的笔数。不停 bot、不暂停开新仓（由调用方决定）
+    int  close_all();
     void remove_bot(const std::string& bot_id);
     // 已停止（暂停）的 bot 的硬止损补挂。挂单重试平时由 tick 驱动，而 tick 跳过
     // 暂停的 bot——于是暂停期间硬止损丢了就永远不补，仓位既没有本地止损也没有
@@ -398,6 +422,15 @@ public:
     void set_priority_reserve(int reserve, double min_score);
     // 智能模式每轮扫描后写入排名与分数（界面显示、名额取舍用）
     void set_smart_meta(const std::string& bot_id, double score, int rank, char list);
+    // 智能裸K 点火：不看这个 bot 自己的入场信号，按给定价格立刻开仓，初始止损用 stop
+    // （点火K线最低点）。待移出也照开（裸K 的 bot 一建好就标待移出，自己不开仓）。
+    // 账户级闸门照常拦。vol / box 记进这一笔（入场量比、入场箱体ATR）。
+    // 返回空串 = 已提交下单，否则是没开的原因
+    std::string force_open(const std::string& bot_id, trend::Pos dir, double price, double stop,
+                           char trigger, double vol, double box);
+    // 标为待移出：手上的仓位照常管到平仓，平仓后不再开新仓。on=false 撤销
+    // （关掉智能模式又用同一套策略打开：这些 bot 重新归它管）
+    void set_retiring(const std::string& bot_id, bool on = true);
     // 把自动 bot 转成手动 bot：智能模式从此不再淘汰它、不再改它的参数。
     // 用户在策略弹窗里亲手改了一个自动 bot 的参数，就是在接管它
     void release_auto(const std::string& bot_id);
@@ -420,7 +453,7 @@ public:
     void update_signal(const std::string& bot_id, double atr, double atr_pct,
                        bool dc_ok, double dc_up, double dc_dn, int64_t bar_open_ms,
                        double box_atr = 0, double vol_ratio = 0,
-                       bool er_ok = false, double er = 0);
+                       bool er_ok = false, double er = 0, double prev_close = 0);
     // K线快照（裸K 与 抛物线SAR 用）。与 update_signal 分开：海龟要的是
     // ATR+通道，这两个要的是原始高低点，合成一个大函数会让调用方被迫为
     // 用不到的参数填占位值。

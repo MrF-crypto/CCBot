@@ -15,15 +15,8 @@ void FundingLedger::apply(const std::string& symbol, double income, int64_t time
     // 分页窗口有重叠时同一条流水会被拉两次。同品种一次结算只产生一条记录，
     // 所以"时间戳不大于游标"就是重复，直接丢弃——不需要额外的 tranId 去重表
     if (time_ms <= e.cursor_ms) return;
-    e.total      += income;
-    e.since_open += income;
-    e.cursor_ms   = time_ms;
-}
-
-void FundingLedger::reset_position(const std::string& symbol) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    auto it = map_.find(symbol);
-    if (it != map_.end()) it->second.since_open = 0;
+    e.total     += income;
+    e.cursor_ms  = time_ms;
 }
 
 void FundingLedger::set_rate(const std::string& symbol, double rate,
@@ -67,7 +60,6 @@ bool FundingLedger::save(const std::string& path) const {
             first = false;
             ss << "\"" << sym << "\":{"
                << "\"total\":"      << e.total      << ","
-               << "\"since_open\":" << e.since_open << ","
                << "\"cursor_ms\":"  << e.cursor_ms  << "}";
         }
     }
@@ -110,8 +102,7 @@ bool FundingLedger::load(const std::string& path) {
         double d = 0;
         int64_t i = 0;
         if (o["total"].get(d)      == simdjson::SUCCESS) e.total      = d;
-        if (o["since_open"].get(d) == simdjson::SUCCESS) e.since_open = d;
-        if (o["cursor_ms"].get(i)  == simdjson::SUCCESS) e.cursor_ms  = i;
+        if (o["cursor_ms"].get(i)  == simdjson::SUCCESS) e.cursor_ms  = i;   // 老文件的 since_open 忽略
         map_[std::string(field.key)] = e;
     }
     return true;

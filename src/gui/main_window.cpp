@@ -12,6 +12,7 @@
 #include <QHeaderView>
 #include <QSplitter>
 #include <QMessageBox>
+#include <QCheckBox>
 #include <QScrollArea>
 #include <QStackedWidget>
 #include <QDateTime>
@@ -998,6 +999,13 @@ void MainWindow::buildUi() {
             connect(btnStop, &QPushButton::clicked, this, &MainWindow::onStopAll);
             row->addWidget(btnStop);
 
+            auto* btnCloseAll = new QPushButton("一键平仓");
+            btnCloseAll->setStyleSheet(
+                "QPushButton{background:#3d1a1a;color:#f85149;padding:3px 10px;}");
+            btnCloseAll->setToolTip("全部 bot 的持仓市价平掉（含已停止的 bot），可选同时暂停开新仓");
+            connect(btnCloseAll, &QPushButton::clicked, this, &MainWindow::onCloseAll);
+            row->addWidget(btnCloseAll);
+
             auto* btnClear = new QPushButton("清除已停");
             btnClear->setStyleSheet("QPushButton{padding:3px 8px;}");
             connect(btnClear, &QPushButton::clicked, this, &MainWindow::onClearStopped);
@@ -1246,7 +1254,7 @@ void MainWindow::onConnect() {
             // 签名、限流闸门、超时与重试，这里不自己发 HTTP。
             // 一轮一个请求，与品种数无关（premiumIndex / ticker24hr 不带 symbol
             // 时返回全市场），所以加品种不会增加任何请求
-            ticker_ = std::make_unique<RestPriceFeed>(
+            ticker_ = std::make_shared<RestPriceFeed>(
                 [this]() -> std::unordered_map<std::string, double> {
                     if (!client_) return {};
                     return client_->fetch_all_mark_prices();
@@ -1268,6 +1276,8 @@ void MainWindow::onConnect() {
                     log(QString::fromStdString(m), "WARN");
                 }, Qt::QueuedConnection);
             });
+            // 失败原因（超时 / 连接中断 / 返回的不是 JSON……）拼进那条日志
+            ticker_->on_fetch_error([this]() { return client_ ? client_->last_error() : std::string(); });
             ticker_->start();
 
             slowTickCount_  = 0;   // 保证"首tick立即对账/对时"在（罕见的）重连后依然成立
@@ -1673,6 +1683,53 @@ void MainWindow::onStopAll() {
     save_trend_bots();
 }
 
+// 一键平仓：全部 bot 的持仓市价平掉。确认框里带一个「同时暂停开新仓」（默认勾上）——
+// 不停的话 bot 平完照常等信号，突破了又会开，智能模式也会继续建 bot
+void MainWindow::onCloseAll() {
+    if (!trend_engine_) return;
+    QStringList syms;
+    int pending = 0;
+    for (const auto& b : trend_engine_->get_bots()) {
+        if (b.st.pos == trend::Pos::Flat || b.qty <= 0) continue;
+        if (b.pending) { ++pending; continue; }
+        syms << QString::fromStdString(b.cfg.symbol);
+    }
+    if (syms.isEmpty()) {
+        log(pending > 0 ? "一键平仓：现在只有在途单（正在开 / 正在平），等它们回来再点"
+                        : "一键平仓：没有持仓", "INFO");
+        return;
+    }
+    QMessageBox box(this);
+    box.setWindowTitle("确认一键平仓");
+    box.setIcon(QMessageBox::Warning);
+    box.setText(QString("将市价平掉 %1 笔持仓：\n%2%3\n\n只平 bot 管着的仓位，你在 App 上自己开的不动。")
+                    .arg(syms.size())
+                    .arg(syms.join("、"))
+                    .arg(pending > 0 ? QString("\n（另有 %1 笔在途单，这次跳过）").arg(pending)
+                                     : QString()));
+    auto* cbPause = new QCheckBox("同时暂停开新仓（bot 保留，之后在智能模式里取消暂停）");
+    cbPause->setChecked(true);
+    box.setCheckBox(cbPause);
+    auto* okBtn     = box.addButton("全部平仓", QMessageBox::AcceptRole);
+    auto* cancelBtn = box.addButton("取消", QMessageBox::RejectRole);
+    box.setDefaultButton(cancelBtn);
+    box.setEscapeButton(cancelBtn);
+    okBtn->setStyleSheet("QPushButton{background:#3d1a1a;color:#f85149;padding:4px 14px;}");
+    box.exec();
+    if (box.clickedButton() != okBtn) return;
+
+    // 先暂停再平：平仓是异步的，反过来的话平仓和开新仓之间有一个空档
+    const bool pause = cbPause->isChecked();
+    if (pause && !smartCfg_.pause_new) {
+        auto c = smartCfg_;
+        c.pause_new = true;
+        applySmartConfig(c);
+    }
+    const int n = trend_engine_->close_all();
+    log(QString("一键平仓：已发出 %1 笔市价平仓%2").arg(n).arg(pause ? "，已暂停开新仓" : ""), "WARN");
+    refreshBotTable();
+}
+
 void MainWindow::onClearStopped() {
     if (!trend_engine_) return;
     int n = 0, withPos = 0;
@@ -1787,10 +1844,13 @@ void MainWindow::onTick() {
                         return;
                     }
                     ++okn_a;
+                    // 量比：开了 vol_paced 的用按已走时间折算的那个
                     trend_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
                                                snap.bar_open_ms, snap.box_atr,
-                                               snap.vol_ratio, snap.er_ok, snap.er);
+                                               b.cfg.rule.vol_paced ? snap.vol_ratio_paced
+                                                                    : snap.vol_ratio,
+                                               snap.er_ok, snap.er, snap.prev_close);
                   } catch (...) {
                     // 跨线程的异常会直接 terminate；拉取失败当成这一个没拉到
                     mark_failed(need[idx].cfg.symbol);
@@ -1805,15 +1865,22 @@ void MainWindow::onTick() {
                     std::set<std::string> now;
                     for (const auto& f : failed) now.insert(f.toStdString());
 
+                    // 连续两轮都失败才报；只有报过的才报恢复
                     QStringList fresh;
-                    for (const auto& s : now)
-                        if (!trendSigFailed_.count(s))
+                    std::set<std::string> reported;
+                    for (const auto& s : now) {
+                        if (trendSigFailed_.count(s)) { reported.insert(s); continue; }
+                        if (trendSigPrevFail_.count(s)) {
+                            reported.insert(s);
                             fresh << QString::fromStdString(s);
+                        }
+                    }
                     QStringList healed;
                     for (const auto& s : trendSigFailed_)
                         if (!now.count(s))
                             healed << QString::fromStdString(s);
-                    trendSigFailed_ = std::move(now);
+                    trendSigFailed_   = std::move(reported);
+                    trendSigPrevFail_ = std::move(now);
 
                     if (!fresh.isEmpty())
                         // 拉不到 K 线 = 没有止损线，所以这些品种不开新仓
@@ -2223,6 +2290,8 @@ void MainWindow::unsubscribeIfUnused(const std::string& symbol) {
     // 价格——止损线永远不会被触发，仓位静默裸奔
     for (const auto& b : trend_engine_->get_bots())
         if (b.cfg.symbol == symbol) return;
+    // 智能裸K 的埋伏池在盯它（bot 删了，币还在池里，之后还能再点火）
+    if (smart_ && smart_->watching(symbol)) return;
     ticker_->unsubscribe(symbol);
 }
 

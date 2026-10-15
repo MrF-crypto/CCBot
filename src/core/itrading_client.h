@@ -24,6 +24,8 @@ public:
     virtual double round_qty(const std::string& symbol, double qty) = 0;
     virtual bool   set_leverage(const std::string& symbol, int lev)  = 0;
     virtual bool   is_dual_mode() const = 0;
+    // 本线程上一次请求的失败原因（给日志用；空 = 没有或不知道）。默认实现返回空
+    virtual std::string last_error() const { return {}; }
 
     // ── 交易所侧硬止损（进程外兜底，"保命单"）────────────────────────────────
     // 本地的移动止损活在进程里，程序崩溃、断电、误关窗口之后仓位就完全裸奔。

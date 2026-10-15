@@ -36,7 +36,15 @@ std::string seg_name(char c) {
     case smart::kSegWeak:    return "弱势";
     case smart::kSegMid:     return "中间";
     case smart::kSegHot:     return "过热";
+    case smart::kSegBare:    return "裸K埋伏";
     default:                 return {};
+    }
+}
+
+std::string trigger_name(char c) {
+    switch (c) {
+    case 'I': return "点火";
+    default:  return {};
     }
 }
 
@@ -116,6 +124,7 @@ void Journal::prune_locked(int64_t now_ms) {
             std::string date;
             if (name.rfind("scan-", 0) == 0)        date = name.substr(5, 8);
             else if (name.rfind("filter-", 0) == 0) date = name.substr(7, 8);
+            else if (name.rfind("ambush-", 0) == 0) date = name.substr(7, 8);
             else continue;
             if (date.size() == 8 && date < cutoff) fs::remove(e.path(), ec);
         }
@@ -143,13 +152,15 @@ void Journal::trade(const TrendTrade& t) {
       << num(t.mfe_pct, 4) << "," << num(t.mae_pct, 4) << ","
       << num(t.mfe_atr, 4) << "," << num(t.mae_atr, 4) << ","
       << num(t.mfe_r, 4)   << "," << num(t.mae_r, 4)   << ","
+      << trigger_name(t.trigger) << "," << num(t.entry_vol_ratio, 4) << ","
+      << num(t.entry_box_atr, 4) << ","
       << csv_field(t.reason) << "\n";
     std::lock_guard<std::mutex> lk(mtx_);
     append("trades.csv",
            "平仓时间UTC,开仓时间UTC,持仓小时,品种,方向,策略,周期,手动自动,开仓时所在段,段内名次,"
            "分数,开仓价,平仓价,数量,盈亏U,估算手续费U,净盈亏U,入场离通道边沿ATR,"
            "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,浮盈亏最低ATR,"
-           "浮盈亏最高R,浮盈亏最低R,原因",
+           "浮盈亏最高R,浮盈亏最低R,触发方式,入场量比,入场箱体ATR,原因",
            l.str());
 }
 
@@ -212,6 +223,27 @@ void Journal::scan(int64_t ms, const smart::Ranking& rk, const smart::Segmented&
            "时间UTC,品种,段,段内名次,做多分,做空分,蓄势分,强弱百分位,相对强弱,效率比24,"
            "箱体12/ATR,ATR14/ATR100,箱体48/ATR,量能抬升,箱体内位置,ATR%,7天最大单日涨%,"
            "7天最大单日跌%,收盘价,已有bot",
+           l.str());
+}
+
+void Journal::ambush(int64_t ms, const std::string& event, const std::vector<smart::Ambush>& pool,
+                     const std::set<std::string>& with_bot) {
+    const std::string t = utc_time(ms);
+    std::ostringstream l;
+    for (const auto& a : pool) {
+        const auto& f = a.f;
+        l << t << "," << csv_field(event) << "," << csv_field(a.symbol) << "," << num(a.score, 4) << ","
+          << num(f.kappa, 4) << "," << num(f.pos, 4) << "," << num(f.atr_pct, 4) << ","
+          << (f.atr_ratio > 0 ? num(f.atr_ratio, 4) : std::string()) << ","
+          << (f.higher_low ? "是" : "") << "," << num(f.up_vol_share, 4) << ","
+          << num(f.box_hi, 10) << "," << num(f.box_lo, 10) << "," << num(f.close, 10) << ","
+          << (with_bot.count(a.symbol) ? "是" : "") << "\n";
+    }
+    std::lock_guard<std::mutex> lk(mtx_);
+    prune_locked(ms);
+    append("ambush-" + utc_date(ms) + ".csv",
+           "时间UTC,事件,品种,分数,κ,箱体内位置,1hATR%,ATR压缩比,低点抬高,上涨量占比,"
+           "箱体上沿,箱体下沿,收盘价,已有bot",
            l.str());
 }
 

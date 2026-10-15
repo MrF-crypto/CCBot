@@ -142,11 +142,20 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
         };
         // "智能"已经显示在周期·模式列，这里只标段和名次。
         // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时不标
-        const QString tag = b.smart_rank > 0
+        // 裸K 的 bot 没有名次：智能模式还在跑裸K 就不标，切走了（持仓等走完）标「待移出」
+        const bool bare_bot = (b.smart_list == smart::kSegBare);
+        const QString tag = bare_bot
+            ? ((smartCfg_.enabled && smartCfg_.strategy == smart::Strategy::BareK)
+                   ? QString() : QString("待移出"))
+            : b.smart_rank > 0
             ? QString("%1#%2").arg(list_short(b.smart_list)).arg(b.smart_rank)
             : (b.smart_score > 0 ? QString("待移出") : QString());
         auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + (tag.isEmpty() ? "" : "  " + tag),
-                          b.smart_rank > 0 ? kBlue : kGrey);
+                          (b.smart_rank > 0 || (bare_bot && tag.isEmpty())) ? kBlue : kGrey);
+        if (bare_bot)
+            sym_it->setToolTip("智能裸K 的 bot：埋伏池里的币点火时建的，开仓即管、平仓后自动删掉；"
+                               "币留在埋伏池，之后还能再点火");
+        else
         sym_it->setToolTip(QString("智能模式管理的 bot\n综合分 %1　%2\n"
                                    "空仓时掉出名单（连续 2 轮、满 24 小时）会被自动移除；"
                                    "持仓中绝不移除，等这笔走完")
@@ -176,9 +185,10 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     // 模式名单独占一格信息量太小，合成 "3m·裸K" / "4h·通道" 更划算
     const auto strat   = b.cfg.rule.strategy;
     const bool bar_mode = (strat == trend::Strategy::BareK);
-    // 智能模式管理的 bot 显示"智能"（它只建海龟，策略和参数在悬停提示里）；
-    // 手动 bot 显示自己的策略名
-    const char* short_name = b.is_auto                                ? "·智能"
+    // 智能模式管理的 bot 显示"智能"（它只建海龟，策略和参数在悬停提示里），
+    // 智能裸K 建的显示"智能裸K"；手动 bot 显示自己的策略名
+    const char* short_name = (b.is_auto && b.smart_list == smart::kSegBare) ? "·智能裸K"
+                           : b.is_auto                                ? "·智能"
                            : (strat == trend::Strategy::Turtle)       ? "·海龟"
                            : (strat == trend::Strategy::ParabolicSar) ? "·SAR"
                                                                       : "·裸K";
@@ -186,7 +196,10 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                         b.is_auto ? kAmber : kBlue);
     {
         QString tip = QString("%1%2　信号周期 %3\n")
-                          .arg(b.is_auto ? "智能模式管理 · " : "")
+                          .arg(!b.is_auto ? ""
+                               : b.smart_list == smart::kSegBare
+                                   ? "智能裸K（埋伏点火开多，止损从点火K线低点起、按 1h ATR 追踪）· "
+                                   : "智能模式管理 · ")
                           .arg(trend::strategy_name(strat))
                           .arg(QString::fromStdString(b.cfg.interval));
         if (b.cfg.rule.direction != trend::Direction::Both)
@@ -209,13 +222,20 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                                .arg(b.er, 0, 'f', 2);
             }
             if (b.cfg.rule.breakout_vol_ratio > 0)
-                tip += QString("放量过滤：量比 ≥ %1 倍（当前 %2）\n")
+                tip += QString("放量过滤：量比 ≥ %1 倍（当前 %2%3）\n")
                            .arg(b.cfg.rule.breakout_vol_ratio, 0, 'f', 1)
-                           .arg(b.vol_ratio, 0, 'f', 1);
-            if (b.cfg.rule.lock_atr || b.cfg.rule.accel_exit)
-                tip += QString("出场优化：%1%2\n")
+                           .arg(b.vol_ratio, 0, 'f', 1)
+                           .arg(b.cfg.rule.vol_paced ? "，按已走时间折算" : "");
+            if (b.cfg.rule.lock_atr || b.cfg.rule.accel_exit || b.cfg.rule.fail_exit ||
+                b.cfg.rule.fail_exit_short)
+                tip += QString("出场优化：%1%2%3\n")
                            .arg(b.cfg.rule.lock_atr ? "锁定ATR " : "")
-                           .arg(b.cfg.rule.accel_exit ? "加速收紧" : "");
+                           .arg(b.cfg.rule.accel_exit ? "加速收紧 " : "")
+                           .arg(b.cfg.rule.fail_exit && b.cfg.rule.fail_exit_short
+                                    ? "收盘跌回通道内就走"
+                                    : b.cfg.rule.fail_exit       ? "多单收盘跌回通道内就走"
+                                    : b.cfg.rule.fail_exit_short ? "空单收盘回到通道内就走"
+                                                                 : "");
             break;
         case trend::Strategy::ParabolicSar:
             tip += QString("抛物线 SAR：SAR 值既是入场也是止损也是反转点\n"
@@ -253,6 +273,15 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                    .arg(b.cfg.rule.reverse == trend::ReverseMode::Immediate
                             ? "立即反手" : "不反手（回到正常入场）")
                    .arg(b.cfg.effective_max_age_sec());
+        if (b.cfg.rule.roi_trail) {
+            tip += QString("\n收益率追踪止盈：到 %1% 后回撤 %2 个点就平")
+                       .arg(b.cfg.rule.roi_trail_start, 0, 'f', 1)
+                       .arg(b.cfg.rule.roi_trail_back, 0, 'f', 1);
+            if (b.st.pos != trend::Pos::Flat && b.st.peak > 0)
+                tip += QString("（持仓期最高 %1%）")
+                           .arg(trend::roi_pct(b.st.pos, b.st.entry_price, b.st.peak, b.cfg.leverage),
+                                0, 'f', 1);
+        }
         strat_it->setToolTip(tip);
     }
     botTable_->setItem(row, ColMode, strat_it);
@@ -608,6 +637,9 @@ struct TrendFormWidgets {
     QLabel*         revNote  = nullptr;   // PSAR 被锁成"立即反手"时的说明
     QCheckBox*      disStop  = nullptr;
     QDoubleSpinBox* disBuf   = nullptr;
+    QCheckBox*      roiTrail = nullptr;   // 收益率追踪止盈
+    QDoubleSpinBox* roiStart = nullptr;
+    QDoubleSpinBox* roiBack  = nullptr;
     QSpinBox*       maxAge   = nullptr;
     QLabel*         maxAgeHint = nullptr;
 
@@ -1047,6 +1079,42 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
     w->revNote->setStyleSheet("color:#8b949e;font-size:11px;");
     revForm->addRow(w->revNote);
 
+    // ── 收益率追踪止盈（三个策略共用）──────────────────────────────────────
+    w->roiTrail = new QCheckBox("收益率追踪止盈");
+    w->roiTrail->setChecked(c.rule.roi_trail);
+    w->roiTrail->setToolTip(
+        "收益率 = 浮动盈亏 ÷ 保证金，和主表「收益率」那一列同一个数（带杠杆）。\n"
+        "最高收益率到过激活线后，从最高点回撤指定的百分点就平仓\n"
+        "（例：激活 10%、回撤 5：最高到过 +15% 后回到 +10% 就平）。\n"
+        "和止损线同时生效，谁先触发听谁的。\n\n"
+        "趋势策略赚钱主要靠少数跑得很远的大单，回撤设得太小会把它们提早截住。");
+    w->roiStart = new QDoubleSpinBox();
+    w->roiStart->setRange(0.5, 1000);
+    w->roiStart->setDecimals(1);
+    w->roiStart->setSuffix(" %");
+    w->roiStart->setValue(c.rule.roi_trail_start);
+    w->roiBack = new QDoubleSpinBox();
+    w->roiBack->setRange(0.1, 1000);
+    w->roiBack->setDecimals(1);
+    w->roiBack->setSuffix(" 个点");
+    w->roiBack->setValue(c.rule.roi_trail_back);
+    auto* roiRow = new QHBoxLayout();
+    roiRow->addWidget(w->roiTrail);
+    roiRow->addWidget(new QLabel("收益率到"));
+    roiRow->addWidget(w->roiStart);
+    roiRow->addWidget(new QLabel("后，回撤"));
+    roiRow->addWidget(w->roiBack);
+    roiRow->addWidget(new QLabel("就平"));
+    roiRow->addStretch();
+    {
+        auto* start = w->roiStart;
+        auto* back  = w->roiBack;
+        auto syncRoi = [start, back](bool on) { start->setEnabled(on); back->setEnabled(on); };
+        syncRoi(c.rule.roi_trail);
+        connect(w->roiTrail, &QCheckBox::toggled, start, syncRoi);
+    }
+    revForm->addRow("止盈", roiRow);
+
     // ── 进程外保护 ──────────────────────────────────────────────────────────
     w->disStop = new QCheckBox("在交易所挂灾难止损单（强烈建议开启）");
     w->disStop->setChecked(c.use_disaster_stop);
@@ -1167,6 +1235,9 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
     out.signal_max_age_sec            = w->maxAge->value();
     out.use_disaster_stop             = w->disStop->isChecked();
     out.disaster_stop_buffer_pct      = w->disBuf->value();
+    out.rule.roi_trail       = w->roiTrail->isChecked();
+    out.rule.roi_trail_start = w->roiStart->value();
+    out.rule.roi_trail_back  = w->roiBack->value();
 
     out.rule.strategy = (trend::Strategy)w->strategy->currentData().toInt();
     out.rule.direction = (trend::Direction)w->direction->currentData().toInt();
@@ -1368,6 +1439,12 @@ void MainWindow::save_trend_bots() {
         o["trend_er_min"]       = b.cfg.rule.trend_er_min;
         o["lock_atr"]           = b.cfg.rule.lock_atr;
         o["accel_exit"]         = b.cfg.rule.accel_exit;
+        o["vol_paced"]          = b.cfg.rule.vol_paced;
+        o["fail_exit"]          = b.cfg.rule.fail_exit;
+        o["fail_exit_short"]    = b.cfg.rule.fail_exit_short;
+        o["roi_trail"]          = b.cfg.rule.roi_trail;
+        o["roi_trail_start"]    = b.cfg.rule.roi_trail_start;
+        o["roi_trail_back"]     = b.cfg.rule.roi_trail_back;
         o["af_start"]        = b.cfg.rule.af_start;
         o["af_step"]         = b.cfg.rule.af_step;
         o["af_max"]          = b.cfg.rule.af_max;
@@ -1403,6 +1480,9 @@ void MainWindow::save_trend_bots() {
         o["af"]              = b.st.af;
         // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
         o["entry_atr"]       = b.st.entry_atr;
+        // 开仓时被突破的通道边沿。丢了的话"收盘跌回通道内就走"在重启后失效
+        o["entry_edge"]      = b.st.entry_edge;
+        o["fail_bar_ms"]     = (qint64)b.st.fail_bar_ms;   // 假突破从哪一根的收盘开始判
         // 数据记录层：开仓那一刻的名单信息与入场位置，跨重启的仓位平掉时要用
         o["open_ms"]         = (qint64)b.open_ms;
         o["open_seg"]        = (int)b.open_seg;
@@ -1412,6 +1492,11 @@ void MainWindow::save_trend_bots() {
         // 浮盈亏最低（持仓期最差价）与 R 的分母。丢了的话重启前那段浮亏就没了
         o["trough"]          = b.trough;
         o["open_stop"]       = b.open_stop;
+        // 开仓时的量比 / 箱体 / 触发方式（记录层）；名单代码——智能裸K 的 bot 重启后靠它认出来
+        if (std::isfinite(b.open_vol_ratio)) o["open_vol_ratio"] = b.open_vol_ratio;
+        if (std::isfinite(b.open_box_atr))   o["open_box_atr"]   = b.open_box_atr;
+        o["open_trigger"]    = (int)b.open_trigger;
+        o["smart_list"]      = (int)b.smart_list;
         o["consec_reverses"] = b.st.consec_reverses;
         o["cooldown_left"]   = b.st.cooldown_left;
         // ③ 裸K 专用：once_per_bar 的判据（最后一次开仓所在K线的开盘时间）。
@@ -1474,6 +1559,12 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.trend_er_min       = std::clamp(o["trend_er_min"].toDouble(0), 0.0, 1.0);
         b.cfg.rule.lock_atr           = o["lock_atr"].toBool(false);
         b.cfg.rule.accel_exit         = o["accel_exit"].toBool(false);
+        b.cfg.rule.vol_paced          = o["vol_paced"].toBool(false);
+        b.cfg.rule.fail_exit          = o["fail_exit"].toBool(false);
+        b.cfg.rule.fail_exit_short    = o["fail_exit_short"].toBool(false);
+        b.cfg.rule.roi_trail          = o["roi_trail"].toBool(false);
+        b.cfg.rule.roi_trail_start    = o["roi_trail_start"].toDouble(10);
+        b.cfg.rule.roi_trail_back     = o["roi_trail_back"].toDouble(5);
         b.cfg.rule.af_start        = o["af_start"].toDouble(0.02);
         b.cfg.rule.af_step         = o["af_step"].toDouble(0.02);
         b.cfg.rule.af_max          = o["af_max"].toDouble(0.20);
@@ -1561,6 +1652,8 @@ void MainWindow::load_and_restore_trend() {
         // （SAR += 0×(EP−SAR)），止损线就此冻在重启那一刻的位置
         b.st.af              = o["af"].toDouble(b.cfg.rule.af_start);
         b.st.entry_atr       = o["entry_atr"].toDouble(0);
+        b.st.entry_edge      = o["entry_edge"].toDouble(0);
+        b.st.fail_bar_ms     = (int64_t)o["fail_bar_ms"].toInteger(0);
         b.open_ms            = (int64_t)o["open_ms"].toInteger(0);
         b.open_seg           = (char)o["open_seg"].toInt(0);
         b.open_rank          = o["open_rank"].toInt(0);
@@ -1570,6 +1663,12 @@ void MainWindow::load_and_restore_trend() {
                                    : std::numeric_limits<double>::quiet_NaN();
         b.trough             = o["trough"].toDouble(0);
         b.open_stop          = o["open_stop"].toDouble(0);
+        b.open_vol_ratio     = o.contains("open_vol_ratio") ? o["open_vol_ratio"].toDouble(0)
+                                                            : std::numeric_limits<double>::quiet_NaN();
+        b.open_box_atr       = o.contains("open_box_atr") ? o["open_box_atr"].toDouble(0)
+                                                          : std::numeric_limits<double>::quiet_NaN();
+        b.open_trigger       = (char)o["open_trigger"].toInt(0);
+        b.smart_list         = (char)o["smart_list"].toInt(0);
         b.st.consec_reverses = o["consec_reverses"].toInt(0);
         b.st.cooldown_left   = o["cooldown_left"].toInt(0);
         b.st.last_entry_bar_ms = (int64_t)o["last_entry_bar_ms"].toInteger(0);

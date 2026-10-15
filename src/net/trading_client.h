@@ -92,6 +92,7 @@ public:
         // 开盘时间（毫秒）。SAR 的冷却按【K线根数】计数，需要它来判断跨没跨根——
         // 按 tick 计数的话，"冷却3根4h线"会在 9 秒内走完，等于没有冷却
         int64_t open_ms = 0;
+        double  quote_volume = 0;   // 成交额（U）。0 = 接口没给
     };
     // 统一的 K 线拉取+解析（fetch_indicators / fetch_trend 共用）
     std::vector<Bar> fetch_klines(const std::string& symbol,
@@ -114,6 +115,8 @@ public:
         double  dc_dn   = 0;
         double  box_atr   = 0;     // 通道宽度 ÷ 已收盘K线的 ATR，0=算不出
         double  vol_ratio = 0;     // 当前根已成交量 ÷ 通道窗口内均量，0=算不出或尚无成交
+        double  vol_ratio_paced = 0;   // 同上，按这根已走时间折算（indicators::paced_ratio）
+        double  prev_close = 0;    // 最近一根已收盘K线的收盘价（假突破提前出场用）
         bool    er_ok = false;     // 通道窗口的效率比算得出来
         double  er    = 0;         // 带符号，正 = 净上涨
         int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
@@ -224,6 +227,7 @@ public:
     // 整轮不可信、一个 bot 都不动；当成"空"的话会把池里的币全判成不合格
     struct MarketSymbol {
         std::string symbol, base, quote, contract_type, status;
+        std::string underlying_type;   // COIN / INDEX / 其它（大宗商品、股票等）；空 = 接口没给
         int64_t onboard_ms = 0, delivery_ms = 0;
         double  tick = 0;
     };
@@ -385,6 +389,11 @@ public:
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;
+    // 【本线程】上一次请求的失败原因（空 = 成功或业务错误）：超时 / 连不上 / 连接中断 /
+    // HTTP 状态码 / 返回的不是 JSON（附开头几十个字）。日志里"JSON解析失败"之类的话
+    // 光看分不出是代理冒充、币安网关 502 还是超时，修法完全不同。
+    // 线程局部：并发请求不串味；调用方在同一线程、紧跟着请求读它
+    std::string last_error() const override;
     // 硬止损单：STOP_MARKET + closePosition=true。
     // 用 closePosition 而不是"显式数量+reduceOnly"，因为金字塔加仓会让仓位不断
     // 变大，显式数量的单子会立刻过期失真；closePosition 永远平掉当时的整个仓位，
@@ -481,6 +490,21 @@ private:
     // 更糟的是它会污染对时——中点估算把握手时间当成对称网络延迟平摊，
     // 于是偏移被系统性抬高约 H/2（实测约 +200ms，与日志基线和干净测量的差值吻合）
     CurlSlot pub_pool_[kCurlPoolSize];
+    // 签名 GET（账户、持仓、挂单……）一个池。v5.10 之前每次都新建句柄，用完即毁——
+    // 主循环 3 秒一轮拉持仓和账户，等于每 3 秒经代理握手两次，而新建连接正是代理最容易
+    // 出岔子的一步（实盘"账户接口 JSON 解析失败"的来源）。不和下单共用池：
+    // 查账户不该占住下单的槽
+    CurlSlot get_pool_[kCurlPoolSize];
+    // 行情轮询专用的一个句柄。行情是止损线推进的唯一来源，不能排在批量拉K线后面——
+    // 公开池 6 个槽全忙时它最多要等 10 秒
+    CurlSlot price_slot_;
+    // 从池里取一个空闲槽：轮询直到有一个空出来（不再死等 0 号槽，那个槽可能正卡在一次
+    // 10 秒的超时里，而别的槽早就空了）
+    static CurlSlot* grab_slot(CurlSlot (&pool)[kCurlPoolSize], std::unique_lock<std::mutex>& lk);
+    // 设杠杆成功过的（品种 → 杠杆）。同样的杠杆不再重复设：每次开仓都发一次 POST，
+    // 多一个请求就多一次在代理上失败的机会
+    std::mutex                           lev_mtx_;
+    std::unordered_map<std::string, int> lev_set_;
 
     std::string sign(const std::string& q) const;
     int64_t     ts_ms() const;
@@ -506,8 +530,10 @@ private:
     std::string http_post(const std::string& path, std::string params = "",
                           long* out_code = nullptr);
     std::string http_del (const std::string& path, std::string params = "");
-    // 不带签名（listenKey 端点只需 X-MBX-APIKEY header）
-    std::string http_get_public  (const std::string& path);
+    // 公开行情。critical = 行情轮询（标记价 / 备用成交价）：走专用句柄，
+    // 限流闸门按订单优先级放行（只在被封禁时等）——权重逼近上限时，非订单请求要等到下一分钟，
+    // 而行情一停移动止损就停
+    std::string http_get_public  (const std::string& path, bool critical = false);
 };
 
 } // namespace ccbot

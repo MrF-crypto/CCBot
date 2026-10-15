@@ -122,6 +122,10 @@ public:
     // 价格已经陈旧的品种，供上层告警
     std::vector<std::string> stale_symbols() const;
     void on_server_msg(LogCb cb);
+    // 拉取失败时取原因（超时 / 连接中断 / 返回的不是 JSON……），拼进日志。
+    // 在行情线程上、紧跟着那次失败的拉取调用——TradingClient::last_error 是线程局部的
+    using ErrFn = std::function<std::string()>;
+    void on_fetch_error(ErrFn fn);
 
     // 一个品种的价格多久没刷新就算陈旧。轮询周期 1 秒，给 10 倍余量：
     // 偶尔一两轮失败不该让界面和引擎立刻失明，而连续十轮拿不到就是真出事了
@@ -148,12 +152,17 @@ private:
     std::unordered_map<std::string, Tick> cache_;   // 键 = 大写品种
     std::set<std::string>                subs_;
     LogCb                                log_cb_;
+    ErrFn                                err_fn_;   // mtx_ 保护
 
     std::atomic<bool>    running_{false};
+    // 这一段失败从什么时候开始、第一轮的原因（只在行情线程里读写）
+    int64_t              fail_since_ms_ = 0;
+    std::string          fail_why_;
     std::atomic<int64_t> last_ok_ms_{0};
     std::atomic<int>     fail_streak_{0};
-    // 连续失败时只报一次，恢复时报一次。中间每轮都报的话，1 秒一轮就是刷屏——
-    // 这正是 WS 版里那套退避+节流在解决的问题，而轮询只要一个 bool 就够
+    // 连续失败 kUnhealthyFails 轮（约 3 秒）才报一次，报过的恢复时报一次。
+    // 一两轮就好的瞬时失败不报：经代理时一小时能有几十次，每次两行就是刷屏
+    // （实盘一个半小时一百多行），而界面的健康灯本来就在实时显示
     std::atomic<bool>    fail_reported_{false};
     // 当前是否在用备用源。切换进/出各报一次 —— 口径变化必须让人知道，
     // 但每轮都报就是刷屏

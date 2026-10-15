@@ -34,7 +34,8 @@ class FundingLedger {
 public:
     struct Entry {
         double  total       = 0;   // 从开始追踪起累计（负数=已付出）
-        double  since_open  = 0;   // 本轮持仓累计，仓位归零时重置
+        // （"本轮持仓累计"since_open 已删：没有任何地方在仓位归零时清它，它其实是
+        //  这个品种全部历史持仓的累计，headless 却每分钟按"本轮已付"打一行，数是错的）
         int64_t cursor_ms   = 0;   // 已处理到的最后一条流水时间
         double  rate        = 0;   // 最新一期费率（正=多头付）
         int64_t next_ms     = 0;   // 下次结算时间
@@ -43,8 +44,6 @@ public:
 
     // 记一笔流水。同一时间戳只记一次（重复调用幂等），防止分页重叠导致重复计数
     void apply(const std::string& symbol, double income, int64_t time_ms);
-    // 仓位归零：本轮累计清零，总累计保留
-    void reset_position(const std::string& symbol);
     void set_rate(const std::string& symbol, double rate, int64_t next_ms, int64_t now_ms);
 
     Entry   get(const std::string& symbol) const;
@@ -56,16 +55,6 @@ public:
 
     // 年化持有成本%：费率 × 3次/天 × 365天。费率为负时结果为负（你在收钱）
     static double annualized_pct(double rate) { return rate * 3.0 * 365.0 * 100.0; }
-
-    // 资金费把回本价推高了多少。
-    // 已付资金费摊到每一份持仓上，就是均价之外还要多涨的部分——这是把"利息"
-    // 换算成使用者真正关心的单位（还要涨多少才回本）
-    static double effective_breakeven(double avg_price, double qty,
-                                      double funding_since_open, bool is_long) {
-        if (avg_price <= 0 || qty <= 0) return avg_price;
-        const double per_unit = -funding_since_open / qty;   // 付出为正
-        return is_long ? (avg_price + per_unit) : (avg_price - per_unit);
-    }
 
 private:
     mutable std::mutex          mtx_;

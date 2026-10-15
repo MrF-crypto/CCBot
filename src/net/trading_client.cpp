@@ -67,9 +67,63 @@ static size_t curl_header(char* ptr, size_t sz, size_t n, void* ud) {
     return sz * n;
 }
 
+// 所有句柄共用的选项。
+//   NOSIGNAL：多线程程序用 libcurl 的标准做法。不设的话（Linux 上同步解析器的构建）
+//     超时靠 SIGALRM 实现，多线程下信号会打到任意线程——崩溃隐患。Windows 无影响
+//   ACCEPT_ENCODING ""：声明支持 libcurl 编进来的全部压缩（gzip / deflate……），
+//     币安按需压缩。全市场标记价每秒一次一两百 KB、交易规则 1MB 以上，压缩后约 1/10。
+//     经代理时体积越大越容易超时（实盘"交易规则拉取失败"）
+//   CONNECTTIMEOUT 5：连不上就早点放弃、早点重试，不把整个 10 秒都耗在握手上
+static void common_opts(CURL* c) {
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+}
+
+// 本线程上一次请求的失败原因，见 TradingClient::last_error
+static thread_local std::string tl_net_err;
+// 拼进错误信息用：没有网络层原因时（比如网络正常、回的是截断的 JSON）也给一句话
+static std::string net_why(const std::string& e) { return e.empty() ? "网络层无异常" : e; }
+
+// 把一次请求的结果说成人话。空串 = 网络层面没问题（含币安的业务错误：那是 JSON，
+// 调用方自己会解析出 code/msg）
+static std::string describe_net(CURLcode rc, long http_code, const std::string& body) {
+    if (rc != CURLE_OK) {
+        switch (rc) {
+        case CURLE_OPERATION_TIMEDOUT:    return "超时";
+        case CURLE_COULDNT_CONNECT:       return "连不上";
+        case CURLE_COULDNT_RESOLVE_HOST:  return "域名解析失败";
+        case CURLE_COULDNT_RESOLVE_PROXY: return "代理域名解析失败";
+        case CURLE_SSL_CONNECT_ERROR:     return "TLS 握手失败";
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:            return "连接中断";
+        case CURLE_GOT_NOTHING:           return "对方没回任何数据";
+        case CURLE_PARTIAL_FILE:          return "数据没收全";
+        default: return std::string("网络错误：") + curl_easy_strerror(rc);
+        }
+    }
+    const size_t p = body.find_first_not_of(" \t\r\n");
+    const bool json_like = p != std::string::npos && (body[p] == '{' || body[p] == '[');
+    if (json_like) return {};
+    // 不是 JSON：附开头一小段，一眼看出是代理的网页、网关的 502 还是空
+    std::string snip = body.substr(p == std::string::npos ? 0 : p, 60);
+    for (auto& ch : snip) if (ch == '\n' || ch == '\r') ch = ' ';
+    if (body.empty() || p == std::string::npos)
+        return http_code > 0 ? "HTTP " + std::to_string(http_code) + "，空响应" : "空响应";
+    return (http_code != 200 ? "HTTP " + std::to_string(http_code) + "，" : std::string()) +
+           "返回的不是 JSON：" + snip;
+}
+
+// 值得立刻重试一次的：连接层的错误、没拿到状态码、网关 5xx。
+// 4xx 不重试（参数 / 权限 / 限流，重试同样的结果，限流时还会加重）
+static bool transient_net(CURLcode rc, long http_code) {
+    return rc != CURLE_OK || http_code == 0 || http_code >= 500;
+}
+
 static CURL* make_curl(const std::string& api_key, std::string& resp,
                         struct curl_slist*& hdrs) {
     CURL* c = curl_easy_init();
+    common_opts(c);
     hdrs = curl_slist_append(nullptr, ("X-MBX-APIKEY: " + api_key).c_str());
     hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
@@ -155,26 +209,16 @@ TradingClient::TradingClient(const Config& cfg) : cfg_(cfg) {
                             : "https://fapi.binance.com";
     base_ = is_pm() ? "https://papi.binance.com" : pub_base_;
 
-    // Pre-warm persistent CURL pool: one handle per slot shares TCP+TLS across calls
-    for (int i = 0; i < kCurlPoolSize; ++i) {
+    // 一个持久句柄：同一个槽里的请求复用 TCP+TLS 连接。with_key = 签名请求（挂 API Key 头）
+    auto init_slot = [&cfg](CurlSlot& s, bool with_key) {
         CURL* c = curl_easy_init();
-        auto* h = curl_slist_append(nullptr, ("X-MBX-APIKEY: " + cfg.api_key).c_str());
-        h = curl_slist_append(h, "Content-Type: application/x-www-form-urlencoded");
-        curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
-        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write);
-        curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
-        curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE, 30L);
-        curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 15L);
-        curl_pool_[i].handle = c;
-        curl_pool_[i].hdrs   = h;
-    }
-
-    // 公开行情池：同样预热，但【不挂 API Key header】——这类端点按 IP 计权重
-    for (int i = 0; i < kCurlPoolSize; ++i) {
-        CURL* c = curl_easy_init();
+        common_opts(c);
+        struct curl_slist* h = nullptr;
+        if (with_key) {
+            h = curl_slist_append(nullptr, ("X-MBX-APIKEY: " + cfg.api_key).c_str());
+            h = curl_slist_append(h, "Content-Type: application/x-www-form-urlencoded");
+            curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+        }
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write);
         curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
@@ -183,19 +227,44 @@ TradingClient::TradingClient(const Config& cfg) : cfg_(cfg) {
         curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE, 30L);
         curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 15L);
-        pub_pool_[i].handle = c;
-        pub_pool_[i].hdrs   = nullptr;
+        s.handle = c;
+        s.hdrs   = h;
+    };
+    // 下单池（POST）、签名 GET 池：挂 API Key
+    for (auto& s : curl_pool_) init_slot(s, true);
+    for (auto& s : get_pool_)  init_slot(s, true);
+    // 公开行情池与行情轮询专用句柄：【不挂 API Key header】——这类端点按 IP 计权重
+    for (auto& s : pub_pool_)  init_slot(s, false);
+    init_slot(price_slot_, false);
+}
+
+TradingClient::CurlSlot* TradingClient::grab_slot(CurlSlot (&pool)[kCurlPoolSize],
+                                                  std::unique_lock<std::mutex>& lk) {
+    for (int round = 0;; ++round) {
+        for (auto& s : pool) {
+            std::unique_lock<std::mutex> try_lk(s.mtx, std::try_to_lock);
+            if (try_lk.owns_lock()) { lk = std::move(try_lk); return &s; }
+        }
+        // 全忙：短暂让出再扫一遍。先密后疏——多数请求几十毫秒就完
+        std::this_thread::sleep_for(std::chrono::milliseconds(round < 50 ? 2 : 10));
     }
 }
+
+std::string TradingClient::last_error() const { return tl_net_err; }
 
 TradingClient::~TradingClient() {
     for (auto& slot : curl_pool_) {
         if (slot.handle) curl_easy_cleanup(static_cast<CURL*>(slot.handle));
         if (slot.hdrs)   curl_slist_free_all(static_cast<struct curl_slist*>(slot.hdrs));
     }
+    for (auto& slot : get_pool_) {
+        if (slot.handle) curl_easy_cleanup(static_cast<CURL*>(slot.handle));
+        if (slot.hdrs)   curl_slist_free_all(static_cast<struct curl_slist*>(slot.hdrs));
+    }
     for (auto& slot : pub_pool_) {
         if (slot.handle) curl_easy_cleanup(static_cast<CURL*>(slot.handle));
     }
+    if (price_slot_.handle) curl_easy_cleanup(static_cast<CURL*>(price_slot_.handle));
 }
 
 std::string TradingClient::sign(const std::string& q) const {
@@ -237,37 +306,43 @@ int64_t TradingClient::wall_now_ms() const {
     return wall_hook_ ? wall_hook_() : wall_ms();
 }
 
-std::string TradingClient::http_get_public(const std::string& path) {
+std::string TradingClient::http_get_public(const std::string& path, bool critical) {
+    tl_net_err.clear();
     if (test_hook_) {
         FakeReply fr;
         if (test_hook_("GET", path, "", fr)) {
             gate_->observe(fr.code, fr.headers, fr.body);
+            tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
             return fr.body;
         }
     }
     std::string url  = pub_base_ + path;
     std::string resp, rhdr;
 
-    // 从公开池取一个空闲槽：先非阻塞轮询，全忙则阻塞等 0 号槽（与订单池同一策略）
+    // 行情轮询走专用句柄（只有行情线程用，不会真的等）；其余从公开池取一个空闲槽
     std::unique_lock<std::mutex> lk;
-    CurlSlot* slot = nullptr;
-    for (auto& s : pub_pool_) {
-        std::unique_lock<std::mutex> try_lk(s.mtx, std::try_to_lock);
-        if (try_lk.owns_lock()) { slot = &s; lk = std::move(try_lk); break; }
-    }
-    if (!slot) { lk = std::unique_lock<std::mutex>(pub_pool_[0].mtx); slot = &pub_pool_[0]; }
+    CurlSlot* slot = critical ? &price_slot_ : grab_slot(pub_pool_, lk);
+    if (critical) lk = std::unique_lock<std::mutex>(price_slot_.mtx);
 
-    // 公开行情按 IP 计权重，和签名请求共用同一个配额——这里是请求量最大的一类
-    // （31品种×每5分钟的指标+趋势批次），突发风险主要来自它
-    gate_->acquire(false);
     CURL* c = static_cast<CURL*>(slot->handle);
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);      // 槽只用于 GET，显式复位以防将来被复用
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
-    curl_easy_perform(c);
-    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    gate_->observe(code, rhdr, resp);
+    // 连接层的瞬时故障（连接被重置、网关 5xx）立刻重试一次：经代理时这类故障很常见、
+    // 往往一两秒就好，第二次多半成功。只重试一次——真断网时不把调用方拖太久
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        resp.clear();
+        rhdr.clear();
+        // 公开行情按 IP 计权重，和签名请求共用同一个配额——请求量最大的一类，突发风险主要来自它。
+        // 行情轮询按订单优先级过闸：权重逼近上限时只延后批量拉K线，不延后行情
+        gate_->acquire(critical);
+        curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);      // 槽只用于 GET，显式复位以防将来被复用
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+        curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
+        const CURLcode rc = curl_easy_perform(c);
+        long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        gate_->observe(code, rhdr, resp);
+        tl_net_err = describe_net(rc, code, resp);
+        if (!transient_net(rc, code)) break;
+    }
     return resp;
 }
 
@@ -385,8 +460,9 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
 }
 
 std::string TradingClient::http_get(const std::string& path, std::string params) {
+    tl_net_err.clear();
     std::string resp, rhdr;
-    struct curl_slist* hdrs = nullptr;
+    const std::string base_params = params;
     // ⚠ 顺序至关重要：先过闸门，【放行之后】才算时间戳并签名。
     //
     // 反过来（先签名再等闸门）会制造一个隐蔽的 -1021 工厂：闸门在权重逼近上限时
@@ -396,46 +472,58 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
     //
     // 这正是那台 macOS 实盘 33% 时间在报 -1021 的真正原因：与本机时钟无关
     // （诊断显示偏移中位数只有 300ms），纯粹是"签名早、发送晚"。
-    gate_->acquire(false);
-    if (!params.empty()) {
-        params += "&timestamp=" + std::to_string(ts_ms());
-        params += "&signature=" + sign(params);
-    }
-    // 测试钩子放在签名【之后】：它拦截的应当是"即将发出的那个请求"，
-    // 而不是刚进函数、还没加时间戳的半成品。用例⑤靠这一点验证时间戳的新鲜度
-    if (test_hook_) {
-        FakeReply fr;
-        if (test_hook_("GET", path, params, fr)) {
-            gate_->observe(fr.code, fr.headers, fr.body);
-            return fr.body;
+    //
+    // 签名 GET 都是查询（账户、持仓、挂单），幂等，连接层的瞬时故障重试一次。
+    // 重试要【重新过闸、重新签名】：时间戳必须是新的
+    std::unique_lock<std::mutex> lk;
+    CurlSlot* slot = nullptr;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        gate_->acquire(false);
+        params = base_params;
+        if (!params.empty()) {
+            params += "&timestamp=" + std::to_string(ts_ms());
+            params += "&signature=" + sign(params);
         }
+        // 测试钩子放在签名【之后】：它拦截的应当是"即将发出的那个请求"，
+        // 而不是刚进函数、还没加时间戳的半成品。用例⑤靠这一点验证时间戳的新鲜度
+        if (test_hook_) {
+            FakeReply fr;
+            if (test_hook_("GET", path, params, fr)) {
+                gate_->observe(fr.code, fr.headers, fr.body);
+                tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
+                return fr.body;
+            }
+        }
+        // 槽在第一次真的要发请求时才取（测试钩子分支不占槽）
+        if (!slot) slot = grab_slot(get_pool_, lk);
+        resp.clear();
+        rhdr.clear();
+        const std::string url = base_ + path + (params.empty() ? "" : "?" + params);
+        CURL* c = static_cast<CURL*>(slot->handle);
+        curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+        curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
+        const CURLcode rc = curl_easy_perform(c);
+        long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        gate_->observe(code, rhdr, resp);
+        tl_net_err = describe_net(rc, code, resp);
+        if (!transient_net(rc, code)) break;
     }
-    std::string url = base_ + path + (params.empty() ? "" : "?" + params);
-    CURL* c = make_curl(cfg_.api_key, resp, hdrs);
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
-    curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
-    curl_easy_perform(c);
-    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    gate_->observe(code, rhdr, resp);
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(c);
     return resp;
 }
 
 std::string TradingClient::http_post(const std::string& path, std::string params,
                                      long* out_code) {
+    tl_net_err.clear();
     std::string url  = base_ + path;
     std::string resp;
 
-    // Acquire a free pooled slot; try non-blocking first, fall back to blocking on slot 0
+    // 取一个空闲槽（全忙时轮询等第一个空出来的，不死等 0 号槽）。
+    // ⚠ 下单【不重试】：POST 不幂等，连接断在发出之后时单子可能已经到了交易所，
+    //   重发就是双倍下单。这类"状态不明"由调用方按 uncertain 去查单处理
     std::unique_lock<std::mutex> lk;
-    CurlSlot* slot = nullptr;
-    for (auto& s : curl_pool_) {
-        std::unique_lock<std::mutex> try_lk(s.mtx, std::try_to_lock);
-        if (try_lk.owns_lock()) { slot = &s; lk = std::move(try_lk); break; }
-    }
-    if (!slot) { lk = std::unique_lock<std::mutex>(curl_pool_[0].mtx); slot = &curl_pool_[0]; }
+    CurlSlot* slot = grab_slot(curl_pool_, lk);
 
     // 订单请求享有优先权：只在真正被封禁时才等，不参与权重软限速。
     // 平仓/止损延迟直接对应资金损失，而拉一次指标晚几秒无所谓
@@ -452,6 +540,7 @@ std::string TradingClient::http_post(const std::string& path, std::string params
         FakeReply fr;
         if (test_hook_("POST", path, params, fr)) {
             gate_->observe(fr.code, fr.headers, fr.body);
+            tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
             if (out_code) *out_code = fr.code;
             return fr.body;
         }
@@ -466,14 +555,16 @@ std::string TradingClient::http_post(const std::string& path, std::string params
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)params.size());
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
-    curl_easy_perform(c);
+    const CURLcode rc = curl_easy_perform(c);
     long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     gate_->observe(code, rhdr, resp);
+    tl_net_err = describe_net(rc, code, resp);
     if (out_code) *out_code = code;
     return resp;
 }
 
 std::string TradingClient::http_del(const std::string& path, std::string params) {
+    tl_net_err.clear();
     std::string resp, rhdr;
     struct curl_slist* hdrs = nullptr;
     gate_->acquire(true);          // 撤单同属订单类，优先
@@ -484,6 +575,7 @@ std::string TradingClient::http_del(const std::string& path, std::string params)
         FakeReply fr;
         if (test_hook_("DELETE", path, params, fr)) {
             gate_->observe(fr.code, fr.headers, fr.body);
+            tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
             return fr.body;
         }
     }
@@ -493,9 +585,10 @@ std::string TradingClient::http_del(const std::string& path, std::string params)
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
-    curl_easy_perform(c);
+    const CURLcode rc = curl_easy_perform(c);
     long dcode = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &dcode);
     gate_->observe(dcode, rhdr, resp);
+    tl_net_err = describe_net(rc, dcode, resp);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(c);
     return resp;
@@ -526,13 +619,13 @@ TradingClient::AccountInfo TradingClient::fetch_account() {
 TradingClient::AccountInfo TradingClient::fetch_account_futures() {
     AccountInfo info;
     auto resp = http_get(ep(Ep::Account), "recvWindow=5000");
-    if (resp.empty()) { info.error = "无响应"; return info; }
+    if (resp.empty()) { info.error = "无响应（" + net_why(last_error()) + "）"; return info; }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
-        info.error = "JSON解析失败";
+        info.error = "JSON解析失败（" + net_why(last_error()) + "）";
         return info;
     }
     if (binance_error(doc, info.error)) return info;
@@ -555,12 +648,15 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
 
     // ① UM 子账户：未实现盈亏，以及 totalAvailableBalance 缺失时的兜底
     auto um_resp = http_get(ep(Ep::Account), "recvWindow=5000");
-    if (um_resp.empty()) { info.error = "统一账户无响应（papi）"; return info; }
+    if (um_resp.empty()) {
+        info.error = "统一账户无响应（papi，" + net_why(last_error()) + "）";
+        return info;
+    }
 
     simdjson::dom::element um;
     auto um_ps = simdjson::padded_string(um_resp);
     if (p1.parse(um_ps).get(um) != simdjson::SUCCESS) {
-        info.error = "统一账户JSON解析失败";
+        info.error = "统一账户JSON解析失败（" + net_why(last_error()) + "）";
         return info;
     }
     if (binance_error(um, info.error)) return info;
@@ -711,12 +807,16 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     auto resp = http_get(ep(Ep::Order),
                          "symbol=" + sym + "&origClientOrderId=" + client_order_id +
                          "&recvWindow=5000");
-    if (resp.empty()) { r.error = "无响应"; r.uncertain = true; return r; }
+    if (resp.empty()) { r.error = "无响应（" + net_why(last_error()) + "）"; r.uncertain = true; return r; }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) { r.error = "JSON解析失败"; r.uncertain = true; return r; }
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
+        r.error = "JSON解析失败（" + net_why(last_error()) + "）";
+        r.uncertain = true;
+        return r;
+    }
     if (binance_error(doc, r.error)) {
         // 只有 -2013（订单不存在）是"确认没到交易所"的可靠答案；其他业务错误
         // （-1021时间戳超窗/-1003限流/-1022签名…）说明【查询本身】没成功，
@@ -910,18 +1010,38 @@ bool TradingClient::fetch_position_mode(bool* ok) {
 // ——"拉取失败当成确实没有"。v5.9.3 正是用这条理由删掉了 close_position，漏了它。
 // 埋着已知缺陷的死代码比没有代码更糟：下一个要"全平"的人会找到它并继承这个 bug。
 bool TradingClient::set_leverage(const std::string& sym, int lev) {
+    // 这个品种已经成功设过同样的杠杆：不再发请求（每次开仓都设一遍是多余的 POST）。
+    // 用户在 App 上手动改了杠杆的话，本程序下一次开仓仍按缓存认为是 lev——
+    // 这和原来"设失败就按交易所原有杠杆开"的口径一样：敞口由数量决定，与杠杆无关
+    {
+        std::lock_guard<std::mutex> lk(lev_mtx_);
+        if (auto it = lev_set_.find(sym); it != lev_set_.end() && it->second == lev) {
+            tl_net_err.clear();
+            return true;
+        }
+    }
     auto resp = http_post(ep(Ep::Leverage),
         "symbol=" + sym + "&leverage=" + std::to_string(lev));
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
-    int64_t code = 0;
-    if (doc["code"].get(code) == simdjson::SUCCESS) {
-        if (code == -4046) return true;
-        return code == 0;
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
+        tl_net_err = net_why(tl_net_err);   // 网络层的原因已经在里面
+        return false;
     }
-    return true;
+    bool ok = true;
+    int64_t code = 0;
+    if (doc["code"].get(code) == simdjson::SUCCESS && code != -4046 && code != 0) {
+        ok = false;
+        std::string msg;
+        binance_error(doc, msg);
+        tl_net_err = msg.empty() ? "[" + std::to_string(code) + "]" : msg;   // 交易所拒绝的原因
+    }
+    if (ok) {
+        std::lock_guard<std::mutex> lk(lev_mtx_);
+        lev_set_[sym] = lev;
+    }
+    return ok;
 }
 
 // unsigned HTTP 三件套（http_post/put/del_unsigned）与 ListenKey 三件套
@@ -1343,7 +1463,8 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
         simdjson::dom::array ka;
         if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
         // klines 数组下标：0=开盘时间(整数毫秒) 1=open 2=high 3=low 4=close 5=volume
-        // （1~5 是字符串，0 是整数——类型不同，必须分开取）
+        // 6=收盘时间 7=成交额（quote volume）
+        // （1~5、7 是字符串，0、6 是整数——类型不同，必须分开取）
         Bar b;
         int idx = 0;
         bool ok = true;
@@ -1363,8 +1484,14 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
                 case 4: b.close = v; break;
                 case 5: b.volume = v; break;
                 }
+            } else if (idx == 7) {
+                // 成交额缺了不算坏行（老接口 / 测试数据只有前 6 列）：留 0，用的人自己兜底
+                std::string_view sv;
+                if (field.get(sv) == simdjson::SUCCESS) {
+                    try { b.quote_volume = std::stod(std::string(sv)); } catch (...) {}
+                }
             }
-            if (++idx > 5) break;
+            if (++idx > 7) break;
         }
         if (ok) out.push_back(b);
     }
@@ -1379,6 +1506,20 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
 //   下面这三个还在用的（trend_signal / atr / bar_pattern）。按行号一整段切会
 //   把中间那三个一起带走，而且编译期发现不了——是链接期才报未解析符号。
 //   删函数要逐个定边界，别信"它们看起来是连在一起的"。
+
+// K线周期 → 秒（"5m" / "1h" / "4h" / "1d" / "1w"）。认不出返回 0（不折算量比）
+static int interval_seconds(const std::string& iv) {
+    if (iv.size() < 2) return 0;
+    int n = 0;
+    try { n = std::stoi(iv.substr(0, iv.size() - 1)); } catch (...) { return 0; }
+    switch (iv.back()) {
+    case 'm': return n * 60;
+    case 'h': return n * 3600;
+    case 'd': return n * 86400;
+    case 'w': return n * 604800;
+    default:  return 0;
+    }
+}
 
 // ── 趋势信号快照（ATR + 唐奇安通道）──────────────────────────────────────────
 TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
@@ -1421,6 +1562,13 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         vols.reserve(bars.size());
         for (const auto& b : bars) vols.push_back(b.volume);
         out.vol_ratio = indicators::volume_ratio(vols, (int)vols.size() - 1, donchian_period);
+        // 已走时间按交易所时钟算（本机时钟可能偏几秒到几分钟）
+        const int bar_sec = interval_seconds(interval);
+        if (bar_sec > 0 && out.bar_open_ms > 0) {
+            const double frac = (double)(ts_ms() - out.bar_open_ms) / (bar_sec * 1000.0);
+            out.vol_ratio_paced = indicators::paced_ratio(out.vol_ratio, frac);
+        }
+        out.prev_close = bars[bars.size() - 2].close;
 
         const auto e = indicators::efficiency_ratio(oh, donchian_period);
         out.er_ok = e.ok;
@@ -1560,6 +1708,7 @@ std::vector<TradingClient::MarketSymbol> TradingClient::fetch_exchange_symbols(b
         if (e["quoteAsset"].get(v) == simdjson::SUCCESS)   m.quote = std::string(v);
         if (e["contractType"].get(v) == simdjson::SUCCESS) m.contract_type = std::string(v);
         if (e["status"].get(v) == simdjson::SUCCESS)       m.status = std::string(v);
+        if (e["underlyingType"].get(v) == simdjson::SUCCESS) m.underlying_type = std::string(v);
         int64_t t = 0;
         if (e["onboardDate"].get(t) == simdjson::SUCCESS)  m.onboard_ms = t;
         if (e["deliveryDate"].get(t) == simdjson::SUCCESS) m.delivery_ms = t;
@@ -1677,7 +1826,7 @@ std::set<std::string> TradingClient::fetch_open_algo_ids(bool* ok) {
 std::unordered_map<std::string, double> TradingClient::fetch_all_last_prices() {
     std::unordered_map<std::string, double> out;
     // 不带 symbol ⇒ 返回全市场数组
-    auto resp = http_get_public("/fapi/v1/ticker/price");
+    auto resp = http_get_public("/fapi/v1/ticker/price", /*critical*/ true);
     if (resp.empty()) return out;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -1701,7 +1850,7 @@ std::unordered_map<std::string, double> TradingClient::fetch_all_last_prices() {
 std::unordered_map<std::string, double> TradingClient::fetch_all_mark_prices() {
     std::unordered_map<std::string, double> out;
     // 不带 symbol ⇒ 返回全市场数组
-    auto resp = http_get_public("/fapi/v1/premiumIndex");
+    auto resp = http_get_public("/fapi/v1/premiumIndex", /*critical*/ true);
     if (resp.empty()) return out;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
